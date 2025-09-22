@@ -35,6 +35,7 @@ __all__ = [
     "NotificationEventEffect",
     "NotificationEventPayload",
     "NotificationEvent",
+    "NotificationActionResponses",
 ]
 
 import asyncio
@@ -74,6 +75,7 @@ from .models import (
     NotificationEventSeverity,
     NotificationEventActions,
     NotificationEventEffect,
+    NotificationActionResponses,
 )
 from .state_model import StateModel, Exclusive, Untracked
 from .utils import _resize_state_inplace

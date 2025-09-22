@@ -36,12 +36,12 @@ class ClientCameraMixin(Client[_T]):
     _request_count: int = 0
 
     def initialize_camera_mixin(
-            self,
-            camera_pool: Optional[CameraPool] = None,
-            pause_timeout: Optional[int] = None,
-            max_cache_age: Optional[datetime.timedelta] = None,
-            camera_debug: Optional[bool] = None,
-            **_kwargs,
+        self,
+        camera_pool: Optional[CameraPool] = None,
+        pause_timeout: Optional[int] = None,
+        max_cache_age: Optional[datetime.timedelta] = None,
+        camera_debug: Optional[bool] = None,
+        **_kwargs,
     ):
         self._camera_pool = camera_pool
         self._stream_lock = CancelableLock()
@@ -54,7 +54,9 @@ class ClientCameraMixin(Client[_T]):
             else camera_debug
         )
         self._camera_logger = self.logger.getChild("camera")
-        self._camera_logger.setLevel(logging.DEBUG if self._camera_debug else logging.INFO)
+        self._camera_logger.setLevel(
+            logging.DEBUG if self._camera_debug else logging.INFO
+        )
 
     @property
     def camera_status(self) -> Literal["ok", "new", "err"]:
@@ -144,10 +146,10 @@ class ClientCameraMixin(Client[_T]):
             self._request_count += 1
 
     async def on_webcam_snapshot(
-            self,
-            data: WebcamSnapshotDemandData = WebcamSnapshotDemandData(),
-            attempt=0,
-            retry_timeout=5,
+        self,
+        data: WebcamSnapshotDemandData = WebcamSnapshotDemandData(),
+        attempt=0,
+        retry_timeout=5,
     ):
         if not self._camera_handle:
             await self._stream_setup.wait()

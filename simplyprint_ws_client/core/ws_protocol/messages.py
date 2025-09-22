@@ -132,8 +132,9 @@ from ..state import (
     JobInfoState,
     MaterialEntry,
     JobObjectEntry,
+    PrinterStatus,
+    NotificationActionResponses,
 )
-from ..state.models import NotificationActionResponses
 
 try:
     from types import NoneType
@@ -735,9 +736,11 @@ class StateChangeMsg(ClientMsg[Literal[ClientMsgType.STATUS]]):
         yield "new", state.status
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.model_reset_changed("status")
-        if not state.is_printing():
+        # When the printer goes operational, we can clear the current job id.
+        if state.status == PrinterStatus.OPERATIONAL:
             state.current_job_id = None
+
+        state.model_reset_changed("status")
 
 
 class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
@@ -765,8 +768,13 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
             yield key, value
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        if state.job_info.model_has_changes("finished", "cancelled", "failed"):
+        # When an ended field has been changed to true, we can clear the current job id.
+        ended_fields = JobInfoState.MUTUALLY_EXCLUSIVE_FIELDS - {"started"}
+        if state.job_info.model_has_changes(*ended_fields) and any(
+            getattr(state.job_info, f) for f in ended_fields
+        ):
             state.current_job_id = None
+
         state.job_info.model_reset_changed()
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
