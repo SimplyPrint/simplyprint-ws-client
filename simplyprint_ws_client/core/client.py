@@ -579,11 +579,16 @@ class DefaultClient(Client[TConfig], ABC):
     @configure(DemandMsgType.SET_MATERIAL_DATA, priority=1)
     def _on_set_material_data(self, data: SetMaterialDataDemandData):
         for material in data.materials:
-            if material.ext not in self.printer.materials:
+            tool = self.printer.tool(material.nozzle)
+
+            if tool is None:
                 continue
 
-            self.printer.materials[material.ext].model_update(material)
-            self.printer.materials[material.ext].model_reset_changed()
+            if material.ext not in tool.materials:
+                continue
+
+            tool.materials[material.ext].model_update(material)
+            tool.materials[material.ext].model_reset_changed()
 
     @configure(DemandMsgType.REFRESH_MATERIAL_DATA, priority=1)
     async def _on_refresh_material_data(self):
