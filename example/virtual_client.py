@@ -15,11 +15,8 @@ from simplyprint_ws_client import (
     FileDemandData,
     FileProgressStateEnum,
     MaterialDataMsg,
-    NotificationEventType,
-    NotificationEventSeverity,
+    MeshDataMsg,
 )
-from simplyprint_ws_client.core.state import NotificationEventPayload
-from simplyprint_ws_client.core.state.models import NotificationEventButtonAction
 from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
@@ -38,6 +35,18 @@ class VirtualConfig(PrinterConfig):
 
 
 _TEST_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAeAAAAFoCAIAAAAAVb93AAAFMklEQVR4nOzWQQkCYRhFUZFpYAVzWcAAGsAONnFvJ3FtAZc/fJfhnARvdXnb8/Q4wF68bp/pCbDMcXoAAP8JNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRG3f+3l6AyxzeV+nJ8AyHjRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNEDULwAA//+/JAlAlWQCTwAAAABJRU5ErkJggg=="
+
+
+def random_float(a, b):
+    return a + random.random() * (b - a)
+
+
+def _generate_fake_mesh_data():
+    return {
+        "mesh_matrix": [[random_float(0, 1) for _ in range(4)] for _ in range(4)],
+        "mesh_max": [random_float(200, 220) for _ in range(3)],
+        "mesh_min": [random_float(0, 20) for _ in range(3)],
+    }
 
 
 class VirtualCamera(BaseCameraProtocol):
@@ -87,24 +96,29 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
     async def on_gcode(self, data: GcodeDemandData):
         self.logger.info("Gcode: %s", data.list)
 
-        event = self.printer.notifications.new(
-            type=NotificationEventType.GENERIC,
-            severity=NotificationEventSeverity.ERROR,
-            payload=NotificationEventPayload(
-                title="Hey! Are you sure about this?",
-                message=f"Bout to execute very dangerous gcode commands {'; '.join(data.list)}",
-                actions={
-                    "cancel": NotificationEventButtonAction(
-                        label="Cancel gcode command before it's too late!"
-                    )
-                },
-            ),
-        )
+        # event = self.printer.notifications.new(
+        #    type=NotificationEventType.GENERIC,
+        #    severity=NotificationEventSeverity.ERROR,
+        #    payload=NotificationEventPayload(
+        #        title="Hey! Are you sure about this?",
+        #        message=f"Bout to execute very dangerous gcode commands {'; '.join(data.list)}",
+        #        actions={
+        #            "cancel": NotificationEventButtonAction(
+        #                label="Cancel gcode command before it's too late!"
+        #            )
+        #        },
+        #    ),
+        # )
+        #
+        # response = await event.wait_for_response(timeout=5)
+        # if response is not None and response.action == "cancel":
+        #    self.logger.info("Gcode command cancelled by user.")
+        #    return
 
-        response = await event.wait_for_response(timeout=5)
-
-        if response is not None and response.action == "cancel":
-            self.logger.info("Gcode command cancelled by user.")
+        if any("BEDLEVELVISUALIZER" in gcode for gcode in data.list):
+            await asyncio.sleep(2)
+            self.logger.info("Generated fake mesh data for BEDLEVELVISUALIZER")
+            await self.send(MeshDataMsg(data=_generate_fake_mesh_data()))
             return
 
         for gcode in data.list:

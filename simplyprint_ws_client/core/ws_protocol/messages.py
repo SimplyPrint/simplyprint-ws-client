@@ -601,8 +601,7 @@ class GcodeScriptsMsg(ClientMsg[Literal[ClientMsgType.GCODE_SCRIPTS]]): ...
 class MachineDataMsg(ClientMsg[Literal[ClientMsgType.INFO]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        for key in state.info.__class__.model_fields:
-            yield key, getattr(state.info, key)
+        return state.info.model_dump(mode="json", exclude_none=True)
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.info.model_reset_changed()
