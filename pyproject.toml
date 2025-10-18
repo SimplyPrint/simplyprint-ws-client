@@ -1,6 +1,6 @@
 [project]
 name = "simplyprint-ws-client"
-version = "1.0.1rc34"
+version = "1.0.1rc35"
 description = "SimplyPrint Websocket Client"
 authors = [{ name = "SimplyPrint", email = "contact@simplyprint.io" }]
 requires-python = ">=3.9"
@@ -24,9 +24,6 @@ dependencies = [
     "async-timeout ; python_version < '3.11'",
     "strenum ; python_version < '3.11'",
     "typing-extensions",
-    "more-itertools>=10.5.0",
-    "lmdb>=1.7.3",
-    "ormsgpack>=1.6.0",
 ]
 
 [project.urls]
