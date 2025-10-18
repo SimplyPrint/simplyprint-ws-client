@@ -6,13 +6,13 @@ import pytest
 
 from simplyprint_ws_client import Client, MaterialDataMsg
 from simplyprint_ws_client.core.state import MaterialLayoutEntry
-from simplyprint_ws_client.core.state.models import VolumeType, NozzleType
+from simplyprint_ws_client.core.state.models import VolumeType, NozzleType, BedType
 
 
 @pytest.mark.parametrize(
     "field,value,expected_data_key",
     [
-        ("bed.type", "PLA", "bed"),
+        ("bed.type", BedType.BAMBU_TEXTURED_PEI_PLATE, "bed"),
         ("tools.*.size", 0.4, "nozzles"),
         ("tools.*.type", NozzleType.HARDENED_STEEL, "nozzles"),
     ],
@@ -109,23 +109,27 @@ def test_refresh_mode_includes_all_sections(client: Client):
 def test_reset_changes_mirrors_producer_fields(client: Client):
     """Test that reset_changes clears exactly the fields that producer watches."""
     # Make changes to all producer-watched fields
-    client.printer.bed.type = "PLA"
-    client.printer.tool0.size = 0.4
-    client.printer.tool0.type = NozzleType.HARDENED_STEEL
-    client.printer.tool0.materials[0].type = "PLA"
-    client.printer.update_mms_layout([MaterialLayoutEntry(nozzle=0, size=4)])
-
-    # Also change fields NOT watched by producer
-    client.printer.tool0.volume_type = VolumeType.HIGH_FLOW
-
-    # Verify producer-watched fields have changes
+    client.printer.bed.type = BedType.BAMBU_TEXTURED_PEI_PLATE
     assert client.printer.bed.model_has_changes("type")
-    assert client.printer.tool0.model_has_changes("size", "type")
+
+    client.printer.tool_count = 2
+
+    for i in range(0, client.printer.tool_count):
+        tool = client.printer.tool(i)
+        tool.size = 0.4
+        tool.type = NozzleType.HARDENED_STEEL
+        tool.volume_type = VolumeType.HIGH_FLOW
+        client.printer.update_mms_layout([MaterialLayoutEntry(nozzle=i, size=4)])
+        for material in tool.materials:
+            material.type = "PLA"
+            material.color = "Blue"
+            material.hex = "#FF0000"
+        # Verify producer-watched fields have changes
+        assert {"size", "type", "volume_type"}.issubset(tool.model_changed_fields)
 
     # Build and reset message
-    msg = MaterialDataMsg(data=dict(MaterialDataMsg.build(client.printer)))
-    msg.reset_changes(client.printer)
-
-    assert not client.printer.bed.model_has_changes("type")
-    assert not client.printer.tool0.model_has_changes("size", "type")
-    assert not client.printer.tool0.model_has_changes("volume_type")
+    msgs, _ = client.consume()
+    assert len(msgs) == 1
+    assert msgs[0].__class__ == MaterialDataMsg
+    msgs, _ = client.consume()
+    assert len(msgs) == 0

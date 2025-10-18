@@ -343,7 +343,7 @@ class MaterialEntry(StateModel):
 
 
 class BedState(StateModel):
-    type: Optional[str] = None
+    type: Optional[BedType] = None
     temperature: TemperatureState = Field(default_factory=TemperatureState)
 
     def is_heating(self) -> bool:

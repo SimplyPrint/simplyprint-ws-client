@@ -216,50 +216,52 @@ class StateModel(BaseModel, Synchronized):
     def model_recursive_changeset(self) -> Dict[str, int]:
         changed_fields = self.model_self_changed_fields.copy()
 
+        def set_changed_field(field: str, change_id: int) -> None:
+            nonlocal changed_fields
+            changed_fields[field] = max(changed_fields.get(field, -1), change_id)
+
         for field_name, model_field in self.__class__.model_fields.items():
             field_value = self.__dict__[field_name]
 
+            if not field_value or not self.is_pydantic_change_detect_annotation(
+                field_info=model_field
+            ):
+                continue
+
+            # Handle direct nested state models.
             if isinstance(field_value, StateModel) and (
                 field_value_changes := field_value.model_recursive_changeset
             ):
                 for key, value in field_value_changes.items():
-                    changed_fields[f"{field_name}.{key}"] = value
-                changed_fields[field_name] = max(
-                    changed_fields.get(field_name, -1), *field_value_changes.values()
-                )
+                    set_changed_field(f"{field_name}.{key}", value)
+
+                set_changed_field(field_name, max(field_value_changes.values()))
                 continue
 
-            if field_value and self.is_pydantic_change_detect_annotation(
-                field_info=model_field
-            ):
-                if isinstance(field_value, list):
-                    field_values = zip(
-                        repeat("*"), field_value
-                    )  # Generate a matchable key for list changes
-                elif isinstance(field_value, tuple):
-                    field_values = enumerate(field_value)  # Tuples have fixed indices
-                elif isinstance(field_value, dict):
-                    field_values = field_value.items()
-                else:
-                    continue
+            # Handle collection of nested state models.
+            if isinstance(field_value, list):
+                # Generate a matchable key for list changes
+                field_values = zip(repeat("*"), field_value)
+            elif isinstance(field_value, tuple):
+                field_values = enumerate(field_value)  # Tuples have fixed indices
+            elif isinstance(field_value, dict):
+                field_values = field_value.items()
+            else:
+                continue
 
-                for inner_field_index, inner_field_value in field_values:
-                    if isinstance(inner_field_value, StateModel) and (
-                        inner_field_value_changes
-                        := inner_field_value.model_recursive_changeset
-                    ):
-                        for key, value in inner_field_value_changes.items():
-                            changed_fields[
-                                f"{field_name}.{inner_field_index}.{key}"
-                            ] = value
-
-                        x = changed_fields[f"{field_name}.{inner_field_index}"] = max(
-                            inner_field_value_changes.values()
+            for inner_field_index, inner_field_value in field_values:
+                if isinstance(inner_field_value, StateModel) and (
+                    inner_field_value_changes
+                    := inner_field_value.model_recursive_changeset
+                ):
+                    for key, value in inner_field_value_changes.items():
+                        set_changed_field(
+                            f"{field_name}.{inner_field_index}.{key}", value
                         )
 
-                        changed_fields[field_name] = max(
-                            changed_fields.get(field_name, -1), x
-                        )
+                    x = max(inner_field_value_changes.values())
+                    set_changed_field(f"{field_name}.{inner_field_index}", x)
+                    set_changed_field(field_name, x)
 
         return changed_fields
 
@@ -404,7 +406,7 @@ class StateModel(BaseModel, Synchronized):
             if exclude and field_name in exclude:
                 continue
 
-            if field_name in other.model_fields:
+            if field_name in other.__class__.model_fields:
                 field_value = getattr(other, field_name)
 
                 if isinstance(field_value, StateModel):
