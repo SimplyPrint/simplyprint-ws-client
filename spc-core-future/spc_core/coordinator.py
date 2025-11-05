@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
-from typing import TypeVar, Generic, Callable, Awaitable, Optional
+from typing import TypeVar, Generic, Callable, Awaitable
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -60,7 +60,7 @@ class CoordinatorState(Event):
     """
     coordinator_id: str
     status: CoordinatorStatus
-    error: Optional[Exception] = None
+    error: Exception | None = None
 
 
 @dataclass
@@ -139,8 +139,8 @@ class UpdateCoordinator(Generic[StateT]):
         self,
         name: str,
         update_method: UpdateMethod[StateT],
-        update_interval: Optional[timedelta] = None,
-        bus: Optional[MessageBus] = None,
+        update_interval: timedelta | None = None,
+        bus: MessageBus | None = None,
         max_retries: int = 3,
         retry_backoff: float = 2.0,
     ):
@@ -162,9 +162,9 @@ class UpdateCoordinator(Generic[StateT]):
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
 
-        self._state: Optional[StateT] = None
+        self._state: StateT | None = None
         self._status = CoordinatorStatus.INITIALIZING
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._refresh_event = asyncio.Event()
         self._consecutive_failures = 0
@@ -172,7 +172,7 @@ class UpdateCoordinator(Generic[StateT]):
         self.logger = logger.getChild(name)
 
     @property
-    def state(self) -> Optional[StateT]:
+    def state(self) -> StateT | None:
         """Current state (may be None if not initialized)"""
         return self._state
 
@@ -344,7 +344,7 @@ class UpdateCoordinator(Generic[StateT]):
         self.logger.error(f"Update failed after {self._max_retries + 1} attempts")
         return False
 
-    def _update_status(self, status: CoordinatorStatus, error: Optional[Exception] = None) -> None:
+    def _update_status(self, status: CoordinatorStatus, error: Exception | None = None) -> None:
         """Update status and emit event"""
         old_status = self._status
         self._status = status

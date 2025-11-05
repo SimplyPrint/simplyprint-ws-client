@@ -7,17 +7,7 @@ Provides change tracking, nested model updates, and atomic fields.
 
 from __future__ import annotations
 
-from typing import (
-    TypeVar,
-    Generic,
-    NamedTuple,
-    Any,
-    Union,
-    Dict,
-    List,
-    Optional,
-    TYPE_CHECKING,
-)
+from typing import TypeVar, Generic, NamedTuple, Any, Union, TYPE_CHECKING
 from pydantic import BaseModel, Field
 from pydantic.fields import FieldInfo
 
@@ -53,14 +43,14 @@ class Changed(NamedTuple, Generic[T]):
         >>> change.delta()
         175.0
     """
-    old: Optional[T]
-    new: Optional[T]
+    old: T | None
+    new: T | None
 
     def has_changed(self) -> bool:
         """Check if the value actually changed"""
         return self.old != self.new
 
-    def delta(self) -> Optional[T]:
+    def delta(self) -> T | None:
         """
         Calculate numeric delta between old and new.
 
@@ -76,7 +66,7 @@ class Changed(NamedTuple, Generic[T]):
 
 
 # Type alias for changed fields
-ChangedFields = Dict[str, Union[Changed, "ChangedFields"]]
+ChangedFields = dict[str, Union[Changed, "ChangedFields"]]
 
 
 # ============================================================================
@@ -93,7 +83,7 @@ def Atomic(default: Any = None, **kwargs: Any) -> FieldInfo:
 
     Example:
         >>> class State(ExternalStateModel):
-        ...     config: Dict[str, Any] = Atomic(default_factory=dict)
+        ...     config: dict[str, Any] = Atomic(default_factory=dict)
         ...     # config is replaced entirely, not merged
 
     Args:
@@ -296,8 +286,8 @@ class ExternalStateModel(BaseModel, StatefulModel):
         return changes
 
     def _update_list(
-        self, old_list: List[Any], new_list: List[Any]
-    ) -> Optional[ChangedFields]:
+        self, old_list: list[Any], new_list: list[Any]
+    ) -> ChangedFields | None:
         """
         Update a list of models, tracking changes by index.
 
@@ -314,7 +304,7 @@ class ExternalStateModel(BaseModel, StatefulModel):
             # Length mismatch - atomic replacement
             return {"_list_replaced": Changed(old=old_list[:], new=new_list[:])}
 
-        list_changes: Dict[Union[int, str], Union[Changed, ChangedFields]] = {}
+        list_changes: dict[Union[int, str], Union[Changed, ChangedFields]] = {}
         for idx, (old_item, new_item) in enumerate(zip(old_list, new_list)):
             if isinstance(old_item, StatefulModel) and isinstance(new_item, StatefulModel):
                 item_changes = old_item.update_from(new_item)
@@ -327,8 +317,8 @@ class ExternalStateModel(BaseModel, StatefulModel):
         return list_changes if list_changes else None
 
     def _update_dict(
-        self, old_dict: Dict[str, Any], new_dict: Dict[str, Any]
-    ) -> Optional[ChangedFields]:
+        self, old_dict: dict[str, Any], new_dict: dict[str, Any]
+    ) -> ChangedFields | None:
         """
         Update a dictionary of models, tracking changes by key.
 
@@ -401,7 +391,7 @@ class ExternalStateModel(BaseModel, StatefulModel):
 
         return False
 
-    def get_change(self, changes: ChangedFields, field_path: str) -> Optional[Changed]:
+    def get_change(self, changes: ChangedFields, field_path: str) -> Changed | None:
         """
         Get the change object for a specific field.
 

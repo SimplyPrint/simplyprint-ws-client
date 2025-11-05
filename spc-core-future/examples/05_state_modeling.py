@@ -16,7 +16,7 @@ import asyncio
 import logging
 from datetime import timedelta
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Any
 import sys
 import os
 
@@ -79,15 +79,15 @@ class PrinterExternalState(ExternalStateModel):
     error_message: str = ""
 
     # Temperature
-    tools: List[ToolState] = Field(default_factory=list)
+    tools: list[ToolState] = Field(default_factory=list)
     bed: BedState = Field(default_factory=BedState)
 
     # Job
-    job: Optional[JobState] = None
+    job: JobState | None = None
 
     # System
     firmware_version: str = "1.0.0"
-    config: Dict[str, Any] = Field(default_factory=dict, json_schema_extra={"atomic": True})
+    config: dict[str, Any] = Field(default_factory=dict, json_schema_extra={"atomic": True})
 
     # Metadata (never updated from external)
     last_update_time: float = Field(default=0.0, json_schema_extra={"metadata": True})
@@ -122,14 +122,14 @@ class PrinterInternalState(ExternalStateModel):
     is_printing: bool
     is_paused: bool
     is_error: bool
-    error: Optional[str] = None
+    error: str | None = None
 
     # Temperatures
     hotend: InternalTemperature
     bed: InternalTemperature
 
     # Job
-    current_job: Optional[InternalJob] = None
+    current_job: InternalJob | None = None
 
 
 # ============================================================================

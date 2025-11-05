@@ -7,18 +7,7 @@ Inspired by patterns in Duet3D integration.
 
 from __future__ import annotations
 
-from typing import (
-    TypeVar,
-    Generic,
-    Callable,
-    Any,
-    get_type_hints,
-    Optional,
-    Dict,
-    List,
-    Type,
-)
-from functools import wraps
+from typing import TypeVar, Generic, Callable, Any, get_type_hints
 from pydantic import BaseModel
 
 __all__ = [
@@ -54,8 +43,8 @@ class FieldMapper(Generic[ExternalT, InternalT]):
 
     def __init__(
         self,
-        extract: Optional[Callable[[ExternalT], Any]] = None,
-        transform: Optional[Callable[[Any], Any]] = None,
+        extract: Callable[[ExternalT], Any] | None = None,
+        transform: Callable[[Any], Any] | None = None,
         default: Any = None,
     ):
         """
@@ -141,8 +130,8 @@ class StateMapper(Generic[ExternalT, InternalT]):
 
     def __init__(
         self,
-        internal_type: Type[InternalT],
-        field_mappings: Optional[Dict[str, FieldMapper[ExternalT, Any]]] = None,
+        internal_type: type[InternalT],
+        field_mappings: dict[str, FieldMapper[ExternalT, Any]] | None = None,
         strict: bool = True,
     ):
         """
@@ -202,7 +191,7 @@ class StateMapper(Generic[ExternalT, InternalT]):
                 raise ValueError(f"Failed to create {self._internal_type.__name__}: {e}") from e
             raise
 
-    def map_partial(self, external: ExternalT, fields: List[str]) -> Dict[str, Any]:
+    def map_partial(self, external: ExternalT, fields: list[str]) -> dict[str, Any]:
         """
         Map only specific fields.
 
@@ -231,8 +220,8 @@ class StateMapper(Generic[ExternalT, InternalT]):
 # ============================================================================
 
 def mapper(
-    external_type: Type[ExternalT],
-    internal_type: Type[InternalT],
+    external_type: type[ExternalT],
+    internal_type: type[InternalT],
     strict: bool = True
 ):
     """
@@ -283,7 +272,7 @@ def mapper(
                 """Map external state to internal state"""
                 return self._state_mapper.map(external)
 
-            def map_partial(self, external: external_type, fields: List[str]) -> Dict[str, Any]:
+            def map_partial(self, external: external_type, fields: list[str]) -> dict[str, Any]:
                 """Map only specific fields"""
                 return self._state_mapper.map_partial(external, fields)
 
@@ -317,8 +306,8 @@ def field_mapper(field_name: str):
 # ============================================================================
 
 def create_mapper(
-    internal_type: Type[InternalT],
-    mappings: Dict[str, Callable[[ExternalT], Any]],
+    internal_type: type[InternalT],
+    mappings: dict[str, Callable[[ExternalT], Any]],
     strict: bool = True
 ) -> StateMapper[ExternalT, InternalT]:
     """
