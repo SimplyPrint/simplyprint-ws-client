@@ -10,11 +10,13 @@ Demonstrates the complete state modeling system:
 Run: python -m examples.05_state_modeling
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import timedelta
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import sys
 import os
 
@@ -77,15 +79,15 @@ class PrinterExternalState(ExternalStateModel):
     error_message: str = ""
 
     # Temperature
-    tools: list = []
-    bed: BedState = BedState()
+    tools: List[ToolState] = Field(default_factory=list)
+    bed: BedState = Field(default_factory=BedState)
 
     # Job
     job: Optional[JobState] = None
 
     # System
     firmware_version: str = "1.0.0"
-    config: dict = Field(default_factory=dict, json_schema_extra={"atomic": True})  # Atomic: replaced entirely
+    config: Dict[str, Any] = Field(default_factory=dict, json_schema_extra={"atomic": True})
 
     # Metadata (never updated from external)
     last_update_time: float = Field(default=0.0, json_schema_extra={"metadata": True})

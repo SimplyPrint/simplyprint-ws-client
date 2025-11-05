@@ -5,9 +5,24 @@ Inspired by Bambu Lab's sophisticated state tracking system.
 Provides change tracking, nested model updates, and atomic fields.
 """
 
-from typing import TypeVar, Generic, NamedTuple, Any, get_origin, get_args, Union, Dict, Optional
+from __future__ import annotations
+
+from typing import (
+    TypeVar,
+    Generic,
+    NamedTuple,
+    Any,
+    Union,
+    Dict,
+    List,
+    Optional,
+    TYPE_CHECKING,
+)
 from pydantic import BaseModel, Field
-from collections.abc import Mapping
+from pydantic.fields import FieldInfo
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = [
     "Changed",
@@ -68,17 +83,8 @@ ChangedFields = Dict[str, Union[Changed, "ChangedFields"]]
 # Field Markers
 # ============================================================================
 
-class _AtomicMarker:
-    """Marker class for atomic fields"""
-    pass
 
-
-class _MetadataMarker:
-    """Marker class for metadata fields"""
-    pass
-
-
-def Atomic(default: Any = None, **kwargs) -> Any:
+def Atomic(default: Any = None, **kwargs: Any) -> FieldInfo:
     """
     Mark a field as atomic (non-recursive).
 
@@ -87,13 +93,20 @@ def Atomic(default: Any = None, **kwargs) -> Any:
 
     Example:
         >>> class State(ExternalStateModel):
-        ...     config: dict = Atomic(default_factory=dict)
+        ...     config: Dict[str, Any] = Atomic(default_factory=dict)
         ...     # config is replaced entirely, not merged
+
+    Args:
+        default: Default value for the field
+        **kwargs: Additional Pydantic Field arguments (e.g., default_factory, description)
+
+    Returns:
+        Pydantic FieldInfo with atomic marker
     """
     return Field(default=default, json_schema_extra={"atomic": True}, **kwargs)
 
 
-def Metadata(**kwargs) -> Any:
+def Metadata(**kwargs: Any) -> FieldInfo:
     """
     Mark a field as metadata (excluded from updates).
 
@@ -104,24 +117,50 @@ def Metadata(**kwargs) -> Any:
         >>> class State(ExternalStateModel):
         ...     last_update: float = Metadata(default=0.0)
         ...     # last_update is never updated from external state
+
+    Args:
+        **kwargs: Pydantic Field arguments (e.g., default, default_factory, description)
+
+    Returns:
+        Pydantic FieldInfo with metadata marker
     """
     return Field(json_schema_extra={"metadata": True}, **kwargs)
 
 
-def is_atomic(field_info: Any) -> bool:
-    """Check if a field is marked as atomic"""
+def is_atomic(field_info: FieldInfo) -> bool:
+    """
+    Check if a field is marked as atomic.
+
+    Args:
+        field_info: Pydantic FieldInfo object
+
+    Returns:
+        True if field is atomic, False otherwise
+    """
     if not hasattr(field_info, "json_schema_extra"):
         return False
-    extra = field_info.json_schema_extra or {}
-    return extra.get("atomic", False)
+    extra = field_info.json_schema_extra
+    if extra is None:
+        return False
+    return bool(extra.get("atomic", False))
 
 
-def is_metadata(field_info: Any) -> bool:
-    """Check if a field is marked as metadata"""
+def is_metadata(field_info: FieldInfo) -> bool:
+    """
+    Check if a field is marked as metadata.
+
+    Args:
+        field_info: Pydantic FieldInfo object
+
+    Returns:
+        True if field is metadata, False otherwise
+    """
     if not hasattr(field_info, "json_schema_extra"):
         return False
-    extra = field_info.json_schema_extra or {}
-    return extra.get("metadata", False)
+    extra = field_info.json_schema_extra
+    if extra is None:
+        return False
+    return bool(extra.get("metadata", False))
 
 
 # ============================================================================
@@ -256,17 +295,26 @@ class ExternalStateModel(BaseModel, StatefulModel):
 
         return changes
 
-    def _update_list(self, old_list: list, new_list: list) -> Optional[ChangedFields]:
+    def _update_list(
+        self, old_list: List[Any], new_list: List[Any]
+    ) -> Optional[ChangedFields]:
         """
         Update a list of models, tracking changes by index.
 
         If lists differ in length, the entire list is replaced atomically.
+
+        Args:
+            old_list: Current list to update in place
+            new_list: New list with updated values
+
+        Returns:
+            Dictionary of changes by index, or None if no changes
         """
         if len(old_list) != len(new_list):
             # Length mismatch - atomic replacement
             return {"_list_replaced": Changed(old=old_list[:], new=new_list[:])}
 
-        list_changes = {}
+        list_changes: Dict[Union[int, str], Union[Changed, ChangedFields]] = {}
         for idx, (old_item, new_item) in enumerate(zip(old_list, new_list)):
             if isinstance(old_item, StatefulModel) and isinstance(new_item, StatefulModel):
                 item_changes = old_item.update_from(new_item)
@@ -278,13 +326,22 @@ class ExternalStateModel(BaseModel, StatefulModel):
 
         return list_changes if list_changes else None
 
-    def _update_dict(self, old_dict: dict, new_dict: dict) -> Optional[ChangedFields]:
+    def _update_dict(
+        self, old_dict: Dict[str, Any], new_dict: Dict[str, Any]
+    ) -> Optional[ChangedFields]:
         """
         Update a dictionary of models, tracking changes by key.
 
         Handles added/removed keys and nested model updates.
+
+        Args:
+            old_dict: Current dictionary to update in place
+            new_dict: New dictionary with updated values
+
+        Returns:
+            Dictionary of changes by key, or None if no changes
         """
-        dict_changes = {}
+        dict_changes: ChangedFields = {}
 
         # Check existing keys
         for key in old_dict:

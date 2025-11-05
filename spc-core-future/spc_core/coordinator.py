@@ -5,11 +5,13 @@ Inspired by Home Assistant's DataUpdateCoordinator pattern.
 Provides centralized device updates with error handling and change tracking.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import timedelta
 from typing import TypeVar, Generic, Callable, Awaitable, Optional
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
 from enum import Enum, auto
 
 from .state import ExternalStateModel, ChangedFields
@@ -233,6 +235,11 @@ class UpdateCoordinator(Generic[StateT]):
 
     async def _update_loop(self) -> None:
         """Main update loop"""
+        if self._update_interval is None:
+            # Should never happen as loop only started if interval is set
+            self.logger.error("Update loop started without interval configured")
+            return
+
         while not self._stop_event.is_set():
             try:
                 # Wait for interval or manual refresh

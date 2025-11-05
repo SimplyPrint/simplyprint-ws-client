@@ -5,7 +5,19 @@ Type-safe transformations between external and internal state.
 Inspired by patterns in Duet3D integration.
 """
 
-from typing import TypeVar, Generic, Callable, Any, get_type_hints, Optional, Dict, List
+from __future__ import annotations
+
+from typing import (
+    TypeVar,
+    Generic,
+    Callable,
+    Any,
+    get_type_hints,
+    Optional,
+    Dict,
+    List,
+    Type,
+)
 from functools import wraps
 from pydantic import BaseModel
 
@@ -129,7 +141,7 @@ class StateMapper(Generic[ExternalT, InternalT]):
 
     def __init__(
         self,
-        internal_type: type[InternalT],
+        internal_type: Type[InternalT],
         field_mappings: Optional[Dict[str, FieldMapper[ExternalT, Any]]] = None,
         strict: bool = True,
     ):
@@ -219,8 +231,8 @@ class StateMapper(Generic[ExternalT, InternalT]):
 # ============================================================================
 
 def mapper(
-    external_type: type[ExternalT],
-    internal_type: type[InternalT],
+    external_type: Type[ExternalT],
+    internal_type: Type[InternalT],
     strict: bool = True
 ):
     """
@@ -305,7 +317,7 @@ def field_mapper(field_name: str):
 # ============================================================================
 
 def create_mapper(
-    internal_type: type[InternalT],
+    internal_type: Type[InternalT],
     mappings: Dict[str, Callable[[ExternalT], Any]],
     strict: bool = True
 ) -> StateMapper[ExternalT, InternalT]:
