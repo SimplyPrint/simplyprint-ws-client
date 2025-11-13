@@ -217,6 +217,9 @@ class Connection(
         wait_delay_task = ContinuousTask(lambda d: self.wait(d), provider=self)
         wait_stop_task = ContinuousTask(self.wait, provider=self)
 
+        wait_first_msg_task = ContinuousTask(lambda d: self.wait(d), provider=self)
+        has_first_msg = False
+
         # Flat main loop. Handles all states correctly.
         # First, PAUSED is excluded and handled.
         # Then NOT_CONNECTED is transformed to CONNECTING.
@@ -315,6 +318,9 @@ class Connection(
 
                     backoff.reset()
                     suspect_bound.reset()
+                    # Begin waiting for first message.
+                    wait_first_msg_task.discard()
+                    has_first_msg = False
 
                     _ = self.event_bus.emit_task(ConnectionEstablishedEvent(self.v))
 
@@ -325,10 +331,16 @@ class Connection(
                         f"Invalid connection state. Previous close code: {self.ws.close_code if self.ws is not None else None}"
                     )
 
+                tasks = [queue_task.schedule(), poll_task.schedule()]
+
+                # Wait for up to 30 seconds for first message, after we have connected.
+                if not has_first_msg:
+                    tasks.append(wait_first_msg_task.schedule(30.0))
+
                 # In this state we are connected and actively polling the connection.
                 # Poll for messages and interrupt on queue action.
                 await asyncio.wait(
-                    [queue_task.schedule(), poll_task.schedule()],
+                    tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
@@ -336,6 +348,11 @@ class Connection(
                 # This is allowed to fail to trigger a reconnect.
                 if poll_task.done():
                     poll_task.pop().result()
+                    has_first_msg = True
+
+                # Reset connection if waiter is done without having received first message.
+                if not has_first_msg and wait_first_msg_task.done():
+                    raise ConnectionResetError("Did not receive first message in time.")
 
             except WsConnectionErrors as e:
                 # Disconnect / No connection handling
