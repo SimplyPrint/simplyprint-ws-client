@@ -13,6 +13,7 @@ from aiohttp import (
     WebSocketError,
     ClientTimeout,
     ClientWSTimeout,
+    WSCloseCode,
 )
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
@@ -108,6 +109,7 @@ WsConnectionErrors = (
 )
 
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
+WsFirstMessageTimeout = 30.0
 
 
 @final
@@ -303,7 +305,8 @@ class Connection(
                         [
                             ws_connect_task.schedule(),
                             queue_task.schedule(),
-                            wait_stop_task.schedule(),  # wait task without any delay (wait forever for stop event)
+                            wait_stop_task.schedule(),
+                            # wait task without any delay (wait forever for stop event)
                         ],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
@@ -335,7 +338,7 @@ class Connection(
 
                 # Wait for up to 30 seconds for first message, after we have connected.
                 if not has_first_msg:
-                    tasks.append(wait_first_msg_task.schedule(30.0))
+                    tasks.append(wait_first_msg_task.schedule(WsFirstMessageTimeout))
 
                 # In this state we are connected and actively polling the connection.
                 # Poll for messages and interrupt on queue action.
@@ -352,7 +355,15 @@ class Connection(
 
                 # Reset connection if waiter is done without having received first message.
                 if not has_first_msg and wait_first_msg_task.done():
-                    raise ConnectionResetError("Did not receive first message in time.")
+                    await self.ws.close(
+                        code=WSCloseCode.PROTOCOL_ERROR,
+                        message=b"Did not receive first message in time.",
+                    )
+
+                    raise ConnectionResetError(
+                        f"Did not receive first message in less"
+                        f" than {WsFirstMessageTimeout} seconds."
+                    )
 
             except WsConnectionErrors as e:
                 # Disconnect / No connection handling
