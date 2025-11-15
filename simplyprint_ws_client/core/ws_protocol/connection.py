@@ -192,15 +192,20 @@ class Connection(
         """Whether the connection loop is running."""
         return self._loop_task.task is not None and not self._loop_task.done()
 
-    async def _close_ws(self):
-        """Close WebSocket connection manually, typically used when we are paused or stopped and no reconnections are taking place."""
-        if self.connected:
-            await self.ws.close()
-            self.ws = None
-            self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
-            _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
-            self.v += 1
-            self.logger.info("Manually closed connection.")
+    async def _close_ws(self, code: int = WSCloseCode.OK, message: bytes = b""):
+        """
+        Close WebSocket connection manually, typically used when we are paused or
+        stopped and no reconnections are taking place.
+        """
+        if not self.connected:
+            return
+        await self.ws.close(code=code, message=message)
+        self.ws = None
+        self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
+        self._state = State.NOT_CONNECTED
+        _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
+        self.v += 1
+        self.logger.info("Manually closed connection.")
 
     async def _loop(self):
         """Connection main loop - only run once per instance."""
@@ -355,14 +360,9 @@ class Connection(
 
                 # Reset connection if waiter is done without having received first message.
                 if not has_first_msg and wait_first_msg_task.done():
-                    await self.ws.close(
+                    await self._close_ws(
                         code=WSCloseCode.PROTOCOL_ERROR,
                         message=b"Did not receive first message in time.",
-                    )
-
-                    raise ConnectionResetError(
-                        f"Did not receive first message in less"
-                        f" than {WsFirstMessageTimeout} seconds."
                     )
 
             except WsConnectionErrors as e:
