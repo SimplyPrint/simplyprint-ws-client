@@ -370,9 +370,17 @@ class Client(
 
     @configure(ConnectionIncomingEvent)
     async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
-        if self.v < v:
+        if self.v > v:
             self.logger.warning("Dropped incoming message %s with v: %d.", msg, v)
             return
+
+        if self.v != v:
+            self.v = v
+            self.logger.warning(
+                "Upgraded client connection version from %d to %d due to new message.",
+                self.v,
+                v,
+            )
 
         if msg.type == ServerMsgType.DEMAND:
             await self.event_bus.emit(msg.data.demand, msg.data)
