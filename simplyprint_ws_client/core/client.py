@@ -370,7 +370,7 @@ class Client(
 
     @configure(ConnectionIncomingEvent)
     async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
-        if self.v != v:
+        if self.v < v:
             self.logger.warning("Dropped incoming message %s with v: %d.", msg, v)
             return
 
