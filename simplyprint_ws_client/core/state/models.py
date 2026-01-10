@@ -6,6 +6,7 @@ __all__ = [
     "Intervals",
     "DisplaySettings",
     "PrinterSettings",
+    "VIRTUAL_SPOOL_POSITION",
     "MultiMaterialSolution",
     "BedType",
     "NozzleType",
@@ -173,6 +174,10 @@ class PrinterSettings(BaseModel):
     display: Optional[DisplaySettings] = None
 
 
+# Virtual spool position constant - used for VIRTUAL MMS type (external spools)
+VIRTUAL_SPOOL_POSITION: int = 256
+
+
 class MultiMaterialSolution(Enum):
     BAMBU_AMS = "bambu_ams"
     BAMBU_AMS_2_PRO = "bambu_ams_2_pro"
@@ -185,6 +190,7 @@ class MultiMaterialSolution(Enum):
     BOXTURTLE = "boxturtle"
     CREALITY_CFS = "creality_cfs"
     ANYCUBIC_ACE_PRO = "anycubic_ace_pro"
+    VIRTUAL = "virtual"
     CUSTOM = "custom"
 
     @property
@@ -214,7 +220,19 @@ class MultiMaterialSolution(Enum):
             self.PRUSA_MMU2: 5,
             self.PRUSA_MMU3: 5,
             self.BAMBU_AMS_HT: 1,
+            self.VIRTUAL: 1,
         }.get(self, 4)
+
+    @property
+    def offset(self) -> int:
+        """Starting extruder offset for this MMS type.
+
+        - Standard MMS types: 0 (sequential slots starting from current position)
+        - VIRTUAL type: 256 (external spool position)
+        """
+        if self == self.VIRTUAL:
+            return VIRTUAL_SPOOL_POSITION
+        return 0
 
 
 class BedType(Enum):

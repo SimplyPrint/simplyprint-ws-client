@@ -21,6 +21,7 @@ __all__ = [
     "Intervals",
     "DisplaySettings",
     "PrinterSettings",
+    "VIRTUAL_SPOOL_POSITION",
     "MaterialLayoutEntry",
     "MaterialEntry",
     "BedState",
@@ -67,6 +68,7 @@ from .models import (
     Intervals,
     DisplaySettings,
     PrinterSettings,
+    VIRTUAL_SPOOL_POSITION,
     MultiMaterialSolution,
     BedType,
     NozzleType,
@@ -306,6 +308,9 @@ class MaterialLayoutEntry(StateModel):
     chains: Optional[int] = None
 
     def get_computed_size(self) -> int:
+        """Get total slot count (size * chains), or 0 for offset-based types."""
+        if self.mms == MultiMaterialSolution.VIRTUAL:
+            return 0  # VIRTUAL type doesn't consume sequential slots
         return self.get_size() * self.get_chains()
 
     def get_size(self) -> int:
@@ -315,6 +320,11 @@ class MaterialLayoutEntry(StateModel):
         if self.mms and self.mms.can_chain:
             return min(self.chains or 1, self.mms.max_chains)
         return 1
+
+    @property
+    def offset(self) -> int:
+        """Starting extruder offset for this layout entry."""
+        return self.mms.offset if self.mms else 0
 
 
 class MaterialEntry(StateModel):
