@@ -667,11 +667,13 @@ class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
 class ToolMsg(ClientMsg[Literal[ClientMsgType.TOOL]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        yield "new", state.active_tool
+        # Derive active_tools from each tool's active_material
+        yield (
+            "active_tools",
+            {tool.nozzle: tool.active_material for tool in state.tools},
+        )
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.model_reset_changed("active_tool", v=v)
-        # Not yet used, but modeled anyhow.
         for tool in state.tools:
             tool.model_reset_changed("active_material", v=v)
 

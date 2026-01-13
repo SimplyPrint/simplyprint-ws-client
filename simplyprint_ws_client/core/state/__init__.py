@@ -616,9 +616,6 @@ class PrinterState(StateModel):
     status: Optional[PrinterStatus] = None
     bed: BedState = Field(default_factory=BedState)
     tools: List[ToolState] = Field(default_factory=lambda: [ToolState(nozzle=0)])
-    active_tool: Optional[int] = (
-        None  # TODO: Deprecate in favor of nozzle-based active tool.
-    )
     mms_layout: List[MaterialLayoutEntry] = Field(default_factory=list)
 
     # Job state.

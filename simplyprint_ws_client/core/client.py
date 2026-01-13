@@ -127,7 +127,7 @@ _CLIENT_MSG_PRODUCERS = {
     WebcamMsg: ["webcam_settings"],
     FirmwareMsg: ["firmware"],
     FirmwareWarningMsg: ["firmware_warning"],
-    ToolMsg: ["active_tool", "tools.*.active_material"],
+    ToolMsg: ["tools.*.active_material"],
     TemperatureMsg: ["bed.temperature", "tools.*.temperature"],
     AmbientTemperatureMsg: ["ambient_temperature.ambient"],
     StateChangeMsg: ["status"],
