@@ -126,6 +126,12 @@ class ClientApp(SyncStoppable):
 
             self.scheduler.submit(client)
 
+            # The client factory may start background connections (e.g. MQTT) during __init__
+            # that set active=True before the ClientStateChangeEvent listener is registered above.
+            # If that happened, the signal was lost. Re-signal the scheduler to pick it up.
+            if client.active:
+                self.scheduler.signal()
+
         return client
 
     def remove(self, config: PrinterConfig) -> None:

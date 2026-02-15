@@ -381,7 +381,11 @@ class ClientConnectionManager(
         client.event_bus.clear(ConnectionOutgoingEvent)
 
         # Tell removed the client it has lost its connection, since it no longer receives messages.
-        _ = client.event_bus.emit_task(ConnectionLostEvent(client.v))
+        # This must be awaited (not emit_task) to prevent a race condition where the client
+        # is re-allocated before the ConnectionLostEvent handler runs, causing the handler
+        # to overwrite the state set by allocate() and permanently sticking the client in
+        # CONNECTING state.
+        await client.event_bus.emit(ConnectionLostEvent(client.v))
 
         # Disconnect the connection if no clients are left.
         if len(client_view) == 0:
