@@ -202,7 +202,6 @@ class Connection(
         await self.ws.close(code=code, message=message)
         self.ws = None
         self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
-        self._state = State.NOT_CONNECTED
         _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
         self.v += 1
         self.logger.info("Manually closed connection.")
@@ -364,6 +363,7 @@ class Connection(
                         code=WSCloseCode.PROTOCOL_ERROR,
                         message=b"Did not receive first message in time.",
                     )
+                    self._state = State.NOT_CONNECTED
 
             except WsConnectionErrors as e:
                 # Disconnect / No connection handling
