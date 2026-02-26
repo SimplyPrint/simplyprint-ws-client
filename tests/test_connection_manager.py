@@ -7,6 +7,7 @@ from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.connection_manager import (
     ClientConnectionManager,
     ClientList,
+    ClientView,
 )
 from simplyprint_ws_client.core.ws_protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.ws_protocol.events import ConnectionLostEvent
@@ -89,3 +90,69 @@ async def test_deallocate_does_not_leave_late_connection_lost_event():
 
     # Regression guard: stale async loss event must not flip us back to CONNECTING.
     assert client.state == ClientState.NOT_CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_emit_all_uses_snapshot_when_view_is_mutated():
+    client_list = ClientList()
+    c1 = Client(PrinterConfig.get_new())
+    c2 = Client(PrinterConfig.get_new())
+    c3 = Client(PrinterConfig.get_new())
+    client_list.add(c1)
+    client_list.add(c2)
+    client_list.add(c3)
+
+    view = ClientView(ConnectionMode.MULTI, object(), client_list)
+    view.add(c1)
+    view.add(c2)
+    view.add(c3)
+
+    received = []
+
+    async def on_c1():
+        received.append(c1.unique_id)
+        # Mutate the live set mid-fanout. Snapshot iteration must still deliver to c3.
+        view.discard(c3)
+
+    async def on_c2():
+        received.append(c2.unique_id)
+
+    async def on_c3():
+        received.append(c3.unique_id)
+
+    c1.event_bus.on("fanout", on_c1)
+    c2.event_bus.on("fanout", on_c2)
+    c3.event_bus.on("fanout", on_c3)
+
+    await view.emit("fanout")
+
+    assert set(received) == {c1.unique_id, c2.unique_id, c3.unique_id}
+
+
+@pytest.mark.asyncio
+async def test_emit_all_ignores_stale_client_ids():
+    client_list = ClientList()
+    c1 = Client(PrinterConfig.get_new())
+    c2 = Client(PrinterConfig.get_new())
+    client_list.add(c1)
+    client_list.add(c2)
+
+    view = ClientView(ConnectionMode.MULTI, object(), client_list)
+    view.add(c1)
+    view.add(c2)
+    view.clients.add("stale-client-id")
+
+    received = []
+
+    async def on_c1():
+        received.append(c1.unique_id)
+
+    async def on_c2():
+        received.append(c2.unique_id)
+
+    c1.event_bus.on("fanout", on_c1)
+    c2.event_bus.on("fanout", on_c2)
+
+    await view.emit("fanout")
+
+    assert set(received) == {c1.unique_id, c2.unique_id}

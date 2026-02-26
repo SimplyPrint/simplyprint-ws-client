@@ -174,15 +174,15 @@ class ClientCameraMixin(Client[_T]):
                 await self.on_webcam_snapshot(data, attempt + 1, retry_timeout)
             else:
                 self._camera_logger.debug(
-                    f"Failed to get frame, giving up. Used camera handle id {self._camera_handle.id}."
+                    f"Failed to get frame, giving up. Used camera handle id {self._camera_handle and self._camera_handle.id}."
                 )
 
             return
 
         self._camera_logger.debug(
             f"Received frame from camera with size {len(frame) if frame else 0} bytes "
-            f"with an fps of {self._camera_handle.fps or 'N/A'} in "
-            f"{datetime.datetime.now() - st} from camera handle id {self._camera_handle.id}."
+            f"with an fps of {self._camera_handle and self._camera_handle.fps or 'N/A'} in "
+            f"{datetime.datetime.now() - st} from camera handle id {self._camera_handle and self._camera_handle.id}."
         )
 
         # Capture snapshot events and send them to the API

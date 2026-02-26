@@ -99,7 +99,16 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
         self.logger = logger
 
     async def _emit_all(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        for client in self:
+        # Iterate over a stable snapshot so mutations to view/client maps during awaits
+        # do not abort fanout partway through.
+        client_ids = tuple(self.clients)
+
+        for client_id in client_ids:
+            client = self.client_list.clients.get(client_id)
+
+            if client is None:
+                continue
+
             try:
                 await client.event_bus.emit(event, *args, **kwargs)
             except Exception as e:
