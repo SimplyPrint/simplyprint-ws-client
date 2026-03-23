@@ -474,7 +474,7 @@ class DefaultClient(Client[TConfig], ABC):
 
     Attributes:
         _have_cleared_bed: Keep track of whether we have called the API successfully to prevent many irrelevant calls.
-        _file_action_token: File action token
+        file_action_token: File action token
     """
 
     @property
@@ -498,7 +498,7 @@ class DefaultClient(Client[TConfig], ABC):
 
         try:
             await SimplyPrintApi.clear_bed(
-                self.config.id, self._file_action_token, success, rating
+                self.config.id, self.file_action_token, success, rating
             )
             self.printer.have_cleared_bed = True
         except Exception as e:
@@ -507,7 +507,7 @@ class DefaultClient(Client[TConfig], ABC):
     async def start_next_print(self):
         try:
             await SimplyPrintApi.start_next_print(
-                self.config.id, self._file_action_token
+                self.config.id, self.file_action_token
             )
         except Exception as e:
             self.logger.warning("Failed to start next print: %s", e)
