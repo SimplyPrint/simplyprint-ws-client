@@ -482,7 +482,7 @@ class DefaultClient(Client[TConfig], ABC):
         return self.printer.current_job_id
 
     @property
-    def file_action_token(self):
+    def _file_action_token(self):
         return self.printer.file_action_token
 
     async def send_ping(self) -> None:
