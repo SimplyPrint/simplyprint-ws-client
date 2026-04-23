@@ -47,6 +47,7 @@ class DemandMsgType(StrEnum):
     SET_PRINTER_PROFILE = "set_printer_profile"
     SET_MATERIAL_DATA = "set_material_data"
     REFRESH_MATERIAL_DATA = "refresh_material_data"
+    REFRESH_PERIPHERALS = "refresh_peripherals"
     SKIP_OBJECTS = "skip_objects"
     GET_GCODE_SCRIPT_BACKUPS = "get_gcode_script_backups"
     HAS_GCODE_CHANGES = "has_gcode_changes"
@@ -58,6 +59,7 @@ class DemandMsgType(StrEnum):
     GOTO_WS_TEST = "goto_ws_test"
     SEND_LOGS = "send_logs"
     RESOLVE_NOTIFICATION = "resolve_notification"
+    PERIPHERAL_ACTION = "peripheral_action"
 
 
 class ClientMsgType(StrEnum):
@@ -100,6 +102,8 @@ class ClientMsgType(StrEnum):
     MATERIAL_DATA = "material_data"
     NOTIFICATION = "notification"
     OBJECTS = "objects"
+    PERIPHERAL = "peripheral"
+    PERIPHERAL_DEFINITIONS = "peripheral_definitions"
 
     def when_pending(self) -> bool:
         # Allowed messages for a pending printer connection

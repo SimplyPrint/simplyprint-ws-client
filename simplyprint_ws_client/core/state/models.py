@@ -88,6 +88,7 @@ IntervalT = Literal[
     "job",
     "temps",
     "temps_target",
+    "peripheral",
     "cpu",
     "reconnect",
     "ready_message",
@@ -102,6 +103,7 @@ class Intervals(BaseModel):
     job: int = 5000
     temps: int = 5000
     temps_target: int = 2500
+    peripheral: int = 0
     cpu: int = 30000
     reconnect: int = 1000
     ready_message: int = 60000

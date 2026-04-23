@@ -5,6 +5,8 @@ __all__ = [
     "DefaultClient",
     "PhysicalClient",
     "ClientState",
+    "PeripheralDefinitionEntry",
+    "PeripheralDefinitions",
     "configure",
 ]
 
@@ -14,12 +16,12 @@ import weakref
 from abc import ABC
 from datetime import timedelta, datetime
 from enum import IntEnum
-from typing import NamedTuple, Optional, Union, Generic, TypeVar, cast
+from typing import Dict, NamedTuple, Optional, Union, Generic, TypeVar, cast, Literal
 
 try:
-    from typing import Unpack, Never
+    from typing import Unpack, Never, TypedDict, NotRequired
 except ImportError:
-    from typing_extensions import Unpack, Never
+    from typing_extensions import Unpack, Never, TypedDict, NotRequired
 
 from .autowire import (
     configure,
@@ -66,6 +68,8 @@ from .ws_protocol.messages import (
     LatencyMsg,
     FileProgressMsg,
     FilamentSensorMsg,
+    PeripheralDefinitionsMsg,
+    PeripheralMsg,
     PowerControllerMsg,
     CpuInfoMsg,
     NotificationMsg,
@@ -105,6 +109,16 @@ class ClientState(IntEnum):
     CONNECTED = 4
 
 
+class PeripheralDefinitionEntry(TypedDict):
+    f: Literal["r", "w", "rw"]
+    n: NotRequired[str]
+    d: NotRequired[str]
+    vt: NotRequired[Literal["bool", "percent"]]
+
+
+PeripheralDefinitions = Dict[str, PeripheralDefinitionEntry]
+
+
 class VersionedState(NamedTuple):
     v: int
     s: ClientState
@@ -136,6 +150,7 @@ _CLIENT_MSG_PRODUCERS = {
     FileProgressMsg: ["file_progress"],
     FilamentSensorMsg: ["filament_sensor"],
     PowerControllerMsg: ["psu_info"],
+    PeripheralMsg: ["peripherals.entries"],
     CpuInfoMsg: ["cpu_info"],
     MaterialDataMsg: [
         "tools.*.materials",
@@ -512,6 +527,9 @@ class DefaultClient(Client[TConfig], ABC):
         except Exception as e:
             self.logger.warning("Failed to start next print: %s", e)
 
+    def get_current_peripheral_definitions(self) -> Optional[PeripheralDefinitions]:
+        return None
+
     async def push_notification(
         self, event_id: Never = ..., **kwargs: Unpack[NotificationEvent]
     ):
@@ -604,6 +622,18 @@ class DefaultClient(Client[TConfig], ABC):
             MaterialDataMsg(
                 data=dict(MaterialDataMsg.build(self.printer, is_refresh=True))
             )
+        )
+
+    @configure(DemandMsgType.REFRESH_PERIPHERALS, priority=1)
+    async def _on_refresh_peripherals(self):
+        peripheral_definitions = self.get_current_peripheral_definitions()
+
+        if not peripheral_definitions:
+            return
+
+        await self.send(
+            PeripheralDefinitionsMsg(data=peripheral_definitions),
+            skip_dispatch=True,
         )
 
     @configure(DemandMsgType.RESOLVE_NOTIFICATION, priority=1)

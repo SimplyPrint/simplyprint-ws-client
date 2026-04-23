@@ -39,6 +39,8 @@ __all__ = [
     "StreamOffDemandData",
     "SetPrinterProfileDemandData",
     "SetMaterialDataDemandData",
+    "RefreshMaterialDataDemandData",
+    "RefreshPeripheralsDemandData",
     "SkipObjectsDemandData",
     "ResolveNotificationDemandData",
     "GetGcodeScriptBackupsDemandData",
@@ -50,6 +52,7 @@ __all__ = [
     "GotoWsProdDemandData",
     "GotoWsTestDemandData",
     "SendLogsDemandData",
+    "PeripheralActionDemandData",
     "DemandMsgKind",
     "DemandMsg",
     "ServerMsgKind",
@@ -87,6 +90,8 @@ __all__ = [
     "MaterialDataMsg",
     "NotificationMsg",
     "ObjectsMsg",
+    "PeripheralMsg",
+    "PeripheralDefinitionsMsg",
 ]
 
 import uuid
@@ -397,6 +402,12 @@ class RefreshMaterialDataDemandData(BaseModel):
     )
 
 
+class RefreshPeripheralsDemandData(BaseModel):
+    demand: Literal[DemandMsgType.REFRESH_PERIPHERALS] = (
+        DemandMsgType.REFRESH_PERIPHERALS
+    )
+
+
 class SkipObjectsDemandData(BaseModel):
     demand: Literal[DemandMsgType.SKIP_OBJECTS] = DemandMsgType.SKIP_OBJECTS
     objects: List[Union[str, int]] = Field(default_factory=list)
@@ -467,6 +478,13 @@ class SendLogsDemandData(BaseModel):
         return "serial" in self.logs
 
 
+class PeripheralActionDemandData(BaseModel):
+    demand: Literal[DemandMsgType.PERIPHERAL_ACTION] = DemandMsgType.PERIPHERAL_ACTION
+    peripheral: str = Field(alias="id")
+    action: str = Field(alias="a")
+    value: Optional[Any] = Field(None, alias="v")
+
+
 DemandMsgKind = Union[
     PauseDemandData,
     ResumeDemandData,
@@ -492,6 +510,7 @@ DemandMsgKind = Union[
     SetPrinterProfileDemandData,
     SetMaterialDataDemandData,
     RefreshMaterialDataDemandData,
+    RefreshPeripheralsDemandData,
     SkipObjectsDemandData,
     ResolveNotificationDemandData,
     GetGcodeScriptBackupsDemandData,
@@ -503,6 +522,7 @@ DemandMsgKind = Union[
     GotoWsProdDemandData,
     GotoWsTestDemandData,
     SendLogsDemandData,
+    PeripheralActionDemandData,
 ]
 
 
@@ -862,6 +882,42 @@ class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.psu_info.model_reset_changed()
+
+
+class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
+    @classmethod
+    def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
+        for entry in sorted(
+            state.peripherals.entries.values(), key=lambda item: item.id
+        ):
+            if not entry.model_has_changed:
+                continue
+
+            yield entry.id, entry.model_dump(exclude={"id"}, by_alias=True, mode="json")
+
+    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+        if not self.data:
+            return
+
+        for peripheral_id in self.data.keys():
+            peripheral = state.peripherals.get(peripheral_id)
+
+            if peripheral is None:
+                continue
+
+            peripheral.model_reset_changed(v=v)
+
+        state.peripherals.model_reset_changed("entries", v=v)
+
+    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
+        return state.intervals.dispatch_mode("peripheral")
+
+
+class PeripheralDefinitionsMsg(
+    ClientMsg[Literal[ClientMsgType.PERIPHERAL_DEFINITIONS]]
+):
+    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
+        return DispatchMode.DISPATCH
 
 
 class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
