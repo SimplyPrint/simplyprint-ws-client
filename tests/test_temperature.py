@@ -68,3 +68,29 @@ def test_multiple_tools_temperatures(client: Client):
     assert message.__class__ == TemperatureMsg
 
     assert message.data == {"tool0": [200, 250], "tool1": [180, 220]}
+
+
+def test_chamber_temperature(client: Client):
+    client.printer.chamber.temperature.actual = 45
+
+    messages, _ = client.consume()
+
+    assert len(messages) == 1
+
+    message = messages[0]
+
+    assert message.__class__ == TemperatureMsg
+    assert message.data == {"chamber": [45]}
+
+    message.reset_changes(client.printer)
+
+    client.printer.chamber.temperature.target = 60
+
+    messages, _ = client.consume()
+
+    assert len(messages) == 1
+
+    message = messages[0]
+
+    assert message.__class__ == TemperatureMsg
+    assert message.data == {"chamber": [45, 60]}
