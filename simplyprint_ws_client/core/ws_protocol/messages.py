@@ -704,6 +704,9 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
         if state.bed.temperature.model_has_changed:
             yield "bed", state.bed.temperature.to_list()
 
+        if state.chamber.temperature.model_has_changed:
+            yield "chamber", state.chamber.temperature.to_list()
+
         for i, tool in enumerate(state.tools):
             if not tool.temperature.model_has_changed:
                 continue
@@ -714,6 +717,9 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
         state.bed.model_reset_changed("temperature")
         state.bed.temperature.model_reset_changed()
 
+        state.chamber.model_reset_changed("temperature")
+        state.chamber.temperature.model_reset_changed()
+
         for tool in state.tools:
             tool.model_reset_changed("temperature")
             tool.temperature.model_reset_changed()
@@ -723,7 +729,8 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
         if any(
             "target" in x.model_self_changed_fields
             for x in chain(
-                (state.bed.temperature,), map(lambda t: t.temperature, state.tools)
+                (state.bed.temperature, state.chamber.temperature),
+                map(lambda t: t.temperature, state.tools),
             )
         ):
             return DispatchMode.DISPATCH

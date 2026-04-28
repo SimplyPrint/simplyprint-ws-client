@@ -474,6 +474,14 @@ class BedState(StateModel):
         return self.temperature.is_heating()
 
 
+class ChamberState(StateModel):
+    temperature: TemperatureState = Field(default_factory=TemperatureState)
+
+    def is_heating(self) -> bool:
+        """Returns True if the chamber is currently heating."""
+        return self.temperature.is_heating()
+
+
 class ToolState(StateModel):
     nozzle: int
     type: Optional[NozzleType] = None
@@ -728,6 +736,7 @@ class PrinterState(StateModel):
     # General state.
     status: Optional[PrinterStatus] = None
     bed: BedState = Field(default_factory=BedState)
+    chamber: ChamberState = Field(default_factory=ChamberState)
     tools: List[ToolState] = Field(default_factory=lambda: [ToolState(nozzle=0)])
     mms_layout: List[MaterialLayoutEntry] = Field(default_factory=list)
 
@@ -881,7 +890,7 @@ class PrinterState(StateModel):
         return PrinterStatus.is_printing(*status)
 
     def is_heating(self) -> bool:
-        return any([h.is_heating() for h in (self.bed.temperature, *self.tools)])
+        return any([h.is_heating() for h in (self.bed, self.chamber, *self.tools)])
 
     def populate_info_from_physical_machine(self, *skip: str):
         """Set information about the physical machine the client is running on."""

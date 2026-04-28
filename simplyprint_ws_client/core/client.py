@@ -142,7 +142,7 @@ _CLIENT_MSG_PRODUCERS = {
     FirmwareMsg: ["firmware"],
     FirmwareWarningMsg: ["firmware_warning"],
     ToolMsg: ["tools.*.active_material"],
-    TemperatureMsg: ["bed.temperature", "tools.*.temperature"],
+    TemperatureMsg: ["bed.temperature", "chamber.temperature", "tools.*.temperature"],
     AmbientTemperatureMsg: ["ambient_temperature.ambient"],
     StateChangeMsg: ["status"],
     JobInfoMsg: ["job_info"],
