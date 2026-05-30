@@ -1,18 +1,19 @@
 from simplyprint_ws_client import (
     ClientApp,
-    ConfigManagerType,
     ClientSettings,
+    ConfigManagerType,
     ConnectionMode,
 )
 from simplyprint_ws_client.shared.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.shared.cli.cli import ClientCli
 from simplyprint_ws_client.shared.logging import setup_logging
-from .virtual_client import VirtualClient, VirtualConfig, VirtualCamera
+
+from .virtual_client import VirtualCamera, VirtualClient, VirtualConfig
 
 if __name__ == "__main__":
     settings = ClientSettings(
-        name="VirtualPrinters",
-        mode=ConnectionMode.MULTI,
+        name="la_fair_printers",
+        mode=ConnectionMode.SINGLE,
         event_loop_backend=EventLoopBackend.AUTO,
         client_factory=VirtualClient,
         config_factory=VirtualConfig,

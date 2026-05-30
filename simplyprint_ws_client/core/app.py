@@ -5,13 +5,13 @@ import atexit
 import functools
 import logging
 import threading
-from typing import Optional, cast
+from typing import Dict, Optional, cast
 
 from .client import Client, ClientConfigChangedEvent, ClientStateChangeEvent
 from .config import ConfigManager, PrinterConfig
 from .connection_manager import ClientList
 from .scheduler import Scheduler
-from .settings import ClientSettings
+from .settings import ClientSettings, ClientSpec
 from ..shared.asyncio.event_loop_runner import Runner
 from ..shared.camera.pool import CameraPool
 from ..shared.debug import traceability
@@ -25,6 +25,8 @@ class ClientApp(SyncStoppable):
     client_list: ClientList
     scheduler: Scheduler
     config_manager: ConfigManager[PrinterConfig]
+    config_managers: Dict[str, ConfigManager[PrinterConfig]]
+    client_specs: Dict[str, ClientSpec]
     camera_pool: Optional[CameraPool] = None
     logger: logging.Logger
 
@@ -40,8 +42,7 @@ class ClientApp(SyncStoppable):
     ):
         super().__init__(**kwargs)
 
-        if settings.client_factory is None or settings.config_factory is None:
-            raise ValueError("Both client and config factory must be set in settings.")
+        specs = settings.resolved_client_specs()
 
         self._app_lock = threading.Lock()
 
@@ -55,10 +56,15 @@ class ClientApp(SyncStoppable):
         self.scheduler = Scheduler(
             self.client_list, self.settings, loop=self._app_event_loop
         )
-        self.config_manager = settings.config_manager_t(
-            name=settings.name,
-            config_t=settings.config_factory,
-        )
+        self.client_specs = {spec.key: spec for spec in specs}
+        self.config_managers = {
+            spec.key: (spec.config_manager_t or settings.config_manager_t)(
+                name=spec.storage_name(settings.name, multiple=len(specs) > 1),
+                config_t=spec.config_factory,
+            )
+            for spec in specs
+        }
+        self.config_manager = next(iter(self.config_managers.values()))
         self.logger = logger
 
         if settings.backend is not None:
@@ -74,8 +80,9 @@ class ClientApp(SyncStoppable):
     async def run(self):
         try:
             # On start, load all current configs.
-            for config in self.config_manager.get_all():
-                self.add(config)
+            for key, manager in self.config_managers.items():
+                for config in manager.get_all():
+                    self.add(config, client_key=key)
 
             await self.scheduler.block_until_stopped()
         except Exception as e:
@@ -103,21 +110,67 @@ class ClientApp(SyncStoppable):
             # Register atexit handler to prevent spamming of "Cannot schedule new futures after shutdown" errors.
             atexit.register(self.stop)
 
-    def add(self, config: PrinterConfig) -> Client:
+    def _get_client_spec(
+        self, config: Optional[PrinterConfig] = None, client_key: Optional[str] = None
+    ) -> ClientSpec:
+        if client_key is not None:
+            return self.client_specs[client_key]
+
+        if len(self.client_specs) == 1:
+            return next(iter(self.client_specs.values()))
+
+        if config is None:
+            raise ValueError("Client key is required when multiple specs exist.")
+
+        matches = []
+        config_mro = config.__class__.mro()
+
+        for spec in self.client_specs.values():
+            if isinstance(spec.config_factory, type) and isinstance(
+                config, spec.config_factory
+            ):
+                matches.append((config_mro.index(spec.config_factory), spec))
+
+        if len(matches) == 1:
+            return matches[0][1]
+
+        if len(matches) > 1:
+            best_distance = min(distance for distance, _ in matches)
+            best_matches = [spec for distance, spec in matches if distance == best_distance]
+
+            if len(best_matches) == 1:
+                return best_matches[0]
+
+            raise ValueError(
+                f"Config {config!r} matches multiple client specs. Pass client_key."
+            )
+
+        raise ValueError(f"No client spec found for config {config!r}.")
+
+    def get_config_manager(
+        self, client_key: Optional[str] = None, config: Optional[PrinterConfig] = None
+    ) -> ConfigManager[PrinterConfig]:
+        spec = self._get_client_spec(config, client_key)
+        return self.config_managers[spec.key]
+
+    def add(self, config: PrinterConfig, client_key: Optional[str] = None) -> Client:
+        spec = self._get_client_spec(config, client_key)
+        config_manager = self.config_managers[spec.key]
+
         with self._app_lock:
             if config.unique_id in self.client_list:
                 return self.client_list[config.unique_id]
 
-            self.config_manager.persist(config)
-            self.config_manager.flush(config)
+            config_manager.persist(config)
+            config_manager.flush(config)
 
-            client = self.settings.client_factory(
+            client = spec.client_factory(
                 config, event_loop_provider=self.scheduler, camera_pool=self.camera_pool
             )
 
             client.event_bus.on(
                 ClientConfigChangedEvent,
-                lambda *args, **kwargs: self.config_manager.flush(
+                lambda *args, **kwargs: config_manager.flush(
                     cast(PrinterConfig, client.config)
                 ),
             )
@@ -134,7 +187,9 @@ class ClientApp(SyncStoppable):
 
         return client
 
-    def remove(self, config: PrinterConfig) -> None:
+    def remove(self, config: PrinterConfig, client_key: Optional[str] = None) -> None:
+        config_manager = self.get_config_manager(client_key, config)
+
         with self._app_lock:
             client = self.client_list.get(config.unique_id)
 
@@ -145,8 +200,8 @@ class ClientApp(SyncStoppable):
             client.event_bus.clear(ClientConfigChangedEvent, ClientStateChangeEvent)
 
             # TODO: TECHNICALLY this should happen after the scheduler calls _delete.
-            self.config_manager.remove(config)
-            self.config_manager.flush(config)
+            config_manager.remove(config)
+            config_manager.flush(config)
 
             self.scheduler.remove(client)
 

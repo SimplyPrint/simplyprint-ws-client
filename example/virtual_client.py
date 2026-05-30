@@ -3,19 +3,20 @@ import base64
 import math
 import random
 import time
+from pathlib import Path
 from typing import Optional
 
 from yarl import URL
 
 from simplyprint_ws_client import (
-    PrinterConfig,
     DefaultClient,
-    GcodeDemandData,
-    PrinterStatus,
     FileDemandData,
     FileProgressStateEnum,
+    GcodeDemandData,
     MaterialDataMsg,
     MeshDataMsg,
+    PrinterConfig,
+    PrinterStatus,
 )
 from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
@@ -34,9 +35,6 @@ class VirtualConfig(PrinterConfig):
     ...
 
 
-_TEST_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAeAAAAFoCAIAAAAAVb93AAAFMklEQVR4nOzWQQkCYRhFUZFpYAVzWcAAGsAONnFvJ3FtAZc/fJfhnARvdXnb8/Q4wF68bp/pCbDMcXoAAP8JNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRG3f+3l6AyxzeV+nJ8AyHjRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNECUQANECTRAlEADRAk0QJRAA0QJNEDULwAA//+/JAlAlWQCTwAAAABJRU5ErkJggg=="
-
-
 def random_float(a, b):
     return a + random.random() * (b - a)
 
@@ -47,6 +45,13 @@ def _generate_fake_mesh_data():
         "mesh_max": [random_float(200, 220) for _ in range(3)],
         "mesh_min": [random_float(0, 20) for _ in range(3)],
     }
+
+
+def _random_test_image():
+    path = Path(__file__).parent / "images"
+    images = list(path.glob("*.jpg"))
+    random.shuffle(images)
+    return images[0].read_bytes()
 
 
 class VirtualCamera(BaseCameraProtocol):
@@ -63,31 +68,30 @@ class VirtualCamera(BaseCameraProtocol):
     def read(self):
         while True:
             time.sleep(0.5)
-            yield base64.b64decode(_TEST_IMAGE)
+            yield _random_test_image()
 
 
 class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
-    job_progress_alpha: float = 0.1
+    job_progress_alpha: float = 2.0
     pending_job: Optional[FileDemandData] = None
 
     def __init__(self, *args, **kwargs):
         DefaultClient.__init__(self, *args, **kwargs)
         self.initialize_camera_mixin(**kwargs)
 
-        self.printer.firmware.name = "Virtual Printer Firmware"
+        self.printer.firmware.machine_name = "Creality K2"
+        self.printer.firmware.name = "Creality K2"
         self.printer.firmware.version = "1.0.0"
 
         self.printer.set_info("Virtual Printer", "0.0.1")
+        self.printer.info.api = "Bambu"
         self.printer.tool_count = 1
-        self.printer.tool().material_count = 4
 
         self.camera_uri = URL("virtual://localhost")
         self.printer.webcam_info.connected = True
 
-        for i, mat in enumerate(self.printer.materials0):
-            mat.type = "PLA" if i in (0, 1) else "PETG"
-            mat.color = "Black"
-            mat.hex = "#000000"
+        self.printer.material0.color = "#BC0900"
+        self.printer.material0.type = "PETG"
 
     async def on_connected(self):
         _ = self
@@ -149,18 +153,13 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
         self.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
         self.printer.file_progress.percent = 0.0
 
-        alpha = random.uniform(0.1, 0.5)
+        # ~10s download: alpha=0.3, dt=0.1
+        alpha = 0.3
+        raw_percent = 0.0
 
-        while self.printer.file_progress.percent < 100.0:
-            self.printer.file_progress.percent = max(
-                100.0,
-                expt_smooth(
-                    105.0,
-                    self.printer.file_progress.percent,
-                    alpha,
-                    0.1,
-                ),
-            )
+        while self.printer.file_progress.percent < 100:
+            raw_percent = expt_smooth(105.0, raw_percent, alpha, 0.1)
+            self.printer.file_progress.percent = min(100, round(raw_percent))
             await asyncio.sleep(0.1)
 
         self.pending_job = data
@@ -185,9 +184,6 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
         # Calculate the time to finish the print using the progress rate
         self.printer.job_info.time = round(100.0 / self.job_progress_alpha)
 
-        self.printer.bed.temperature.target = 60.0
-        self.printer.tool0.temperature.target = 225.0
-
     async def on_cancel(self, _):
         self.printer.status = PrinterStatus.CANCELLING
         self.printer.job_info.cancelled = True
@@ -196,26 +192,6 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
 
         self.printer.bed.temperature.target = 0.0
         self.printer.tool0.temperature.target = 0.0
-
-    async def on_stream_off(self):
-        self.printer.material0.raw = {
-            "tray_uuid": "C5D095A34DF246E8A9B99C1D6AD667BE",
-            "tag_uid": "2496010000000100",
-            "tray_color": "5898DDFF",
-            "tray_type": "TPU-AMS",
-            "tray_id_name": "U02-B0",
-            "tray_info_idx": "GFU02",
-            "tray_sub_brands": "TPU for AMS",
-            "tray_weight": "1000",
-            "tray_diameter": "1.75",
-            "cols": ["5898DDFF"],
-        }
-
-        await self.send(
-            MaterialDataMsg(
-                data=dict(MaterialDataMsg.build(self.printer, is_refresh=True))
-            )
-        )
 
     async def init(self):
         self.printer.bed.temperature.actual = 20.0

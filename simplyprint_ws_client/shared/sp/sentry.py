@@ -75,9 +75,11 @@ class Sentry:
 
             sentry_sdk.set_tag("lib_version", VERSION)
 
-            printer_ids = set(
-                [str(config.id) for config in settings.new_config_manager().get_all()]
-            )
+            printer_ids = set()
+
+            for spec in settings.resolved_client_specs():
+                manager = settings.new_config_manager(spec.key)
+                printer_ids.update(str(config.id) for config in manager.get_all())
 
             sentry_sdk.set_extra("printer_ids", ",".join(list(printer_ids)))
 

@@ -1,7 +1,7 @@
-__all__ = ["ClientSettings", "ClientFactory"]
+__all__ = ["ClientSettings", "ClientFactory", "ClientSpec"]
 
 from dataclasses import dataclass
-from typing import Optional, Type, Union, Callable, Protocol, TypeVar, List
+from typing import Optional, Type, Union, Callable, Protocol, TypeVar, List, Sequence
 
 from .client import Client
 from .config import ConfigManagerType, PrinterConfig
@@ -22,6 +22,25 @@ TClientFactory = Union[Type[TAnyClient], ClientFactory]
 TConfigFactory = Union[Type[TAnyPrinterConfig], Callable[..., TAnyPrinterConfig]]
 
 
+@dataclass(frozen=True)
+class ClientSpec:
+    key: str
+    client_factory: TClientFactory
+    config_factory: TConfigFactory
+    name: Optional[str] = None
+    config_manager_t: Optional[ConfigManagerType] = None
+    allow_setup: Optional[bool] = None
+
+    def storage_name(self, app_name: Optional[str], multiple: bool) -> Optional[str]:
+        if self.name is not None:
+            return self.name
+
+        if not multiple:
+            return app_name
+
+        return f"{app_name}-{self.key}" if app_name else self.key
+
+
 @dataclass
 class ClientSettings:
     client_factory: Optional[TClientFactory] = None
@@ -39,6 +58,59 @@ class ClientSettings:
     sentry_dsn: Optional[str] = None
     camera_workers: Optional[int] = None
     camera_protocols: Optional[List[Type[BaseCameraProtocol]]] = None
+    client_specs: Optional[Sequence[ClientSpec]] = None
 
-    def new_config_manager(self):
-        return self.config_manager_t(name=self.name, config_t=self.config_factory)
+    def resolved_client_specs(self) -> tuple[ClientSpec, ...]:
+        if self.client_specs is not None:
+            specs = tuple(self.client_specs)
+
+            if not specs:
+                raise ValueError("At least one client spec must be configured.")
+
+            keys = {spec.key for spec in specs}
+
+            if len(keys) != len(specs):
+                raise ValueError("Client spec keys must be unique.")
+
+            return specs
+
+        if self.client_factory is None or self.config_factory is None:
+            raise ValueError(
+                "Either client_specs or both client_factory/config_factory must be set."
+            )
+
+        return (
+            ClientSpec(
+                key="default",
+                client_factory=self.client_factory,
+                config_factory=self.config_factory,
+                name=self.name,
+                config_manager_t=self.config_manager_t,
+                allow_setup=self.allow_setup,
+            ),
+        )
+
+    def get_client_spec(self, key: Optional[str] = None) -> ClientSpec:
+        specs = self.resolved_client_specs()
+
+        if key is None:
+            if len(specs) == 1:
+                return specs[0]
+
+            raise ValueError("Client spec key is required when multiple specs exist.")
+
+        for spec in specs:
+            if spec.key == key:
+                return spec
+
+        raise KeyError(f"Unknown client spec: {key}")
+
+    def new_config_manager(self, key: Optional[str] = None):
+        spec = self.get_client_spec(key)
+        specs = self.resolved_client_specs()
+        manager_t = spec.config_manager_t or self.config_manager_t
+
+        return manager_t(
+            name=spec.storage_name(self.name, multiple=len(specs) > 1),
+            config_t=spec.config_factory,
+        )
