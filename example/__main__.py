@@ -6,7 +6,7 @@ from simplyprint_ws_client import (
 )
 from simplyprint_ws_client.shared.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.shared.cli.cli import ClientCli
-from simplyprint_ws_client.shared.logging import setup_logging
+from simplyprint_ws_client.contrib.logging import setup_logging
 
 from .virtual_client import VirtualCamera, VirtualClient, VirtualConfig
 

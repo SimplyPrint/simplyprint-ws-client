@@ -5,15 +5,16 @@ Tests ensure that:
 - Messages are not dropped while connected to the correct version
 - Messages are dropped when targeting a stale version
 - Multiple disconnect/reconnect cycles maintain version consistency
+
+These drive :class:`Connection` through a :class:`FakeTransport`, so they pin the
+version/state contract independently of the concrete socket library.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, patch
-from typing import List, Optional
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-from aiohttp import WSMsgType, WSMessage
 
 from simplyprint_ws_client.core.ws_protocol.connection import (
     Connection,
@@ -29,66 +30,25 @@ from simplyprint_ws_client.core.ws_protocol.messages import (
     PingMsg,
 )
 
-
-class MockWebSocket:
-    """Mock WebSocket that simulates connection behavior."""
-
-    def __init__(self):
-        self.closed = False
-        self.close_code = None
-        self.sent_messages: List[str] = []
-        self._receive_queue: asyncio.Queue = asyncio.Queue()
-        self._receive_task: Optional[asyncio.Task] = None
-
-    async def receive(self) -> WSMessage:
-        """Simulate receiving a message."""
-        item = await self._receive_queue.get()
-        # If the item is a future with an exception, await it to raise the exception
-        if asyncio.isfuture(item):
-            return await item
-        return item
-
-    async def send_str(self, data: str) -> None:
-        """Simulate sending a message."""
-        if self.closed:
-            raise ConnectionError("WebSocket is closed")
-        self.sent_messages.append(data)
-
-    async def close(self, *, code: int = 1000, message: bytes = b"") -> None:
-        """Simulate closing the connection."""
-        self.closed = True
-        self.close_code = code
-
-    def queue_receive(self, msg: WSMessage) -> None:
-        """Queue a message to be received."""
-        self._receive_queue.put_nowait(msg)
-
-    def queue_error(self, error: Exception) -> None:
-        """Queue an error to be raised on receive."""
-        future: asyncio.Future = asyncio.Future()
-        future.set_exception(error)
-        self._receive_queue.put_nowait(future)
+from tests._fakes import FakeTransport
 
 
 @pytest_asyncio.fixture
-async def mock_ws():
-    """Provide a mock WebSocket."""
-    return MockWebSocket()
+async def fake_transport():
+    """Provide a fake transport instance."""
+    return FakeTransport()
 
 
 @pytest_asyncio.fixture
-async def connection(mock_ws):
-    """Create a Connection instance with mocked session."""
-    conn = Connection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+async def connection(fake_transport):
+    """Create a Connection whose transport factory yields the fake transport."""
+    conn = Connection(
+        transport_factory=lambda logger: fake_transport,
+        hint=ConnectionHint(mode=ConnectionMode.SINGLE),
+    )
 
     # Provide the running event loop to the connection
     conn.use_running_loop()
-
-    # Mock the session to return our mock WebSocket
-    mock_session = AsyncMock()
-    mock_session.ws_connect = AsyncMock(return_value=mock_ws)
-    mock_session.close = AsyncMock()
-    conn.session = mock_session
 
     yield conn
 
@@ -103,7 +63,7 @@ async def test_initial_version_is_zero(connection):
 
 
 @pytest.mark.asyncio
-async def test_message_dropped_when_version_mismatch(connection, mock_ws):
+async def test_message_dropped_when_version_mismatch(connection, fake_transport):
     """Test that messages are dropped when targeting a different version."""
     # Start with version 0
     assert connection.v == 0
@@ -111,21 +71,21 @@ async def test_message_dropped_when_version_mismatch(connection, mock_ws):
     # Create a test message
     test_msg = PingMsg()
 
-    # Send message targeting version 0 - should be accepted
+    # Send message targeting version 0 - should be dropped (not connected)
     await connection.send(test_msg, v=0)
-    assert len(mock_ws.sent_messages) == 0  # Not connected, message dropped
+    assert len(fake_transport.sent) == 0  # Not connected, message dropped
 
-    # Now try targeting wrong version
-    connection.ws = mock_ws  # Fake connection
+    # Now connect (fake) and try targeting wrong version
+    connection.transport = fake_transport.open()
     await connection.send(test_msg, v=1)
-    assert len(mock_ws.sent_messages) == 0  # Version mismatch, dropped
+    assert len(fake_transport.sent) == 0  # Version mismatch, dropped
 
 
 @pytest.mark.asyncio
-async def test_message_sent_when_version_matches(connection, mock_ws):
+async def test_message_sent_when_version_matches(connection, fake_transport):
     """Test that messages are sent when version matches."""
     # Setup: fake a connected state
-    connection.ws = mock_ws
+    connection.transport = fake_transport.open()
     connection.v = 0
 
     # Create a test message
@@ -133,19 +93,19 @@ async def test_message_sent_when_version_matches(connection, mock_ws):
 
     # Send message targeting matching version
     await connection.send(test_msg, v=0)
-    assert len(mock_ws.sent_messages) == 1
+    assert len(fake_transport.sent) == 1
 
     # Increment version and try again - should fail
     connection.v = 1
     await connection.send(test_msg, v=0)
-    assert len(mock_ws.sent_messages) == 1  # Not sent due to version mismatch
+    assert len(fake_transport.sent) == 1  # Not sent due to version mismatch
 
 
 @pytest.mark.asyncio
-async def test_message_sent_without_version_constraint(connection, mock_ws):
+async def test_message_sent_without_version_constraint(connection, fake_transport):
     """Test that messages without version constraint are sent when connected."""
     # Setup: fake a connected state
-    connection.ws = mock_ws
+    connection.transport = fake_transport.open()
     connection.v = 0
 
     # Create a test message
@@ -153,12 +113,12 @@ async def test_message_sent_without_version_constraint(connection, mock_ws):
 
     # Send message without version constraint
     await connection.send(test_msg, v=None)
-    assert len(mock_ws.sent_messages) == 1
+    assert len(fake_transport.sent) == 1
 
     # Change version - message should still be sent since no constraint
     connection.v = 5
     await connection.send(test_msg, v=None)
-    assert len(mock_ws.sent_messages) == 2
+    assert len(fake_transport.sent) == 2
 
 
 @pytest.mark.asyncio
@@ -235,9 +195,9 @@ async def test_version_isolation_between_connections():
 
 @pytest.mark.asyncio
 async def test_message_dropped_when_not_connected(connection):
-    """Test that messages are dropped when WebSocket is not connected."""
+    """Test that messages are dropped when the transport is not connected."""
     # Ensure not connected
-    connection.ws = None
+    connection.transport = None
     connection.v = 0
 
     test_msg = PingMsg()
@@ -252,17 +212,17 @@ async def test_message_dropped_when_not_connected(connection):
 
 @pytest.mark.asyncio
 async def test_first_message_timeout_version_increment_is_single_not_double(
-    connection, mock_ws
+    connection,
 ):
     """
-    Integration test that NEGATIVELY tests the bug on line 369.
+    Integration test that NEGATIVELY tests the double-increment bug.
 
-    This test runs the actual _loop() as a background task and triggers the first message timeout.
-    It verifies that version is incremented exactly once, not twice.
+    This runs the actual _loop() as a background task and triggers the first
+    message timeout. It verifies that version is incremented exactly once.
 
-    Bug behavior: _close_ws() increments v, then raise ConnectionResetError(), then exception
-    handler increments v again → v becomes 2
-    Fixed behavior: _close_ws() increments v once → v becomes 1
+    Bug behavior: _close_ws() increments v, then raise, then exception handler
+    increments v again -> v becomes 2.
+    Fixed behavior: _close_ws() increments v once -> v becomes 1.
     """
     # Capture ConnectionLostEvent to know when timeout was handled
     lost_events = []
@@ -281,8 +241,7 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
         await connection.connect()
 
         # Wait for the timeout to trigger and be handled
-        # The loop will: connect → wait for first message → timeout → close ws → increment v
-        # Maximum wait time is timeout + some buffer for processing
+        # The loop will: connect -> wait for first message -> timeout -> close -> v += 1
         for _ in range(50):  # Try 50 times with 100ms sleep = 5 seconds max wait
             await asyncio.sleep(0.1)
             if lost_events:  # ConnectionLostEvent was emitted
@@ -292,29 +251,25 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
         await connection.disconnect()
 
         # Assert version was incremented exactly once
-        # FAILS if bug is present (v would be 2 instead of 1)
         assert connection.v == 1, (
             f"Expected v == 1 (single increment) but got {connection.v}. "
-            f"This indicates the bug on line 369 is present: "
-            f"_close_ws() increments v, then raises exception, then exception handler increments v again."
+            f"This indicates a double-increment bug: _close_ws() increments v, "
+            f"then raises, then the exception handler increments v again."
         )
 
 
 @pytest.mark.asyncio
 async def test_poll_failure_increments_version_via_exception_handler(
-    connection, mock_ws
+    connection, fake_transport
 ):
     """
     Integration test for poll() failure path.
 
-    Tests the exception handler flow (lines 368-375) that catches WsConnectionErrors
-    during poll() and increments version.
+    Tests the exception handler flow that catches WsConnectionErrors during
+    poll() (now a dropped transport -> TransportClosed) and increments version.
 
-    This exercises the exception handler increment path (line 375: self.v += 1)
-    that's different from the first message timeout path.
-
-    Verifies that version is correctly incremented exactly once when poll() fails,
-    not twice (which would indicate a double-increment bug similar to line 369).
+    Verifies that version is incremented exactly once when poll() fails, not
+    twice (which would indicate a double-increment bug).
     """
     # Capture connection lost events to verify exception was handled
     lost_events = []
@@ -340,9 +295,8 @@ async def test_poll_failure_increments_version_via_exception_handler(
 
         assert connection.connected and connection.v == 0, "Should be connected at v=0"
 
-        # Queue a CLOSE message that will cause poll() to raise ConnectionResetError
-        # This triggers the exception handler at line 368-375 which increments v
-        mock_ws.queue_receive(WSMessage(WSMsgType.CLOSE, b"", None))
+        # Make the next recv() raise TransportClosed -> exception handler increments v
+        fake_transport.queue_close()
 
         # Wait for poll to fail and exception handler to increment v
         for _ in range(50):
@@ -351,11 +305,9 @@ async def test_poll_failure_increments_version_via_exception_handler(
                 break
 
         # Version should be incremented to exactly 1 by exception handler
-        # FAILS if there's a double-increment bug: v would be 2
         assert connection.v == 1, (
             f"Expected v=1 after poll() failure, got {connection.v}. "
-            f"This indicates a double-increment bug in the exception handler path "
-            f"(similar to line 369 bug where raise statement causes double increment)."
+            f"This indicates a double-increment bug in the exception handler path."
         )
         assert len(lost_events) == 1, (
             "Should have emitted exactly one ConnectionLostEvent"

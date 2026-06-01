@@ -81,8 +81,8 @@ from .ws_protocol.models import (
 from ..events import EventBus, Event
 from ..events.event import sync_only
 from ..shared.asyncio.event_loop_provider import EventLoopProvider
+from ..contrib.logging import printer_logger
 from ..shared.hardware.physical_machine import PhysicalMachine
-from ..shared.logging import ClientName
 from ..shared.sp.simplyprint_api import SimplyPrintApi
 from ..shared.utils.backoff import Backoff, ExponentialBackoff
 
@@ -207,7 +207,7 @@ class Client(
         self.event_bus = EventBus(event_loop_provider=self)
         self.printer = PrinterState(config=config)
         self.printer.provide_context(weakref.ref(self))
-        self.logger = logging.getLogger(ClientName(self))
+        self.logger = printer_logger(self.unique_id)
         autowire(self)
 
     @property

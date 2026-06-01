@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import math
 import random
 import time
@@ -13,7 +12,6 @@ from simplyprint_ws_client import (
     FileDemandData,
     FileProgressStateEnum,
     GcodeDemandData,
-    MaterialDataMsg,
     MeshDataMsg,
     PrinterConfig,
     PrinterStatus,

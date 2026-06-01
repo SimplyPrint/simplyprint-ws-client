@@ -5,16 +5,6 @@ import logging
 from enum import Enum, auto
 from typing import Optional, final, Hashable
 
-from aiohttp import (
-    ClientWebSocketResponse,
-    ClientSession,
-    WSMsgType,
-    ClientError,
-    WebSocketError,
-    ClientTimeout,
-    ClientWSTimeout,
-    WSCloseCode,
-)
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 from yarl import URL
@@ -35,6 +25,15 @@ from ...shared.asyncio.event_loop_provider import EventLoopProvider
 from ...shared.sp.url_builder import SimplyPrintURL
 from ...shared.utils.backoff import ConstantBackoff
 from ...shared.utils.bounded_variable import BoundedInterval
+from ...contrib.logging import printer_logger
+from ...contrib.transport import (
+    WS_CLOSE_OK,
+    WS_CLOSE_PROTOCOL_ERROR,
+    TransportError,
+    TransportFactory,
+    WebSocketsTransport,
+    WebSocketTransport,
+)
 from ...shared.utils.stoppable import AsyncStoppable
 
 
@@ -84,28 +83,24 @@ class State(Enum):
     PAUSED = auto()
 
 
-ConnectionTimeout = ClientTimeout(
-    total=None, connect=60.0, sock_connect=60.0, sock_read=None
-)
-
-# aiohttp WebSocket parameters.
-# https://docs.aiohttp.org/en/stable/client_reference.html#aiohttp.ClientSession.ws_connect
-WsParams = {
-    "autoclose": True,
-    "autoping": True,
-    "heartbeat": 30,
-    "max_msg_size": 0,
-    "timeout": ClientWSTimeout(ws_receive=None, ws_close=10.0),
+# WebSocket transport parameters, passed to ``WebSocketTransport.connect``.
+# Mirrors the previous aiohttp settings: a 30s ping heartbeat, unbounded message
+# size, a 60s connect timeout and a 10s close timeout.
+TransportParams = {
+    "ping_interval": 30,
+    "ping_timeout": 30,
+    "open_timeout": 60,
+    "close_timeout": 10,
+    "max_size": None,
 }
 
 # Errors we treat as a closed connection.
 WsConnectionErrors = (
     OSError,
     ConnectionError,  # Technically a subset of OSError, but more specific.
-    ClientError,
     asyncio.TimeoutError,
     asyncio.CancelledError,
-    WebSocketError,
+    TransportError,  # Base of TransportClosed -- covers both.
 )
 
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
@@ -126,8 +121,7 @@ class Connection(
 
     Attributes:
         v: Version representing the connection generation, on every disconnect this value is incremented to invalidate previous versions.
-        ws: WebSocket connection.
-        session: HTTP session.
+        transport: The underlying WebSocket transport (rebuilt per connection attempt).
         hint: Connection hint from which the URL is derived.
         logger: Logger for connection events.
         event_bus: ConnectionEvent bus for lifetime events and message events.
@@ -137,8 +131,8 @@ class Connection(
     """
 
     v: int
-    ws: Optional[ClientWebSocketResponse]
-    session: Optional[ClientSession]
+    transport: Optional[WebSocketTransport]
+    transport_factory: TransportFactory
     hint: ConnectionHint
     logger: logging.Logger
 
@@ -150,7 +144,7 @@ class Connection(
 
     def __init__(
         self,
-        session: Optional[ClientSession] = None,
+        transport_factory: TransportFactory = WebSocketsTransport,
         hint: Optional[ConnectionHint] = None,
         logger: logging.Logger = logging.getLogger("ws"),
         **kwargs,
@@ -159,8 +153,8 @@ class Connection(
         EventLoopProvider.__init__(self, **kwargs)
 
         self.v = 0
-        self.ws = None
-        self.session = session
+        self.transport = None
+        self.transport_factory = transport_factory
         self.hint = hint or ConnectionHint()
         self.logger = logger
 
@@ -185,26 +179,35 @@ class Connection(
     def connected(self):
         """This has nothing to do with our `Connection` state and everything to do
         with the real, physical underlying connection state."""
-        return self.ws is not None and not self.ws.closed
+        return self.transport is not None and self.transport.is_open
 
     @property
     def running(self):
         """Whether the connection loop is running."""
         return self._loop_task.task is not None and not self._loop_task.done()
 
-    async def _close_ws(self, code: int = WSCloseCode.OK, message: bytes = b""):
+    async def _close_ws(self, code: int = WS_CLOSE_OK, reason: str = ""):
         """
         Close WebSocket connection manually, typically used when we are paused or
         stopped and no reconnections are taking place.
         """
         if not self.connected:
             return
-        await self.ws.close(code=code, message=message)
-        self.ws = None
+        await self.transport.close(code=code, reason=reason)
+        self.transport = None
         self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
         _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
         self.v += 1
         self.logger.info("Manually closed connection.")
+
+    async def _open_transport(self) -> WebSocketTransport:
+        """Build a fresh transport and open it. Returns the connected transport.
+
+        Raised :class:`TransportError` propagates into the loop's reconnect path.
+        """
+        transport = self.transport_factory(self.logger)
+        await transport.connect(str(self.url), **TransportParams)
+        return transport
 
     async def _loop(self):
         """Connection main loop - only run once per instance."""
@@ -217,9 +220,7 @@ class Connection(
 
         queue_task = ContinuousTask(self._queue.get, provider=self)
         poll_task = ContinuousTask(self.poll, provider=self)
-        ws_connect_task = ContinuousTask(
-            lambda: self.session.ws_connect(self.url, **WsParams), provider=self
-        )
+        ws_connect_task = ContinuousTask(self._open_transport, provider=self)
         wait_delay_task = ContinuousTask(lambda d: self.wait(d), provider=self)
         wait_stop_task = ContinuousTask(self.wait, provider=self)
 
@@ -319,7 +320,7 @@ class Connection(
                     if not ws_connect_task.done():
                         continue
 
-                    self.ws = ws_connect_task.pop().result()
+                    self.transport = ws_connect_task.pop().result()
 
                     self._state = State.CONNECTED
 
@@ -334,9 +335,7 @@ class Connection(
                     self.logger.info(f"Connected to {self.url}")
 
                 if not self.connected:
-                    raise ConnectionResetError(
-                        f"Invalid connection state. Previous close code: {self.ws.close_code if self.ws is not None else None}"
-                    )
+                    raise ConnectionResetError("Invalid connection state.")
 
                 tasks = [queue_task.schedule(), poll_task.schedule()]
 
@@ -360,8 +359,8 @@ class Connection(
                 # Reset connection if waiter is done without having received first message.
                 if not has_first_msg and wait_first_msg_task.done():
                     await self._close_ws(
-                        code=WSCloseCode.PROTOCOL_ERROR,
-                        message=b"Did not receive first message in time.",
+                        code=WS_CLOSE_PROTOCOL_ERROR,
+                        reason="Did not receive first message in time.",
                     )
                     self._state = State.NOT_CONNECTED
 
@@ -389,10 +388,6 @@ class Connection(
         # Clean up.
         await self._close_ws()
 
-        if self.session:
-            await self.session.close()
-            self.session = None
-
         poll_task.discard()
         ws_connect_task.discard()
         wait_delay_task.discard()
@@ -402,9 +397,6 @@ class Connection(
 
     async def connect(self, hint: Optional[ConnectionHint] = None):
         """Create or resume the connection loop."""
-        if not self.session:
-            self.session = ClientSession(timeout=ConnectionTimeout)
-
         self.hint = hint or self.hint
 
         # Task is already running.
@@ -434,33 +426,41 @@ class Connection(
         if self.running:
             await self._queue.put(Action.INTERRUPT)
 
+    def _message_logger(self, msg) -> logging.Logger:
+        """Route a WS message's log line to the printer it belongs to.
+
+        A printer-specific message goes to that printer's ``ws`` log
+        (``<unique_id>/ws.log``); a genuinely global message stays on the
+        connection's ``ws`` logger (the system scope). In MULTI mode each message
+        carries ``for_client`` -- the printer's unique_id, or ``None`` when
+        global; in SINGLE mode every message belongs to the connection's printer.
+        """
+        if self.hint.mode == ConnectionMode.MULTI:
+            client_id = getattr(msg, "for_client", None)
+        else:
+            client_id = self.hint.config.unique_id
+        if client_id:
+            return printer_logger(str(client_id), "ws")
+        return self.logger
+
     async def poll(self) -> None:
         """
         Raises:
-         ConnectionResetError: Signal that the connection is closed.
+         TransportClosed: Signal that the connection is closed.
         """
-        message = await self.ws.receive()
+        data = await self.transport.recv()
 
-        if message.type in (
-            WSMsgType.CLOSE,
-            WSMsgType.CLOSING,
-            WSMsgType.CLOSED,
-            WSMsgType.ERROR,
-        ):
-            raise ConnectionResetError(f"Connection closed. {message}")
+        if data is None:
+            return
 
         try:
-            if message.type in (WSMsgType.TEXT, WSMsgType.BINARY):
-                msg = ServerMsg.model_validate_json(message.data).root
-                self.logger.debug("received %s", msg)
-                _ = self.event_bus.emit_task(ConnectionIncomingEvent, msg, self.v)
-                return
-
-            self.logger.warning("Unhandled message: %s", message)
+            msg = ServerMsg.model_validate_json(data).root
+            self._message_logger(msg).debug("received %s", msg)
+            _ = self.event_bus.emit_task(ConnectionIncomingEvent, msg, self.v)
 
         except ValidationError as e:
             # Invalid message.
-            self.logger.error("Invalid message: %s", message, exc_info=e)
+            self.logger.error("Invalid message: %s", data, exc_info=e)
 
     async def send(
         self, msg: ClientMsg[ClientMsgType], v: Optional[int] = None
@@ -486,8 +486,10 @@ class Connection(
 
         try:
             data = msg.model_dump_json()
-            await self.ws.send_str(data)
-            self.logger.debug("sent %s", data if len(data) < 1024 else msg.msg_type())
+            await self.transport.send(data)
+            self._message_logger(msg).debug(
+                "sent %s", data if len(data) < 1024 else msg.msg_type()
+            )
 
         except (PydanticSerializationError, UnicodeError) as e:
             # Serialization error.

@@ -136,7 +136,9 @@ class ClientApp(SyncStoppable):
 
         if len(matches) > 1:
             best_distance = min(distance for distance, _ in matches)
-            best_matches = [spec for distance, spec in matches if distance == best_distance]
+            best_matches = [
+                spec for distance, spec in matches if distance == best_distance
+            ]
 
             if len(best_matches) == 1:
                 return best_matches[0]

@@ -336,10 +336,6 @@ class EventBus(Emitter[TEvent]):
 
         self.listeners[event_type].add(listener, **kwargs)
 
-    def _register_from_class(self, klass: type):
-        """Register all listeners from a class (statically)."""
-        ...
-
     def _iterate_subclasses(self, klass: type) -> Generator[type, None, None]:
         """Perform class introspection to construct listeners generically"""
         if not issubclass(klass, self.event_klass):
