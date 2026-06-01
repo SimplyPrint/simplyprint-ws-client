@@ -128,6 +128,41 @@ class TestNoShims:
             "core.state still re-exports a `StateModel` alias"
         )
 
+    def test_job_lock_module_removed(self):
+        """SHIM (B1): job_lock.py is gone; set_active_job absorbed into FileTransfer.
+
+        ``contrib/transfer/job_lock.py`` exposed a free ``set_active_job()`` (a
+        misnomer — it owned no lock, just three lines of active-job bookkeeping).
+        That behavior now lives on the prepare-lifecycle-owning class as
+        ``FileTransfer._set_active_job_for_prepare``. This guards against the
+        module being resurrected and the free function creeping back into the
+        ``contrib.transfer`` surface.
+        """
+        import importlib
+
+        # 1. The module no longer exists.
+        jl = LIB_PKG / "contrib" / "transfer" / "job_lock.py"
+        assert not jl.exists(), (
+            "job_lock.py must be deleted; set_active_job is now "
+            "FileTransfer._set_active_job_for_prepare"
+        )
+
+        # 2. Importing the dead module path raises ImportError.
+        with pytest.raises(ImportError):
+            importlib.import_module("simplyprint_ws_client.contrib.transfer.job_lock")
+
+        # 3. set_active_job is NOT exported from contrib.transfer.
+        from simplyprint_ws_client.contrib import transfer
+
+        assert not hasattr(transfer, "set_active_job"), (
+            "contrib.transfer still exports a `set_active_job` free function"
+        )
+
+        # 4. The behavior lives on FileTransfer.
+        assert hasattr(transfer.FileTransfer, "_set_active_job_for_prepare"), (
+            "FileTransfer must own _set_active_job_for_prepare"
+        )
+
     @staticmethod
     def _find_shim_aliases(root: pathlib.Path) -> List[str]:
         """AST-scan for module-level Name = OtherName; skip decorator RHS and class-level attrs."""

@@ -2,7 +2,8 @@
 
 Every LAN-upload integration runs the same play when a print file arrives:
 
-1. cancel any in-flight transfer, claim the job (``set_active_job``),
+1. cancel any in-flight transfer, claim the job
+   (``_set_active_job_for_prepare``),
 2. ``begin_prepare`` -> download from the SP CDN (0-50%),
 3. transform the file for this printer, upload it (50-100%),
 4. either stash it (no auto-start) or send the start command and arm a grace
@@ -44,7 +45,6 @@ from simplyprint_ws_client.shared.utils.slugify import slugify
 
 from simplyprint_ws_client.contrib.transfer.checksum import fast_md5sum
 from simplyprint_ws_client.contrib.transfer.concurrency import start_in_thread
-from simplyprint_ws_client.contrib.transfer.job_lock import set_active_job
 
 if TYPE_CHECKING:
     from simplyprint_ws_client import DefaultClient
@@ -175,7 +175,7 @@ class FileTransfer(ABC):
         self._download_canceller.clear()
 
         with self._download_lock:
-            set_active_job(self.client.printer, data.job_id, data.action_token)
+            self._set_active_job_for_prepare(data.job_id, data.action_token)
 
             try:
                 self.begin_prepare()
@@ -386,3 +386,15 @@ class FileTransfer(ABC):
 
     def _on_end_prepare(self) -> None:
         """Brand bookkeeping at prepare end."""
+
+    def _set_active_job_for_prepare(
+        self, job_id: Optional[int], action_token: Optional[str]
+    ) -> None:
+        """Mark ``job_id`` as the printer's active job at prepare start.
+
+        Records which job is now "the active job" (so later pause/cancel/resume
+        target the right one) and resets the bed-cleared flag.
+        """
+        self.client.printer.current_job_id = job_id
+        self.client.printer.file_action_token = action_token
+        self.client.printer.have_cleared_bed = False
