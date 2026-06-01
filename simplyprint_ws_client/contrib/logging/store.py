@@ -24,7 +24,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterable, List, Optional
+from typing import BinaryIO, Iterable, List, Optional, Tuple
 
 from .config import LoggingConfig
 
@@ -231,6 +231,77 @@ class LogStore:
             text = text[-max_bytes:]
 
         return text
+
+    def read_tail_lines(
+        self,
+        scope: str,
+        name: str,
+        max_lines: int,
+        *,
+        max_bytes: int = 5 * 1024 * 1024,
+    ) -> Tuple[str, bool]:
+        """The last ``max_lines`` complete lines of a log file, read cheaply.
+
+        For an uncompressed file this seeks from the end and reads fixed-size
+        blocks backwards until it has gathered ``max_lines`` complete lines (or
+        reached the start of the file), so a 30 MB live log is never read in full
+        just to show its tail. A gzipped backup cannot be seeked, so it falls back
+        to the whole-file tail in :meth:`read_text` (only hit when paging deep
+        history). Never reads more than ``max_bytes`` from the end.
+
+        Returns ``(text, truncated)``: ``text`` is in file order (oldest line
+        first), the same orientation as :meth:`read_text`; ``truncated`` is True
+        when the start of the file was cut off (by the line cap, the byte ceiling
+        or a mid-line seek), so the caller knows the first logical line may be a
+        fragment of an earlier entry (e.g. a continued traceback) to drop.
+        """
+        if max_lines <= 0:
+            return "", False
+
+        path = self.resolve_file(scope, name)
+        if _is_compressed(path):
+            text = self.read_text(scope, name, max_bytes=max_bytes)
+            lines = text.splitlines()
+            truncated = len(lines) > max_lines or len(text) >= max_bytes
+            lines = lines[-max_lines:]
+            return ("\n".join(lines) + "\n" if lines else ""), truncated
+
+        size = self._safe_size(path)
+        if size == 0:
+            return "", False
+
+        # Read blocks backwards until we have one more newline than lines wanted
+        # (the extra one lets us drop the partial leading line), reach the start of
+        # the file, or hit the byte ceiling.
+        block = 64 * 1024
+        want_newlines = max_lines + 1
+        data = b""
+        pos = size
+        with open(path, "rb") as handle:
+            while pos > 0 and len(data) < max_bytes:
+                read_size = min(block, pos)
+                pos -= read_size
+                handle.seek(pos)
+                data = handle.read(read_size) + data
+                if data.count(b"\n") >= want_newlines:
+                    break
+
+        # We read the whole file only if we walked all the way back to byte 0 (so
+        # line 0 is real); otherwise the seek landed mid-line and line 0 is a
+        # fragment to drop.
+        reached_start = pos == 0
+        if len(data) > max_bytes:
+            data = data[-max_bytes:]
+            reached_start = False
+
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        # If we stopped before the start of the file the first line is a fragment of
+        # an earlier line (the seek landed mid-line) -- drop it.
+        if not reached_start and lines:
+            lines = lines[1:]
+        truncated = not reached_start or len(lines) > max_lines
+        lines = lines[-max_lines:]
+        return ("\n".join(lines) + "\n" if lines else ""), truncated
 
     def open_bytes(self, scope: str, name: str) -> BinaryIO:
         """Raw bytes of a log file, for streaming a download."""

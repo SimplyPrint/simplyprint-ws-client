@@ -149,6 +149,41 @@ def test_logstore_reads_gzipped_backup(tmp_path):
     assert "compressed line" in store.read_text("p7", "main.log.1")
 
 
+def test_read_tail_lines_returns_last_n_complete_lines(tmp_path):
+    # A file several 64 KB blocks long, so the backward read seeks land mid-line
+    # and the partial leading fragment must be dropped (not returned as a line).
+    store = LogStore(LoggingConfig(log_dir=tmp_path))
+    lines = [f"line-{i:05d}-{'x' * 180}" for i in range(1000)]
+    _write(tmp_path / "p7" / "main.log", "\n".join(lines) + "\n")
+
+    text, truncated = store.read_tail_lines("p7", "main.log", 5)
+    assert text.splitlines() == lines[-5:]
+    # No fragment: the first returned line is a whole line, not a tail of an earlier one.
+    assert text.splitlines()[0] == "line-00995-" + "x" * 180
+    assert truncated is True  # the start of the file was cut off
+
+
+def test_read_tail_lines_whole_file_when_fewer_lines(tmp_path):
+    store = LogStore(LoggingConfig(log_dir=tmp_path))
+    _write(tmp_path / "p7" / "main.log", "a\nb\nc\n")
+    # Asking for more lines than exist returns the whole file, with no line dropped.
+    text, truncated = store.read_tail_lines("p7", "main.log", 100)
+    assert text.splitlines() == ["a", "b", "c"]
+    assert truncated is False  # whole file -> line 0 is real, not a fragment
+
+
+def test_read_tail_lines_gzip_fallback(tmp_path):
+    store = LogStore(LoggingConfig(log_dir=tmp_path))
+    backup = tmp_path / "p7" / "main.log.1"
+    backup.parent.mkdir(parents=True)
+    with gzip.GzipFile(backup, "wb", mtime=0) as handle:
+        handle.write(b"one\ntwo\nthree\n")
+    # A gzipped backup can't be seeked, so it falls back to the whole-file tail.
+    text, truncated = store.read_tail_lines("p7", "main.log.1", 2)
+    assert text.splitlines() == ["two", "three"]
+    assert truncated is True  # more lines existed than were returned
+
+
 def test_logstore_traversal_guard(tmp_path):
     store = LogStore(LoggingConfig(log_dir=tmp_path))
     _write(tmp_path / "p7" / "main.log", "x\n")
