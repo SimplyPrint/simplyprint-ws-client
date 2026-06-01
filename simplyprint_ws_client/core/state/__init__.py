@@ -1,5 +1,4 @@
 __all__ = [
-    "StateModel",
     "TemperatureState",
     "AmbientTemperatureState",
     "FileProgressState",
@@ -79,7 +78,8 @@ from .models import (
     NotificationEventEffect,
     NotificationActionResponses,
 )
-from .state_model import StateModel, Exclusive, Untracked
+from simplyprint_ws_client.contrib.model.reactive import ReactiveModel
+from simplyprint_ws_client.contrib.model.annotations import Exclusive, Untracked
 from .utils import _resize_state_inplace
 from ..config import PrinterConfig
 from ...const import VERSION
@@ -96,7 +96,7 @@ except ImportError:
     from typing_extensions import Unpack, Never
 
 
-class TemperatureState(StateModel):
+class TemperatureState(ReactiveModel):
     actual: Optional[float] = None
     target: Optional[float] = None
 
@@ -128,7 +128,7 @@ class TemperatureState(StateModel):
         ) and self.as_rounded("actual") == other.as_rounded("actual")
 
 
-class AmbientTemperatureState(StateModel):
+class AmbientTemperatureState(ReactiveModel):
     ambient: int = 0
 
     _initial_sample: Optional[float] = None
@@ -165,7 +165,7 @@ class AmbientTemperatureState(StateModel):
         )
 
 
-class FileProgressState(StateModel):
+class FileProgressState(ReactiveModel):
     state: Optional[FileProgressStateEnum] = None
     percent: float = 0.0
     message: Optional[str] = None
@@ -179,13 +179,13 @@ class FileProgressState(StateModel):
             self.percent = 0.0
 
 
-class CpuInfoState(StateModel):
+class CpuInfoState(ReactiveModel):
     usage: Optional[float] = None
     temp: Optional[float] = None
     memory: Optional[float] = None
 
 
-class PrinterInfoState(StateModel):
+class PrinterInfoState(ReactiveModel):
     ui: Optional[str] = None
     ui_version: Optional[str] = None
     api: Optional[str] = None
@@ -203,7 +203,7 @@ class PrinterInfoState(StateModel):
     mac: Optional[str] = None
 
 
-class PrinterFirmwareState(StateModel):
+class PrinterFirmwareState(ReactiveModel):
     name: Optional[str] = None
     name_raw: Optional[str] = None
     machine: Optional[str] = None
@@ -213,22 +213,22 @@ class PrinterFirmwareState(StateModel):
     link: Optional[str] = None
 
 
-class PrinterFirmwareWarning(StateModel):
+class PrinterFirmwareWarning(ReactiveModel):
     check_name: Optional[str] = None
     warning_type: Optional[str] = None
     severity: Optional[str] = None
     url: Optional[str] = None
 
 
-class PrinterFilamentSensorState(StateModel):
+class PrinterFilamentSensorState(ReactiveModel):
     state: Optional[FilamentSensorEnum] = None
 
 
-class PSUState(StateModel):
+class PSUState(ReactiveModel):
     on: bool = False
 
 
-class JobInfoState(StateModel, validate_assignment=True):
+class JobInfoState(ReactiveModel, validate_assignment=True):
     progress: Optional[float] = None
     initial_estimate: Optional[float] = None
     layer: Optional[int] = None
@@ -274,7 +274,7 @@ class JobInfoState(StateModel, validate_assignment=True):
         return super().__setattr__(key, value)
 
 
-class PingPongState(StateModel):
+class PingPongState(ReactiveModel):
     ping: Optional[float] = None
     pong: Optional[float] = None
 
@@ -291,17 +291,17 @@ class PingPongState(StateModel):
         return round((self.pong - self.ping) * 1000)
 
 
-class WebcamState(StateModel):
+class WebcamState(ReactiveModel):
     connected: bool = False
 
 
-class WebcamSettings(StateModel):
+class WebcamSettings(ReactiveModel):
     flipH: bool = False
     flipV: bool = False
     rotate90: bool = False
 
 
-class MaterialLayoutEntry(StateModel):
+class MaterialLayoutEntry(ReactiveModel):
     nozzle: int = 0
     mms: Optional[MultiMaterialSolution] = None
     size: Optional[int] = None
@@ -327,7 +327,7 @@ class MaterialLayoutEntry(StateModel):
         return self.mms.offset if self.mms else 0
 
 
-class MaterialEntry(StateModel):
+class MaterialEntry(ReactiveModel):
     nozzle: int
     ext: int
     type: Union[str, int, None] = None  # Material type name
@@ -352,7 +352,7 @@ class MaterialEntry(StateModel):
         self.raw = None
 
 
-class BedState(StateModel):
+class BedState(ReactiveModel):
     type: Optional[BedType] = None
     temperature: TemperatureState = Field(default_factory=TemperatureState)
 
@@ -361,7 +361,7 @@ class BedState(StateModel):
         return self.temperature.is_heating()
 
 
-class ToolState(StateModel):
+class ToolState(ReactiveModel):
     nozzle: int
     type: Optional[NozzleType] = None
     volume_type: Optional[VolumeType] = None
@@ -399,7 +399,7 @@ class ToolState(StateModel):
             )
 
 
-class JobObjectEntry(StateModel):
+class JobObjectEntry(ReactiveModel):
     """A skip-able object definition to share with SimplyPrint."""
 
     class PrintProgressPoint(BaseModel):
@@ -420,7 +420,7 @@ class JobObjectEntry(StateModel):
     prints_to: Optional[PrintProgressPoint] = None
 
 
-class NotificationEventPayload(StateModel):
+class NotificationEventPayload(ReactiveModel):
     title: Optional[str] = None
     message: Optional[str] = None
     url: Optional[str] = None
@@ -430,7 +430,7 @@ class NotificationEventPayload(StateModel):
     data: Optional[dict] = None  # any data to attach to the event
 
 
-class NotificationEvent(StateModel):
+class NotificationEvent(ReactiveModel):
     event_id: Optional[uuid.UUID] = None
     type: NotificationEventType = NotificationEventType.GENERIC
     severity: NotificationEventSeverity = NotificationEventSeverity.INFO
@@ -472,7 +472,7 @@ class NotificationEvent(StateModel):
         ctx.event_loop.call_soon(self._response_future.set_result, data)
 
 
-class NotificationsState(StateModel):
+class NotificationsState(ReactiveModel):
     """Notification and event center for printer, relayed to SimplyPrint"""
 
     notifications: Dict[uuid.UUID, NotificationEvent] = Field(default_factory=dict)
@@ -605,7 +605,7 @@ class NotificationsState(StateModel):
         return item in self.notifications.keys()
 
 
-class PrinterState(StateModel):
+class PrinterState(ReactiveModel):
     # Non-tracked configuration/state.
     config: Untracked[PrinterConfig]
     have_cleared_bed: Untracked[bool] = False

@@ -87,6 +87,47 @@ class TestNoShims:
         offenders = self._find_star_imports(LIB_PKG / "shared")
         assert not offenders, f"Star re-exports in shared/: {offenders}"
 
+    def test_state_model_alias_removed(self):
+        """SHIM (S-state): the StateModel re-export shim is gone for good.
+
+        ``core/state/state_model.py`` used to expose ``StateModel = ReactiveModel``
+        (and re-export Exclusive/Untracked). That alias was a re-export shim: every
+        state class is now defined directly on ``ReactiveModel``. This guards against
+        the file being resurrected and against the alias creeping back as a local name.
+        """
+        import importlib
+
+        # 1. The shim file no longer exists.
+        shim = LIB_PKG / "core" / "state" / "state_model.py"
+        assert not shim.exists(), f"state_model.py was resurrected: {shim}"
+
+        # 2. Importing the dead module path raises ImportError.
+        with pytest.raises(ImportError):
+            importlib.import_module("simplyprint_ws_client.core.state.state_model")
+
+        # 3. Every state class inherits from the real ReactiveModel, not a local alias.
+        from simplyprint_ws_client.contrib.model.reactive import ReactiveModel
+        import simplyprint_ws_client.core.state as state_pkg
+
+        state_classes = [
+            "TemperatureState",
+            "AmbientTemperatureState",
+            "FileProgressState",
+            "JobInfoState",
+            "NotificationEvent",
+            "PrinterState",
+        ]
+        for cls_name in state_classes:
+            cls = getattr(state_pkg, cls_name)
+            assert ReactiveModel in cls.__mro__, (
+                f"{cls_name} does not inherit from ReactiveModel: {cls.__mro__}"
+            )
+
+        # 4. No `StateModel` name re-exported from the state package.
+        assert not hasattr(state_pkg, "StateModel"), (
+            "core.state still re-exports a `StateModel` alias"
+        )
+
     @staticmethod
     def _find_shim_aliases(root: pathlib.Path) -> List[str]:
         """AST-scan for module-level Name = OtherName; skip decorator RHS and class-level attrs."""
