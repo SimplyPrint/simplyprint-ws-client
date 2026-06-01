@@ -123,9 +123,6 @@ class ThreadedWebSocketTransport:
             except Exception as e:
                 self.logger.warning("Failed to close WebSocket: %s", e)
 
-    #: Backwards-friendly alias -- brand clients historically called ``close()``.
-    close = stop
-
     def send(self, data: str) -> bool:
         wsapp = self.wsapp
         if wsapp is None or wsapp.sock is None:

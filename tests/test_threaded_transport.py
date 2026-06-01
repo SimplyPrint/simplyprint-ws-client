@@ -37,9 +37,19 @@ def test_send_returns_false_when_not_connected():
     assert t.send("hello") is False
 
 
-def test_close_is_idempotent_before_start():
+def test_stop_is_idempotent_before_start():
     t = _make()
-    # close is an alias for stop; both must be safe with no socket/threads yet.
-    t.close()
+    # The ``close`` alias was removed per S-close; ``stop()`` is the only
+    # public shutdown method, and it must be safe with no socket/threads yet.
+    t.stop()
     t.stop()
     assert t.connected is False
+
+
+def test_no_close_alias():
+    t = _make()
+    # The backwards-compat ``close = stop`` alias was deleted per S-close;
+    # ``stop()`` is the sole canonical shutdown method. Guard against the
+    # alias creeping back in.
+    assert not hasattr(ThreadedWebSocketTransport, "close")
+    assert callable(t.stop)
