@@ -2,7 +2,7 @@
 
 Routing is derived purely from the (plain, dotted) logger name -- no
 ``ClientName``. Per-printer records land in ``<uid>/<sub>.log``, system records in
-root-level ``system.log``; rules are configurable; the LogStore browses the tree.
+the root-level app log; rules are configurable; the LogStore browses the tree.
 """
 
 import gzip
@@ -12,20 +12,23 @@ import zipfile
 
 import pytest
 
+from simplyprint_ws_client import ClientSettings
 from simplyprint_ws_client.contrib.logging import (
+    configure_logging,
     LoggingConfig,
     LogNotFound,
     LogStore,
     RoutingHandler,
     RoutingRule,
     printer_logger_name,
+    PRINTER_ROOT,
     scope_of,
 )
 from simplyprint_ws_client.contrib.logging.naming import decode_uid, encode_uid
 
 
-def _record(name, message="msg"):
-    return logging.LogRecord(name, logging.INFO, __file__, 1, message, None, None)
+def _record(name, message="msg", level=logging.INFO):
+    return logging.LogRecord(name, level, __file__, 1, message, None, None)
 
 
 # -- naming + scope ---------------------------------------------------------
@@ -87,6 +90,27 @@ def test_routing_per_printer_and_system(tmp_path):
     handler.close()
 
 
+def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record("supervisor", "system debug", logging.DEBUG))
+    handler.emit(_record("supervisor", "system info", logging.INFO))
+    handler.emit(_record("websockets.client", "websocket info", logging.INFO))
+    handler.emit(_record("websockets.client", "websocket warning", logging.WARNING))
+    handler.emit(
+        _record(printer_logger_name("p7", "mqtt"), "mqtt debug", logging.DEBUG)
+    )
+    _drain(handler)
+
+    system = (tmp_path / "system.log").read_text()
+    printer = (tmp_path / "p7" / "mqtt.log").read_text()
+    assert "system info" in system
+    assert "websocket warning" in system
+    assert "system debug" not in system
+    assert "websocket info" not in system
+    assert "mqtt debug" in printer
+    handler.close()
+
+
 def test_routing_custom_rule(tmp_path):
     # The "powerful" bit: route 'discovery' to its own JSON file; everything else default.
     config = LoggingConfig(
@@ -118,6 +142,114 @@ def test_routing_dotted_uid_round_trips_to_one_dir(tmp_path):
     # The dotted uid is one directory, not nested a/b/c.
     assert (tmp_path / "a.b.c" / "mqtt.log").is_file()
     handler.close()
+
+
+def test_configure_logging_uses_app_name_for_default_system_file(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    try:
+        logging.getLogger("supervisor").warning("boot")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    assert facility.config.system_log_stem == "BambuClient"
+    assert (tmp_path / "BambuClient.log").read_text().strip().endswith("boot")
+    assert not (tmp_path / "system.log").exists()
+
+
+def test_configure_logging_sets_effective_levels_for_performance(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    try:
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+        assert logging.getLogger(PRINTER_ROOT).getEffectiveLevel() == logging.DEBUG
+        assert (
+            logging.getLogger("websockets.client").getEffectiveLevel()
+            == logging.WARNING
+        )
+        assert (
+            logging.getLogger("httpcore.connection").getEffectiveLevel()
+            == logging.WARNING
+        )
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+
+def test_policy_rejects_spam_before_record_allocation(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    printer_name = printer_logger_name("p7", "mqtt")
+    created = []
+    original_factory = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        created.append(args[0])
+        return original_factory(*args, **kwargs)
+
+    try:
+        logging.setLogRecordFactory(factory)
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger("websockets.client").info("websocket info")
+        assert created == []
+
+        logging.getLogger(printer_name).debug("mqtt debug")
+        assert created == [printer_name]
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+
+def test_stream_policy_keeps_console_operational(capsys, tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    try:
+        logging.getLogger("supervisor").info("system info")
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger("websockets.client").info("websocket info")
+        logging.getLogger("websockets.client").warning("websocket warning")
+        logging.getLogger(printer_logger_name("p7", "mqtt")).debug("mqtt debug")
+        logging.getLogger(printer_logger_name("p7", "mqtt")).warning("mqtt warning")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    stderr = capsys.readouterr().err
+    assert "system info" in stderr
+    assert "websocket warning" in stderr
+    assert "mqtt warning" in stderr
+    assert "system debug" not in stderr
+    assert "websocket info" not in stderr
+    assert "mqtt debug" not in stderr
+
+
+def test_development_policy_keeps_noisy_debug_suppressed(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient", development=True),
+        LoggingConfig(log_dir=tmp_path),
+    )
+    try:
+        assert logging.getLogger().getEffectiveLevel() == logging.DEBUG
+        assert logging.getLogger(PRINTER_ROOT).getEffectiveLevel() == logging.DEBUG
+        assert (
+            logging.getLogger("websockets.client").getEffectiveLevel()
+            == logging.WARNING
+        )
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger("websockets.client").debug("websocket debug")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    system = (tmp_path / "BambuClient.log").read_text()
+    assert "system debug" in system
+    assert "websocket debug" not in system
 
 
 # -- LogStore ---------------------------------------------------------------

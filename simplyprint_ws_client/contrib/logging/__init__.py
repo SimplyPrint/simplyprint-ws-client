@@ -3,8 +3,8 @@
 Records route purely by their (plain, dotted) logger name -- no ``ClientName``
 str-subclass, no custom Logger class. Per-printer loggers
 (``simplyprint.printer.<uid>[.<sub>]``, made via :func:`printer_logger`) land in
-``<log_dir>/<uid>/<sub>.log``; everything else in one root-level
-``<log_dir>/system.log``.
+``<log_dir>/<uid>/<sub>.log``; everything else in one root-level app log
+(``<log_dir>/<ClientSettings.name>.log`` by default).
 Output is plain text or one-line JSON, chosen per routing rule, so a record can be
 rendered differently per destination.
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import queue
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .config import LoggingConfig, RoutingRule
@@ -30,6 +30,14 @@ from .naming import (
     printer_logger_name,
     scope_of,
 )
+from .policy import (
+    LOG_TARGET_FILE,
+    LOG_TARGET_LIVE,
+    LOG_TARGET_QUEUE,
+    LOG_TARGET_STREAM,
+    LoggingPolicy,
+    LoggingPolicyFilter,
+)
 from .routing import JsonLogFormatter, PassthroughQueueHandler, RoutingHandler
 from .store import LogFileInfo, LogNotFound, LogScopeInfo, LogStore
 
@@ -38,6 +46,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "LoggingConfig",
+    "LoggingPolicy",
+    "LoggingPolicyFilter",
+    "LOG_TARGET_FILE",
+    "LOG_TARGET_LIVE",
+    "LOG_TARGET_QUEUE",
+    "LOG_TARGET_STREAM",
     "RoutingRule",
     "LoggingFacility",
     "LogStore",
@@ -67,6 +81,25 @@ class LoggingFacility:
     config: LoggingConfig
 
 
+def _resolve_config(settings: "ClientSettings", config: LoggingConfig) -> LoggingConfig:
+    policy = config.policy
+    if settings.development:
+        policy = replace(
+            policy,
+            system_file_level=logging.DEBUG,
+            stream_system_level=logging.DEBUG,
+            live_system_level=logging.DEBUG,
+        )
+
+    if config.system_log_stem is not None:
+        return replace(config, policy=policy)
+
+    from ...shared.utils.slugify import slugify
+
+    stem = slugify(settings.name or "") or config.system_scope
+    return replace(config, system_log_stem=stem, policy=policy)
+
+
 def setup_logging(
     settings: "ClientSettings", config: Optional[LoggingConfig] = None
 ) -> Callable[[], None]:
@@ -76,12 +109,15 @@ def setup_logging(
     name-based :class:`RoutingHandler`. ``config`` tunes destinations, rotation
     and rendering.
     """
-    config = config or LoggingConfig()
+    config = _resolve_config(settings, config or LoggingConfig())
+    restore_levels = config.policy.apply_logger_levels()
 
     logging_queue: queue.SimpleQueue = queue.SimpleQueue()
+    queue_handler = PassthroughQueueHandler(logging_queue)
+    queue_handler.addFilter(LoggingPolicyFilter(config.policy, LOG_TARGET_QUEUE))
     logging.basicConfig(
-        level=logging.DEBUG,
-        handlers=[PassthroughQueueHandler(logging_queue)],
+        level=config.policy.system_logger_level(),
+        handlers=[queue_handler],
         force=True,
     )
 
@@ -89,7 +125,10 @@ def setup_logging(
     stream_handler.setFormatter(
         config.formatter_for("json" if config.json_output else "text")
     )
-    stream_handler.setLevel(logging.DEBUG if settings.development else logging.INFO)
+    stream_handler.setLevel(
+        min(config.policy.stream_system_level, config.policy.stream_printer_level)
+    )
+    stream_handler.addFilter(LoggingPolicyFilter(config.policy, LOG_TARGET_STREAM))
 
     router = RoutingHandler(config)
     listener = logging.handlers.QueueListener(
@@ -100,6 +139,7 @@ def setup_logging(
     def stop() -> None:
         listener.stop()
         router.close()
+        restore_levels()
 
     return stop
 
@@ -109,6 +149,6 @@ def configure_logging(
 ) -> LoggingFacility:
     """Set logging up (via :func:`setup_logging`) and return a
     :class:`LoggingFacility` whose :class:`LogStore` browses/retains the result."""
-    config = config or LoggingConfig()
+    config = _resolve_config(settings, config or LoggingConfig())
     stop = setup_logging(settings, config)
     return LoggingFacility(store=LogStore(config), stop=stop, config=config)

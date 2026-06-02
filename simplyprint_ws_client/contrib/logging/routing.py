@@ -16,6 +16,7 @@ import threading
 from typing import TYPE_CHECKING, Dict
 
 from .naming import scope_of
+from .policy import LOG_TARGET_FILE, LoggingPolicyFilter
 
 if TYPE_CHECKING:
     from .config import LoggingConfig
@@ -71,8 +72,11 @@ class RoutingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if not self._config.policy.allows(record, LOG_TARGET_FILE):
+                return
+
             handler = self._handler_for(record)
-            handler.emit(record)
+            handler.handle(record)
         except Exception:
             self.handleError(record)
 
@@ -93,6 +97,9 @@ class RoutingHandler(logging.Handler):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 handler = self._config.make_file_handler(path)
                 handler.setFormatter(self._config.formatter_for(formatter_kind))
+                handler.addFilter(
+                    LoggingPolicyFilter(self._config.policy, LOG_TARGET_FILE)
+                )
                 self._handlers[key] = handler
             return handler
 
@@ -104,11 +111,15 @@ class RoutingHandler(logging.Handler):
                 else:
                     scope, stem = (
                         self._config.system_scope,
-                        self._config.system_log_stem,
+                        self._config.system_log_stem or self._config.system_scope,
                     )
                 return scope, stem, rule.formatter
         # _rules always ends with a catch-all, so this is unreachable.
-        return self._config.system_scope, self._config.system_log_stem, "text"
+        return (
+            self._config.system_scope,
+            self._config.system_log_stem or self._config.system_scope,
+            "text",
+        )
 
     def close(self) -> None:
         with self._lock:

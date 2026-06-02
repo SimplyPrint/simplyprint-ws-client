@@ -2,19 +2,21 @@
 
 The library owns where records land and how they're rendered; an integration
 tunes it with a :class:`LoggingConfig` (or accepts the defaults, which reproduce
-the historical ``<uid>/<sub>.log`` + root-level ``system.log`` layout). Routing is a
-list of :class:`RoutingRule` matched against the plain logger name, so an app can
-add destinations (e.g. send ``discovery`` to its own JSON file) without touching
-the handler.
+the historical ``<uid>/<sub>.log`` + root-level app log layout). Routing is a list
+of :class:`RoutingRule` matched against the plain logger name, so an app can add
+destinations (e.g. send ``discovery`` to its own JSON file) without touching the
+handler.
 """
 
 from __future__ import annotations
 
 import logging
 import logging.handlers
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+
+from .policy import LoggingPolicy
 
 DEFAULT_TEXT_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s | %(message)s"
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -52,12 +54,15 @@ class LoggingConfig:
 
     log_dir: Optional[Path] = None
     system_scope: str = "system"
-    system_log_stem: str = "system"  # -> <log_dir>/system.log
+    # None -> setup_logging uses ClientSettings.name; RoutingHandler alone falls
+    # back to <log_dir>/<system_scope>.log.
+    system_log_stem: Optional[str] = None
     max_bytes: int = DEFAULT_MAX_BYTES
     backup_count: int = DEFAULT_BACKUP_COUNT
     text_format: str = DEFAULT_TEXT_FORMAT
     date_format: str = DEFAULT_DATE_FORMAT
     json_output: bool = False
+    policy: LoggingPolicy = field(default_factory=LoggingPolicy)
     #: Custom routing rules; ``None`` -> the default per-printer + system rules.
     routes: Optional[List[RoutingRule]] = None
 
