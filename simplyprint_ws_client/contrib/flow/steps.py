@@ -164,6 +164,10 @@ class ChoiceStep(Step):
         if not await _included(self._include, state):
             return Advance()
 
+        # Already chosen (e.g. seeded by a deep link) -> keep it, skip the screen.
+        if state.get(self.key) is not None:
+            return Advance()
+
         if answer is None:
             return Ask(self._prompt())
 

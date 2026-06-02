@@ -657,3 +657,24 @@ async def test_discovery_manual_entry_routes_through_manual():
 
     step = await advance_flow(flow, step.state, {"manual_host": "192.168.1.9"})
     assert isinstance(step, Done) and step.value == "192.168.1.9"
+
+
+@pytest.mark.asyncio
+async def test_choice_step_skipped_when_preseeded():
+    """A pre-seeded choice value (a deep link) skips the choice screen entirely."""
+    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+
+    flow = Flow(
+        id="c",
+        title="c",
+        steps=[
+            ChoiceStep(
+                "mode",
+                label="?",
+                options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+            )
+        ],
+        finish=lambda s: s["mode"],
+    )
+    # No on_prompt needed: the seeded value short-circuits the screen.
+    assert await run_flow(flow, initial_state={"mode": "cloud"}) == "cloud"
