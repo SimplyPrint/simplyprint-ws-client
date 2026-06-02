@@ -2,7 +2,7 @@
 
 Routing is derived purely from the (plain, dotted) logger name -- no
 ``ClientName``. Per-printer records land in ``<uid>/<sub>.log``, system records in
-one ``system/system.log``; rules are configurable; the LogStore browses the tree.
+root-level ``system.log``; rules are configurable; the LogStore browses the tree.
 """
 
 import gzip
@@ -81,11 +81,9 @@ def test_routing_per_printer_and_system(tmp_path):
 
     assert (tmp_path / "p7" / "mqtt.log").read_text().strip().endswith("from mqtt")
     assert (tmp_path / "p7" / "main.log").read_text().strip().endswith("from base")
-    assert (
-        (tmp_path / "system" / "system.log").read_text().strip().endswith("from system")
-    )
+    assert (tmp_path / "system.log").read_text().strip().endswith("from system")
     # No per-ClientSpec file leaked at the root.
-    assert not list(tmp_path.glob("*.log"))
+    assert {p.name for p in tmp_path.glob("*.log")} == {"system.log"}
     handler.close()
 
 
@@ -107,9 +105,9 @@ def test_routing_custom_rule(tmp_path):
     handler.emit(_record("supervisor", "boot"))
     _drain(handler)
 
-    discovery_line = (tmp_path / "system" / "discovery.log").read_text().strip()
+    discovery_line = (tmp_path / "discovery.log").read_text().strip()
     assert json.loads(discovery_line)["message"] == "found a printer"
-    assert (tmp_path / "system" / "system.log").read_text().strip().endswith("boot")
+    assert (tmp_path / "system.log").read_text().strip().endswith("boot")
     handler.close()
 
 
@@ -132,10 +130,13 @@ def _write(path, text):
 
 def test_logstore_enumeration_and_read(tmp_path):
     store = LogStore(LoggingConfig(log_dir=tmp_path))
-    _write(tmp_path / "system" / "system.log", "system line\n")
+    _write(tmp_path / "system.log", "system line\n")
+    _write(tmp_path / "system" / "system.log", "ignored nested line\n")
     _write(tmp_path / "p7" / "main.log", "a\nb\nc\n")
 
     assert {s.scope for s in store.list_scopes()} == {"system", "p7"}
+    assert [f.name for f in store.list_files("system")] == ["system.log"]
+    assert store.read_text("system", "system.log") == "system line\n"
     assert [f.name for f in store.list_files("p7")] == ["main.log"]
     assert store.read_text("p7", "main.log", tail_lines=1) == "c\n"
 
@@ -188,18 +189,18 @@ def test_logstore_traversal_guard(tmp_path):
     store = LogStore(LoggingConfig(log_dir=tmp_path))
     _write(tmp_path / "p7" / "main.log", "x\n")
     with pytest.raises(LogNotFound):
-        store.resolve_file("p7", "../system/system.log")
+        store.resolve_file("p7", "../system.log")
 
 
 def test_logstore_prune_and_compress(tmp_path):
     store = LogStore(LoggingConfig(log_dir=tmp_path))
-    _write(tmp_path / "system" / "system.log", "s\n")
+    _write(tmp_path / "system.log", "s\n")
     _write(tmp_path / "active" / "main.log", "a\n")
     _write(tmp_path / "stale" / "main.log", "b\n")
     _write(tmp_path / "active" / "main.log.1", "old\n")
 
     store.prune_unused_scopes(["active"])
-    assert (tmp_path / "system").is_dir()
+    assert (tmp_path / "system.log").is_file()
     assert (tmp_path / "active").is_dir()
     assert not (tmp_path / "stale").exists()
 
@@ -210,7 +211,7 @@ def test_logstore_prune_and_compress(tmp_path):
 
 def test_logstore_bundle_and_system_undeletable(tmp_path):
     store = LogStore(LoggingConfig(log_dir=tmp_path))
-    _write(tmp_path / "system" / "system.log", "s\n")
+    _write(tmp_path / "system.log", "s\n")
     _write(tmp_path / "p7" / "main.log", "a\n")
 
     with zipfile.ZipFile(store.bundle_zip()) as archive:

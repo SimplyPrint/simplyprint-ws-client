@@ -3,7 +3,8 @@
 Records route purely by their (plain, dotted) logger name -- no ``ClientName``
 str-subclass, no custom Logger class. Per-printer loggers
 (``simplyprint.printer.<uid>[.<sub>]``, made via :func:`printer_logger`) land in
-``<log_dir>/<uid>/<sub>.log``; everything else in one ``<log_dir>/<system>/system.log``.
+``<log_dir>/<uid>/<sub>.log``; everything else in one root-level
+``<log_dir>/system.log``.
 Output is plain text or one-line JSON, chosen per routing rule, so a record can be
 rendered differently per destination.
 

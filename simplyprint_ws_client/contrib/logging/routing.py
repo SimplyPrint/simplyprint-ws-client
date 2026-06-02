@@ -78,7 +78,11 @@ class RoutingHandler(logging.Handler):
 
     def _handler_for(self, record: logging.LogRecord) -> logging.Handler:
         scope, stem, formatter_kind = self._route(record.name)
-        path = self._config.resolve_log_dir() / scope / (stem + ".log")
+        root = self._config.resolve_log_dir()
+        if scope == self._config.system_scope:
+            path = root / (stem + ".log")
+        else:
+            path = root / scope / (stem + ".log")
         key = str(path)
         handler = self._handlers.get(key)
         if handler is not None:

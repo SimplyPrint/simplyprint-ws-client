@@ -3,8 +3,7 @@
 Two scopes:
 
 * the *system* scope (``config.system_scope``, default ``system``) -- app-wide
-  logs. On disk these are the flat ``*.log`` files at the log-dir root plus
-  anything under the ``system/`` subdirectory.
+  logs. On disk these are the flat ``*.log`` files at the log-dir root.
 * one per printer, keyed by its ``unique_id`` -- the ``<unique_id>/`` subdirectory
   the logging facility writes per-printer files into.
 
@@ -101,10 +100,9 @@ class LogStore:
         return self._system_scope
 
     def system_dir(self) -> Path:
-        """The dedicated system subdirectory (created on demand)."""
-        path = self._root / self._system_scope
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        """The directory that contains root-level system logs."""
+        self._root.mkdir(parents=True, exist_ok=True)
+        return self._root
 
     # --- scope/file resolution (traversal-safe) ----------------------------
 
@@ -125,12 +123,7 @@ class LogStore:
             return []
 
         if scope == self._system_scope:
-            # Flat root-level files + anything under system/.
-            files = [p for p in self._root.iterdir() if _is_log_file(p)]
-            system_dir = self._root / self._system_scope
-            if system_dir.is_dir():
-                files += [p for p in system_dir.iterdir() if _is_log_file(p)]
-            return files
+            return [p for p in self._root.iterdir() if _is_log_file(p)]
 
         scope_dir = self._root / scope
         if not scope_dir.is_dir():

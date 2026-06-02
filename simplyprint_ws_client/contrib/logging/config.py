@@ -2,7 +2,7 @@
 
 The library owns where records land and how they're rendered; an integration
 tunes it with a :class:`LoggingConfig` (or accepts the defaults, which reproduce
-the historical ``<uid>/<sub>.log`` + ``system/system.log`` layout). Routing is a
+the historical ``<uid>/<sub>.log`` + root-level ``system.log`` layout). Routing is a
 list of :class:`RoutingRule` matched against the plain logger name, so an app can
 add destinations (e.g. send ``discovery`` to its own JSON file) without touching
 the handler.
@@ -52,7 +52,7 @@ class LoggingConfig:
 
     log_dir: Optional[Path] = None
     system_scope: str = "system"
-    system_log_stem: str = "system"  # -> <system_scope>/system.log
+    system_log_stem: str = "system"  # -> <log_dir>/system.log
     max_bytes: int = DEFAULT_MAX_BYTES
     backup_count: int = DEFAULT_BACKUP_COUNT
     text_format: str = DEFAULT_TEXT_FORMAT
