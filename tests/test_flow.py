@@ -434,6 +434,34 @@ async def test_fields_step_rejects_missing_required():
 
 
 @pytest.mark.asyncio
+async def test_finalize_false_stops_at_terminal_then_commits():
+    """The two-phase bridge: advance to the terminal boundary without folding
+    (finalize=False -> Ready), then resume the sealed state to commit (Done)."""
+    from simplyprint_ws_client.contrib.flow import Ready, advance_flow
+
+    flow = make_add_printer_flow(
+        [FakeDevice(host="10.0.0.5", serial="S", name="A")], reachable={"10.0.0.5"}
+    )
+
+    # verify-phase: gather facts (select+verify) but don't build the config; the
+    # setup form still wants the access code, so we land on its prompt.
+    step = await advance_flow(flow, {"host": "10.0.0.5"}, None, finalize=False)
+    assert isinstance(step, Prompt) and step.prompt.key == "setup"
+
+    # An immediate-terminal flow (no prompts) returns Ready under finalize=False.
+    bare = Flow(
+        id="bare",
+        title="bare",
+        steps=[ActionStep("noop", lambda s, a: Advance())],
+        finish=lambda s: "committed",
+    )
+    ready = await advance_flow(bare, {}, None, finalize=False)
+    assert isinstance(ready, Ready)
+    done = await advance_flow(bare, ready.state, None)
+    assert isinstance(done, Done) and done.value == "committed"
+
+
+@pytest.mark.asyncio
 async def test_cursor_is_carried_but_ignored_by_finish():
     from simplyprint_ws_client.contrib.flow import CURSOR_KEY
 

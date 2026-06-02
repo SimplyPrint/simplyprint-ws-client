@@ -162,6 +162,19 @@ class Done(Generic[T]):
 
 
 @dataclass(frozen=True)
+class Ready:
+    """Every step is done, but the outcome was not committed (``finalize=False``).
+
+    Lets a two-phase caller seal state at the terminal boundary and commit later:
+    a web ``verify`` endpoint advances to here without building/persisting the
+    result, then ``setup-step`` resumes the same state with ``finalize=True`` to
+    fold it. ``state`` resumes straight to the terminal -- no step re-runs.
+    """
+
+    state: FlowState
+
+
+@dataclass(frozen=True)
 class Failed:
     """A recoverable failure: show ``message``, re-offer ``prompt``, retry."""
 
@@ -170,7 +183,7 @@ class Failed:
     state: FlowState
 
 
-FlowResult = Union[Prompt, Poll, "Done", Failed]
+FlowResult = Union[Prompt, Poll, "Done", "Ready", Failed]
 
 
 class FlowError(RuntimeError):
@@ -241,6 +254,8 @@ async def advance_flow(
     flow: "Flow[T]",
     state: Optional[Mapping[str, object]] = None,
     answer: Optional[Mapping[str, object]] = None,
+    *,
+    finalize: bool = True,
 ) -> "FlowResult":
     """Advance ``flow`` by one caller-visible increment and return the result.
 
@@ -250,6 +265,11 @@ async def advance_flow(
     real :class:`Prompt`/:class:`Poll`, the terminal :class:`Done`, or a
     recoverable :class:`Failed`, never an intermediate. ``state`` is treated as
     immutable; a fresh state dict rides on the result.
+
+    When ``finalize`` is ``False`` and every step is exhausted, returns
+    :class:`Ready` (state sealed at the terminal boundary) instead of folding the
+    outcome -- the two-phase web bridge advances to here in ``verify`` and folds
+    in ``setup-step``.
     """
     work: FlowState = dict(state or {})
     cursor = int(work.get(CURSOR_KEY, 0))
@@ -280,6 +300,9 @@ async def advance_flow(
         raise FlowError(
             f"step {step.key!r} returned {type(outcome).__name__}, not a StepOutcome"
         )
+
+    if not finalize:
+        return Ready(work)
 
     value = await resolve(flow.finish(work))
     return Done(value)
