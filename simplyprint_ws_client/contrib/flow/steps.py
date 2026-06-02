@@ -1,19 +1,19 @@
 """The reusable step kit -- compose a flow from these instead of hand-writing a
 state machine.
 
-Three primitives cover the common shapes; subclass :class:`Step` directly when a
-stage is genuinely bespoke:
-
-* :class:`FieldsStep` -- collect a form once, advance with the answers.
-* :class:`SelectStep` -- discover/list candidates and settle on one.
-* :class:`ActionStep` -- run an async action that owns its own control flow
-  (probe, log in, verify a code, persist). The general escape hatch: its action
-  may itself ask, advance or reject.
+* :class:`FieldsStep`   -- collect a form (with markdown content) once, advance.
+* :class:`ChoiceStep`   -- a branch point: pick one of a fixed set of options; the
+  chosen value is merged into state so later steps ``include`` on it.
+* :class:`SelectStep`   -- discover/list candidates (live scan + optional manual
+  entry) and settle on one.
+* :class:`ActionStep`   -- run an async action that owns its own control flow
+  (probe, log in, verify a code, persist), optionally handling secondary screen
+  actions (``resend``) via ``on_action``.
 
 Every step takes an optional ``include`` predicate that skips the stage when it
-returns false, so a flow can carry conditional steps (ask the serial only when
-discovery didn't supply one; run the code-challenge only when login returned
-one) without the engine knowing the condition.
+returns false -- so a flow branches by writing a value (a ChoiceStep) and gating
+later steps on it (``include=lambda s: s.get("mode") == "lan"``) without the
+engine knowing the condition.
 """
 
 from __future__ import annotations
@@ -32,9 +32,11 @@ from typing import (
 from .base import (
     Advance,
     Ask,
+    Choice,
     FlowError,
     Reject,
     Step,
+    StepAction,
     StepField,
     StepOutcome,
     StepPrompt,
@@ -50,11 +52,12 @@ async def _included(include: Optional[Include], state: Mapping[str, object]) -> 
 
 
 class FieldsStep(Step):
-    """Collect a set of inputs once, then advance with them merged into state.
+    """Collect a set of inputs once (with optional markdown ``content`` shown
+    above them), then advance with them merged into state.
 
     ``fields`` is a static list or a callable of state -- so a step can drop a
-    field it already knows (ask the serial only when discovery didn't supply
-    one). An answer missing a required field re-offers the prompt.
+    field it already knows. An answer missing a required field re-offers the
+    screen.
     """
 
     def __init__(
@@ -66,12 +69,18 @@ class FieldsStep(Step):
             Sequence[StepField], Callable[[Mapping[str, object]], Sequence[StepField]]
         ],
         help_text: Optional[str] = None,
+        content: Optional[Sequence[str]] = None,
+        actions: Optional[Sequence[StepAction]] = None,
+        kind: str = "form",
         include: Optional[Include] = None,
     ) -> None:
         self.key = key
         self._label = label
         self._fields = fields
         self._help = help_text
+        self._content = list(content or [])
+        self._actions = list(actions or [])
+        self._kind = kind
         self._include = include
 
     def _resolve_fields(self, state: Mapping[str, object]) -> List[StepField]:
@@ -80,11 +89,20 @@ class FieldsStep(Step):
 
     def _prompt(self, fields: Sequence[StepField]) -> StepPrompt:
         return StepPrompt(
-            key=self.key, label=self._label, help_text=self._help, fields=list(fields)
+            key=self.key,
+            label=self._label,
+            help_text=self._help,
+            kind=self._kind,
+            content=list(self._content),
+            fields=list(fields),
+            actions=list(self._actions),
         )
 
     async def run(
-        self, state: Mapping[str, object], answer: Optional[Mapping[str, object]]
+        self,
+        state: Mapping[str, object],
+        answer: Optional[Mapping[str, object]],
+        action: Optional[str] = None,
     ) -> StepOutcome:
         if not await _included(self._include, state):
             return Advance()
@@ -102,19 +120,71 @@ class FieldsStep(Step):
         return Advance(updates)
 
 
+class ChoiceStep(Step):
+    """A branch point: present a fixed set of options and merge the chosen value.
+
+    Later steps gate on it (``include=lambda s: s.get(key) == "lan"``), so a flow
+    forks without the engine knowing the condition. ``content`` is markdown shown
+    above the options.
+    """
+
+    def __init__(
+        self,
+        key: str,
+        *,
+        options: Sequence[Choice],
+        label: str,
+        help_text: Optional[str] = None,
+        content: Optional[Sequence[str]] = None,
+        include: Optional[Include] = None,
+    ) -> None:
+        self.key = key
+        self._options = list(options)
+        self._label = label
+        self._help = help_text
+        self._content = list(content or [])
+        self._include = include
+
+    def _prompt(self) -> StepPrompt:
+        return StepPrompt(
+            key=self.key,
+            label=self._label,
+            help_text=self._help,
+            kind="choice",
+            content=list(self._content),
+            options=list(self._options),
+        )
+
+    async def run(
+        self,
+        state: Mapping[str, object],
+        answer: Optional[Mapping[str, object]],
+        action: Optional[str] = None,
+    ) -> StepOutcome:
+        if not await _included(self._include, state):
+            return Advance()
+
+        if answer is None:
+            return Ask(self._prompt())
+
+        chosen = answer.get(self.key)
+        if chosen not in {option.value for option in self._options}:
+            return Reject("Please choose an option.", self._prompt())
+        return Advance({self.key: chosen})
+
+
 class SelectStep(Step):
-    """Discover or list candidates and settle on exactly one.
+    """Discover or list candidates (a ``discovery`` screen: live options plus an
+    optional manual-entry field) and settle on exactly one.
 
     ``source(state) -> [item]`` produces candidates (a LAN scan, an account's
-    devices); ``option(item) -> (value, label)`` renders each as a choice;
-    ``pick(state, item) -> updates`` folds the chosen item's facts into state.
-    Auto-advances when one candidate is found, or when ``skip_when`` says the
-    choice is already made (a host typed up front). With no candidates it
-    advances untouched -- leaving a later step to collect input manually -- so a
-    brand without discovery is just a flow whose first selectable step is empty.
-
-    ``source`` may be re-run on the answer call, so back it with a cached
-    snapshot for an expensive scan rather than re-scanning.
+    devices); ``option(item) -> (value, label)`` renders each; ``pick(state,
+    item) -> updates`` folds the chosen item's facts into state. When
+    ``manual_field`` is given the screen also offers manual entry, and a filled
+    manual answer routes through ``manual(state, value) -> updates``. Auto-advances
+    when one candidate is found, or when ``skip_when`` says the choice is already
+    made (a host typed up front). ``source`` may re-run on the answer call, so
+    back it with a cached snapshot for an expensive scan.
     """
 
     def __init__(
@@ -131,6 +201,15 @@ class SelectStep(Step):
         ],
         label: str,
         help_text: Optional[str] = None,
+        content: Optional[Sequence[str]] = None,
+        kind: str = "discovery",
+        manual_field: Optional[StepField] = None,
+        manual: Optional[
+            Callable[
+                [Mapping[str, object], str],
+                Union[Mapping[str, object], Awaitable[Mapping[str, object]]],
+            ]
+        ] = None,
         auto: bool = True,
         skip_when: Optional[Include] = None,
         include: Optional[Include] = None,
@@ -141,28 +220,41 @@ class SelectStep(Step):
         self._pick = pick
         self._label = label
         self._help = help_text
+        self._content = list(content or [])
+        self._kind = kind
+        self._manual_field = manual_field
+        self._manual = manual
         self._auto = auto
         self._skip_when = skip_when
         self._include = include
 
     def _prompt(self, items: Sequence[object]) -> StepPrompt:
-        choices = [self._option(item)[1] for item in items]
+        options = [
+            Choice(value=str(self._option(item)[0]), label=str(self._option(item)[1]))
+            for item in items
+        ]
         return StepPrompt(
             key=self.key,
             label=self._label,
             help_text=self._help,
-            fields=[StepField(key=self.key, label=self._label, choices=choices)],
+            kind=self._kind,
+            content=list(self._content),
+            options=options,
+            fields=[self._manual_field] if self._manual_field is not None else [],
         )
 
     def _match(self, items: Sequence[object], chosen: object) -> Optional[object]:
         for item in items:
-            _value, label = self._option(item)
-            if str(label) == str(chosen):
+            value, _label = self._option(item)
+            if str(value) == str(chosen):
                 return item
         return None
 
     async def run(
-        self, state: Mapping[str, object], answer: Optional[Mapping[str, object]]
+        self,
+        state: Mapping[str, object],
+        answer: Optional[Mapping[str, object]],
+        action: Optional[str] = None,
     ) -> StepOutcome:
         if not await _included(self._include, state):
             return Advance()
@@ -172,15 +264,20 @@ class SelectStep(Step):
         items = list(await resolve(self._source(state)))
 
         if answer is not None:
-            chosen = answer.get(self.key)
-            item = self._match(items, chosen)
+            # A filled manual-entry field wins over a list selection.
+            if self._manual_field is not None and answer.get(self._manual_field.key):
+                value = str(answer[self._manual_field.key])
+                handler = self._manual or (lambda _s, v: {self.key: v})
+                return Advance(await resolve(handler(state, value)))
+
+            item = self._match(items, answer.get(self.key))
             if item is None:
                 return Reject("That option is no longer available", self._prompt(items))
             return Advance(await resolve(self._pick(state, item)))
 
-        if not items:
+        if not items and self._manual_field is None:
             return Advance()
-        if len(items) == 1 and self._auto:
+        if len(items) == 1 and self._auto and self._manual_field is None:
             return Advance(await resolve(self._pick(state, items[0])))
         return Ask(self._prompt(items))
 
@@ -193,7 +290,9 @@ class ActionStep(Step):
     verify a code, persist a result. ``action(state, answer)`` returns a
     :class:`StepOutcome` itself -- so it may :class:`Ask` then, on the next call,
     :class:`Advance` or :class:`Reject` -- or returns a plain mapping/``None`` as
-    shorthand for :class:`Advance`. Raise :class:`FlowError` for a hard failure.
+    shorthand for :class:`Advance`. ``on_action`` maps a screen action id (e.g.
+    ``resend``) to a handler ``(state) -> StepOutcome`` invoked when the caller
+    triggers it. Raise :class:`FlowError` for a hard failure.
     """
 
     def __init__(
@@ -205,19 +304,19 @@ class ActionStep(Step):
         ],
         *,
         include: Optional[Include] = None,
+        on_action: Optional[
+            Mapping[
+                str, Callable[[Mapping[str, object]], Union[StepOutcome, Awaitable]]
+            ]
+        ] = None,
     ) -> None:
         self.key = key
         self._action = action
         self._include = include
+        self._on_action = dict(on_action or {})
 
-    async def run(
-        self, state: Mapping[str, object], answer: Optional[Mapping[str, object]]
-    ) -> StepOutcome:
-        if not await _included(self._include, state):
-            return Advance()
-
-        result = await resolve(self._action(state, answer))
-
+    @staticmethod
+    def _as_outcome(result, key: str) -> StepOutcome:
         if isinstance(result, (Ask, Advance, Reject)):
             return result
         if result is None:
@@ -225,6 +324,22 @@ class ActionStep(Step):
         if isinstance(result, Mapping):
             return Advance(result)
         raise FlowError(
-            f"action {self.key!r} returned {type(result).__name__}, "
+            f"action {key!r} returned {type(result).__name__}, "
             "expected a StepOutcome, mapping or None"
         )
+
+    async def run(
+        self,
+        state: Mapping[str, object],
+        answer: Optional[Mapping[str, object]],
+        action: Optional[str] = None,
+    ) -> StepOutcome:
+        if not await _included(self._include, state):
+            return Advance()
+
+        if action is not None and action in self._on_action:
+            return self._as_outcome(
+                await resolve(self._on_action[action](state)), self.key
+            )
+
+        return self._as_outcome(await resolve(self._action(state, answer)), self.key)

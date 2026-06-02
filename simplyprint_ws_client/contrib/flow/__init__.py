@@ -16,6 +16,7 @@ from simplyprint_ws_client.contrib.flow.base import (
     CURSOR_KEY,
     Advance,
     Ask,
+    Choice,
     Done,
     Failed,
     Flow,
@@ -28,15 +29,18 @@ from simplyprint_ws_client.contrib.flow.base import (
     Ready,
     Reject,
     Step,
+    StepAction,
     StepField,
     StepOutcome,
     StepPrompt,
+    Validation,
     advance_flow,
     resolve,
     run_flow,
 )
 from simplyprint_ws_client.contrib.flow.steps import (
     ActionStep,
+    ChoiceStep,
     FieldsStep,
     SelectStep,
 )
@@ -51,9 +55,12 @@ __all__ = [
     "FlowError",
     "FlowState",
     "CURSOR_KEY",
-    # prompt descriptors
+    # screen descriptors
     "StepField",
     "StepPrompt",
+    "Choice",
+    "Validation",
+    "StepAction",
     # step outcomes
     "Ask",
     "Advance",
@@ -69,6 +76,7 @@ __all__ = [
     "PromptCallback",
     # step kit
     "FieldsStep",
+    "ChoiceStep",
     "SelectStep",
     "ActionStep",
 ]

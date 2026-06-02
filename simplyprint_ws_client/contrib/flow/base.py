@@ -57,16 +57,65 @@ FlowState = Dict[str, object]
 CURSOR_KEY = "__flow_cursor__"
 
 
-# -- prompt descriptors (the neutral frontend contract) ----------------------
+# -- screen descriptors (the neutral, data-driven frontend contract) ---------
+
+
+@dataclass(frozen=True)
+class Choice:
+    """A labelled, selectable option.
+
+    Used both for a select field's options and for a ``choice``/``discovery``
+    screen's options. ``value`` is what the answer carries; ``label`` (and the
+    optional ``description``/``icon``/``badge``) are presentation only, so a
+    backend can serve a region list or a device list fully described.
+    """
+
+    value: str
+    label: str
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    badge: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Validation:
+    """Declarative validation hints for a field.
+
+    Mirrored to the client (so a superForm/zod schema can be built from them) and
+    enforceable server-side. All optional; ``message`` overrides the default text.
+    """
+
+    min: Optional[float] = None
+    max: Optional[float] = None
+    min_length: Optional[int] = None
+    max_length: Optional[int] = None
+    pattern: Optional[str] = None
+    message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class StepAction:
+    """A secondary action on a screen beside the primary submit.
+
+    Resend a code, rescan the network, switch mode. The caller invokes it by
+    ``id`` (no answer); the engine routes the ``id`` to the current step, which
+    handles it (e.g. re-issue the code and re-offer the same screen).
+    """
+
+    id: str
+    label: str
+    kind: str = "button"
 
 
 @dataclass(frozen=True)
 class StepField:
-    """One input a prompt asks for, described so any renderer can draw it.
+    """One input a screen asks for, described so any renderer can draw it.
 
-    ``choices`` turns it into a selection; ``secret`` masks the echo;
-    ``field_type`` is a renderer hint (``text``/``password``/``number``/...).
-    A flow never names a brand here -- only the field it needs.
+    ``field_type`` is a renderer hint (``text``/``email``/``password``/``number``/
+    ``otp``/``toggle``/``textarea``/``select``); ``options`` (labelled) or
+    ``choices`` (plain) turn it into a selection; ``validation`` carries
+    declarative rules the client mirrors into its form schema. A flow never names
+    a brand here -- only the field it needs.
     """
 
     key: str
@@ -76,24 +125,32 @@ class StepField:
     help_text: Optional[str] = None
     secret: bool = False
     choices: Optional[List[str]] = None
+    options: Optional[List[Choice]] = None
     default: Optional[str] = None
     placeholder: Optional[str] = None
+    validation: Optional[Validation] = None
 
 
 @dataclass(frozen=True)
 class StepPrompt:
-    """A request for input handed back to the caller to render and answer.
+    """One screen the engine hands back for the caller to render and answer.
 
-    A prompt is a labelled group of :class:`StepField` s -- one for a single
-    input, several for a form. ``poll`` marks a prompt that needs no field, only
-    that the user acts on the device (press Allow) before the step is retried;
-    a driver shows ``label``/``help_text`` and re-advances on a timer.
+    Data-driven so the frontend renders generically. ``kind`` selects the
+    renderer (``form`` fields, ``choice``/``discovery`` ``options``, ``poll``
+    wait, ``review`` summary, ``info``); ``content`` is markdown blocks the UI
+    shows above the inputs (instructions, FAQ accordions, callouts); ``fields``
+    are inputs, ``options`` selectables, ``actions`` secondary buttons. ``poll``
+    marks a wait-on-device screen the driver re-advances on a timer.
     """
 
     key: str
     label: str
     help_text: Optional[str] = None
+    kind: str = "form"
+    content: List[str] = field(default_factory=list)
     fields: List[StepField] = field(default_factory=list)
+    options: List[Choice] = field(default_factory=list)
+    actions: List[StepAction] = field(default_factory=list)
     poll: bool = False
 
 
@@ -223,9 +280,18 @@ class Step(ABC):
 
     @abstractmethod
     async def run(
-        self, state: Mapping[str, object], answer: Optional[Mapping[str, object]]
+        self,
+        state: Mapping[str, object],
+        answer: Optional[Mapping[str, object]],
+        action: Optional[str] = None,
     ) -> StepOutcome:
-        """Advance this stage by one increment. See the class docstring."""
+        """Advance this stage by one increment.
+
+        ``answer`` is the caller's response to the screen this step last
+        :class:`Ask` ed; ``action`` is a secondary action the caller invoked on
+        that screen (e.g. ``resend``/``rescan``) with no answer. Both are routed
+        only to the step at the cursor and consumed once. See the class docstring.
+        """
 
 
 @dataclass(frozen=True)
@@ -255,6 +321,7 @@ async def advance_flow(
     state: Optional[Mapping[str, object]] = None,
     answer: Optional[Mapping[str, object]] = None,
     *,
+    action: Optional[str] = None,
     finalize: bool = True,
 ) -> "FlowResult":
     """Advance ``flow`` by one caller-visible increment and return the result.
@@ -274,11 +341,14 @@ async def advance_flow(
     work: FlowState = dict(state or {})
     cursor = int(work.get(CURSOR_KEY, 0))
     pending = answer
+    pending_action = action
 
     while cursor < len(flow.steps):
         step = flow.steps[cursor]
-        outcome = await step.run(work, pending)
-        pending = None  # an answer is consumed only by the step that asked it
+        outcome = await step.run(work, pending, pending_action)
+        # An answer/action is consumed only by the step at the cursor.
+        pending = None
+        pending_action = None
 
         if isinstance(outcome, Ask):
             work[CURSOR_KEY] = cursor

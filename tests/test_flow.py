@@ -153,7 +153,8 @@ async def test_onboarding_multiple_devices_prompts_choice():
         ],
         reachable={"10.0.0.5", "10.0.0.6"},
     )
-    driver = Driver(device=["Beta"], setup=[{"access_code": "9999"}])
+    # SelectStep options are value-keyed; the chosen value is the device host.
+    driver = Driver(device=["10.0.0.6"], setup=[{"access_code": "9999"}])
 
     result = await run_flow(flow, on_prompt=driver)
 
@@ -190,9 +191,9 @@ async def test_onboarding_stateless_round_trip_matches_in_process():
     assert isinstance(step, Prompt)
     assert step.prompt.key == "device"
 
-    # Round-trip the (sealed) state with the chosen option.
+    # Round-trip the (sealed) state with the chosen option (value = host).
     sealed = dict(step.state)
-    step = await advance_flow(flow, sealed, {"device": "Beta"})
+    step = await advance_flow(flow, sealed, {"device": "10.0.0.6"})
     assert isinstance(step, Prompt)  # verify passed, now the setup form
     assert step.prompt.key == "setup"
 
@@ -484,3 +485,175 @@ async def test_cursor_is_carried_but_ignored_by_finish():
     # The cursor rode along in state but did not disturb the outcome.
     assert CURSOR_KEY in seen
     assert seen["a"] == "1"
+
+
+# -- v2: branching, content, actions, manual discovery -----------------------
+
+
+@pytest.mark.asyncio
+async def test_choice_step_branches_via_include():
+    """A ChoiceStep writes the chosen value; later steps include on it, so one
+    flow forks (LAN vs cloud) without the engine knowing the condition."""
+    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+
+    flow = Flow(
+        id="connect",
+        title="Connect",
+        steps=[
+            ChoiceStep(
+                "mode",
+                label="How do you want to connect?",
+                options=[
+                    Choice("lan", "Local network"),
+                    Choice("cloud", "Cloud account"),
+                ],
+            ),
+            FieldsStep(
+                "lan",
+                label="LAN",
+                fields=[StepField(key="lan_host", label="Host")],
+                include=lambda s: s.get("mode") == "lan",
+            ),
+            FieldsStep(
+                "cloud",
+                label="Cloud",
+                fields=[StepField(key="cloud_user", label="User")],
+                include=lambda s: s.get("mode") == "cloud",
+            ),
+        ],
+        finish=lambda s: (s.get("mode"), s.get("lan_host"), s.get("cloud_user")),
+    )
+
+    lan = await run_flow(
+        flow, on_prompt=Driver(mode=["lan"], lan=[{"lan_host": "10.0.0.5"}])
+    )
+    assert lan == ("lan", "10.0.0.5", None)
+
+    cloud = await run_flow(
+        flow, on_prompt=Driver(mode=["cloud"], cloud=[{"cloud_user": "a@b.io"}])
+    )
+    assert cloud == ("cloud", None, "a@b.io")
+
+
+@pytest.mark.asyncio
+async def test_choice_step_emits_choice_screen():
+    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep, advance_flow
+
+    flow = Flow(
+        id="c",
+        title="c",
+        steps=[
+            ChoiceStep(
+                "mode",
+                label="Pick",
+                content=["Most printers connect over your **LAN**."],
+                options=[Choice("lan", "LAN", description="Recommended")],
+            )
+        ],
+        finish=lambda s: s["mode"],
+    )
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt)
+    assert step.prompt.kind == "choice"
+    assert step.prompt.content == ["Most printers connect over your **LAN**."]
+    assert step.prompt.options[0].value == "lan"
+    assert step.prompt.options[0].description == "Recommended"
+
+
+@pytest.mark.asyncio
+async def test_action_step_handles_resend_action():
+    """A screen action (resend) routes to the step's on_action handler with no
+    answer, re-issuing without advancing."""
+    from simplyprint_ws_client.contrib.flow import advance_flow
+
+    sent = {"count": 0}
+
+    def _code_prompt():
+        return StepPrompt(
+            key="code", label="Code", fields=[StepField(key="code", label="Code")]
+        )
+
+    def resend(_state):
+        sent["count"] += 1
+        return Ask(_code_prompt())
+
+    async def verify(_state, answer):
+        if answer is None:
+            return Ask(_code_prompt())
+        return Advance({"code": answer.get("code")})
+
+    flow = Flow(
+        id="v",
+        title="v",
+        steps=[ActionStep("code", verify, on_action={"resend": resend})],
+        finish=lambda s: s["code"],
+    )
+
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt) and step.prompt.key == "code"
+
+    step = await advance_flow(flow, step.state, None, action="resend")
+    assert isinstance(step, Prompt) and step.prompt.key == "code"
+    assert sent["count"] == 1
+
+    step = await advance_flow(flow, step.state, {"code": "123456"})
+    assert isinstance(step, Done) and step.value == "123456"
+
+
+@pytest.mark.asyncio
+async def test_step_carries_markdown_content_and_kind():
+    from simplyprint_ws_client.contrib.flow import advance_flow
+
+    flow = Flow(
+        id="i",
+        title="i",
+        steps=[
+            FieldsStep(
+                "setup",
+                label="Set up",
+                content=["## Where to find it", "Open **Settings → Network**."],
+                fields=[StepField(key="x", label="X")],
+            )
+        ],
+        finish=lambda s: s["x"],
+    )
+    step = await advance_flow(flow)
+    assert step.prompt.kind == "form"
+    assert step.prompt.content == [
+        "## Where to find it",
+        "Open **Settings → Network**.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_manual_entry_routes_through_manual():
+    """A discovery step with no candidates still offers manual entry, and a filled
+    manual field routes through the manual handler."""
+    from simplyprint_ws_client.contrib.flow import advance_flow
+
+    async def source(_state):
+        return []
+
+    flow = Flow(
+        id="d",
+        title="d",
+        steps=[
+            SelectStep(
+                "device",
+                source=source,
+                option=lambda item: (item, item),
+                pick=lambda _s, item: {"host": item},
+                label="Find your printer",
+                manual_field=StepField(key="manual_host", label="IP address"),
+                manual=lambda _s, value: {"host": value},
+            )
+        ],
+        finish=lambda s: s["host"],
+    )
+
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt) and step.prompt.kind == "discovery"
+    assert step.prompt.fields[0].key == "manual_host"
+
+    step = await advance_flow(flow, step.state, {"manual_host": "192.168.1.9"})
+    assert isinstance(step, Done) and step.value == "192.168.1.9"
