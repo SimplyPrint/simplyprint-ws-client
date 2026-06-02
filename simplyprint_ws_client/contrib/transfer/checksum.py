@@ -1,9 +1,17 @@
-"""Checksum helpers shared by file-transfer code."""
+"""Checksum helpers shared by file-transfer code.
+
+One place to answer "what is this transfer file's MD5", however we can cheapest
+get it: from an S3 (CDN) ETag without touching the file, or by hashing it off
+the event loop. :func:`fast_md5sum` is the sync streaming leaf; everything else
+is the async/ETag-aware surface callers should prefer.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
+from typing import Optional
 
 
 def fast_md5sum(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -15,3 +23,48 @@ def fast_md5sum(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
             md5.update(chunk)
 
     return md5.hexdigest().upper()
+
+
+async def file_md5(path: Path) -> str:
+    """Uppercase hex MD5 of ``path``, streamed and hashed off the event loop.
+
+    The whole read+hash runs on a worker thread, so a large file never blocks
+    the loop and the file is never slurped into memory.
+    """
+    return await asyncio.to_thread(fast_md5sum, path)
+
+
+def parse_s3_etag(etag: Optional[str]) -> Optional[str]:
+    """Return the uppercase MD5 an S3 ETag encodes, or ``None`` if it doesn't.
+
+    SimplyPrint's CDN is S3-backed, so a single-part object's ETag *is* the
+    file's MD5 (quoted, optionally with a weak-validator ``W/`` prefix). A
+    multipart upload's ETag is ``"<hash>-<partcount>"`` -- not a whole-file MD5
+    -- so we return ``None`` and let the caller fall back to computing one.
+    """
+    if not etag:
+        return None
+
+    value = etag.strip()
+    if value.startswith("W/"):
+        value = value[2:]
+    value = value.strip('"')
+
+    if not value or "-" in value:  # empty or multipart
+        return None
+
+    return value.upper()
+
+
+async def resolve_md5(path: Path, *, etag: Optional[str] = None) -> str:
+    """MD5 of the transfer file: from ``etag`` when it carries one, else hashed.
+
+    Prefers the (free) ETag MD5 so we don't read the file at all; falls back to
+    :func:`file_md5` when no usable ETag is available (e.g. a multipart ETag, or
+    a file we transformed locally).
+    """
+    from_etag = parse_s3_etag(etag)
+    if from_etag is not None:
+        return from_etag
+
+    return await file_md5(path)

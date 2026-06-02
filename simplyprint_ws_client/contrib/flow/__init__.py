@@ -23,6 +23,7 @@ from simplyprint_ws_client.contrib.flow.base import (
     FlowError,
     FlowResult,
     FlowState,
+    Phase,
     Poll,
     Prompt,
     PromptCallback,
@@ -35,6 +36,7 @@ from simplyprint_ws_client.contrib.flow.base import (
     StepPrompt,
     Validation,
     advance_flow,
+    outline,
     resolve,
     run_flow,
 )
@@ -58,6 +60,8 @@ __all__ = [
     # screen descriptors
     "StepField",
     "StepPrompt",
+    "Phase",
+    "outline",
     "Choice",
     "Validation",
     "StepAction",

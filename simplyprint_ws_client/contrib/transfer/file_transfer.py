@@ -43,7 +43,7 @@ from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
 from simplyprint_ws_client.shared.files.file_download import FileDownload
 from simplyprint_ws_client.shared.utils.slugify import slugify
 
-from simplyprint_ws_client.contrib.transfer.checksum import fast_md5sum
+from simplyprint_ws_client.contrib.transfer.checksum import file_md5
 from simplyprint_ws_client.contrib.transfer.concurrency import start_in_thread
 
 if TYPE_CHECKING:
@@ -260,7 +260,9 @@ class FileTransfer(ABC):
 
             try:
                 dest = (await self._upload(local_dest, on_progress)).relative_to("/")
-                return dest, fast_md5sum(local_dest)
+                # Hash the final (post-transform) file, off-loop, so a large
+                # gcode can't stall the firmware-ACK grace window.
+                return dest, await file_md5(local_dest)
             except CancelledError:
                 self.client.logger.info("Upload was cancelled")
                 return None

@@ -46,9 +46,24 @@ from .base import (
 #: A predicate on flow state, sync or async, gating whether a step runs.
 Include = Callable[[Mapping[str, object]], Union[bool, Awaitable[bool]]]
 
+#: Markdown blocks shown above a screen's inputs -- a static list, or a callable of
+#: state so a step can tailor the copy to what's known (show only the guide for the
+#: picked model). Sync or async.
+Content = Union[
+    Sequence[str], Callable[[Mapping[str, object]], Union[Sequence[str], Awaitable]]
+]
+
 
 async def _included(include: Optional[Include], state: Mapping[str, object]) -> bool:
     return include is None or bool(await resolve(include(state)))
+
+
+async def _resolve_content(content: Content, state: Mapping[str, object]) -> List[str]:
+    """Resolve a step's ``content`` against state: call it if it's a callable,
+    else use the list as-is. Always returns a fresh list."""
+    if callable(content):
+        content = await resolve(content(state))
+    return list(content or [])
 
 
 class FieldsStep(Step):
@@ -69,33 +84,44 @@ class FieldsStep(Step):
             Sequence[StepField], Callable[[Mapping[str, object]], Sequence[StepField]]
         ],
         help_text: Optional[str] = None,
-        content: Optional[Sequence[str]] = None,
+        content: Optional[Content] = None,
+        footer: Optional[Content] = None,
         actions: Optional[Sequence[StepAction]] = None,
         kind: str = "form",
+        phase: Optional[str] = None,
         include: Optional[Include] = None,
     ) -> None:
         self.key = key
         self._label = label
         self._fields = fields
         self._help = help_text
-        self._content = list(content or [])
+        self._content = content or []
+        self._footer = footer or []
         self._actions = list(actions or [])
         self._kind = kind
+        self._phase = phase
         self._include = include
 
     def _resolve_fields(self, state: Mapping[str, object]) -> List[StepField]:
         fields = self._fields(state) if callable(self._fields) else self._fields
         return list(fields)
 
-    def _prompt(self, fields: Sequence[StepField]) -> StepPrompt:
+    def _prompt(
+        self,
+        fields: Sequence[StepField],
+        content: Sequence[str],
+        footer: Sequence[str],
+    ) -> StepPrompt:
         return StepPrompt(
             key=self.key,
             label=self._label,
             help_text=self._help,
             kind=self._kind,
-            content=list(self._content),
+            content=list(content),
             fields=list(fields),
             actions=list(self._actions),
+            footer=list(footer),
+            phase=self._phase,
         )
 
     async def run(
@@ -108,15 +134,28 @@ class FieldsStep(Step):
             return Advance()
 
         fields = self._resolve_fields(state)
+        content = await _resolve_content(self._content, state)
+        footer = await _resolve_content(self._footer, state)
 
         if answer is None:
-            return Ask(self._prompt(fields))
+            return Ask(self._prompt(fields, content, footer))
 
-        missing = [f.key for f in fields if f.required and not answer.get(f.key)]
+        # A prefilled field carries its known value, so a renderer may collapse it
+        # into a summary and not re-submit it; fall back to that value when the
+        # answer omits the field (the user didn't edit it).
+        def effective(f: StepField):
+            if f.key in answer:
+                return answer[f.key]
+            return f.value
+
+        missing = [f.key for f in fields if f.required and not effective(f)]
         if missing:
-            return Reject("Please fill in: " + ", ".join(missing), self._prompt(fields))
+            return Reject(
+                "Please fill in: " + ", ".join(missing),
+                self._prompt(fields, content, footer),
+            )
 
-        updates = {f.key: answer[f.key] for f in fields if f.key in answer}
+        updates = {f.key: effective(f) for f in fields if effective(f) is not None}
         return Advance(updates)
 
 
@@ -135,24 +174,27 @@ class ChoiceStep(Step):
         options: Sequence[Choice],
         label: str,
         help_text: Optional[str] = None,
-        content: Optional[Sequence[str]] = None,
+        content: Optional[Content] = None,
+        phase: Optional[str] = None,
         include: Optional[Include] = None,
     ) -> None:
         self.key = key
         self._options = list(options)
         self._label = label
         self._help = help_text
-        self._content = list(content or [])
+        self._content = content or []
+        self._phase = phase
         self._include = include
 
-    def _prompt(self) -> StepPrompt:
+    def _prompt(self, content: Sequence[str]) -> StepPrompt:
         return StepPrompt(
             key=self.key,
             label=self._label,
             help_text=self._help,
             kind="choice",
-            content=list(self._content),
+            content=list(content),
             options=list(self._options),
+            phase=self._phase,
         )
 
     async def run(
@@ -168,12 +210,14 @@ class ChoiceStep(Step):
         if state.get(self.key) is not None:
             return Advance()
 
+        content = await _resolve_content(self._content, state)
+
         if answer is None:
-            return Ask(self._prompt())
+            return Ask(self._prompt(content))
 
         chosen = answer.get(self.key)
         if chosen not in {option.value for option in self._options}:
-            return Reject("Please choose an option.", self._prompt())
+            return Reject("Please choose an option.", self._prompt(content))
         return Advance({self.key: chosen})
 
 
@@ -205,8 +249,9 @@ class SelectStep(Step):
         ],
         label: str,
         help_text: Optional[str] = None,
-        content: Optional[Sequence[str]] = None,
+        content: Optional[Content] = None,
         kind: str = "discovery",
+        phase: Optional[str] = None,
         manual_field: Optional[StepField] = None,
         manual: Optional[
             Callable[
@@ -224,15 +269,16 @@ class SelectStep(Step):
         self._pick = pick
         self._label = label
         self._help = help_text
-        self._content = list(content or [])
+        self._content = content or []
         self._kind = kind
+        self._phase = phase
         self._manual_field = manual_field
         self._manual = manual
         self._auto = auto
         self._skip_when = skip_when
         self._include = include
 
-    def _prompt(self, items: Sequence[object]) -> StepPrompt:
+    def _prompt(self, items: Sequence[object], content: Sequence[str]) -> StepPrompt:
         options = [
             Choice(value=str(self._option(item)[0]), label=str(self._option(item)[1]))
             for item in items
@@ -242,9 +288,10 @@ class SelectStep(Step):
             label=self._label,
             help_text=self._help,
             kind=self._kind,
-            content=list(self._content),
+            content=list(content),
             options=options,
             fields=[self._manual_field] if self._manual_field is not None else [],
+            phase=self._phase,
         )
 
     def _match(self, items: Sequence[object], chosen: object) -> Optional[object]:
@@ -276,14 +323,19 @@ class SelectStep(Step):
 
             item = self._match(items, answer.get(self.key))
             if item is None:
-                return Reject("That option is no longer available", self._prompt(items))
+                content = await _resolve_content(self._content, state)
+                return Reject(
+                    "That option is no longer available",
+                    self._prompt(items, content),
+                )
             return Advance(await resolve(self._pick(state, item)))
 
         if not items and self._manual_field is None:
             return Advance()
         if len(items) == 1 and self._auto and self._manual_field is None:
             return Advance(await resolve(self._pick(state, items[0])))
-        return Ask(self._prompt(items))
+        content = await _resolve_content(self._content, state)
+        return Ask(self._prompt(items, content))
 
 
 class ActionStep(Step):

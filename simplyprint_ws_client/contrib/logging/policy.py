@@ -19,6 +19,7 @@ DEFAULT_NOISY_LOGGERS: Tuple[str, ...] = (
     "urllib3",
     "websocket",
     "websockets",
+    "apscheduler",
 )
 
 LOG_TARGET_FILE = "file"

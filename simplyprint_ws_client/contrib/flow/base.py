@@ -35,6 +35,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    FrozenSet,
     Generic,
     List,
     Mapping,
@@ -68,6 +69,8 @@ class Choice:
     screen's options. ``value`` is what the answer carries; ``label`` (and the
     optional ``description``/``icon``/``badge``) are presentation only, so a
     backend can serve a region list or a device list fully described.
+    ``recommended`` lets a renderer mark the suggested default option (e.g. the
+    recommended connection mode); presentation-only, the engine never reads it.
     """
 
     value: str
@@ -75,6 +78,7 @@ class Choice:
     description: Optional[str] = None
     icon: Optional[str] = None
     badge: Optional[str] = None
+    recommended: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,12 @@ class StepField:
     ``choices`` (plain) turn it into a selection; ``validation`` carries
     declarative rules the client mirrors into its form schema. A flow never names
     a brand here -- only the field it needs.
+
+    ``value`` + ``prefilled`` describe a field whose answer is *already known* (a
+    fact a discovered/seeded device carried in): the renderer shows it collapsed
+    in a "detected" summary with an edit affordance rather than as an open input,
+    and submits ``value`` unless the user edits it. ``prefilled`` is the flag the
+    UI keys on; ``value`` is the known answer.
     """
 
     key: str
@@ -129,6 +139,8 @@ class StepField:
     default: Optional[str] = None
     placeholder: Optional[str] = None
     validation: Optional[Validation] = None
+    value: Optional[str] = None
+    prefilled: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,7 +163,30 @@ class StepPrompt:
     fields: List[StepField] = field(default_factory=list)
     options: List[Choice] = field(default_factory=list)
     actions: List[StepAction] = field(default_factory=list)
+    #: Markdown blocks rendered *below* the inputs (after the submit button) --
+    #: where a "where do I find this?" walkthrough or FAQ belongs, so it doesn't
+    #: push the form down. ``content`` is the above-the-inputs counterpart.
+    footer: List[str] = field(default_factory=list)
     poll: bool = False
+    #: Which outline :class:`Phase` this screen belongs to (matches a ``Phase.id``
+    #: in the flow's plan). Optional and presentation-only -- lets a UI highlight
+    #: the current step in a progress stepper; the engine never reads it.
+    phase: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Phase:
+    """One entry in a flow's step outline: a stable id and a human label.
+
+    A flow declares an ordered ``plan`` of these so a UI can render a progress
+    stepper *before* the user has answered every screen, and each prompt tags
+    itself with the phase id it belongs to (:attr:`StepPrompt.phase`). Because a
+    flow can branch, the plan is best-effort and may be refined as choices resolve
+    (see :attr:`Flow.plan`); it is never load-bearing -- the engine ignores it.
+    """
+
+    id: str
+    label: str
 
 
 # -- step outcomes (what a Step.run returns) ---------------------------------
@@ -311,6 +346,33 @@ class Flow(Generic[T]):
     finish: Callable[[Mapping[str, object]], Union[T, Awaitable[T]]]
     #: Human label of what the flow yields (for a UI; never load-bearing).
     produces: str = ""
+    #: Best-effort step outline for a UI stepper: an ordered list of :class:`Phase`
+    #: the flow expects to move through, **or** a callable of the accumulated state
+    #: (so a branch can refine the outline once a choice is made). Each prompt tags
+    #: its phase via :attr:`StepPrompt.phase`. Presentation-only; the engine never
+    #: reads it.
+    plan: Union[Sequence[Phase], Callable[[Mapping[str, object]], Sequence[Phase]]] = ()
+    #: The state keys a *caller* may seed when starting the flow (the facts a
+    #: discovered/deep-linked device carries in: a host, a serial, a model, a
+    #: branch mode). A stateless front door intersects an untrusted launch context
+    #: with this allowlist, so only what a flow opts into can pre-fill or skip a
+    #: step -- a secret (an access code, a password) is never listed and so can
+    #: never be seeded. Empty by default: a flow seeds nothing until it says so.
+    seedable: FrozenSet[str] = frozenset()
+
+
+def outline(flow: "Flow", state: Optional[Mapping[str, object]] = None) -> List[Phase]:
+    """Resolve a flow's :attr:`Flow.plan` against ``state`` into a concrete list.
+
+    A static plan is returned as-is; a callable plan is invoked with the
+    accumulated ``state`` so a branch can tailor the outline (e.g. a LAN path and
+    a cloud-account path expose different phases). Always returns a list, possibly
+    empty when the flow declares no plan.
+    """
+    plan = flow.plan
+    if callable(plan):
+        plan = plan(dict(state or {}))
+    return list(plan or ())
 
 
 # -- the engine --------------------------------------------------------------

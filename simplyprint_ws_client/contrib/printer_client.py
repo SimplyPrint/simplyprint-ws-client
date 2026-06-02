@@ -33,15 +33,18 @@ the holds or the start/finish detection.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import timedelta
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     Generic,
     Iterable,
     Optional,
+    Protocol,
     Tuple,
     TypeVar,
 )
@@ -49,10 +52,13 @@ from typing import (
 from ..core.client import DefaultClient
 from ..core.config import PrinterConfig
 from ..core.state import PrinterStatus
+from ..core.ws_protocol.messages import PluginInstallDemandData
 from ..shared.camera.mixin import ClientCameraMixin
 from ..shared.hardware.physical_machine import PhysicalMachine
 
 if TYPE_CHECKING:
+    import logging
+
     from yarl import URL
 
     from ..events.event_bus import EventBus
@@ -72,17 +78,40 @@ _host_usage_snapshot: dict = {}
 _host_usage_read_at: float = 0.0
 
 
-def _host_usage() -> dict:
-    """Return a process-wide, throttled snapshot of host CPU/memory usage."""
+async def _host_usage() -> dict:
+    """Return a process-wide, throttled snapshot of host CPU/memory usage.
+
+    The refresh reads sysfs/proc via ``psutil`` and is offloaded to a worker
+    thread so it never blocks the loop; a fresh-enough snapshot is returned
+    immediately without a thread hop.
+    """
     global _host_usage_snapshot, _host_usage_read_at
     now = time.monotonic()
     if (
         not _host_usage_snapshot
         or now - _host_usage_read_at >= _HOST_USAGE_MIN_INTERVAL
     ):
-        _host_usage_snapshot = PhysicalMachine.get_usage()
+        _host_usage_snapshot = await asyncio.to_thread(PhysicalMachine.get_usage)
         _host_usage_read_at = now
     return _host_usage_snapshot
+
+
+class AppUpdater(Protocol):
+    """The connector's self-update entry point, wired once by the integration.
+
+    Updating the connector is an app-level concern, not a brand one, so the
+    library handles the plugin-install demand generically and delegates the
+    actual update here. The integration supplies an implementation (and sets
+    :attr:`PrinterClient.app_updater`); brands never see it.
+    """
+
+    #: The connector's plugin name in the SimplyPrint demand. A demand naming a
+    #: different plugin is ignored.
+    plugin_name: str
+
+    async def run(self, logger: "logging.Logger") -> None:
+        """Perform (or decline) the connector self-update, logging the outcome."""
+        ...
 
 
 class PrinterClient(
@@ -103,6 +132,10 @@ class PrinterClient(
     camera_pause_timeout: int = 10
     camera_max_cache_age: timedelta = timedelta(seconds=1)
 
+    #: Connector self-updater, wired once by the integration (``None`` = updates
+    #: not wired, so a plugin-install demand is a no-op). See :class:`AppUpdater`.
+    app_updater: ClassVar[Optional[AppUpdater]] = None
+
     # -- lifecycle template --------------------------------------------------
     # init/halt are called once per halt + initially; tick every scheduling
     # slice; teardown once at final cleanup (see Client docstring).
@@ -116,7 +149,7 @@ class PrinterClient(
         telemetry and the SimplyPrint heartbeat ping (each interval-gated)."""
         self._tick_progress()
         self.printer.ambient_temperature.tick(self.printer)
-        self.update_host_telemetry()
+        await self.update_host_telemetry()
         await self.send_ping()
 
     async def halt(self) -> None:
@@ -343,9 +376,40 @@ class PrinterClient(
 
     # -- host telemetry ------------------------------------------------------
 
-    def update_host_telemetry(self) -> None:
+    async def update_host_telemetry(self) -> None:
         """Populate the host CPU/memory sensors from the machine running the client."""
-        usage = _host_usage()
+        usage = await _host_usage()
         self.printer.cpu_info.usage = usage.get("usage")
         self.printer.cpu_info.temp = usage.get("temp")
         self.printer.cpu_info.memory = usage.get("memory")
+
+    # -- demands -------------------------------------------------------------
+
+    async def on_plugin_install(self, event: PluginInstallDemandData) -> None:
+        """Update the connector when SimplyPrint asks the brand to.
+
+        Updating the connector is brand-agnostic, so the library owns the demand
+        and delegates to :attr:`app_updater` (wired once by the integration);
+        no brand reimplements this.
+        """
+        # Non-mutating read: two concurrent dispatches must not race on the
+        # shared list (a pop() raced and could IndexError on the second).
+        if not event.plugins:
+            return
+        plugin = event.plugins[0]
+
+        updater = self.app_updater
+        if updater is None:
+            self.logger.debug(
+                "Plugin install demand received, but no app updater is wired."
+            )
+            return
+
+        if plugin.get("type") != "install" or plugin.get("name") != updater.plugin_name:
+            self.logger.warning(
+                "Plugin install demand received for %s, but it is not supported.",
+                plugin,
+            )
+            return
+
+        await updater.run(self.logger)

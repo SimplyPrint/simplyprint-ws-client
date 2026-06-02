@@ -678,3 +678,273 @@ async def test_choice_step_skipped_when_preseeded():
     )
     # No on_prompt needed: the seeded value short-circuits the screen.
     assert await run_flow(flow, initial_state={"mode": "cloud"}) == "cloud"
+
+
+@pytest.mark.asyncio
+async def test_steps_carry_phase_and_outline_resolves_static_and_branch():
+    """A flow declares a step outline (``plan``) and tags each prompt with its
+    phase, so a UI can render a stepper before every screen is answered. ``outline``
+    resolves a static plan as-is and a callable plan against the branch state."""
+    from simplyprint_ws_client.contrib.flow import (
+        Choice,
+        ChoiceStep,
+        Phase,
+        outline,
+    )
+
+    lan = [Phase("connect", "Connect"), Phase("find", "Find"), Phase("done", "Done")]
+    cloud = [
+        Phase("connect", "Connect"),
+        Phase("sign-in", "Sign in"),
+        Phase("done", "Done"),
+    ]
+
+    flow = Flow(
+        id="add",
+        title="Add",
+        steps=[
+            ChoiceStep(
+                "mode",
+                label="How?",
+                phase="connect",
+                options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+            ),
+            FieldsStep(
+                "find",
+                label="Find it",
+                phase="find",
+                fields=[StepField(key="host", label="Host")],
+            ),
+        ],
+        # A callable plan refines the outline once the branch is chosen.
+        plan=lambda s: cloud if s.get("mode") == "cloud" else lan,
+        finish=lambda s: s.get("host", ""),
+    )
+
+    # Static resolution before any choice -> the default (LAN) outline.
+    assert [p.id for p in outline(flow)] == ["connect", "find", "done"]
+    # Branch resolution -> the cloud outline.
+    assert [p.id for p in outline(flow, {"mode": "cloud"})] == [
+        "connect",
+        "sign-in",
+        "done",
+    ]
+
+    # Each prompt carries its phase id, so the UI can highlight the stepper.
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt)
+    assert step.prompt.key == "mode" and step.prompt.phase == "connect"
+
+    step = await advance_flow(flow, step.state, {"mode": "lan"})
+    assert isinstance(step, Prompt)
+    assert step.prompt.key == "find" and step.prompt.phase == "find"
+
+
+# -- v3: seedable, dynamic content, prefilled fields, recommended, insta-add --
+
+
+@pytest.mark.asyncio
+async def test_flow_seedable_defaults_empty_and_carries_declared_keys():
+    """``Flow.seedable`` is the allowlist a stateless front door intersects an
+    untrusted launch context against. Empty by default; a flow opts keys in, and a
+    secret is never opted in -- so it can never be seeded to skip a step."""
+    bare = Flow(id="b", title="b", steps=[], finish=lambda s: None)
+    assert bare.seedable == frozenset()
+
+    seeded = Flow(
+        id="s",
+        title="s",
+        steps=[],
+        finish=lambda s: None,
+        seedable=frozenset({"mode", "host", "serial", "device_type"}),
+    )
+    context = {
+        "mode": "lan",
+        "host": "10.0.0.5",
+        "serial": "S1",
+        "access_code": "secret",  # not opted in
+    }
+    seeded_in = {k: v for k, v in context.items() if k in seeded.seedable}
+    assert seeded_in == {"mode": "lan", "host": "10.0.0.5", "serial": "S1"}
+    assert "access_code" not in seeded_in
+
+
+@pytest.mark.asyncio
+async def test_callable_content_curates_by_state():
+    """A step's ``content`` may be a callable of state, so a screen shows only the
+    guide for what's known (the picked model) instead of every guide at once."""
+
+    def guide(state):
+        model = state.get("device_type")
+        if model == "x1":
+            return ["Guide for **X1**."]
+        if model == "a1":
+            return ["Guide for **A1**."]
+        return ["Generic: open Settings → Network."]
+
+    flow = Flow(
+        id="g",
+        title="g",
+        steps=[
+            FieldsStep(
+                "find",
+                label="Find it",
+                content=guide,
+                fields=[StepField(key="host", label="Host")],
+            )
+        ],
+        finish=lambda s: s["host"],
+    )
+
+    step = await advance_flow(flow, {"device_type": "x1"})
+    assert step.prompt.content == ["Guide for **X1**."]
+    step = await advance_flow(flow, {"device_type": "a1"})
+    assert step.prompt.content == ["Guide for **A1**."]
+    step = await advance_flow(flow, {})  # unknown model -> generic
+    assert step.prompt.content == ["Generic: open Settings → Network."]
+
+
+@pytest.mark.asyncio
+async def test_prefilled_field_value_used_when_answer_omits_it():
+    """A prefilled field carries its known value: a renderer may collapse it into a
+    summary and not re-submit it, yet the value is folded into state and satisfies
+    the required check; an explicit answer overrides it."""
+    flow = Flow(
+        id="p",
+        title="p",
+        steps=[
+            FieldsStep(
+                "find",
+                label="Find it",
+                fields=[
+                    StepField(key="host", label="IP", value="10.0.0.5", prefilled=True),
+                    StepField(key="access_code", label="Access code", secret=True),
+                ],
+            )
+        ],
+        finish=lambda s: (s.get("host"), s.get("access_code")),
+    )
+
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt)
+    host_field = step.prompt.fields[0]
+    assert host_field.prefilled and host_field.value == "10.0.0.5"
+
+    # The form submits only the missing secret; the prefilled host rides along.
+    step = await advance_flow(flow, step.state, {"access_code": "abcd1234"})
+    assert isinstance(step, Done)
+    assert step.value == ("10.0.0.5", "abcd1234")
+
+
+@pytest.mark.asyncio
+async def test_prefilled_field_edited_value_overrides():
+    flow = Flow(
+        id="p2",
+        title="p2",
+        steps=[
+            FieldsStep(
+                "find",
+                label="Find it",
+                fields=[
+                    StepField(key="host", label="IP", value="10.0.0.5", prefilled=True)
+                ],
+            )
+        ],
+        finish=lambda s: s.get("host"),
+    )
+    step = await advance_flow(flow)
+    # The user expanded the summary and corrected the value.
+    step = await advance_flow(flow, step.state, {"host": "10.0.0.9"})
+    assert isinstance(step, Done) and step.value == "10.0.0.9"
+
+
+@pytest.mark.asyncio
+async def test_recommended_choice_is_carried_to_the_screen():
+    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+
+    flow = Flow(
+        id="r",
+        title="r",
+        steps=[
+            ChoiceStep(
+                "mode",
+                label="How?",
+                options=[
+                    Choice("lan", "Local network", recommended=True),
+                    Choice("cloud", "Cloud account"),
+                ],
+            )
+        ],
+        finish=lambda s: s["mode"],
+    )
+    step = await advance_flow(flow)
+    assert step.prompt.options[0].recommended is True
+    assert step.prompt.options[1].recommended is False
+
+
+@pytest.mark.asyncio
+async def test_step_footer_renders_below_and_curates_by_state():
+    """``footer`` is markdown shown below the inputs (a "where do I find this?"
+    walkthrough), and like ``content`` it may be a callable curated by state."""
+
+    def guide(state):
+        return [f"Guide for {state.get('device_type') or 'any'}"]
+
+    flow = Flow(
+        id="f",
+        title="f",
+        steps=[
+            FieldsStep(
+                "find",
+                label="Find it",
+                content=["Enter the IP below."],
+                footer=guide,
+                fields=[StepField(key="host", label="Host")],
+            )
+        ],
+        finish=lambda s: s["host"],
+    )
+
+    step = await advance_flow(flow, {"device_type": "x1"})
+    assert step.prompt.content == ["Enter the IP below."]
+    assert step.prompt.footer == ["Guide for x1"]
+
+
+@pytest.mark.asyncio
+async def test_fully_seeded_device_insta_adds_in_one_advance():
+    """The quick-start path: a discovered device seeds every fact a flow needs, so
+    each step's include gate is satisfied and the flow reaches Done in a single
+    advance -- no prompt shown (an insta-add)."""
+
+    async def verify(state, _answer):
+        # Reachable + identity already known; nothing to add.
+        return Advance()
+
+    flow = Flow(
+        id="add",
+        title="Add",
+        seedable=frozenset({"host", "device_type"}),
+        steps=[
+            # identify: run only when the model is unknown (skipped once seeded).
+            FieldsStep(
+                "identify",
+                label="Pick model",
+                fields=[StepField(key="device_type", label="Model")],
+                include=lambda s: not s.get("device_type"),
+            ),
+            # find+info: run only when something required is still missing.
+            FieldsStep(
+                "find",
+                label="Find it",
+                fields=[StepField(key="host", label="Host")],
+                include=lambda s: not s.get("host"),
+            ),
+            ActionStep("verify", verify),
+        ],
+        finish=lambda s: {"host": s.get("host"), "device_type": s.get("device_type")},
+    )
+
+    # Seed everything a discovered device carried -> straight to Done, no prompt.
+    step = await advance_flow(flow, {"host": "10.0.0.5", "device_type": "x1"})
+    assert isinstance(step, Done)
+    assert step.value == {"host": "10.0.0.5", "device_type": "x1"}

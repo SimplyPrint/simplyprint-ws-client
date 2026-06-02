@@ -107,13 +107,13 @@ class FileDownload:
         dest: Path,
         clamp_progress: Optional[Callable] = None,
     ) -> Path:
-        """
-        Download a file with file progress and save it to a file.
-        """
+        """Download a file with progress and write it to ``dest``.
 
-        # Save the data to a file
+        Each chunk is written on a worker thread so a large or slow disk never
+        blocks the event loop between network reads.
+        """
         with open(dest, "wb") as f:
             async for chunk in self.download(data, clamp_progress):
-                f.write(chunk)
+                await asyncio.to_thread(f.write, chunk)
 
         return dest
