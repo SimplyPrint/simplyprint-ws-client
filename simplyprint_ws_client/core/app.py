@@ -2,7 +2,6 @@ __all__ = ["ClientApp"]
 
 import asyncio
 import atexit
-import functools
 import logging
 import threading
 from typing import Dict, Optional, cast
@@ -14,7 +13,6 @@ from .scheduler import Scheduler
 from .settings import ClientSettings, ClientSpec
 from ..shared.asyncio.event_loop_runner import Runner
 from ..shared.camera.pool import CameraPool
-from ..shared.debug import traceability
 from ..shared.sp.sentry import Sentry
 from ..shared.sp.url_builder import SimplyPrintURL
 from ..shared.utils.stoppable import SyncStoppable
@@ -91,7 +89,6 @@ class ClientApp(SyncStoppable):
 
     def run_blocking(self, debug=False, contexts: Optional[list] = None):
         contexts = contexts or []
-        contexts.append(functools.partial(traceability.enable_traceable, debug))
 
         with Runner(debug, contexts, self.settings.event_loop_backend) as runner:
             runner.run(self.run(), loop_factory=lambda: self._app_event_loop)

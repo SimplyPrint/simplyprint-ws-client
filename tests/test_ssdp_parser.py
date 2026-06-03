@@ -1,6 +1,10 @@
 """Tests for the shared SSDP request parser."""
 
-from simplyprint_ws_client.contrib.discovery import SSDPRequest, SSDPRequestParser
+from simplyprint_ws_client.contrib.discovery import (
+    DiscoveredDevice,
+    SSDPRequest,
+    SSDPRequestParser,
+)
 
 
 _SAMPLE_PACKET = (
@@ -24,6 +28,15 @@ def test_parse_returns_ssdp_request_with_expected_fields():
     assert request.method == "NOTIFY"
     assert request.uri == "*"
     assert request.version == "HTTP/1.1"
+
+
+def test_discovered_device_is_a_neutral_discovery_dto():
+    device = DiscoveredDevice(host="192.168.1.50", name="Printer", serial="SN1")
+
+    assert device.host == "192.168.1.50"
+    assert device.name == "Printer"
+    assert device.serial == "SN1"
+    assert device.extra == {}
 
 
 def test_parse_lowercases_header_names_and_strips_values():

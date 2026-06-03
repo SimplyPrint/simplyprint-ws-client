@@ -6,7 +6,6 @@ import hashlib
 from simplyprint_ws_client.contrib.transfer.checksum import (
     file_md5,
     parse_s3_etag,
-    resolve_md5,
 )
 
 
@@ -23,7 +22,7 @@ def test_parse_s3_etag():
     assert parse_s3_etag("") is None
 
 
-def test_file_md5_and_resolve(tmp_path):
+def test_file_md5(tmp_path):
     data = b"simplyprint" * 100_000  # a few MB, exercises chunked streaming
     path = tmp_path / "blob.gcode"
     path.write_bytes(data)
@@ -31,10 +30,3 @@ def test_file_md5_and_resolve(tmp_path):
 
     # file_md5 streams + hashes off-loop, matching hashlib (uppercase).
     assert asyncio.run(file_md5(path)) == expected
-
-    # resolve_md5 short-circuits to a usable ETag without hashing the file...
-    etag_md5 = "0123456789abcdef0123456789abcdef"
-    assert asyncio.run(resolve_md5(path, etag=f'"{etag_md5}"')) == etag_md5.upper()
-    # ...and falls back to hashing when the ETag is absent or multipart.
-    assert asyncio.run(resolve_md5(path, etag='"abc-2"')) == expected
-    assert asyncio.run(resolve_md5(path)) == expected

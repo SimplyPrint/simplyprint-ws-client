@@ -275,10 +275,3 @@ class ConnectivityReport(BaseModel):
             f.write(self.model_dump_json(indent=4))
 
         return full_path
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    r = ConnectivityReport.generate_default()
-    p = r.store_in_path(Path.cwd())
-    print("Connectivity test suite complete. Report saved to:", p)

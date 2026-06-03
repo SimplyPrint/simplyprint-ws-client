@@ -54,17 +54,3 @@ def parse_s3_etag(etag: Optional[str]) -> Optional[str]:
         return None
 
     return value.upper()
-
-
-async def resolve_md5(path: Path, *, etag: Optional[str] = None) -> str:
-    """MD5 of the transfer file: from ``etag`` when it carries one, else hashed.
-
-    Prefers the (free) ETag MD5 so we don't read the file at all; falls back to
-    :func:`file_md5` when no usable ETag is available (e.g. a multipart ETag, or
-    a file we transformed locally).
-    """
-    from_etag = parse_s3_etag(etag)
-    if from_etag is not None:
-        return from_etag
-
-    return await file_md5(path)
