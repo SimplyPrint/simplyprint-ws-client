@@ -3,11 +3,12 @@
 The headline :class:`FileTransfer` owns the whole prepare -> download ->
 transform -> upload -> await-firmware lifecycle and exposes brand hooks; a brand
 subclasses it. Active-job bookkeeping at prepare start is now owned by
-:class:`FileTransfer` as ``_set_active_job_for_prepare``. The leaf primitive an
-integration's file handler also composes is :func:`start_in_thread`.
+:class:`FileTransfer` as ``_set_active_job_for_prepare``. Leaf primitives an
+integration's file handler also composes live here too.
 """
 
 from simplyprint_ws_client.contrib.transfer.concurrency import start_in_thread
+from simplyprint_ws_client.contrib.transfer.download import download_to_file
 from simplyprint_ws_client.contrib.transfer.file_transfer import (
     FileTransfer,
     FirmwareStartOutcome,
@@ -18,5 +19,6 @@ __all__ = [
     "FileTransfer",
     "FirmwareStartOutcome",
     "PreparedPrint",
+    "download_to_file",
     "start_in_thread",
 ]
