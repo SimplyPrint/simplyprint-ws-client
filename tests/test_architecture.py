@@ -64,6 +64,37 @@ class TestBrandFree:
         return offenders
 
 
+# Brand ports / SSDP topic fragments that must never be hardcoded in the shared
+# discovery machinery (they belong only in each integration's per-brand spec).
+# A brand name as a NAME token is caught by TestBrandFree; these are string
+# literals (ports, topic shapes), so they need a plain substring scan.
+_DISCOVERY_LEAK_TOKENS = (
+    "2021",
+    "1900",
+    "3030",
+    "bambulab",
+    "devmodel",
+    "ac:3dprinter",
+    "modelid",
+)
+
+
+def test_discovery_has_no_brand_ports_or_topics():
+    """contrib/discovery is brand-agnostic machinery: even as plain strings, brand
+    ports / SSDP topic shapes must not appear (they live only in each integration's
+    per-brand discovery spec)."""
+    root = LIB_PKG / "contrib" / "discovery"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8").lower()
+        for token in _DISCOVERY_LEAK_TOKENS:
+            if token in text:
+                offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
+    assert offenders == [], f"brand port/topic leak in contrib/discovery: {offenders}"
+
+
 class TestNoShims:
     """SHIM — no re-export aliases or star imports in contrib/ + shared/."""
 
