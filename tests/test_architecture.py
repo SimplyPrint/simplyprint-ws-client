@@ -95,6 +95,28 @@ def test_discovery_has_no_brand_ports_or_topics():
     assert offenders == [], f"brand port/topic leak in contrib/discovery: {offenders}"
 
 
+# Brand cloud field / login-type tokens that must never appear in the shared
+# account surface. Brand NAMES are caught by TestBrandFree + the text scan; these
+# are brand API field names (and the no-word-boundary "bambulab") those miss.
+_ACCOUNT_LEAK_TOKENS = ("verifycode", "tfakey", "bambulab")
+
+
+def test_accounts_has_no_brand_field_tokens():
+    """contrib/accounts is the neutral cloud-account surface: no brand cloud API
+    field / login-type token may appear (they live only in each integration's
+    concrete provider)."""
+    root = LIB_PKG / "contrib" / "accounts"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8").lower()
+        for token in _ACCOUNT_LEAK_TOKENS:
+            if token in text:
+                offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
+    assert offenders == [], f"brand field-token leak in contrib/accounts: {offenders}"
+
+
 class TestNoShims:
     """SHIM — no re-export aliases or star imports in contrib/ + shared/."""
 
