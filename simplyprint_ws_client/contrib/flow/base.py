@@ -41,6 +41,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -57,8 +58,13 @@ FlowState = Dict[str, object]
 #: ``finish`` ignore it; it is non-secret continuation state like any other.
 CURSOR_KEY = "__flow_cursor__"
 
+#: A predicate on accumulated flow state, gating whether a phase or step runs.
+#: A step's predicate may be async (the engine awaits it); a phase's must be
+#: synchronous, since the outline is resolved outside the engine's async loop.
+Predicate = Callable[[Mapping[str, object]], Union[bool, Awaitable[bool]]]
 
-# -- screen descriptors (the neutral, data-driven frontend contract) ---------
+
+# screen descriptors -- the neutral, data-driven frontend contract
 
 
 @dataclass(frozen=True)
@@ -168,25 +174,28 @@ class StepPrompt:
     #: push the form down. ``content`` is the above-the-inputs counterpart.
     footer: List[str] = field(default_factory=list)
     poll: bool = False
-    #: Which outline :class:`Phase` this screen belongs to (matches a ``Phase.id``
-    #: in the flow's plan). Optional and presentation-only -- lets a UI highlight
-    #: the current step in a progress stepper; the engine never reads it.
-    phase: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class Phase:
-    """One entry in a flow's step outline: a stable id and a human label.
+    """One stage of a flow, owning the steps that realize it plus its outline label.
 
-    A flow declares an ordered ``plan`` of these so a UI can render a progress
-    stepper *before* the user has answered every screen, and each prompt tags
-    itself with the phase id it belongs to (:attr:`StepPrompt.phase`). Because a
-    flow can branch, the plan is best-effort and may be refined as choices resolve
-    (see :attr:`Flow.plan`); it is never load-bearing -- the engine ignores it.
+    A flow is an ordered list of phases; each phase groups the :class:`Step` s that
+    run while the user is in it and the ``label`` a progress stepper shows. The
+    engine flattens phases into one step sequence to drive the cursor, but keeps the
+    grouping so a UI knows, up front, every phase, its substeps, and which is active.
+
+    ``include`` branches a flow: when its predicate is false for the current state
+    the whole phase (all its steps) is skipped and it drops out of the resolved
+    :func:`outline` -- so a LAN phase and a cloud phase coexist in one flow and only
+    the chosen one runs and shows. It must be synchronous (a pure check on
+    already-accumulated state). A phase may hold no steps (a terminal "Done" marker).
     """
 
     id: str
     label: str
+    steps: Sequence["Step"] = ()
+    include: Optional[Predicate] = None
 
 
 # -- step outcomes (what a Step.run returns) ---------------------------------
@@ -312,6 +321,9 @@ class Step(ABC):
 
     #: Stable identifier for the step, used in prompts and for debugging.
     key: str = ""
+    #: Human label for this substep, surfaced in a flow's resolved outline so a UI
+    #: can name the steps within each phase and mark the active one.
+    label: str = ""
 
     @abstractmethod
     async def run(
@@ -331,27 +343,21 @@ class Step(ABC):
 
 @dataclass(frozen=True)
 class Flow(Generic[T]):
-    """A guided interaction: an ordered list of steps plus a terminal fold.
+    """A guided interaction: an ordered list of :class:`Phase` s plus a terminal fold.
 
-    Declarative -- a brand builds one by listing steps (each capturing its own
-    closures for discovery, probing, submitting) and a ``finish`` that folds the
-    accumulated :data:`FlowState` into the typed outcome ``T`` (a
-    ``PrinterConfig``, a saved account, ...). The engine drives it; the flow is
-    pure data.
+    Declarative -- a brand builds one by grouping its steps into phases (each step
+    capturing its own closures for discovery, probing, submitting) and a ``finish``
+    that folds the accumulated :data:`FlowState` into the typed outcome ``T`` (a
+    ``PrinterConfig``, a saved account, ...). The engine flattens the phases to drive
+    the cursor; the flow is pure data.
     """
 
     id: str
     title: str
-    steps: Sequence[Step]
+    phases: Sequence[Phase]
     finish: Callable[[Mapping[str, object]], Union[T, Awaitable[T]]]
     #: Human label of what the flow yields (for a UI; never load-bearing).
     produces: str = ""
-    #: Best-effort step outline for a UI stepper: an ordered list of :class:`Phase`
-    #: the flow expects to move through, **or** a callable of the accumulated state
-    #: (so a branch can refine the outline once a choice is made). Each prompt tags
-    #: its phase via :attr:`StepPrompt.phase`. Presentation-only; the engine never
-    #: reads it.
-    plan: Union[Sequence[Phase], Callable[[Mapping[str, object]], Sequence[Phase]]] = ()
     #: The state keys a *caller* may seed when starting the flow (the facts a
     #: discovered/deep-linked device carries in: a host, a serial, a model, a
     #: branch mode). A stateless front door intersects an untrusted launch context
@@ -361,21 +367,35 @@ class Flow(Generic[T]):
     seedable: FrozenSet[str] = frozenset()
 
 
+def _walk(flow: "Flow") -> List[Tuple[Phase, Step]]:
+    """Flatten a flow's phases into the ``(phase, step)`` sequence the cursor indexes."""
+    return [(phase, step) for phase in flow.phases for step in phase.steps]
+
+
 def outline(flow: "Flow", state: Optional[Mapping[str, object]] = None) -> List[Phase]:
-    """Resolve a flow's :attr:`Flow.plan` against ``state`` into a concrete list.
+    """The phases that apply to ``state``, in order -- a flow's resolved outline.
 
-    A static plan is returned as-is; a callable plan is invoked with the
-    accumulated ``state`` so a branch can tailor the outline (e.g. a LAN path and
-    a cloud-account path expose different phases). Always returns a list, possibly
-    empty when the flow declares no plan.
+    Drops any phase whose ``include`` predicate is false for the accumulated state
+    (the inactive side of a branch), so the result is exactly the path the user is
+    on. With no branches every phase is returned. ``include`` is called
+    synchronously (phase predicates are pure state checks).
     """
-    plan = flow.plan
-    if callable(plan):
-        plan = plan(dict(state or {}))
-    return list(plan or ())
+    work = dict(state or {})
+    return [p for p in flow.phases if p.include is None or bool(p.include(work))]
 
 
-# -- the engine --------------------------------------------------------------
+def active_position(
+    flow: "Flow", state: Optional[Mapping[str, object]] = None
+) -> Optional[Tuple[Phase, Step]]:
+    """The ``(phase, step)`` the cursor in ``state`` rests on, or ``None`` if exhausted.
+
+    The active step is wherever the engine paused (an :class:`Ask`/:class:`Reject`),
+    so a UI can mark the live phase and substep straight from the sealed state. Past
+    the last step (the flow is done) there is no active position.
+    """
+    flat = _walk(flow)
+    cursor = int(dict(state or {}).get(CURSOR_KEY, 0))
+    return flat[cursor] if 0 <= cursor < len(flat) else None
 
 
 async def advance_flow(
@@ -390,10 +410,11 @@ async def advance_flow(
 
     Resumes at the cursor recorded in ``state`` (step 0 on the first call),
     hands ``answer`` to that step, and runs forward through every step that
-    :class:`Advance` s without asking -- so the caller always lands on the next
-    real :class:`Prompt`/:class:`Poll`, the terminal :class:`Done`, or a
-    recoverable :class:`Failed`, never an intermediate. ``state`` is treated as
-    immutable; a fresh state dict rides on the result.
+    :class:`Advance` s without asking -- including steps whose phase ``include`` is
+    false, which skip silently -- so the caller always lands on the next real
+    :class:`Prompt`/:class:`Poll`, the terminal :class:`Done`, or a recoverable
+    :class:`Failed`, never an intermediate. ``state`` is treated as immutable; a
+    fresh state dict rides on the result.
 
     When ``finalize`` is ``False`` and every step is exhausted, returns
     :class:`Ready` (state sealed at the terminal boundary) instead of folding the
@@ -401,12 +422,19 @@ async def advance_flow(
     in ``setup-step``.
     """
     work: FlowState = dict(state or {})
+    flat = _walk(flow)
     cursor = int(work.get(CURSOR_KEY, 0))
     pending = answer
     pending_action = action
 
-    while cursor < len(flow.steps):
-        step = flow.steps[cursor]
+    while cursor < len(flat):
+        phase, step = flat[cursor]
+        # A skipped branch's steps advance untouched, never seeing the answer.
+        if phase.include is not None and not bool(phase.include(work)):
+            cursor += 1
+            work[CURSOR_KEY] = cursor
+            continue
+
         outcome = await step.run(work, pending, pending_action)
         # An answer/action is consumed only by the step at the cursor.
         pending = None

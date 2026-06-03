@@ -43,7 +43,8 @@ from .base import (
     resolve,
 )
 
-#: A predicate on flow state, sync or async, gating whether a step runs.
+#: A predicate on flow state gating whether a step runs. Unlike a phase's (which
+#: must be sync), a step's may be async -- the engine awaits it.
 Include = Callable[[Mapping[str, object]], Union[bool, Awaitable[bool]]]
 
 #: Markdown blocks shown above a screen's inputs -- a static list, or a callable of
@@ -88,18 +89,16 @@ class FieldsStep(Step):
         footer: Optional[Content] = None,
         actions: Optional[Sequence[StepAction]] = None,
         kind: str = "form",
-        phase: Optional[str] = None,
         include: Optional[Include] = None,
     ) -> None:
         self.key = key
-        self._label = label
+        self.label = label
         self._fields = fields
         self._help = help_text
         self._content = content or []
         self._footer = footer or []
         self._actions = list(actions or [])
         self._kind = kind
-        self._phase = phase
         self._include = include
 
     def _resolve_fields(self, state: Mapping[str, object]) -> List[StepField]:
@@ -114,14 +113,13 @@ class FieldsStep(Step):
     ) -> StepPrompt:
         return StepPrompt(
             key=self.key,
-            label=self._label,
+            label=self.label,
             help_text=self._help,
             kind=self._kind,
             content=list(content),
             fields=list(fields),
             actions=list(self._actions),
             footer=list(footer),
-            phase=self._phase,
         )
 
     async def run(
@@ -175,26 +173,23 @@ class ChoiceStep(Step):
         label: str,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
-        phase: Optional[str] = None,
         include: Optional[Include] = None,
     ) -> None:
         self.key = key
         self._options = list(options)
-        self._label = label
+        self.label = label
         self._help = help_text
         self._content = content or []
-        self._phase = phase
         self._include = include
 
     def _prompt(self, content: Sequence[str]) -> StepPrompt:
         return StepPrompt(
             key=self.key,
-            label=self._label,
+            label=self.label,
             help_text=self._help,
             kind="choice",
             content=list(content),
             options=list(self._options),
-            phase=self._phase,
         )
 
     async def run(
@@ -251,7 +246,6 @@ class SelectStep(Step):
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
         kind: str = "discovery",
-        phase: Optional[str] = None,
         manual_field: Optional[StepField] = None,
         manual: Optional[
             Callable[
@@ -267,11 +261,10 @@ class SelectStep(Step):
         self._source = source
         self._option = option
         self._pick = pick
-        self._label = label
+        self.label = label
         self._help = help_text
         self._content = content or []
         self._kind = kind
-        self._phase = phase
         self._manual_field = manual_field
         self._manual = manual
         self._auto = auto
@@ -285,13 +278,12 @@ class SelectStep(Step):
         ]
         return StepPrompt(
             key=self.key,
-            label=self._label,
+            label=self.label,
             help_text=self._help,
             kind=self._kind,
             content=list(content),
             options=options,
             fields=[self._manual_field] if self._manual_field is not None else [],
-            phase=self._phase,
         )
 
     def _match(self, items: Sequence[object], chosen: object) -> Optional[object]:
@@ -359,6 +351,7 @@ class ActionStep(Step):
             Union[StepOutcome, Mapping[str, object], None, Awaitable],
         ],
         *,
+        label: str = "",
         include: Optional[Include] = None,
         on_action: Optional[
             Mapping[
@@ -367,6 +360,7 @@ class ActionStep(Step):
         ] = None,
     ) -> None:
         self.key = key
+        self.label = label
         self._action = action
         self._include = include
         self._on_action = dict(on_action or {})

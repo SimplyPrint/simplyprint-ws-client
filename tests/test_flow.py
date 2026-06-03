@@ -22,12 +22,15 @@ from simplyprint_ws_client.contrib.flow import (
     FieldsStep,
     Flow,
     FlowError,
+    Phase,
     Prompt,
     Reject,
     SelectStep,
     StepField,
     StepPrompt,
+    active_position,
     advance_flow,
+    outline,
     run_flow,
 )
 
@@ -93,17 +96,23 @@ def make_add_printer_flow(devices: List[FakeDevice], reachable: set):
     return Flow(
         id="add-printer",
         title="Add a printer",
-        steps=[
-            SelectStep(
-                "device",
-                source=discover,
-                option=option,
-                pick=pick,
-                label="Choose a printer",
-                skip_when=lambda s: bool(s.get("host")),
-            ),
-            ActionStep("verify", verify),
-            FieldsStep("setup", label="Set up", fields=setup_fields),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    SelectStep(
+                        "device",
+                        source=discover,
+                        option=option,
+                        pick=pick,
+                        label="Choose a printer",
+                        skip_when=lambda s: bool(s.get("host")),
+                    ),
+                    ActionStep("verify", verify),
+                    FieldsStep("setup", label="Set up", fields=setup_fields),
+                ],
+            )
         ],
         finish=finish,
     )
@@ -248,9 +257,17 @@ def make_account_login_flow(*, valid: dict, challenge_users: set, codes: dict):
     return Flow(
         id="account-login",
         title="Sign in",
-        steps=[
-            ActionStep("login", login),
-            ActionStep("verify", verify, include=lambda s: bool(s.get("_challenge"))),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ActionStep("login", login),
+                    ActionStep(
+                        "verify", verify, include=lambda s: bool(s.get("_challenge"))
+                    ),
+                ],
+            )
         ],
         finish=finish,
     )
@@ -366,7 +383,7 @@ async def test_poll_waits_then_advances():
     flow = Flow(
         id="pair",
         title="Pair",
-        steps=[ActionStep("approve", approve)],
+        phases=[Phase("main", "Main", steps=[ActionStep("approve", approve)])],
         finish=lambda s: "paired" if s.get("approved") else "no",
     )
 
@@ -393,7 +410,7 @@ async def test_scalar_answer_normalised_to_single_field():
     flow = Flow(
         id="x",
         title="x",
-        steps=[ActionStep("name", ask_name)],
+        phases=[Phase("main", "Main", steps=[ActionStep("name", ask_name)])],
         finish=lambda s: s["name"],
     )
 
@@ -409,11 +426,17 @@ async def test_fields_step_rejects_missing_required():
     flow = Flow(
         id="f",
         title="f",
-        steps=[
-            FieldsStep(
-                "creds",
-                label="Creds",
-                fields=[StepField(key="token", label="Token", required=True)],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "creds",
+                        label="Creds",
+                        fields=[StepField(key="token", label="Token", required=True)],
+                    )
+                ],
             )
         ],
         finish=lambda s: s.get("token"),
@@ -453,7 +476,9 @@ async def test_finalize_false_stops_at_terminal_then_commits():
     bare = Flow(
         id="bare",
         title="bare",
-        steps=[ActionStep("noop", lambda s, a: Advance())],
+        phases=[
+            Phase("main", "Main", steps=[ActionStep("noop", lambda s, a: Advance())])
+        ],
         finish=lambda s: "committed",
     )
     ready = await advance_flow(bare, {}, None, finalize=False)
@@ -475,7 +500,17 @@ async def test_cursor_is_carried_but_ignored_by_finish():
     flow = Flow(
         id="c",
         title="c",
-        steps=[FieldsStep("one", label="One", fields=[StepField(key="a", label="A")])],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "one", label="One", fields=[StepField(key="a", label="A")]
+                    )
+                ],
+            )
+        ],
         finish=finish,
     )
 
@@ -499,27 +534,33 @@ async def test_choice_step_branches_via_include():
     flow = Flow(
         id="connect",
         title="Connect",
-        steps=[
-            ChoiceStep(
-                "mode",
-                label="How do you want to connect?",
-                options=[
-                    Choice("lan", "Local network"),
-                    Choice("cloud", "Cloud account"),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="How do you want to connect?",
+                        options=[
+                            Choice("lan", "Local network"),
+                            Choice("cloud", "Cloud account"),
+                        ],
+                    ),
+                    FieldsStep(
+                        "lan",
+                        label="LAN",
+                        fields=[StepField(key="lan_host", label="Host")],
+                        include=lambda s: s.get("mode") == "lan",
+                    ),
+                    FieldsStep(
+                        "cloud",
+                        label="Cloud",
+                        fields=[StepField(key="cloud_user", label="User")],
+                        include=lambda s: s.get("mode") == "cloud",
+                    ),
                 ],
-            ),
-            FieldsStep(
-                "lan",
-                label="LAN",
-                fields=[StepField(key="lan_host", label="Host")],
-                include=lambda s: s.get("mode") == "lan",
-            ),
-            FieldsStep(
-                "cloud",
-                label="Cloud",
-                fields=[StepField(key="cloud_user", label="User")],
-                include=lambda s: s.get("mode") == "cloud",
-            ),
+            )
         ],
         finish=lambda s: (s.get("mode"), s.get("lan_host"), s.get("cloud_user")),
     )
@@ -542,12 +583,18 @@ async def test_choice_step_emits_choice_screen():
     flow = Flow(
         id="c",
         title="c",
-        steps=[
-            ChoiceStep(
-                "mode",
-                label="Pick",
-                content=["Most printers connect over your **LAN**."],
-                options=[Choice("lan", "LAN", description="Recommended")],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="Pick",
+                        content=["Most printers connect over your **LAN**."],
+                        options=[Choice("lan", "LAN", description="Recommended")],
+                    )
+                ],
             )
         ],
         finish=lambda s: s["mode"],
@@ -585,7 +632,13 @@ async def test_action_step_handles_resend_action():
     flow = Flow(
         id="v",
         title="v",
-        steps=[ActionStep("code", verify, on_action={"resend": resend})],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[ActionStep("code", verify, on_action={"resend": resend})],
+            )
+        ],
         finish=lambda s: s["code"],
     )
 
@@ -607,12 +660,18 @@ async def test_step_carries_markdown_content_and_kind():
     flow = Flow(
         id="i",
         title="i",
-        steps=[
-            FieldsStep(
-                "setup",
-                label="Set up",
-                content=["## Where to find it", "Open **Settings → Network**."],
-                fields=[StepField(key="x", label="X")],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "setup",
+                        label="Set up",
+                        content=["## Where to find it", "Open **Settings → Network**."],
+                        fields=[StepField(key="x", label="X")],
+                    )
+                ],
             )
         ],
         finish=lambda s: s["x"],
@@ -637,15 +696,21 @@ async def test_discovery_manual_entry_routes_through_manual():
     flow = Flow(
         id="d",
         title="d",
-        steps=[
-            SelectStep(
-                "device",
-                source=source,
-                option=lambda item: (item, item),
-                pick=lambda _s, item: {"host": item},
-                label="Find your printer",
-                manual_field=StepField(key="manual_host", label="IP address"),
-                manual=lambda _s, value: {"host": value},
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    SelectStep(
+                        "device",
+                        source=source,
+                        option=lambda item: (item, item),
+                        pick=lambda _s, item: {"host": item},
+                        label="Find your printer",
+                        manual_field=StepField(key="manual_host", label="IP address"),
+                        manual=lambda _s, value: {"host": value},
+                    )
+                ],
             )
         ],
         finish=lambda s: s["host"],
@@ -667,11 +732,17 @@ async def test_choice_step_skipped_when_preseeded():
     flow = Flow(
         id="c",
         title="c",
-        steps=[
-            ChoiceStep(
-                "mode",
-                label="?",
-                options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="?",
+                        options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+                    )
+                ],
             )
         ],
         finish=lambda s: s["mode"],
@@ -681,63 +752,84 @@ async def test_choice_step_skipped_when_preseeded():
 
 
 @pytest.mark.asyncio
-async def test_steps_carry_phase_and_outline_resolves_static_and_branch():
-    """A flow declares a step outline (``plan``) and tags each prompt with its
-    phase, so a UI can render a stepper before every screen is answered. ``outline``
-    resolves a static plan as-is and a callable plan against the branch state."""
-    from simplyprint_ws_client.contrib.flow import (
-        Choice,
-        ChoiceStep,
-        Phase,
-        outline,
-    )
+async def test_phase_include_branches_outline_and_marks_active_step():
+    """Phases own their steps and branch via ``include``: the inactive side drops
+    out of ``outline`` and never runs, and ``active_position`` names the live phase
+    and substep straight from the cursor -- so a UI can render and track the stepper
+    before every screen is answered, with no hand-tagged phase strings."""
+    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
 
-    lan = [Phase("connect", "Connect"), Phase("find", "Find"), Phase("done", "Done")]
-    cloud = [
-        Phase("connect", "Connect"),
-        Phase("sign-in", "Sign in"),
-        Phase("done", "Done"),
-    ]
+    def is_cloud(s):
+        return s.get("mode") == "cloud"
+
+    def is_lan(s):
+        return not is_cloud(s)
 
     flow = Flow(
         id="add",
         title="Add",
-        steps=[
-            ChoiceStep(
-                "mode",
-                label="How?",
-                phase="connect",
-                options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+        phases=[
+            Phase(
+                "connect",
+                "Connect",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="How do you want to connect?",
+                        options=[Choice("lan", "LAN"), Choice("cloud", "Cloud")],
+                    )
+                ],
             ),
-            FieldsStep(
+            Phase(
                 "find",
-                label="Find it",
-                phase="find",
-                fields=[StepField(key="host", label="Host")],
+                "Find",
+                include=is_lan,
+                steps=[
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        fields=[StepField(key="host", label="Host")],
+                    )
+                ],
             ),
+            Phase(
+                "sign-in",
+                "Sign in",
+                include=is_cloud,
+                steps=[
+                    FieldsStep(
+                        "signin",
+                        label="Sign in",
+                        fields=[StepField(key="user", label="User")],
+                    )
+                ],
+            ),
+            Phase("done", "Done"),
         ],
-        # A callable plan refines the outline once the branch is chosen.
-        plan=lambda s: cloud if s.get("mode") == "cloud" else lan,
         finish=lambda s: s.get("host", ""),
     )
 
-    # Static resolution before any choice -> the default (LAN) outline.
+    # Before any choice the default (LAN) side shows; the cloud phase is hidden.
     assert [p.id for p in outline(flow)] == ["connect", "find", "done"]
-    # Branch resolution -> the cloud outline.
+    # Choosing cloud swaps the branch in the resolved outline.
     assert [p.id for p in outline(flow, {"mode": "cloud"})] == [
         "connect",
         "sign-in",
         "done",
     ]
 
-    # Each prompt carries its phase id, so the UI can highlight the stepper.
+    # The active phase + substep fall straight out of the cursor in the sealed state.
     step = await advance_flow(flow)
-    assert isinstance(step, Prompt)
-    assert step.prompt.key == "mode" and step.prompt.phase == "connect"
+    assert isinstance(step, Prompt) and step.prompt.key == "mode"
+    phase, sub = active_position(flow, step.state)
+    assert phase.id == "connect" and sub.key == "mode" and sub.label
 
     step = await advance_flow(flow, step.state, {"mode": "lan"})
-    assert isinstance(step, Prompt)
-    assert step.prompt.key == "find" and step.prompt.phase == "find"
+    assert isinstance(step, Prompt) and step.prompt.key == "find"
+    phase, sub = active_position(flow, step.state)
+    assert phase.id == "find" and sub.key == "find"
+    # The unchosen cloud phase never ran and is gone from the outline.
+    assert "sign-in" not in [p.id for p in outline(flow, step.state)]
 
 
 # -- v3: seedable, dynamic content, prefilled fields, recommended, insta-add --
@@ -748,13 +840,18 @@ async def test_flow_seedable_defaults_empty_and_carries_declared_keys():
     """``Flow.seedable`` is the allowlist a stateless front door intersects an
     untrusted launch context against. Empty by default; a flow opts keys in, and a
     secret is never opted in -- so it can never be seeded to skip a step."""
-    bare = Flow(id="b", title="b", steps=[], finish=lambda s: None)
+    bare = Flow(
+        id="b",
+        title="b",
+        phases=[Phase("main", "Main", steps=[])],
+        finish=lambda s: None,
+    )
     assert bare.seedable == frozenset()
 
     seeded = Flow(
         id="s",
         title="s",
-        steps=[],
+        phases=[Phase("main", "Main", steps=[])],
         finish=lambda s: None,
         seedable=frozenset({"mode", "host", "serial", "device_type"}),
     )
@@ -785,12 +882,18 @@ async def test_callable_content_curates_by_state():
     flow = Flow(
         id="g",
         title="g",
-        steps=[
-            FieldsStep(
-                "find",
-                label="Find it",
-                content=guide,
-                fields=[StepField(key="host", label="Host")],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        content=guide,
+                        fields=[StepField(key="host", label="Host")],
+                    )
+                ],
             )
         ],
         finish=lambda s: s["host"],
@@ -812,13 +915,23 @@ async def test_prefilled_field_value_used_when_answer_omits_it():
     flow = Flow(
         id="p",
         title="p",
-        steps=[
-            FieldsStep(
-                "find",
-                label="Find it",
-                fields=[
-                    StepField(key="host", label="IP", value="10.0.0.5", prefilled=True),
-                    StepField(key="access_code", label="Access code", secret=True),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        fields=[
+                            StepField(
+                                key="host", label="IP", value="10.0.0.5", prefilled=True
+                            ),
+                            StepField(
+                                key="access_code", label="Access code", secret=True
+                            ),
+                        ],
+                    )
                 ],
             )
         ],
@@ -841,12 +954,20 @@ async def test_prefilled_field_edited_value_overrides():
     flow = Flow(
         id="p2",
         title="p2",
-        steps=[
-            FieldsStep(
-                "find",
-                label="Find it",
-                fields=[
-                    StepField(key="host", label="IP", value="10.0.0.5", prefilled=True)
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        fields=[
+                            StepField(
+                                key="host", label="IP", value="10.0.0.5", prefilled=True
+                            )
+                        ],
+                    )
                 ],
             )
         ],
@@ -865,13 +986,19 @@ async def test_recommended_choice_is_carried_to_the_screen():
     flow = Flow(
         id="r",
         title="r",
-        steps=[
-            ChoiceStep(
-                "mode",
-                label="How?",
-                options=[
-                    Choice("lan", "Local network", recommended=True),
-                    Choice("cloud", "Cloud account"),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="How?",
+                        options=[
+                            Choice("lan", "Local network", recommended=True),
+                            Choice("cloud", "Cloud account"),
+                        ],
+                    )
                 ],
             )
         ],
@@ -893,13 +1020,19 @@ async def test_step_footer_renders_below_and_curates_by_state():
     flow = Flow(
         id="f",
         title="f",
-        steps=[
-            FieldsStep(
-                "find",
-                label="Find it",
-                content=["Enter the IP below."],
-                footer=guide,
-                fields=[StepField(key="host", label="Host")],
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        content=["Enter the IP below."],
+                        footer=guide,
+                        fields=[StepField(key="host", label="Host")],
+                    )
+                ],
             )
         ],
         finish=lambda s: s["host"],
@@ -924,22 +1057,28 @@ async def test_fully_seeded_device_insta_adds_in_one_advance():
         id="add",
         title="Add",
         seedable=frozenset({"host", "device_type"}),
-        steps=[
-            # identify: run only when the model is unknown (skipped once seeded).
-            FieldsStep(
-                "identify",
-                label="Pick model",
-                fields=[StepField(key="device_type", label="Model")],
-                include=lambda s: not s.get("device_type"),
-            ),
-            # find+info: run only when something required is still missing.
-            FieldsStep(
-                "find",
-                label="Find it",
-                fields=[StepField(key="host", label="Host")],
-                include=lambda s: not s.get("host"),
-            ),
-            ActionStep("verify", verify),
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    # identify: run only when the model is unknown (skipped once seeded).
+                    FieldsStep(
+                        "identify",
+                        label="Pick model",
+                        fields=[StepField(key="device_type", label="Model")],
+                        include=lambda s: not s.get("device_type"),
+                    ),
+                    # find+info: run only when something required is still missing.
+                    FieldsStep(
+                        "find",
+                        label="Find it",
+                        fields=[StepField(key="host", label="Host")],
+                        include=lambda s: not s.get("host"),
+                    ),
+                    ActionStep("verify", verify),
+                ],
+            )
         ],
         finish=lambda s: {"host": s.get("host"), "device_type": s.get("device_type")},
     )
