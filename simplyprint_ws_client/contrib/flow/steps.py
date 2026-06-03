@@ -42,6 +42,7 @@ from .base import (
     StepField,
     StepOutcome,
     StepPrompt,
+    fields_from_schema,
     model_input_schema,
     resolve,
     validate_input,
@@ -85,18 +86,23 @@ class FieldsStep(Step):
         key: str,
         *,
         label: str,
-        fields: Union[
-            Sequence[StepField], Callable[[Mapping[str, object]], Sequence[StepField]]
-        ],
+        fields: Optional[
+            Union[Sequence[StepField], Callable[[Mapping[str, object]], Sequence[StepField]]]
+        ] = None,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
         footer: Optional[Content] = None,
         actions: Optional[Sequence[StepAction]] = None,
         kind: str = "form",
         input_model: Optional[InputModel] = None,
+        input_values: Optional[
+            Union[Mapping[str, object], Callable[[Mapping[str, object]], Mapping[str, object]]]
+        ] = None,
         include: Optional[Include] = None,
         show_in_outline: bool = True,
     ) -> None:
+        if fields is None and input_model is None:
+            raise FlowError("FieldsStep requires fields or input_model")
         self.key = key
         self.label = label
         self.show_in_outline = show_in_outline
@@ -107,9 +113,28 @@ class FieldsStep(Step):
         self._actions = list(actions or [])
         self._kind = kind
         self._input_model = input_model
+        self._input_values = input_values
         self._include = include
 
-    def _resolve_fields(self, state: Mapping[str, object]) -> List[StepField]:
+    def _schema(self, state: Mapping[str, object]) -> Optional[Mapping[str, object]]:
+        if self._input_model is None:
+            return None
+        values = (
+            self._input_values(state)
+            if callable(self._input_values)
+            else self._input_values
+        )
+        return model_input_schema(
+            self._input_model,
+            values=values,
+            prefilled=(values or {}).keys(),
+        )
+
+    def _resolve_fields(
+        self, state: Mapping[str, object], schema: Optional[Mapping[str, object]]
+    ) -> List[StepField]:
+        if self._fields is None:
+            return fields_from_schema(schema or {})
         fields = self._fields(state) if callable(self._fields) else self._fields
         return list(fields)
 
@@ -118,6 +143,7 @@ class FieldsStep(Step):
         fields: Sequence[StepField],
         content: Sequence[str],
         footer: Sequence[str],
+        schema: Optional[Mapping[str, object]],
     ) -> StepPrompt:
         return StepPrompt(
             key=self.key,
@@ -126,11 +152,7 @@ class FieldsStep(Step):
             kind=self._kind,
             content=list(content),
             fields=list(fields),
-            input_schema=(
-                model_input_schema(self._input_model)
-                if self._input_model is not None
-                else None
-            ),
+            input_schema=schema,
             actions=list(self._actions),
             footer=list(footer),
         )
@@ -144,12 +166,13 @@ class FieldsStep(Step):
         if not await _included(self._include, state):
             return Advance()
 
-        fields = self._resolve_fields(state)
+        schema = self._schema(state)
+        fields = self._resolve_fields(state, schema)
         content = await _resolve_content(self._content, state)
         footer = await _resolve_content(self._footer, state)
 
         if answer is None:
-            return Ask(self._prompt(fields, content, footer))
+            return Ask(self._prompt(fields, content, footer, schema))
 
         # A prefilled field carries its known value, so a renderer may collapse it
         # into a summary and not re-submit it; fall back to that value when the
@@ -163,7 +186,7 @@ class FieldsStep(Step):
         if missing:
             return Reject(
                 "Please fill in: " + ", ".join(missing),
-                self._prompt(fields, content, footer),
+                self._prompt(fields, content, footer, schema),
             )
 
         updates = {f.key: effective(f) for f in fields if effective(f) is not None}
@@ -171,7 +194,7 @@ class FieldsStep(Step):
             try:
                 updates = validate_input(self._input_model, updates, fields=fields)
             except InputValidationError as exc:
-                return Reject(str(exc), self._prompt(fields, content, footer))
+                return Reject(str(exc), self._prompt(fields, content, footer, schema))
         return Advance(updates)
 
 

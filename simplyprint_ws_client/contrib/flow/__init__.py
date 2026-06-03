@@ -38,6 +38,7 @@ from simplyprint_ws_client.contrib.flow.base import (
     StepPrompt,
     active_position,
     advance_flow,
+    fields_from_schema,
     model_input_schema,
     outline,
     resolve,
@@ -71,6 +72,7 @@ __all__ = [
     "active_position",
     "Choice",
     "StepAction",
+    "fields_from_schema",
     "model_input_schema",
     "validate_input",
     # step outcomes

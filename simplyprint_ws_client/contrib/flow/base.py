@@ -28,6 +28,7 @@ widget, only fields.
 
 from __future__ import annotations
 
+import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -38,6 +39,7 @@ from typing import (
     Dict,
     FrozenSet,
     Generic,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -165,6 +167,10 @@ class StepPrompt:
     #: push the form down. ``content`` is the above-the-inputs counterpart.
     footer: List[str] = field(default_factory=list)
     poll: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.fields and self.input_schema:
+            object.__setattr__(self, "fields", fields_from_schema(self.input_schema))
 
 
 @dataclass(frozen=True)
@@ -549,9 +555,107 @@ def _as_mapping(
 InputModel = Type[BaseModel]
 
 
-def model_input_schema(model: InputModel) -> Mapping[str, Any]:
+def model_input_schema(
+    model: InputModel,
+    *,
+    values: Optional[Mapping[str, object]] = None,
+    prefilled: Optional[Iterable[str]] = None,
+) -> Mapping[str, Any]:
     """The JSON Schema a prompt exposes for the answer object it accepts."""
-    return model.model_json_schema(mode="validation")
+    schema = copy.deepcopy(model.model_json_schema(mode="validation"))
+    if not values and not prefilled:
+        return schema
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+
+    prefilled_keys = set(prefilled or ())
+    for key, value in (values or {}).items():
+        if value is None:
+            continue
+        prop = properties.get(key)
+        if not isinstance(prop, dict):
+            continue
+        wire_value = str(value)
+        prop["default"] = wire_value
+        ui = prop.setdefault("ui", {})
+        if isinstance(ui, dict):
+            ui["value"] = wire_value
+            if key in prefilled_keys:
+                ui["prefilled"] = True
+    return schema
+
+
+def fields_from_schema(schema: Mapping[str, Any]) -> List[StepField]:
+    """Derive neutral render fields from a Pydantic JSON Schema."""
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return []
+    required = set(schema.get("required") or ())
+    fields: List[StepField] = []
+    for key, raw in properties.items():
+        if not isinstance(raw, Mapping):
+            continue
+        prop = dict(raw)
+        ui = prop.get("ui") if isinstance(prop.get("ui"), Mapping) else {}
+        options = _schema_options(prop, ui)
+        field_type = str(ui.get("type") or _schema_field_type(prop, options))
+        help_text = ui.get("help_text") or prop.get("description")
+        default = prop.get("default")
+        value = ui.get("value")
+        fields.append(
+            StepField(
+                key=str(key),
+                label=str(ui.get("label") or prop.get("title") or key),
+                field_type=field_type,
+                required=str(key) in required,
+                help_text=str(help_text) if help_text is not None else None,
+                secret=bool(ui.get("secret")) or field_type in {"password", "secret"},
+                choices=[str(option.value) for option in options] or None,
+                options=options or None,
+                default=str(default) if default is not None else None,
+                placeholder=(
+                    str(ui.get("placeholder"))
+                    if ui.get("placeholder") is not None
+                    else None
+                ),
+                value=str(value) if value is not None else None,
+                prefilled=bool(ui.get("prefilled")),
+            )
+        )
+    return fields
+
+
+def _schema_options(prop: Mapping[str, Any], ui: Mapping[str, Any]) -> List[Choice]:
+    raw_options = ui.get("options") or []
+    options: List[Choice] = []
+    for item in raw_options:
+        if isinstance(item, Mapping):
+            value = str(item.get("value", ""))
+            options.append(Choice(value=value, label=str(item.get("label") or value)))
+        else:
+            value = str(item)
+            options.append(Choice(value=value, label=value))
+    if options:
+        return options
+
+    raw_enum = prop.get("enum") or []
+    return [Choice(value=str(value), label=str(value)) for value in raw_enum]
+
+
+def _schema_field_type(prop: Mapping[str, Any], options: Sequence[Choice]) -> str:
+    if options:
+        return "select"
+    if prop.get("format") == "email":
+        return "email"
+    if prop.get("format") in {"uri", "url"}:
+        return "url"
+    if prop.get("type") in {"number", "integer"}:
+        return "number"
+    if prop.get("type") == "boolean":
+        return "toggle"
+    return "text"
 
 
 def validate_input(
