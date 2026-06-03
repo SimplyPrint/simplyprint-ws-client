@@ -87,7 +87,10 @@ class FieldsStep(Step):
         *,
         label: str,
         fields: Optional[
-            Union[Sequence[StepField], Callable[[Mapping[str, object]], Sequence[StepField]]]
+            Union[
+                Sequence[StepField],
+                Callable[[Mapping[str, object]], Sequence[StepField]],
+            ]
         ] = None,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
@@ -96,7 +99,10 @@ class FieldsStep(Step):
         kind: str = "form",
         input_model: Optional[InputModel] = None,
         input_values: Optional[
-            Union[Mapping[str, object], Callable[[Mapping[str, object]], Mapping[str, object]]]
+            Union[
+                Mapping[str, object],
+                Callable[[Mapping[str, object]], Mapping[str, object]],
+            ]
         ] = None,
         include: Optional[Include] = None,
         show_in_outline: bool = True,
