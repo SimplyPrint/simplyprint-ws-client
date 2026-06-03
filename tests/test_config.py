@@ -1,4 +1,18 @@
+import hashlib
+from dataclasses import dataclass
+from typing import Optional
+
 from simplyprint_ws_client import PrinterConfig
+
+
+@dataclass
+class _HwConfig(PrinterConfig):
+    """A config whose stable hardware id is its serial (test double)."""
+
+    serial: Optional[str] = None
+
+    def stable_hardware_id(self) -> Optional[str]:
+        return self.serial
 
 
 def test_config_fields():
@@ -66,3 +80,56 @@ def test_config_fields():
         }
     )
     assert not config4.is_empty()
+
+
+def test_stable_hardware_id_default_is_none():
+    """The base hook has no hardware id; brands override it."""
+    assert PrinterConfig.get_blank().stable_hardware_id() is None
+
+
+def test_derive_unique_id_is_salted_sha1_of_hardware_id():
+    cfg = _HwConfig.get_blank()
+    cfg.serial = "SN-123"
+
+    expected = hashlib.sha1(b"saltvalue:SN-123").hexdigest()
+    # Pins the exact formula: sha1(salt + ":" + hardware_id).
+    assert cfg.derive_unique_id("saltvalue") == expected
+    # Deterministic for the same (salt, device).
+    assert cfg.derive_unique_id("saltvalue") == expected
+    # Installation-scoped: a different salt derives a different id.
+    assert cfg.derive_unique_id("other-salt") != expected
+    # Device-scoped: a different hardware id derives a different id.
+    cfg.serial = "SN-999"
+    assert cfg.derive_unique_id("saltvalue") != expected
+
+
+def test_derive_unique_id_is_none_without_hardware_id():
+    assert _HwConfig.get_blank().derive_unique_id("salt") is None
+    assert PrinterConfig.get_blank().derive_unique_id("salt") is None
+
+
+def test_ensure_unique_id_prefers_derived_and_never_rekeys():
+    cfg = _HwConfig.get_blank()
+    cfg.serial = "SN-123"
+
+    first = cfg.ensure_unique_id("salt")
+    assert first == hashlib.sha1(b"salt:SN-123").hexdigest()
+    assert cfg.unique_id == first
+
+    # Idempotent: an already-assigned id is never re-keyed, even when the salt
+    # and hardware id both change (re-keying would orphan backend correlation).
+    cfg.serial = "SN-999"
+    assert cfg.ensure_unique_id("different-salt") == first
+    assert cfg.unique_id == first
+
+
+def test_ensure_unique_id_falls_back_to_random_without_hardware_id():
+    cfg = PrinterConfig.get_blank()
+    assert cfg.unique_id is None
+
+    assigned = cfg.ensure_unique_id("salt")
+    assert assigned and assigned == cfg.unique_id
+    # No hardware id to derive from, so the assigned id is a random fallback.
+    assert cfg.derive_unique_id("salt") is None
+    # Idempotent: it keeps the random id it minted.
+    assert cfg.ensure_unique_id("salt") == assigned

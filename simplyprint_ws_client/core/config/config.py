@@ -1,5 +1,6 @@
 __all__ = ["Config", "PrinterConfig"]
 
+import hashlib
 import json
 import uuid
 from abc import ABC, abstractmethod
@@ -153,3 +154,48 @@ class PrinterConfig(Config):
     @classmethod
     def get_new(cls) -> Self:
         return cls(id=0, token="0", unique_id=str(uuid.uuid4()))
+
+    # -- Identity ----------------------------------------------------------
+    # A printer's ``unique_id`` should be *stable* across re-discovery so the
+    # backend (and discovery's de-dup) can correlate a re-found printer to its
+    # existing config. A bare random id cannot do that. The contract below
+    # lets a brand supply a stable hardware id and derive the unique id from
+    # it; brands without one fall back to a random id.
+
+    def stable_hardware_id(self) -> Optional[str]:
+        """A brand-stable hardware identifier for this printer, or ``None``.
+
+        Override per brand to return the device's own immutable id (serial,
+        board uniqueId, system guid, ...). The default has none, so identity
+        falls back to a random id. This is *hardware* identity, never a
+        credential (access codes / auth keys are not identity).
+        """
+        return None
+
+    def derive_unique_id(self, salt: str) -> Optional[str]:
+        """Derive an installation-scoped unique id from the hardware id.
+
+        ``sha1(salt + ":" + hardware_id)`` -- deterministic for a given
+        (installation salt, device), so re-discovering the same printer
+        derives the same id and discovery correlates it to its config. The
+        salt keeps the id installation-scoped (the same physical device on two
+        connectors derives different ids, so they never collide). Returns
+        ``None`` when the device exposes no stable hardware id.
+        """
+        hardware_id = self.stable_hardware_id()
+        if not hardware_id:
+            return None
+        return hashlib.sha1(f"{salt}:{hardware_id}".encode("utf-8")).hexdigest()
+
+    def ensure_unique_id(self, salt: str) -> str:
+        """Idempotently assign and return ``unique_id``.
+
+        Never re-keys: an already-assigned ``unique_id`` is returned unchanged
+        (re-keying would orphan backend correlation and logs). Otherwise prefer
+        a hardware-derived id; only when the device exposes no stable hardware
+        id does it fall back to a random id.
+        """
+        if self.unique_id:
+            return self.unique_id
+        self.unique_id = self.derive_unique_id(salt) or str(uuid.uuid4())
+        return self.unique_id
