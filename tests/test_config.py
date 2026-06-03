@@ -108,19 +108,38 @@ def test_derive_unique_id_is_none_without_hardware_id():
     assert PrinterConfig.get_blank().derive_unique_id("salt") is None
 
 
-def test_ensure_unique_id_prefers_derived_and_never_rekeys():
+def test_ensure_unique_id_prefers_derived_while_pending():
     cfg = _HwConfig.get_blank()
     cfg.serial = "SN-123"
 
-    first = cfg.ensure_unique_id("salt")
-    assert first == hashlib.sha1(b"salt:SN-123").hexdigest()
-    assert cfg.unique_id == first
+    assigned = cfg.ensure_unique_id("salt")
+    assert assigned == hashlib.sha1(b"salt:SN-123").hexdigest()
+    assert cfg.unique_id == assigned
 
-    # Idempotent: an already-assigned id is never re-keyed, even when the salt
-    # and hardware id both change (re-keying would orphan backend correlation).
-    cfg.serial = "SN-999"
-    assert cfg.ensure_unique_id("different-salt") == first
-    assert cfg.unique_id == first
+
+def test_ensure_unique_id_replaces_placeholder_while_pending():
+    # get_new mints a random placeholder; while the printer is still in setup
+    # (id == 0) the seam swaps it for the stable hardware-derived id.
+    cfg = _HwConfig.get_new()
+    placeholder = cfg.unique_id
+    assert placeholder
+    cfg.serial = "SN-123"
+
+    derived = cfg.ensure_unique_id("salt")
+    assert derived == hashlib.sha1(b"salt:SN-123").hexdigest()
+    assert derived != placeholder
+
+
+def test_ensure_unique_id_never_rekeys_a_registered_printer():
+    cfg = _HwConfig.get_new()
+    cfg.serial = "SN-123"
+    cfg.id = 42  # backend-assigned -> registered, no longer pending
+
+    existing = cfg.unique_id
+    # Even with a stable hardware id available, a registered printer keeps its
+    # id (re-keying would orphan backend correlation and logs).
+    assert cfg.ensure_unique_id("salt") == existing
+    assert cfg.unique_id == existing
 
 
 def test_ensure_unique_id_falls_back_to_random_without_hardware_id():
@@ -131,5 +150,5 @@ def test_ensure_unique_id_falls_back_to_random_without_hardware_id():
     assert assigned and assigned == cfg.unique_id
     # No hardware id to derive from, so the assigned id is a random fallback.
     assert cfg.derive_unique_id("salt") is None
-    # Idempotent: it keeps the random id it minted.
+    # Idempotent while pending with no hardware id: it keeps the random id.
     assert cfg.ensure_unique_id("salt") == assigned

@@ -188,14 +188,18 @@ class PrinterConfig(Config):
         return hashlib.sha1(f"{salt}:{hardware_id}".encode("utf-8")).hexdigest()
 
     def ensure_unique_id(self, salt: str) -> str:
-        """Idempotently assign and return ``unique_id``.
+        """Assign and return ``unique_id``, called once at the persist seam.
 
-        Never re-keys: an already-assigned ``unique_id`` is returned unchanged
-        (re-keying would orphan backend correlation and logs). Otherwise prefer
-        a hardware-derived id; only when the device exposes no stable hardware
-        id does it fall back to a random id.
+        While a printer is still in setup (no backend id yet) it prefers a
+        stable hardware-derived id so the backend can correlate it across
+        re-discovery, replacing any placeholder id minted at config creation.
+        A registered printer (past setup, real id) is *never* re-keyed --
+        re-keying would orphan backend correlation and logs. Falls back to a
+        random id only when the device exposes no stable hardware id.
         """
-        if self.unique_id:
+        if self.unique_id and not self.is_pending():
             return self.unique_id
-        self.unique_id = self.derive_unique_id(salt) or str(uuid.uuid4())
+        self.unique_id = (
+            self.derive_unique_id(salt) or self.unique_id or str(uuid.uuid4())
+        )
         return self.unique_id
