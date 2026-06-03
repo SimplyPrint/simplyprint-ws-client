@@ -495,6 +495,43 @@ async def test_fields_step_validates_with_pydantic_schema():
     assert done.value == "::1"
 
 
+def test_model_input_schema_stamps_field_order_for_renderers():
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from simplyprint_ws_client.contrib.flow import (
+        fields_from_schema,
+        model_input_schema,
+    )
+
+    class SetupInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        serial: str = Field(title="Serial")
+        host: str = Field(
+            title="Host",
+            json_schema_extra={"ui": {"placeholder": "192.168.1.42"}},
+        )
+        access_code: str = Field(title="Access code")
+
+    schema = model_input_schema(SetupInput)
+    properties = schema["properties"]
+    assert properties["serial"]["ui"]["order"] == 0
+    assert properties["host"]["ui"] == {"placeholder": "192.168.1.42", "order": 1}
+    assert properties["access_code"]["ui"]["order"] == 2
+
+    reordered = {
+        **schema,
+        "properties": {
+            key: properties[key] for key in ("access_code", "host", "serial")
+        },
+    }
+    assert [field.key for field in fields_from_schema(reordered)] == [
+        "serial",
+        "host",
+        "access_code",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_finalize_false_stops_at_terminal_then_commits():
     """The two-phase bridge: advance to the terminal boundary without folding

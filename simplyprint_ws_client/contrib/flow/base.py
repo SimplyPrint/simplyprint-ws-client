@@ -563,11 +563,22 @@ def model_input_schema(
 ) -> Mapping[str, Any]:
     """The JSON Schema a prompt exposes for the answer object it accepts."""
     schema = copy.deepcopy(model.model_json_schema(mode="validation"))
-    if not values and not prefilled:
-        return schema
-
     properties = schema.get("properties")
     if not isinstance(properties, dict):
+        return schema
+
+    field_order = {key: index for index, key in enumerate(model.model_fields)}
+    for key, prop in properties.items():
+        if not isinstance(prop, dict):
+            continue
+        ui = prop.get("ui")
+        if not isinstance(ui, dict):
+            ui = {}
+            prop["ui"] = ui
+        if key in field_order:
+            ui["order"] = field_order[key]
+
+    if not values and not prefilled:
         return schema
 
     prefilled_keys = set(prefilled or ())
@@ -594,7 +605,7 @@ def fields_from_schema(schema: Mapping[str, Any]) -> List[StepField]:
         return []
     required = set(schema.get("required") or ())
     fields: List[StepField] = []
-    for key, raw in properties.items():
+    for key, raw in sorted(properties.items(), key=_schema_field_order):
         if not isinstance(raw, Mapping):
             continue
         prop = dict(raw)
@@ -625,6 +636,22 @@ def fields_from_schema(schema: Mapping[str, Any]) -> List[StepField]:
             )
         )
     return fields
+
+
+def _schema_field_order(item: Tuple[str, Any]) -> Tuple[int, int]:
+    raw = item[1]
+    if isinstance(raw, Mapping):
+        ui = raw.get("ui")
+        if isinstance(ui, Mapping):
+            order = ui.get("order")
+            if isinstance(order, int) and not isinstance(order, bool):
+                return (0, order)
+            if isinstance(order, str):
+                try:
+                    return (0, int(order))
+                except ValueError:
+                    pass
+    return (1, 0)
 
 
 def _schema_options(prop: Mapping[str, Any], ui: Mapping[str, Any]) -> List[Choice]:
