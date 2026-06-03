@@ -34,6 +34,7 @@ the holds or the start/finish detection.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 from datetime import timedelta
 from typing import (
@@ -41,6 +42,7 @@ from typing import (
     Any,
     Callable,
     ClassVar,
+    Coroutine,
     Generic,
     Iterable,
     Optional,
@@ -159,7 +161,6 @@ class PrinterClient(
         """Final cleanup: tear the device connection down."""
         await self._stop_connection()
 
-
     async def _start_connection(self) -> None:
         """Establish/arm the device connection. Push devices start MQTT/WS here.
         No-op default for devices that start in ``__init__``."""
@@ -176,10 +177,21 @@ class PrinterClient(
         return your device client(s)."""
         return ()
 
+    def submit_to_loop(
+        self, coro: Coroutine[Any, Any, Any]
+    ) -> "concurrent.futures.Future":
+        """Schedule ``coro`` on this client's event loop from another thread.
+
+        The one sanctioned way for a device callback running on a connection or
+        worker thread to fire async work on the client's loop -- a thin, named
+        wrapper over ``run_coroutine_threadsafe`` so brands don't reach across
+        threads themselves. Returns the future so a caller can wait if needed.
+        """
+        return asyncio.run_coroutine_threadsafe(coro, self.event_loop)
+
     def _tick_progress(self) -> None:
         """Drive a client-side progress shim each tick. Default no-op; devices
         with a fake-progress shim override to tick it."""
-
 
     def _connection_event_bus(self) -> Optional["EventBus"]:
         """The connection component's own event bus, if it has one. Push devices
@@ -203,7 +215,6 @@ class PrinterClient(
         for event, handler in self._connection_event_bindings():
             bus.on(event, handler)
 
-
     def on_connected_to_printer(self, *_args) -> None:
         """The device connection came up: mark active and (re)resolve the
         camera. Subclasses override to add device startup commands."""
@@ -216,7 +227,6 @@ class PrinterClient(
         self.active = False
         self.logger.info("Disconnected from printer")
         self.camera_uri = None
-
 
     @staticmethod
     def _guard_cancelling(
@@ -274,7 +284,6 @@ class PrinterClient(
             and self.printer.is_printing()
         )
 
-
     def apply_status(
         self,
         new_status: PrinterStatus,
@@ -324,7 +333,6 @@ class PrinterClient(
     def _on_job_progress(self, new_status: PrinterStatus) -> None:
         """Update in-progress job fields (progress/layer/time). Default no-op."""
 
-
     def _init_camera(self, **kwargs) -> None:
         """Initialise the camera mixin with the device-tuned cache constants."""
         self.initialize_camera_mixin(
@@ -367,14 +375,12 @@ class PrinterClient(
                 "Failed to set camera URI to %s", redacted_uri, exc_info=e
             )
 
-
     async def update_host_telemetry(self) -> None:
         """Populate the host CPU/memory sensors from the machine running the client."""
         usage = await _host_usage()
         self.printer.cpu_info.usage = usage.get("usage")
         self.printer.cpu_info.temp = usage.get("temp")
         self.printer.cpu_info.memory = usage.get("memory")
-
 
     async def on_plugin_install(self, event: PluginInstallDemandData) -> None:
         """Update the connector when SimplyPrint asks the brand to.
