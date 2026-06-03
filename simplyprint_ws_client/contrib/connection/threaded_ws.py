@@ -20,12 +20,13 @@ execution model -- only the WebSocket wire.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Hashable, NamedTuple, Optional, Type
 
 import websocket
 
 from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
 
+from .pool import ClientBucket, Connection, ConnectionManager, TClient
 from .state import ConnectionState
 
 
@@ -192,3 +193,103 @@ class ThreadedWebSocketTransport:
         self.logger.error("%s", error)
         if self._on_error is not None:
             self._on_error(error)
+
+
+class WsConnectionParams(NamedTuple):
+    """Hashable identity of a websocket endpoint -- one per printer host."""
+
+    url: str
+
+    def __str__(self) -> str:
+        return self.url
+
+
+class WsConnection(Connection[WsConnectionParams]):
+    """A websocket-client connection, pooled like any other :class:`Connection`.
+
+    Composes the proven :class:`ThreadedWebSocketTransport` (which owns the one
+    unavoidable blocking ``run_forever`` daemon thread) and adapts its callbacks
+    onto the pool lifecycle: ``on_connected`` -> :meth:`handle_connected`,
+    ``on_message`` -> fan ``message_event`` to every client on this connection,
+    ``on_disconnected`` -> :meth:`handle_disconnected`. The blocking thread is
+    owned here, by the pool -- never by a brand client.
+
+    The optional ``app_ping`` is the brand keep-warm callback the transport fires
+    on its own cadence (e.g. a device that needs a periodic poke); leave it
+    ``None`` to rely on the WebSocket protocol ping alone.
+    """
+
+    def __init__(
+        self,
+        bucket: ClientBucket,
+        params: WsConnectionParams,
+        *,
+        connected_event: Hashable,
+        disconnected_event: Hashable,
+        message_event: Hashable,
+        app_ping: Optional[Callable[[], None]] = None,
+        app_ping_interval: float = 30.0,
+        header: Optional[Any] = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(
+            bucket,
+            params,
+            connected_event=connected_event,
+            disconnected_event=disconnected_event,
+            **kwargs,
+        )
+
+        self.message_event = message_event
+        self.transport = ThreadedWebSocketTransport(
+            params.url,
+            logger=self.logger,
+            on_message=self._on_message,
+            on_connected=self.handle_connected,
+            on_disconnected=self._on_disconnected,
+            app_ping=app_ping,
+            app_ping_interval=app_ping_interval,
+            header=header,
+        )
+        self.transport.start()
+
+    @property
+    def connected(self) -> bool:
+        return self.transport.connected
+
+    def send(self, data: str) -> bool:
+        """Write a text frame over this connection."""
+        return self.transport.send(data)
+
+    def _on_message(self, message: str) -> None:
+        self.emit_sync_all(self.message_event, message)
+
+    def _on_disconnected(self, reason: str = "") -> None:
+        self.handle_disconnected(reason=reason)
+
+    def stop(self) -> None:
+        super().stop()
+        self.transport.stop()
+
+
+class WsConnectionManager(ConnectionManager[TClient, WsConnectionParams]):
+    """Connection manager for websocket-client transports.
+
+    Concrete brand managers set the event types + ``params_factory`` (as class
+    attributes) and override :attr:`connection_class` for a brand-specific
+    :class:`WsConnection`. WebSocket printers are 1:1 (one client per host), so
+    there is no topic routing and no subscribe step -- the manager just owns the
+    pooled connection's lifecycle and event fan-out.
+    """
+
+    connection_class: Type[WsConnection] = WsConnection
+
+    def _create_connection(self, params: WsConnectionParams) -> WsConnection:
+        return self.connection_class(
+            bucket=self.bucket,
+            params=params,
+            connected_event=self.connected_event,
+            disconnected_event=self.disconnected_event,
+            message_event=self.message_event,
+            parent_stoppable=self,
+        )

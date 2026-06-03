@@ -52,6 +52,9 @@ if TYPE_CHECKING:  # eager names for IDEs / type checkers
     )
     from simplyprint_ws_client.contrib.connection.threaded_ws import (
         ThreadedWebSocketTransport,
+        WsConnection,
+        WsConnectionManager,
+        WsConnectionParams,
     )
     from simplyprint_ws_client.contrib.connection.transports import (
         AiohttpWebSocketTransport,
@@ -79,6 +82,9 @@ __all__ = [
     "WebSocketTransport",
     "WS_CLOSE_OK",
     "WS_CLOSE_PROTOCOL_ERROR",
+    "WsConnection",
+    "WsConnectionManager",
+    "WsConnectionParams",
     "now_ms",
 ]
 
@@ -88,12 +94,15 @@ def __getattr__(name: str):
         from simplyprint_ws_client.contrib.connection import mqtt
 
         return getattr(mqtt, name)
-    if name == "ThreadedWebSocketTransport":
-        from simplyprint_ws_client.contrib.connection.threaded_ws import (
-            ThreadedWebSocketTransport,
-        )
+    if name in (
+        "ThreadedWebSocketTransport",
+        "WsConnection",
+        "WsConnectionManager",
+        "WsConnectionParams",
+    ):
+        from simplyprint_ws_client.contrib.connection import threaded_ws
 
-        return ThreadedWebSocketTransport
+        return getattr(threaded_ws, name)
     if name in ("WebSocketsTransport", "AiohttpWebSocketTransport"):
         from simplyprint_ws_client.contrib.connection import transports
 
