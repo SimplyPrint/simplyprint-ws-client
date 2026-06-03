@@ -35,8 +35,6 @@ from simplyprint_ws_client.contrib.flow import (
 )
 
 
-
-
 class Driver:
     """Answers prompts from a per-prompt-key script; records what it was asked."""
 
@@ -50,8 +48,6 @@ class Driver:
         if not answers:
             raise AssertionError(f"unexpected prompt {prompt.key!r} (msg={message!r})")
         return answers.pop(0)
-
-
 
 
 @dataclass
@@ -211,8 +207,6 @@ async def test_onboarding_stateless_round_trip_matches_in_process():
     assert step.value["access_code"] == "777"
 
 
-
-
 def make_account_login_flow(*, valid: dict, challenge_users: set, codes: dict):
     creds_prompt = StepPrompt(
         key="login",
@@ -354,8 +348,6 @@ async def test_login_no_callback_raises_with_failed_message():
         await run_flow(flow)
 
 
-
-
 @pytest.mark.asyncio
 async def test_poll_waits_then_advances():
     approved = {"value": False}
@@ -454,6 +446,56 @@ async def test_fields_step_rejects_missing_required():
 
 
 @pytest.mark.asyncio
+async def test_fields_step_validates_with_pydantic_schema():
+    from ipaddress import IPv4Address, IPv6Address
+    from typing import Union
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class HostInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        host: Union[IPv4Address, IPv6Address] = Field(title="IP address")
+
+    flow = Flow(
+        id="f",
+        title="f",
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "host",
+                        label="Host",
+                        fields=[StepField(key="host", label="IP address")],
+                        input_model=HostInput,
+                    )
+                ],
+            )
+        ],
+        finish=lambda s: s.get("host"),
+    )
+
+    step = await advance_flow(flow)
+    assert isinstance(step, Prompt)
+    assert step.prompt.input_schema is not None
+    assert step.prompt.input_schema["properties"]["host"]["anyOf"] == [
+        {"format": "ipv4", "type": "string"},
+        {"format": "ipv6", "type": "string"},
+    ]
+
+    failed = await advance_flow(flow, step.state, {"host": "not-an-ip"})
+    assert isinstance(failed, Failed)
+    assert "IP address" in failed.message
+    assert failed.prompt is not None and failed.prompt.key == "host"
+
+    done = await advance_flow(flow, step.state, {"host": "::1"})
+    assert isinstance(done, Done)
+    assert done.value == "::1"
+
+
+@pytest.mark.asyncio
 async def test_finalize_false_stops_at_terminal_then_commits():
     """The two-phase bridge: advance to the terminal boundary without folding
     (finalize=False -> Ready), then resume the sealed state to commit (Done)."""
@@ -516,8 +558,6 @@ async def test_cursor_is_carried_but_ignored_by_finish():
     # The cursor rode along in state but did not disturb the outcome.
     assert CURSOR_KEY in seen
     assert seen["a"] == "1"
-
-
 
 
 @pytest.mark.asyncio
@@ -827,6 +867,34 @@ async def test_phase_include_branches_outline_and_marks_active_step():
     assert "sign-in" not in [p.id for p in outline(flow, step.state)]
 
 
+def test_outline_hides_steps_marked_not_visible():
+    flow = Flow(
+        id="hidden",
+        title="hidden",
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "host",
+                        label="Host",
+                        fields=[StepField(key="host", label="Host")],
+                    ),
+                    ActionStep(
+                        "verify",
+                        lambda _s, _a: Advance(),
+                        label="Verify",
+                        show_in_outline=False,
+                    ),
+                ],
+            )
+        ],
+        finish=lambda _s: None,
+    )
+
+    [phase] = outline(flow)
+    assert [step.key for step in phase.steps] == ["host"]
 
 
 @pytest.mark.asyncio

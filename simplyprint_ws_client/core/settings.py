@@ -30,6 +30,10 @@ class ClientSpec:
     name: Optional[str] = None
     config_manager_t: Optional[ConfigManagerType] = None
     allow_setup: Optional[bool] = None
+    #: Camera protocol classes this client type can drive. Generic (every entry
+    #: is a library ``BaseCameraProtocol``), so an integration declares its
+    #: per-client cameras here instead of in a parallel descriptor.
+    camera_protocols: tuple[Type[BaseCameraProtocol], ...] = ()
 
     def storage_name(self, app_name: Optional[str], multiple: bool) -> Optional[str]:
         if self.name is not None:

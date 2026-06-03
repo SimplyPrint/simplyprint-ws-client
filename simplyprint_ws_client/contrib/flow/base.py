@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
+    Any,
     Awaitable,
     Callable,
     Dict,
@@ -42,9 +43,12 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Type,
     TypeVar,
     Union,
 )
+
+from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T")
 
@@ -88,22 +92,6 @@ class Choice:
 
 
 @dataclass(frozen=True)
-class Validation:
-    """Declarative validation hints for a field.
-
-    Mirrored to the client (so a superForm/zod schema can be built from them) and
-    enforceable server-side. All optional; ``message`` overrides the default text.
-    """
-
-    min: Optional[float] = None
-    max: Optional[float] = None
-    min_length: Optional[int] = None
-    max_length: Optional[int] = None
-    pattern: Optional[str] = None
-    message: Optional[str] = None
-
-
-@dataclass(frozen=True)
 class StepAction:
     """A secondary action on a screen beside the primary submit.
 
@@ -123,9 +111,9 @@ class StepField:
 
     ``field_type`` is a renderer hint (``text``/``email``/``password``/``number``/
     ``otp``/``toggle``/``textarea``/``select``); ``options`` (labelled) or
-    ``choices`` (plain) turn it into a selection; ``validation`` carries
-    declarative rules the client mirrors into its form schema. A flow never names
-    a brand here -- only the field it needs.
+    ``choices`` (plain) turn it into a selection. Validation belongs to the
+    prompt's Pydantic-derived JSON Schema, not this render descriptor. A flow
+    never names a brand here -- only the field it needs.
 
     ``value`` + ``prefilled`` describe a field whose answer is *already known* (a
     fact a discovered/seeded device carried in): the renderer shows it collapsed
@@ -144,7 +132,6 @@ class StepField:
     options: Optional[List[Choice]] = None
     default: Optional[str] = None
     placeholder: Optional[str] = None
-    validation: Optional[Validation] = None
     value: Optional[str] = None
     prefilled: bool = False
 
@@ -167,6 +154,10 @@ class StepPrompt:
     kind: str = "form"
     content: List[str] = field(default_factory=list)
     fields: List[StepField] = field(default_factory=list)
+    #: Pydantic-derived JSON Schema for the answer object this prompt accepts.
+    #: Frontends can turn it into their native validator (e.g. zod) while the
+    #: step validates the same schema server-side before advancing.
+    input_schema: Optional[Mapping[str, Any]] = None
     options: List[Choice] = field(default_factory=list)
     actions: List[StepAction] = field(default_factory=list)
     #: Markdown blocks rendered *below* the inputs (after the submit button) --
@@ -196,8 +187,6 @@ class Phase:
     label: str
     steps: Sequence["Step"] = ()
     include: Optional[Predicate] = None
-
-
 
 
 @dataclass(frozen=True)
@@ -232,8 +221,6 @@ class Reject:
 
 
 StepOutcome = Union[Ask, Advance, Reject]
-
-
 
 
 @dataclass(frozen=True)
@@ -295,14 +282,20 @@ class FlowError(RuntimeError):
     """
 
 
+class InputValidationError(ValueError):
+    """A recoverable prompt-answer validation failure."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 async def resolve(value):
     """Await ``value`` if awaitable, else return it -- so a step, a ``finish``
     or a driver callback may be written sync or async without the engine caring."""
     if inspect.isawaitable(value):
         return await value
     return value
-
-
 
 
 class Step(ABC):
@@ -321,6 +314,9 @@ class Step(ABC):
     #: Human label for this substep, surfaced in a flow's resolved outline so a UI
     #: can name the steps within each phase and mark the active one.
     label: str = ""
+    #: Whether this step should segment a UI progress outline. Instant backend
+    #: actions can run in the flow without becoming their own visible progress tick.
+    show_in_outline: bool = True
 
     @abstractmethod
     async def run(
@@ -378,7 +374,15 @@ def outline(flow: "Flow", state: Optional[Mapping[str, object]] = None) -> List[
     synchronously (phase predicates are pure state checks).
     """
     work = dict(state or {})
-    return [p for p in flow.phases if p.include is None or bool(p.include(work))]
+    phases: List[Phase] = []
+    for phase in flow.phases:
+        if phase.include is not None and not bool(phase.include(work)):
+            continue
+        visible_steps = [
+            step for step in phase.steps if getattr(step, "show_in_outline", True)
+        ]
+        phases.append(replace(phase, steps=visible_steps))
+    return phases
 
 
 def active_position(
@@ -540,3 +544,43 @@ def _as_mapping(
         return answer
     key = prompt.fields[0].key if prompt.fields else prompt.key
     return {key: answer}
+
+
+InputModel = Type[BaseModel]
+
+
+def model_input_schema(model: InputModel) -> Mapping[str, Any]:
+    """The JSON Schema a prompt exposes for the answer object it accepts."""
+    return model.model_json_schema(mode="validation")
+
+
+def validate_input(
+    model: InputModel,
+    answer: Mapping[str, object],
+    *,
+    fields: Sequence[StepField] = (),
+) -> Dict[str, object]:
+    """Validate a prompt answer with Pydantic and return JSON-safe updates.
+
+    Raises :class:`InputValidationError` with a human message when the answer is
+    malformed, so a step can re-offer the same prompt as a recoverable failure.
+    """
+    try:
+        parsed = model.model_validate(dict(answer))
+    except ValidationError as exc:
+        raise InputValidationError(_validation_message(exc, fields))
+    return dict(parsed.model_dump(mode="json", exclude_none=True))
+
+
+def _validation_message(exc: ValidationError, fields: Sequence[StepField]) -> str:
+    labels = {field.key: field.label for field in fields}
+    messages: List[str] = []
+    for error in exc.errors():
+        loc_parts = [str(part) for part in error.get("loc", ())]
+        key = loc_parts[0] if loc_parts else "input"
+        label = labels.get(key, key)
+        message = str(error.get("msg") or "Invalid value")
+        entry = f"{label}: {message}" if label else message
+        if entry not in messages:
+            messages.append(entry)
+    return "; ".join(messages) or "Please check the values and try again."

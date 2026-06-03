@@ -34,13 +34,17 @@ from .base import (
     Ask,
     Choice,
     FlowError,
+    InputModel,
+    InputValidationError,
     Reject,
     Step,
     StepAction,
     StepField,
     StepOutcome,
     StepPrompt,
+    model_input_schema,
     resolve,
+    validate_input,
 )
 
 #: A predicate on flow state gating whether a step runs. Unlike a phase's (which
@@ -89,16 +93,20 @@ class FieldsStep(Step):
         footer: Optional[Content] = None,
         actions: Optional[Sequence[StepAction]] = None,
         kind: str = "form",
+        input_model: Optional[InputModel] = None,
         include: Optional[Include] = None,
+        show_in_outline: bool = True,
     ) -> None:
         self.key = key
         self.label = label
+        self.show_in_outline = show_in_outline
         self._fields = fields
         self._help = help_text
         self._content = content or []
         self._footer = footer or []
         self._actions = list(actions or [])
         self._kind = kind
+        self._input_model = input_model
         self._include = include
 
     def _resolve_fields(self, state: Mapping[str, object]) -> List[StepField]:
@@ -118,6 +126,11 @@ class FieldsStep(Step):
             kind=self._kind,
             content=list(content),
             fields=list(fields),
+            input_schema=(
+                model_input_schema(self._input_model)
+                if self._input_model is not None
+                else None
+            ),
             actions=list(self._actions),
             footer=list(footer),
         )
@@ -154,6 +167,11 @@ class FieldsStep(Step):
             )
 
         updates = {f.key: effective(f) for f in fields if effective(f) is not None}
+        if self._input_model is not None:
+            try:
+                updates = validate_input(self._input_model, updates, fields=fields)
+            except InputValidationError as exc:
+                return Reject(str(exc), self._prompt(fields, content, footer))
         return Advance(updates)
 
 
@@ -174,8 +192,10 @@ class ChoiceStep(Step):
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
         include: Optional[Include] = None,
+        show_in_outline: bool = True,
     ) -> None:
         self.key = key
+        self.show_in_outline = show_in_outline
         self._options = list(options)
         self.label = label
         self._help = help_text
@@ -256,8 +276,10 @@ class SelectStep(Step):
         auto: bool = True,
         skip_when: Optional[Include] = None,
         include: Optional[Include] = None,
+        show_in_outline: bool = True,
     ) -> None:
         self.key = key
+        self.show_in_outline = show_in_outline
         self._source = source
         self._option = option
         self._pick = pick
@@ -353,6 +375,7 @@ class ActionStep(Step):
         *,
         label: str = "",
         include: Optional[Include] = None,
+        show_in_outline: bool = True,
         on_action: Optional[
             Mapping[
                 str, Callable[[Mapping[str, object]], Union[StepOutcome, Awaitable]]
@@ -361,6 +384,7 @@ class ActionStep(Step):
     ) -> None:
         self.key = key
         self.label = label
+        self.show_in_outline = show_in_outline
         self._action = action
         self._include = include
         self._on_action = dict(on_action or {})
