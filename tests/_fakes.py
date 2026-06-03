@@ -10,7 +10,7 @@ drive :class:`Connection` deterministically -- no real socket, no aiohttp/
 import asyncio
 from typing import List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.transport import (
+from simplyprint_ws_client.contrib.connection import (
     TransportClosed,
     WebSocketTransport,
 )

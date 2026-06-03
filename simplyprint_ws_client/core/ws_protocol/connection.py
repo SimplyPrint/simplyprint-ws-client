@@ -26,7 +26,7 @@ from ...shared.sp.url_builder import SimplyPrintURL
 from ...shared.utils.backoff import ConstantBackoff
 from ...shared.utils.bounded_variable import BoundedInterval
 from ...contrib.logging import printer_logger
-from ...contrib.transport import (
+from ...contrib.connection import (
     WS_CLOSE_OK,
     WS_CLOSE_PROTOCOL_ERROR,
     TransportError,

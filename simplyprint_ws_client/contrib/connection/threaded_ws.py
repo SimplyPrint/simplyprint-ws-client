@@ -12,7 +12,7 @@ This unifies brands that previously each grew their own retry thread or manual
 ping thread onto one supervised, stop-aware implementation.
 
 Note the deliberate name split from the async :class:`WebSocketTransport` ABC in
-:mod:`.base`: that one is the asyncio backend transport; this one is the
+:mod:`.transport`: that one is the asyncio backend transport; this one is the
 threaded, websocket-client-based printer transport. They share neither code nor
 execution model -- only the WebSocket wire.
 """
@@ -26,7 +26,7 @@ import websocket
 
 from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
 
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
+from .state import ConnectionState
 
 
 class ThreadedWebSocketTransport:
@@ -89,7 +89,6 @@ class ThreadedWebSocketTransport:
             and self.state is ConnectionState.ONLINE
         )
 
-
     def start(self) -> None:
         with self._lock:
             if (
@@ -134,7 +133,6 @@ class ThreadedWebSocketTransport:
             self.logger.error("Failed to send over WebSocket: %s", e)
             return False
 
-
     def _supervise(self) -> None:
         while not self._stop.is_set():
             try:
@@ -169,7 +167,6 @@ class ThreadedWebSocketTransport:
                 self._app_ping()
             except Exception as e:
                 self.logger.error("Error sending app-level ping: %s", e)
-
 
     def _handle_open(self, _wsapp) -> None:
         self.state = ConnectionState.ONLINE

@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("websocket")
 
-from simplyprint_ws_client.contrib.transport import (  # noqa: E402
+from simplyprint_ws_client.contrib.connection import (  # noqa: E402
     ThreadedWebSocketTransport,
 )
 from simplyprint_ws_client.contrib.connection.state import ConnectionState  # noqa: E402

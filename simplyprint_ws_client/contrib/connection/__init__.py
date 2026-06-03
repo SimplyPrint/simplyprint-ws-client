@@ -1,15 +1,25 @@
-"""Threaded connection pooling + transports for printer integrations.
+"""Connect to a printer, fan its events, and keep the link alive.
 
-The brand-agnostic pool lifecycle -- :class:`ClientBucket`,
-:class:`PooledConnection`, :class:`ConnectionManager` -- lets many clients (one
-per printer) share a smaller set of physical connections keyed by hashable
-params. Transports subclass the pool: :mod:`.mqtt` ships the paho-mqtt binding.
-The shared :class:`ConnectionState` vocabulary and the :class:`Watchdog` round
-it out.
+This is the one home for "give me a connection to X and tell me what it says".
+It owns three layers, brand-agnostic throughout:
 
-The MQTT binding is imported lazily (PEP 562 ``__getattr__``) so plain
-``import simplyprint_ws_client.contrib.connection`` never drags ``paho`` into the
-import graph; the pool / state / watchdog leaves carry no third-party imports.
+* the **pool** -- :class:`ClientBucket`, :class:`PooledConnection`,
+  :class:`ConnectionManager` -- lets many clients (one per printer) share a
+  smaller set of physical connections keyed by hashable params. Wire bindings
+  subclass the pool: :mod:`.mqtt` ships the paho-mqtt binding,
+  :mod:`.threaded_ws` the websocket-client binding.
+* the **transport** -- the async :class:`WebSocketTransport` ABC
+  (:mod:`.transport`) the SimplyPrint backend ``Connection`` drives, with the
+  two shipped wire leaves under :mod:`.transports` (``websockets`` / aiohttp).
+* the shared **vocabulary** -- :class:`ConnectionState`, the
+  :class:`TransportError` / :class:`TransportClosed` exceptions, the WS close
+  codes, and the :class:`Watchdog`.
+
+Every wire library (paho, websocket-client, websockets, aiohttp) is imported
+lazily (PEP 562 ``__getattr__``) so plain ``import
+simplyprint_ws_client.contrib.connection`` drags none of them; only the pool /
+state / transport-ABC / watchdog leaves load eagerly, and they carry no
+third-party imports.
 """
 
 from typing import TYPE_CHECKING
@@ -24,6 +34,14 @@ from simplyprint_ws_client.contrib.connection.pool import (
     now_ms,
 )
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
+from simplyprint_ws_client.contrib.connection.transport import (
+    WS_CLOSE_OK,
+    WS_CLOSE_PROTOCOL_ERROR,
+    TransportClosed,
+    TransportError,
+    TransportFactory,
+    WebSocketTransport,
+)
 from simplyprint_ws_client.contrib.connection.watchdog import Watchdog
 
 if TYPE_CHECKING:  # eager names for IDEs / type checkers
@@ -32,8 +50,16 @@ if TYPE_CHECKING:  # eager names for IDEs / type checkers
         MqttConnectionManager,
         MqttConnectionParams,
     )
+    from simplyprint_ws_client.contrib.connection.threaded_ws import (
+        ThreadedWebSocketTransport,
+    )
+    from simplyprint_ws_client.contrib.connection.transports import (
+        AiohttpWebSocketTransport,
+        WebSocketsTransport,
+    )
 
 __all__ = [
+    "AiohttpWebSocketTransport",
     "ClientBucket",
     "ConnectionManager",
     "ConnectionState",
@@ -44,7 +70,15 @@ __all__ = [
     "MqttConnectionParams",
     "PoolClient",
     "PooledConnection",
+    "ThreadedWebSocketTransport",
+    "TransportClosed",
+    "TransportError",
+    "TransportFactory",
     "Watchdog",
+    "WebSocketsTransport",
+    "WebSocketTransport",
+    "WS_CLOSE_OK",
+    "WS_CLOSE_PROTOCOL_ERROR",
     "now_ms",
 ]
 
@@ -54,4 +88,14 @@ def __getattr__(name: str):
         from simplyprint_ws_client.contrib.connection import mqtt
 
         return getattr(mqtt, name)
+    if name == "ThreadedWebSocketTransport":
+        from simplyprint_ws_client.contrib.connection.threaded_ws import (
+            ThreadedWebSocketTransport,
+        )
+
+        return ThreadedWebSocketTransport
+    if name in ("WebSocketsTransport", "AiohttpWebSocketTransport"):
+        from simplyprint_ws_client.contrib.connection import transports
+
+        return getattr(transports, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

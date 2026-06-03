@@ -45,8 +45,14 @@ def test_connection_import_does_not_load_paho():
 
 
 def test_transport_import_does_not_load_optional_libs():
+    # The unified connection package must not eager-load any wire library: the
+    # MQTT (paho), websocket-client, websockets and aiohttp leaves all stay lazy.
     _import_is_clean(
-        "import simplyprint_ws_client.contrib.transport", "websocket", "aiohttp"
+        "import simplyprint_ws_client.contrib.connection",
+        "websocket",
+        "aiohttp",
+        "paho",
+        "paho.mqtt.client",
     )
 
 
@@ -57,7 +63,6 @@ def test_contrib_init_is_import_free():
         "import simplyprint_ws_client.contrib",
         "simplyprint_ws_client.contrib.printer_client",
         "simplyprint_ws_client.contrib.connection",
-        "simplyprint_ws_client.contrib.transport",
     )
 
 

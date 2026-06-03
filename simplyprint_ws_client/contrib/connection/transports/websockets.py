@@ -10,7 +10,7 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.protocol import State
 
-from .base import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
+from ..transport import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection

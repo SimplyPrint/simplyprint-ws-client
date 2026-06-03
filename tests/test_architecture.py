@@ -307,7 +307,6 @@ class TestImportDAG:
     def test_contrib_leaves_do_not_import_printer_client(self):
         """contrib leaf modules must not import contrib.printer_client (cycle)."""
         leaves = [
-            LIB_PKG / "contrib" / "transport",
             LIB_PKG / "contrib" / "connection",
             LIB_PKG / "contrib" / "model",
             LIB_PKG / "contrib" / "transfer",

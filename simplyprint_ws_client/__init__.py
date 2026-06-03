@@ -30,7 +30,7 @@ from . import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
 # Modules whose public names are re-exported, tried light-first so resolving a
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
-    ".contrib.transport",
+    ".contrib.connection",
     ".core.config",
     ".core.settings",
     ".core.state",
@@ -107,7 +107,7 @@ def __dir__():
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
     from .contrib.printer_client import PrinterClient  # noqa: F401
-    from .contrib.transport import (  # noqa: F401
+    from .contrib.connection import (  # noqa: F401
         AiohttpWebSocketTransport,
         TransportClosed,
         TransportError,
