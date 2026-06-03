@@ -103,6 +103,23 @@ class MqttConnection(Connection[MqttConnectionParams]):
     def connected(self) -> bool:
         return self.client.is_connected()
 
+    # IO surface: clients publish/subscribe *through* the connection, so the paho
+    # client never has to be reached into from outside this class.
+
+    def publish(
+        self, topic: str, payload: object = None, qos: int = 0, retain: bool = False
+    ) -> mqtt.MQTTMessageInfo:
+        """Publish ``payload`` on ``topic``; returns paho's ``MQTTMessageInfo``."""
+        return self.client.publish(topic, payload, qos, retain)
+
+    def subscribe(self, topic: str) -> None:
+        """Subscribe this connection to ``topic``."""
+        self.client.subscribe(topic)
+
+    def unsubscribe(self, topic: str) -> None:
+        """Drop this connection's subscription to ``topic``."""
+        self.client.unsubscribe(topic)
+
     def _connect_succeeded(self, reason_code: PahoReasonCode) -> bool:
         """Whether the CONNACK indicates success. Override for stricter checks."""
         return True
@@ -175,7 +192,7 @@ class MqttConnectionManager(ConnectionManager[TClient, MqttConnectionParams]):
     def _refresh_subscription(
         self, client: TClient, connection: MqttConnection
     ) -> None:
-        connection.client.subscribe(client.report_topic)
+        connection.subscribe(client.report_topic)
 
     def _unsubscribe(self, client: TClient, connection: MqttConnection) -> None:
-        connection.client.unsubscribe(client.report_topic)
+        connection.unsubscribe(client.report_topic)
