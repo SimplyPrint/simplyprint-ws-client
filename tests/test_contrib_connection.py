@@ -15,7 +15,7 @@ from simplyprint_ws_client.contrib.connection import (
     ClientBucket,
     ConnectionManager,
     ConnectionState,
-    PooledConnection,
+    Connection,
     Watchdog,
     now_ms,
 )
@@ -130,7 +130,7 @@ class _FakeClient:
         return self._connected
 
 
-class _FakeConnection(PooledConnection):
+class _FakeConnection(Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._is_connected = True

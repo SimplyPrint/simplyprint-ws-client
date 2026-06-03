@@ -8,12 +8,12 @@ each client's config. Clients with identical params share one connection.
 Three collaborators, all transport-independent:
 
 * :class:`ClientBucket` -- thread-safe registry of clients + topic/param routing.
-* :class:`PooledConnection` -- one physical connection; transports subclass it.
+* :class:`Connection` -- one physical connection; transports subclass it.
 * :class:`ConnectionManager` -- owns the bucket + connection pool and the
   register / remove / refresh / keepalive lifecycle.
 
 Transport specifics (paho-mqtt, websockets, ...) live in sibling modules that
-subclass :class:`PooledConnection` / :class:`ConnectionManager`. Brand specifics
+subclass :class:`Connection` / :class:`ConnectionManager`. Brand specifics
 (keepalive command, topic shape, auth refresh) are subclass hooks.
 """
 
@@ -120,7 +120,6 @@ class ClientBucket(Synchronized, Generic[TClient, TParams]):
         self.params_cache: Dict[TClient, TParams] = {}
         self.params_to_clients: Dict[TParams, Set[TClient]] = {}
 
-
     def _get_or_create_params(self, client: TClient) -> Optional[TParams]:
         if client not in self.params_cache:
             try:
@@ -184,7 +183,6 @@ class ClientBucket(Synchronized, Generic[TClient, TParams]):
             self._rebuild_client_params(*clients)
             self._rebuild_topic_cache(*clients)
 
-
     def get_from_topic(self, topic: str) -> Optional[TClient]:
         with self:
             client = self.topic_to_client.get(topic)
@@ -211,7 +209,6 @@ class ClientBucket(Synchronized, Generic[TClient, TParams]):
         with self:
             return self._get_or_create_params(client)
 
-
     def add(self, client: TClient) -> None:
         with self:
             self.clients.add(client)
@@ -237,7 +234,7 @@ class ClientBucket(Synchronized, Generic[TClient, TParams]):
             return item in self.clients
 
 
-class PooledConnection(SyncStoppable, Generic[TParams]):
+class Connection(SyncStoppable, Generic[TParams]):
     """One physical connection shared by all clients with matching params.
 
     Transports (MQTT, WebSocket, ...) subclass this and translate their native
@@ -275,7 +272,6 @@ class PooledConnection(SyncStoppable, Generic[TParams]):
         """Emit ``event`` to every client sharing this connection."""
         for client in self.bucket.get_from_params(self.params):
             client.event_bus_worker.emit_sync(event, *args, **kwargs)
-
 
     def handle_connected(self) -> None:
         self.logger.info("Connected to %s", self.params)
@@ -317,7 +313,7 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
     """Owns the client bucket and the pool of physical connections.
 
     Generic over transport: subclasses implement :meth:`_create_connection`
-    (build a :class:`PooledConnection` for some params) and the keepalive hooks
+    (build a :class:`Connection` for some params) and the keepalive hooks
     :meth:`_refresh_subscription` / :meth:`_send_keepalive`.
     """
 
@@ -338,28 +334,24 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
         self.bucket: ClientBucket[TClient, TParams] = ClientBucket(
             self.params_factory, wildcard_topics=self.wildcard_topics
         )
-        self.connections: Dict[TParams, PooledConnection] = {}
+        self.connections: Dict[TParams, Connection] = {}
         self._lock = threading.Lock()
 
-
     @abstractmethod
-    def _create_connection(self, params: TParams) -> PooledConnection:
+    def _create_connection(self, params: TParams) -> Connection:
         """Build a new physical connection for ``params``."""
         raise NotImplementedError
 
-    def _refresh_subscription(
-        self, client: TClient, connection: PooledConnection
-    ) -> None:
+    def _refresh_subscription(self, client: TClient, connection: Connection) -> None:
         """Re-assert the client's subscription during keepalive (transport hook)."""
 
-    def _send_keepalive(self, client: TClient, connection: PooledConnection) -> None:
+    def _send_keepalive(self, client: TClient, connection: Connection) -> None:
         """Ask the printer to send us a message (brand keepalive command)."""
 
-    def _unsubscribe(self, client: TClient, connection: PooledConnection) -> None:
+    def _unsubscribe(self, client: TClient, connection: Connection) -> None:
         """Drop the client's subscription on removal (transport hook)."""
 
-
-    def create_or_get_connection(self, params: TParams) -> PooledConnection:
+    def create_or_get_connection(self, params: TParams) -> Connection:
         """Atomically reuse or create the single connection for ``params``."""
         with self._lock:
             if params in self.connections:
@@ -387,7 +379,6 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
             params = self.bucket.get_params(client)
             if params:
                 self.create_or_get_connection(params)
-
 
     def add_client(self, client: TClient) -> None:
         if client in self.bucket:
@@ -424,11 +415,10 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
         self.bucket.remove(client)
         self.rebuild_connections()
 
-    def get_connection_from_client(self, client: TClient) -> Optional[PooledConnection]:
+    def get_connection_from_client(self, client: TClient) -> Optional[Connection]:
         params = self.bucket.get_params(client)
         with self._lock:
             return self.connections.get(params)
-
 
     def keepalive_check(self) -> None:
         for client in list(self.bucket):
@@ -457,7 +447,6 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
 
             # Give the printer a chance to answer before we poke again.
             client.last_message_at = now_ms() - (self.keepalive_timeout_ms // 2)
-
 
     def stop(self) -> None:
         self.logger.info("Stopping connection manager")

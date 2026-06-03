@@ -23,7 +23,7 @@ from simplyprint_ws_client.contrib.connection.pool import (
     KEEPALIVE_TIMEOUT_MS,
     ClientBucket,
     ConnectionManager,
-    PooledConnection,
+    Connection,
     TClient,
 )
 
@@ -53,7 +53,7 @@ TRANSIENT_DISCONNECT_CODES = (
 )
 
 
-class MqttConnection(PooledConnection[MqttConnectionParams]):
+class MqttConnection(Connection[MqttConnectionParams]):
     """A single physical paho-mqtt connection shared by matching clients."""
 
     def __init__(
@@ -103,7 +103,6 @@ class MqttConnection(PooledConnection[MqttConnectionParams]):
     def connected(self) -> bool:
         return self.client.is_connected()
 
-
     def _connect_succeeded(self, reason_code: PahoReasonCode) -> bool:
         """Whether the CONNACK indicates success. Override for stricter checks."""
         return True
@@ -111,7 +110,6 @@ class MqttConnection(PooledConnection[MqttConnectionParams]):
     def _on_auth_failure(self, reason_code: PahoReasonCode) -> None:
         """Handle a rejected connection. Default: treat as a connect failure."""
         self.handle_connect_failed()
-
 
     def _on_connect(self, _client, _userdata, _flags, reason_code, *_a, **_kw):  # noqa
         if self._connect_succeeded(reason_code):

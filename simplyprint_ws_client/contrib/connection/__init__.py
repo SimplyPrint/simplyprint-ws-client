@@ -3,7 +3,7 @@
 This is the one home for "give me a connection to X and tell me what it says".
 It owns three layers, brand-agnostic throughout:
 
-* the **pool** -- :class:`ClientBucket`, :class:`PooledConnection`,
+* the **pool** -- :class:`ClientBucket`, :class:`Connection`,
   :class:`ConnectionManager` -- lets many clients (one per printer) share a
   smaller set of physical connections keyed by hashable params. Wire bindings
   subclass the pool: :mod:`.mqtt` ships the paho-mqtt binding,
@@ -27,10 +27,10 @@ from typing import TYPE_CHECKING
 from simplyprint_ws_client.contrib.connection.pool import (
     KEEPALIVE_TIMEOUT_MS,
     ClientBucket,
+    Connection,
     ConnectionManager,
     EventBusWorker,
     PoolClient,
-    PooledConnection,
     now_ms,
 )
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
@@ -61,6 +61,7 @@ if TYPE_CHECKING:  # eager names for IDEs / type checkers
 __all__ = [
     "AiohttpWebSocketTransport",
     "ClientBucket",
+    "Connection",
     "ConnectionManager",
     "ConnectionState",
     "EventBusWorker",
@@ -69,7 +70,6 @@ __all__ = [
     "MqttConnectionManager",
     "MqttConnectionParams",
     "PoolClient",
-    "PooledConnection",
     "ThreadedWebSocketTransport",
     "TransportClosed",
     "TransportError",
