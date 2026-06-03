@@ -31,7 +31,6 @@ def _record(name, message="msg", level=logging.INFO):
     return logging.LogRecord(name, level, __file__, 1, message, None, None)
 
 
-# -- naming + scope ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -67,7 +66,6 @@ def test_json_formatter_tags_scope():
     assert "unique_id" not in system
 
 
-# -- RoutingHandler ---------------------------------------------------------
 
 
 def _drain(handler):
@@ -252,7 +250,6 @@ def test_development_policy_keeps_noisy_debug_suppressed(tmp_path):
     assert "websocket debug" not in system
 
 
-# -- LogStore ---------------------------------------------------------------
 
 
 def _write(path, text):

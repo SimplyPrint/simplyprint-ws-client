@@ -95,7 +95,6 @@ class FileTransfer(ABC):
         self._download_thread: Optional[threading.Thread] = None
         self._download_canceller = threading.Event()
 
-    # -- prepare state ------------------------------------------------------
 
     @property
     def is_preparing_to_print(self) -> bool:
@@ -149,7 +148,6 @@ class FileTransfer(ABC):
         self.client.printer.file_progress.state = FileProgressStateEnum.READY
         self.end_prepare(reason)
 
-    # -- orchestration ------------------------------------------------------
 
     def ensure_file_and_start_thread(self, data: FileDemandData) -> None:
         start_in_thread(self.ensure_file_and_start(data))
@@ -294,7 +292,6 @@ class FileTransfer(ABC):
 
         await self._send_start(path, data, md5checksum)
 
-    # -- firmware observation -----------------------------------------------
 
     def on_print_changed(self, changes) -> None:
         """Drive the prepare terminal from a firmware state push.
@@ -342,7 +339,6 @@ class FileTransfer(ABC):
                 "client (dis)connected",
             )
 
-    # -- brand hooks --------------------------------------------------------
 
     @abstractmethod
     async def _upload(

@@ -198,7 +198,6 @@ class Phase:
     include: Optional[Predicate] = None
 
 
-# -- step outcomes (what a Step.run returns) ---------------------------------
 
 
 @dataclass(frozen=True)
@@ -235,7 +234,6 @@ class Reject:
 StepOutcome = Union[Ask, Advance, Reject]
 
 
-# -- flow results (what advancing the whole flow yields) ---------------------
 
 
 @dataclass(frozen=True)
@@ -305,7 +303,6 @@ async def resolve(value):
     return value
 
 
-# -- the Step contract -------------------------------------------------------
 
 
 class Step(ABC):

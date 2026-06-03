@@ -103,7 +103,6 @@ class MqttConnection(PooledConnection[MqttConnectionParams]):
     def connected(self) -> bool:
         return self.client.is_connected()
 
-    # -- brand hooks --------------------------------------------------------
 
     def _connect_succeeded(self, reason_code: PahoReasonCode) -> bool:
         """Whether the CONNACK indicates success. Override for stricter checks."""
@@ -113,7 +112,6 @@ class MqttConnection(PooledConnection[MqttConnectionParams]):
         """Handle a rejected connection. Default: treat as a connect failure."""
         self.handle_connect_failed()
 
-    # -- paho callbacks (run on the paho network loop thread) ---------------
 
     def _on_connect(self, _client, _userdata, _flags, reason_code, *_a, **_kw):  # noqa
         if self._connect_succeeded(reason_code):

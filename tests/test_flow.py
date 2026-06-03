@@ -35,7 +35,6 @@ from simplyprint_ws_client.contrib.flow import (
 )
 
 
-# -- a scripted driver standing in for a CLI / web wizard --------------------
 
 
 class Driver:
@@ -53,7 +52,6 @@ class Driver:
         return answers.pop(0)
 
 
-# -- onboarding-shaped flow --------------------------------------------------
 
 
 @dataclass
@@ -213,7 +211,6 @@ async def test_onboarding_stateless_round_trip_matches_in_process():
     assert step.value["access_code"] == "777"
 
 
-# -- account-login-shaped flow -----------------------------------------------
 
 
 def make_account_login_flow(*, valid: dict, challenge_users: set, codes: dict):
@@ -357,7 +354,6 @@ async def test_login_no_callback_raises_with_failed_message():
         await run_flow(flow)
 
 
-# -- engine mechanics --------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -522,7 +518,6 @@ async def test_cursor_is_carried_but_ignored_by_finish():
     assert seen["a"] == "1"
 
 
-# -- v2: branching, content, actions, manual discovery -----------------------
 
 
 @pytest.mark.asyncio
@@ -832,7 +827,6 @@ async def test_phase_include_branches_outline_and_marks_active_step():
     assert "sign-in" not in [p.id for p in outline(flow, step.state)]
 
 
-# -- v3: seedable, dynamic content, prefilled fields, recommended, insta-add --
 
 
 @pytest.mark.asyncio

@@ -89,7 +89,6 @@ class ThreadedWebSocketTransport:
             and self.state is ConnectionState.ONLINE
         )
 
-    # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
         with self._lock:
@@ -135,7 +134,6 @@ class ThreadedWebSocketTransport:
             self.logger.error("Failed to send over WebSocket: %s", e)
             return False
 
-    # -- internal threads ---------------------------------------------------
 
     def _supervise(self) -> None:
         while not self._stop.is_set():
@@ -172,7 +170,6 @@ class ThreadedWebSocketTransport:
             except Exception as e:
                 self.logger.error("Error sending app-level ping: %s", e)
 
-    # -- WebSocketApp callbacks (run on the supervisor thread) --------------
 
     def _handle_open(self, _wsapp) -> None:
         self.state = ConnectionState.ONLINE

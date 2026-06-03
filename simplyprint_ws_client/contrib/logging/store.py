@@ -104,7 +104,6 @@ class LogStore:
         self._root.mkdir(parents=True, exist_ok=True)
         return self._root
 
-    # --- scope/file resolution (traversal-safe) ----------------------------
 
     def _scope_token_ok(self, scope: str) -> bool:
         return (
@@ -145,7 +144,6 @@ class LogStore:
 
         raise LogNotFound(name)
 
-    # --- enumeration -------------------------------------------------------
 
     def list_scopes(self) -> List[LogScopeInfo]:
         """System scope first, then one entry per printer ``unique_id`` directory."""
@@ -197,7 +195,6 @@ class LogStore:
         except OSError:
             return 0.0
 
-    # --- reading (gz-aware) ------------------------------------------------
 
     def read_text(
         self,
@@ -320,7 +317,6 @@ class LogStore:
         buffer.seek(0)
         return buffer
 
-    # --- mutation ----------------------------------------------------------
 
     def delete_file(self, scope: str, name: str) -> None:
         self.resolve_file(scope, name).unlink(missing_ok=True)
@@ -338,7 +334,6 @@ class LogStore:
 
         shutil.rmtree(scope_dir, ignore_errors=True)
 
-    # --- retention (driven by the integration's scheduler) -----------------
 
     def strip_system_raw_logs(self, max_size: int = 50 * 1024 * 1024) -> None:
         """Tail-truncate the unbounded macOS raw capture logs to ``max_size``."""

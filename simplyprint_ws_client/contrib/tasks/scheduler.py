@@ -78,7 +78,6 @@ class SchedulerService:
         # Per-task runtime health, republished under TASKS_SECTION on each run.
         self._health: Dict[str, Dict[str, Any]] = {}
 
-    # --- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
         """Spin up the scheduler loop/thread, register every enabled scheduled
@@ -132,7 +131,6 @@ class SchedulerService:
                 task.cancel()
             self._loop.close()
 
-    # --- scheduling --------------------------------------------------------
 
     def _schedule_all(self) -> None:
         assert self._scheduler is not None
@@ -168,7 +166,6 @@ class SchedulerService:
         assert spec.interval is not None
         return "interval", {"seconds": spec.interval.total_seconds()}
 
-    # --- running -----------------------------------------------------------
 
     async def _fire(self, name: str) -> None:
         """The APScheduler entry point for a scheduled run (key = service-wide)."""
@@ -218,7 +215,6 @@ class SchedulerService:
         self._record(spec.name, started, error=None)
         return result
 
-    # --- observability -----------------------------------------------------
 
     def _record(self, name: str, started: float, *, error: Optional[str]) -> None:
         now = time.time()

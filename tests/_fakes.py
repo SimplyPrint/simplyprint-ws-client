@@ -50,7 +50,6 @@ class FakeTransport(WebSocketTransport):
     def is_open(self) -> bool:
         return self._open
 
-    # -- test helpers --------------------------------------------------------
 
     def open(self) -> "FakeTransport":
         """Mark connected without going through the loop (for unit tests)."""

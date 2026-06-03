@@ -92,7 +92,6 @@ def test_watchdog_does_not_expire_before_timeout():
         wd.stop()
 
 
-# -- brand-free pool fakes --------------------------------------------------
 
 
 class _FakeWorker:

@@ -136,7 +136,6 @@ class PrinterClient(
     #: not wired, so a plugin-install demand is a no-op). See :class:`AppUpdater`.
     app_updater: ClassVar[Optional[AppUpdater]] = None
 
-    # -- lifecycle template --------------------------------------------------
     # init/halt are called once per halt + initially; tick every scheduling
     # slice; teardown once at final cleanup (see Client docstring).
 
@@ -160,7 +159,6 @@ class PrinterClient(
         """Final cleanup: tear the device connection down."""
         await self._stop_connection()
 
-    # -- connection-component lifecycle hooks --------------------------------
 
     async def _start_connection(self) -> None:
         """Establish/arm the device connection. Push devices start MQTT/WS here.
@@ -182,7 +180,6 @@ class PrinterClient(
         """Drive a client-side progress shim each tick. Default no-op; devices
         with a fake-progress shim override to tick it."""
 
-    # -- connection event wiring (push devices) ------------------------------
 
     def _connection_event_bus(self) -> Optional["EventBus"]:
         """The connection component's own event bus, if it has one. Push devices
@@ -206,7 +203,6 @@ class PrinterClient(
         for event, handler in self._connection_event_bindings():
             bus.on(event, handler)
 
-    # -- connect/disconnect defaults -----------------------------------------
 
     def on_connected_to_printer(self, *_args) -> None:
         """The device connection came up: mark active and (re)resolve the
@@ -221,7 +217,6 @@ class PrinterClient(
         self.logger.info("Disconnected from printer")
         self.camera_uri = None
 
-    # -- status translation (reads/uses self.printer; no device specifics) ---
 
     @staticmethod
     def _guard_cancelling(
@@ -279,7 +274,6 @@ class PrinterClient(
             and self.printer.is_printing()
         )
 
-    # -- status application --------------------------------------------------
 
     def apply_status(
         self,
@@ -330,7 +324,6 @@ class PrinterClient(
     def _on_job_progress(self, new_status: PrinterStatus) -> None:
         """Update in-progress job fields (progress/layer/time). Default no-op."""
 
-    # -- camera --------------------------------------------------------------
 
     def _init_camera(self, **kwargs) -> None:
         """Initialise the camera mixin with the device-tuned cache constants."""
@@ -374,7 +367,6 @@ class PrinterClient(
                 "Failed to set camera URI to %s", redacted_uri, exc_info=e
             )
 
-    # -- host telemetry ------------------------------------------------------
 
     async def update_host_telemetry(self) -> None:
         """Populate the host CPU/memory sensors from the machine running the client."""
@@ -383,7 +375,6 @@ class PrinterClient(
         self.printer.cpu_info.temp = usage.get("temp")
         self.printer.cpu_info.memory = usage.get("memory")
 
-    # -- demands -------------------------------------------------------------
 
     async def on_plugin_install(self, event: PluginInstallDemandData) -> None:
         """Update the connector when SimplyPrint asks the brand to.

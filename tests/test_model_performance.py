@@ -37,7 +37,6 @@ class _Ctx:
         pass
 
 
-# -- reactive (accumulate-changeset) models ---------------------------------
 
 
 class _Leaf(ReactiveModel):
@@ -96,7 +95,6 @@ def test_recursive_changeset_throughput():
     assert elapsed < 5.0, f"changeset walk regressed: {elapsed:.3f}s for {iterations}"
 
 
-# -- merge/diff models ------------------------------------------------------
 
 
 class _DiffLeaf(BaseModel, SimpleUpdateModel):

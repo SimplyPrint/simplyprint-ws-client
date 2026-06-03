@@ -26,7 +26,6 @@ from typing import Annotated
 
 from pydantic.fields import FieldInfo
 
-# -- Exclusive (changeset: always signal) -----------------------------------
 
 _ExclusiveSentinel = object()
 _TExclusive = TypeVar("_TExclusive", bound=Any)
@@ -38,7 +37,6 @@ def _is_exclusive(field_info: FieldInfo) -> bool:
     return any(v is _ExclusiveSentinel for v in field_info.metadata)
 
 
-# -- Untracked (changeset: never tracked) -----------------------------------
 
 _UntrackedSentinel = object()
 _TUntracked = TypeVar("_TUntracked", bound=Any)
@@ -50,7 +48,6 @@ def _is_untracked(field_info: FieldInfo) -> bool:
     return any(v is _UntrackedSentinel for v in field_info.metadata)
 
 
-# -- Atomic (merge/diff: treat as a leaf) ------------------------------------
 
 _AtomicSentinel = object()
 _TAtomic = TypeVar("_TAtomic", bound=Any)
@@ -62,7 +59,6 @@ def is_atomic(field_info: FieldInfo) -> bool:
     return any(m is _AtomicSentinel for m in field_info.metadata)
 
 
-# -- ExtraInfo (merge/diff: exclude from merge) ------------------------------
 
 _ExtraSentinel = object()
 _TExtra = TypeVar("_TExtra", bound=Any)

@@ -46,39 +46,31 @@ _REEXPORT_MODULES = (
 # The curated, documented public surface. Other public names remain importable
 # (resolved lazily by __getattr__), just not advertised by ``import *``.
 _PUBLIC = (
-    # -- Author a client -------------------------------------------------
     "PrinterClient",
     "Client",
     "DefaultClient",
     "PhysicalClient",
     "ClientState",
     "configure",
-    # -- Declare + run ---------------------------------------------------
     "ClientApp",
     "ClientSettings",
     "ClientSpec",
     "ConnectionMode",
-    # -- Transport seam (swap/reuse the WebSocket transport) -------------
     "WebSocketTransport",
     "WebSocketsTransport",
     "AiohttpWebSocketTransport",
     "TransportError",
     "TransportClosed",
-    # -- Config + persistence --------------------------------------------
     "PrinterConfig",
     "Config",
     "ConfigManager",
     "ConfigManagerType",
-    # -- State you read / write ------------------------------------------
     "PrinterState",
     "PrinterStatus",
-    # -- Lifecycle events you can bind -----------------------------------
     "ClientConfigChangedEvent",
     "ClientStateChangeEvent",
-    # -- Demand payloads your handlers receive ---------------------------
     "FileDemandData",
     "PluginInstallDemandData",
-    # -- Common state models / messages integrations use -----------------
     "FileProgressState",
     "FileProgressStateEnum",
     "MaterialEntry",
