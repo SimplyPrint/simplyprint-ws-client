@@ -29,6 +29,7 @@ imported lazily so importing this module stays dependency-light.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -77,7 +78,6 @@ class SchedulerService:
         self._inflight: Dict[Tuple[str, str], asyncio.Future] = {}
         # Per-task runtime health, republished under TASKS_SECTION on each run.
         self._health: Dict[str, Dict[str, Any]] = {}
-
 
     def start(self) -> None:
         """Spin up the scheduler loop/thread, register every enabled scheduled
@@ -131,7 +131,6 @@ class SchedulerService:
                 task.cancel()
             self._loop.close()
 
-
     def _schedule_all(self) -> None:
         assert self._scheduler is not None
         startup_index = 0
@@ -166,7 +165,6 @@ class SchedulerService:
         assert spec.interval is not None
         return "interval", {"seconds": spec.interval.total_seconds()}
 
-
     async def _fire(self, name: str) -> None:
         """The APScheduler entry point for a scheduled run (key = service-wide)."""
         await self._run(self._registry.get(name), key="")
@@ -184,6 +182,17 @@ class SchedulerService:
         spec = self._registry.get(name)
         fut = asyncio.run_coroutine_threadsafe(self._run(spec, key=key), self._loop)
         return await asyncio.wrap_future(fut)
+
+    def fire(self, name: str, *, key: str = "") -> "concurrent.futures.Future":
+        """Fire-and-forget ``name`` from synchronous code -- the sync sibling of
+        :meth:`trigger`. Schedules the run on the scheduler loop and returns its
+        Future without awaiting; coalesces under the same single-flight guard, so
+        firing an already-running ``(name, key)`` joins it rather than duplicating.
+        """
+        if not self._started or self._loop is None:
+            raise RuntimeError("SchedulerService is not started")
+        spec = self._registry.get(name)
+        return asyncio.run_coroutine_threadsafe(self._run(spec, key=key), self._loop)
 
     async def _run(self, spec: TaskSpec, key: str) -> object:
         """Single-flight wrapper -- one in-flight run per (name, key); late
@@ -214,7 +223,6 @@ class SchedulerService:
             raise
         self._record(spec.name, started, error=None)
         return result
-
 
     def _record(self, name: str, started: float, *, error: Optional[str]) -> None:
         now = time.time()
