@@ -335,6 +335,10 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
             self.params_factory, wildcard_topics=self.wildcard_topics
         )
         self.connections: Dict[TParams, Connection] = {}
+        #: Clients that asked to be registered (via :meth:`request_registration`).
+        #: Re-attempted by :meth:`reconcile_registrations` until they land in the
+        #: bucket -- the harness-owned replacement for a per-client retry thread.
+        self._wanted: Set[TClient] = set()
         self._lock = threading.Lock()
 
     @abstractmethod
@@ -381,20 +385,60 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
                 self.create_or_get_connection(params)
 
     def add_client(self, client: TClient) -> None:
+        # Idempotent: registering an already-registered client is a no-op (the
+        # reconcile sweep may race a successful registration).
         if client in self.bucket:
-            raise ValueError("Client already registered")
+            return
 
-        self.bucket.add(client)
-
+        # Transactional: validate params BEFORE mutating the bucket, so a client
+        # whose config can't yet produce params stays OUT of the bucket and is
+        # cleanly retryable -- never half-registered.
         params = self.bucket.get_params(client)
         if not params:
             raise ValueError("Failed to create connection params")
+
+        self.bucket.add(client)
 
         connection = self.create_or_get_connection(params)
 
         # If the shared connection is already up, let this client know now.
         if connection.connected:
             client.event_bus_worker.emit_sync(self.connected_event)
+
+    def request_registration(self, client: TClient) -> None:
+        """Register ``client`` now, retried by the keepalive sweep until it lands.
+
+        The harness-owned replacement for a per-client registration retry
+        thread: record the intent, attempt it once, and -- if the config can't
+        yet produce params (e.g. the printer was offline at connector boot) --
+        leave it for :meth:`reconcile_registrations` to re-attempt on the next
+        keepalive sweep. A registration only has to succeed once; the transport
+        reconnects on its own thereafter.
+        """
+        with self._lock:
+            self._wanted.add(client)
+        self._try_register(client)
+
+    def _try_register(self, client: TClient) -> bool:
+        try:
+            self.add_client(client)
+            return True
+        except Exception as e:
+            client.logger.warning("Deferring registration: %s", e)
+            return False
+
+    def reconcile_registrations(self) -> None:
+        """Re-attempt registration for any wanted client not yet in the bucket.
+
+        Driven from :meth:`keepalive_check` so the harness's existing periodic
+        sweep also covers a client whose params only became valid after it first
+        asked to register. A still-unready client simply fails again next sweep.
+        """
+        with self._lock:
+            wanted = list(self._wanted)
+        for client in wanted:
+            if client not in self.bucket:
+                self._try_register(client)
 
     def refresh_client(self, client: TClient) -> None:
         """Recompute a client's params (config changed) and reconcile the pool."""
@@ -405,6 +449,9 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
         self.rebuild_connections(client)
 
     def remove_client(self, client: TClient) -> None:
+        with self._lock:
+            self._wanted.discard(client)
+
         if client not in self.bucket:
             return
 
@@ -421,6 +468,11 @@ class ConnectionManager(SyncStoppable, Generic[TClient, TParams]):
             return self.connections.get(params)
 
     def keepalive_check(self) -> None:
+        # Re-attempt any deferred registrations first -- a client that asked to
+        # register but wasn't ready yet (offline at boot) lands here on the next
+        # sweep without needing its own retry thread.
+        self.reconcile_registrations()
+
         for client in list(self.bucket):
             # Not connected -> nothing to keep alive; the transport reconnects.
             if not client.connected:

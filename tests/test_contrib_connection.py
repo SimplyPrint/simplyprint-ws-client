@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from simplyprint_ws_client.contrib.connection import (
     ClientBucket,
     ConnectionManager,
@@ -95,8 +97,6 @@ def test_watchdog_does_not_expire_before_timeout():
         assert not wd.expired
     finally:
         wd.stop()
-
-
 
 
 class _FakeWorker:
@@ -255,5 +255,97 @@ def test_pooled_connection_fans_events_to_all_clients():
 
         assert ("disconnected", ("bye",)) in a.event_bus_worker.events
         assert ("disconnected", ("bye",)) in b.event_bus_worker.events
+    finally:
+        manager.stop()
+
+
+class _GateConfig:
+    """A config whose params only become valid once ``ready`` flips True."""
+
+    def __init__(self, host: str):
+        self.host = host
+        self.ready = True
+
+
+def _gate_params(config: "_GateConfig") -> str:
+    if not config.ready:
+        raise ValueError("params not ready")
+    return config.host
+
+
+class _GateClient(_FakeClient):
+    def __init__(self, host: str, topic: str, *, ready: bool = True):
+        super().__init__(host, topic)
+        self.config = _GateConfig(host)
+        self.config.ready = ready
+
+
+class _GateManager(_FakeManager):
+    params_factory = staticmethod(_gate_params)
+
+
+def test_add_client_is_idempotent():
+    manager = _GateManager()
+    try:
+        a = _GateClient("10.0.0.1", "devices/a/report")
+        manager.add_client(a)
+        manager.add_client(a)  # second add is a no-op, not an error
+        assert a in manager.bucket
+        assert len(manager.connections) == 1
+    finally:
+        manager.stop()
+
+
+def test_add_client_is_transactional_on_unready_params():
+    manager = _GateManager()
+    try:
+        a = _GateClient("10.0.0.1", "devices/a/report", ready=False)
+        with pytest.raises(ValueError):
+            manager.add_client(a)
+        # A failed add leaves the client OUT of the bucket -- never half-registered.
+        assert a not in manager.bucket
+        assert len(manager.connections) == 0
+    finally:
+        manager.stop()
+
+
+def test_request_registration_defers_then_reconcile_and_keepalive_retry():
+    manager = _GateManager()
+    try:
+        # Params not ready (printer offline at boot): registration is deferred.
+        a = _GateClient("10.0.0.1", "devices/a/report", ready=False)
+        manager.request_registration(a)
+        assert a not in manager.bucket
+
+        # Params become valid; an explicit reconcile registers it.
+        a.config.ready = True
+        manager.reconcile_registrations()
+        assert a in manager.bucket
+
+        # And the keepalive sweep drives reconcile too: a fresh deferred client
+        # lands on the next keepalive_check without its own retry thread.
+        b = _GateClient("10.0.0.2", "devices/b/report", ready=False)
+        manager.request_registration(b)
+        assert b not in manager.bucket
+        b.config.ready = True
+        manager.keepalive_check()
+        assert b in manager.bucket
+    finally:
+        manager.stop()
+
+
+def test_remove_client_is_not_resurrected_by_reconcile():
+    manager = _GateManager()
+    try:
+        a = _GateClient("10.0.0.1", "devices/a/report")
+        manager.request_registration(a)
+        assert a in manager.bucket
+
+        manager.remove_client(a)
+        assert a not in manager.bucket
+        # A removed client is dropped from the wanted set, so reconcile won't
+        # re-add it.
+        manager.reconcile_registrations()
+        assert a not in manager.bucket
     finally:
         manager.stop()
