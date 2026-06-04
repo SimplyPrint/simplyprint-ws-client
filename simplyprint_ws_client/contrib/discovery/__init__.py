@@ -35,6 +35,7 @@ from simplyprint_ws_client.contrib.discovery.multicast import (
     scan_blocking,
 )
 from simplyprint_ws_client.contrib.discovery.subnet import SubnetScanBackend
+from simplyprint_ws_client.contrib.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.contrib.discovery.service import DiscoveryService
 from simplyprint_ws_client.contrib.discovery.results import (
     DiscoveryResult,
@@ -62,6 +63,7 @@ __all__ = [
     "MulticastDiscoveryBackend",
     "scan_blocking",
     "SubnetScanBackend",
+    "DiscoveryServiceHost",
     "DiscoveryService",
     "DiscoveryResult",
     "DiscoveryResultsStore",

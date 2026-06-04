@@ -1,14 +1,14 @@
 """The single, process-wide owner of LAN discovery.
 
 One injected :class:`DiscoveryService` holds every brand's discovery backend and
-a shared event bus. Passive multicast backends run always-on (one thread each);
+a shared event bus. The always-on multicast backends run on a single harness
+thread + loop owned by a :class:`DiscoveryServiceHost` (not a thread each);
 printer clients subscribe to ``event_bus`` for live device updates and onboarding
-reads :meth:`snapshot`. Active subnet scans (added later) run on demand via
-:meth:`scan`.
+reads :meth:`snapshot`. Active subnet scans run on demand via :meth:`scan`.
 
-The service is a thin owner: each multicast backend keeps its own thread + loop,
-but the service exposes a single synchronous :meth:`stop` so the supervisor can
-shut discovery down like any other background service.
+The service is a thin owner: the host runs + supervises (restarts on death) the
+listener coroutines, and the service exposes a single synchronous :meth:`stop` so
+the supervisor can shut discovery down like any other background service.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Iterable, Mapping
 
 from simplyprint_ws_client.events import EventBus
 
+from simplyprint_ws_client.contrib.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.contrib.discovery.multicast import MulticastDiscoveryBackend
 from simplyprint_ws_client.contrib.discovery.network import (
     HostDiagnostic,
@@ -39,6 +40,7 @@ class DiscoveryService:
         multicast_specs: Iterable[MulticastSpec] = (),
         subnet_specs: Iterable[SubnetScanSpec] = (),
         network_services: Mapping[str, tuple[NetworkServiceSpec, ...]] | None = None,
+        restart_interval: float = 5.0,
     ) -> None:
         self.logger = logging.getLogger("discovery")
         self.event_bus = EventBus()
@@ -46,6 +48,8 @@ class DiscoveryService:
             spec.brand: MulticastDiscoveryBackend(spec, self.event_bus)
             for spec in multicast_specs
         }
+        self._restart_interval = restart_interval
+        self._host: DiscoveryServiceHost | None = None
         self._subnet = {spec.brand: spec for spec in subnet_specs}
         self._network_services = dict(network_services or {})
         for spec in self._subnet.values():
@@ -68,23 +72,18 @@ class DiscoveryService:
             self._scan_context_users = 0
 
     def start(self) -> None:
-        """Start every always-on (multicast) backend."""
-        for backend in self._multicast.values():
-            backend.run_detached()
+        """Start the host that runs (and restarts on death) every multicast backend."""
+        self._host = DiscoveryServiceHost(
+            self._multicast.values(),
+            restart_interval=self._restart_interval,
+            logger=self.logger,
+        )
+        self._host.start()
         self._stopped = False
 
     def is_stopped(self) -> bool:
-        """True when any always-on backend has died (the supervisor restarts it)."""
-        return any(backend.is_stopped() for backend in self._multicast.values())
-
-    def restart_dead(self) -> None:
-        """Re-launch only the backends that have stopped."""
-        for backend in self._multicast.values():
-            if backend.is_stopped():
-                self.logger.warning(
-                    "restarting dead discovery backend %s", backend.spec.brand
-                )
-                backend.run_detached()
+        """True once :meth:`stop` has shut discovery down."""
+        return self._stopped
 
     def snapshot(self, brand: str) -> list:
         """Devices currently in a brand's passive cache (empty if none)."""
@@ -155,5 +154,5 @@ class DiscoveryService:
         if self._stopped:
             return
         self._stopped = True
-        for backend in self._multicast.values():
-            backend.stop()
+        if self._host is not None:
+            self._host.shutdown()

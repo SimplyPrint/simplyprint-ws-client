@@ -7,10 +7,9 @@ emit the spec's event. The backend holds no brand knowledge -- group/port,
 optional search payload, header mapping and cache key all come from the spec.
 
 A *passive* spec (no ``search_payload``) only listens for announcements; an
-*active* spec additionally sends periodic searches. Each backend owns its own
-thread + asyncio loop, mirroring the per-brand SSDP services it replaces
-(``AsyncStoppable.wait`` binds to the running loop, so a dedicated loop per
-listener is required).
+*active* spec additionally sends periodic searches. :meth:`run` is a long-lived
+coroutine; the harness runs every backend's ``run()`` concurrently on one shared
+loop (see :class:`DiscoveryServiceHost`), so no backend owns a thread of its own.
 """
 
 from __future__ import annotations
@@ -20,13 +19,10 @@ import errno
 import logging
 import socket
 import struct
-import threading
 import time
-from typing import Optional
 
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.shared.asyncio.event_loop_runner import Runner
 from simplyprint_ws_client.shared.utils.stoppable import AsyncStoppable
 
 from simplyprint_ws_client.contrib.discovery.spec import MulticastSpec
@@ -94,7 +90,6 @@ class MulticastDiscoveryBackend(
         self.event_bus = event_bus
         self.logger = logging.getLogger("discovery")
         self.devices = ExpiringDict(ttl=_DEVICE_TTL)
-        self._thread: Optional[threading.Thread] = None
         # blocking=True -> the async ``emit`` (the wrapped callable is awaited in
         # the backend loop); identical to the per-brand services this replaces.
         self._emit = event_bus.emit_wrap(spec.event_type, blocking=True)
@@ -191,23 +186,6 @@ class MulticastDiscoveryBackend(
 
         self.logger.info("discovery for %s stopping", self.spec.brand)
 
-    def run_blocking(self) -> None:
-        with Runner() as runner:
-            runner.run(self.run())
-
-    def run_detached(self) -> None:
-        if self._thread:
-            self.logger.warning(
-                "discovery backend %s already running - restarting", self.spec.brand
-            )
-            self.stop()
-            self.clear()
-
-        self._thread = threading.Thread(
-            target=self.run_blocking, daemon=True, name=f"discovery-{self.spec.brand}"
-        )
-        self._thread.start()
-
     def stop(self) -> None:
         if self.is_stopped():
             return
@@ -216,10 +194,6 @@ class MulticastDiscoveryBackend(
             self.event_loop.call_soon_threadsafe(super().stop)
         else:
             super().stop()
-
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
 
 
 def scan_blocking(spec: MulticastSpec, timeout: float = 5.0) -> list:
