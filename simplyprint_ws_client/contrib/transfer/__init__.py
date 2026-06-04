@@ -7,7 +7,6 @@ subclasses it. Active-job bookkeeping at prepare start is now owned by
 integration's file handler also composes live here too.
 """
 
-from simplyprint_ws_client.contrib.transfer.concurrency import start_in_thread
 from simplyprint_ws_client.contrib.transfer.download import download_to_file
 from simplyprint_ws_client.contrib.transfer.file_transfer import (
     FileTransfer,
@@ -20,5 +19,4 @@ __all__ = [
     "FirmwareStartOutcome",
     "PreparedPrint",
     "download_to_file",
-    "start_in_thread",
 ]

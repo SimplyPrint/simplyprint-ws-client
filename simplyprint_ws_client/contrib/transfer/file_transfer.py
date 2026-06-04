@@ -44,7 +44,6 @@ from simplyprint_ws_client.shared.files.file_download import FileDownload
 from simplyprint_ws_client.shared.utils.slugify import slugify
 
 from simplyprint_ws_client.contrib.transfer.checksum import file_md5
-from simplyprint_ws_client.contrib.transfer.concurrency import start_in_thread
 
 if TYPE_CHECKING:
     from simplyprint_ws_client import DefaultClient
@@ -90,11 +89,17 @@ class FileTransfer(ABC):
         self._prepare_transfer_type: Optional[str] = None
         self._prepare_awaiting_since: Optional[float] = None
 
-        self._download_thread_meta_lock = threading.Lock()
-        self._download_lock = threading.Lock()
-        self._download_thread: Optional[threading.Thread] = None
+        # The transfer runs as an asyncio.Task on the client's own event loop; a
+        # new dispatch preempts the one in flight (cooperative cancel + await).
+        # The canceller stays a threading.Event -- it is only ever polled via
+        # is_set() at the cooperative checkpoints, never awaited.
+        self._download_task_lock = asyncio.Lock()
+        self._download_lock = asyncio.Lock()
+        self._download_task: Optional["asyncio.Task"] = None
         self._download_canceller = threading.Event()
-
+        # Strong ref to the scheduled task until it registers itself as
+        # _download_task (asyncio only weakly references tasks).
+        self._download_dispatch: Optional["asyncio.Task"] = None
 
     @property
     def is_preparing_to_print(self) -> bool:
@@ -148,31 +153,37 @@ class FileTransfer(ABC):
         self.client.printer.file_progress.state = FileProgressStateEnum.READY
         self.end_prepare(reason)
 
-
-    def ensure_file_and_start_thread(self, data: FileDemandData) -> None:
-        start_in_thread(self.ensure_file_and_start(data))
+    def ensure_file_and_start_task(self, data: FileDemandData) -> None:
+        """Schedule the prepare-and-start on the client's event loop, returning
+        immediately. A new call preempts any transfer still in flight (see
+        :meth:`ensure_file_and_start`)."""
+        self._download_dispatch = asyncio.create_task(self.ensure_file_and_start(data))
 
     async def ensure_file_and_start(self, data: FileDemandData) -> None:
         """Ensure the SP file is on the printer and, if auto-start is set,
         start it. A new call cancels any transfer still in flight."""
-        # Take over as the active download thread, signalling any in-flight
-        # transfer to cancel. The previous thread's join() must happen OFF the
-        # loop thread (it can block on a slow upload), so we capture it under
-        # the meta-lock with the canceller already set, release the lock, then
-        # await the join in an executor. The set -> join -> clear ordering is
-        # preserved: set under the lock, join in the executor, clear after.
-        with self._download_thread_meta_lock:
-            prev = self._download_thread
+        # Take over as the active download task, signalling any in-flight
+        # transfer to cancel, then await it. Because the transfer runs as a task
+        # on this loop, awaiting the previous one suspends only this coroutine
+        # (the previous task cooperates via the canceller and bows out) -- the
+        # loop keeps running. The set -> await -> clear ordering mirrors the old
+        # set -> join -> clear: set under the lock, await the previous task,
+        # clear after.
+        async with self._download_task_lock:
+            prev = self._download_task
             if prev is not None:
                 self._download_canceller.set()
-            self._download_thread = threading.current_thread()
+            self._download_task = asyncio.current_task()
 
         if prev is not None:
-            await asyncio.get_running_loop().run_in_executor(None, prev.join)
+            try:
+                await prev
+            except asyncio.CancelledError:
+                pass
 
         self._download_canceller.clear()
 
-        with self._download_lock:
+        async with self._download_lock:
             self._set_active_job_for_prepare(data.job_id, data.action_token)
 
             try:
@@ -292,7 +303,6 @@ class FileTransfer(ABC):
 
         await self._send_start(path, data, md5checksum)
 
-
     def on_print_changed(self, changes) -> None:
         """Drive the prepare terminal from a firmware state push.
 
@@ -338,7 +348,6 @@ class FileTransfer(ABC):
                 "Printer connection changed during file transfer",
                 "client (dis)connected",
             )
-
 
     @abstractmethod
     async def _upload(
