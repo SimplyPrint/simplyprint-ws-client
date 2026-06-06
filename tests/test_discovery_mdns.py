@@ -68,3 +68,59 @@ def test_mdns_spec_defaults():
     assert spec.port == 5353
     assert spec.query_interval == 30.0
     assert spec.follow_up(object()) == ()  # default: no DNS-SD chaining
+
+
+import asyncio
+import pytest
+from simplyprint_ws_client.events import Event, EventBus
+from simplyprint_ws_client.events.event import sync_only
+
+
+@sync_only
+class _ProbeEvent(Event):
+    ...
+
+
+def _ultimaker_response():
+    return _response_wire([
+        ("_ultimaker._tcp.local.", "PTR", "um._ultimaker._tcp.local."),
+        ("um._ultimaker._tcp.local.", "SRV", "0 0 80 um.local."),
+        ("um.local.", "A", "192.0.2.7"),
+    ])
+
+
+def _single_stage_spec():
+    from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
+
+    def mapper(response, addr):
+        for srv in response.srv_records():
+            ip = response.address_for(srv.target) or addr[0]
+            return {"host": ip, "name": srv.name}
+        return None
+
+    return MDNSSpec(
+        brand="probe",
+        queries=("_ultimaker._tcp.local",),
+        event_type=_ProbeEvent,
+        mapper=mapper,
+        key=lambda record: record["host"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_caches_and_emits():
+    from simplyprint_ws_client.contrib.discovery.mdns import MDNSDiscoveryBackend
+
+    bus = EventBus()
+    received = []
+    bus.on(_ProbeEvent, lambda record: received.append(record))
+
+    backend = MDNSDiscoveryBackend(_single_stage_spec(), bus)
+    protocol = backend._protocol_factory()
+    protocol.datagram_received(_ultimaker_response(), ("192.0.2.7", 5353))
+    await asyncio.sleep(0)
+
+    devices = backend.get_devices()
+    assert len(devices) == 1
+    assert devices[0]["host"] == "192.0.2.7"
+    assert len(received) == 1
