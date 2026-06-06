@@ -1,32 +1,28 @@
-"""Shared threaded WebSocket transport (websocket-client).
+"""The blocking websocket-client wire (the WS family's lowest leaf).
 
-Unlike MQTT, WebSocket printers are *not* pooled -- each printer owns one
-``WebSocketApp`` on its own daemon thread. So the shared piece here is a small
-transport object that brand clients *compose* (hold one) rather than subclass:
-it owns the socket, the supervised connect/reconnect loop, an optional
-app-level ping, and :class:`ConnectionState` tracking. The brand client keeps
-its own message parsing, protocol and event emission and just wires three
-callbacks (``on_message`` / ``on_connected`` / ``on_disconnected``).
-
-This unifies brands that previously each grew their own retry thread or manual
-ping thread onto one supervised, stop-aware implementation.
+A single, supervised ``WebSocketApp`` on its own daemon thread: it owns the
+socket, the connect/reconnect loop, an optional app-level ping, and
+:class:`ConnectionState` tracking, and exposes three callbacks (``on_message`` /
+``on_connected`` / ``on_disconnected``) plus ``send``. It knows nothing of pools,
+leases or events -- :class:`~.sync_ws.ThreadedWsTransport` wraps one of these and
+translates its callbacks into :class:`TransportEvent` s carried onto the consumer
+loop by a :class:`~simplyprint_ws_client.shared.asyncio.courier.Courier`.
 
 Note the deliberate name split from the async :class:`WebSocketTransport` ABC in
 :mod:`.transport`: that one is the asyncio backend transport; this one is the
-threaded, websocket-client-based printer transport. They share neither code nor
-execution model -- only the WebSocket wire.
+threaded, websocket-client-based printer wire. They share neither code nor
+execution model -- only the WebSocket protocol.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Hashable, NamedTuple, Optional, Type
+from typing import Any, Callable, Optional
 
 import websocket
 
 from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
 
-from .pool import ClientBucket, Connection, ConnectionManager, TClient
 from .state import ConnectionState
 
 
@@ -42,6 +38,7 @@ class ThreadedWebSocketTransport:
     DEFAULT_PING_INTERVAL = 5
     DEFAULT_PING_TIMEOUT = 2
     DEFAULT_RECONNECT = 5
+    DEFAULT_STOP_TIMEOUT = 5.0
 
     def __init__(
         self,
@@ -59,6 +56,7 @@ class ThreadedWebSocketTransport:
         app_ping_interval: float = 30.0,
         header: Optional[Any] = None,
         backoff: Optional[Backoff] = None,
+        stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     ) -> None:
         self.url = url
         self.logger = logger
@@ -73,6 +71,7 @@ class ThreadedWebSocketTransport:
         self._app_ping_interval = app_ping_interval
         self._header = header
         self._backoff = backoff or ConstantBackoff()
+        self._stop_timeout = stop_timeout
 
         self.state: ConnectionState = ConnectionState.OFFLINE
         self.wsapp: Optional[websocket.WebSocketApp] = None
@@ -116,11 +115,30 @@ class ThreadedWebSocketTransport:
         self._stop.set()
         with self._lock:
             wsapp = self.wsapp
+            supervisor_thread = self._supervisor_thread
+            ping_thread = self._ping_thread
         if wsapp is not None:
             try:
                 wsapp.close()
             except Exception as e:
                 self.logger.warning("Failed to close WebSocket: %s", e)
+        self._join_thread(supervisor_thread, "supervisor")
+        self._join_thread(ping_thread, "ping")
+        with self._lock:
+            if (
+                self._supervisor_thread is not None
+                and not self._supervisor_thread.is_alive()
+            ):
+                self._supervisor_thread = None
+            if self._ping_thread is not None and not self._ping_thread.is_alive():
+                self._ping_thread = None
+
+    def _join_thread(self, thread: Optional[threading.Thread], label: str) -> None:
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=self._stop_timeout)
+        if thread.is_alive():
+            self.logger.warning("WebSocket %s thread did not stop", label)
 
     def send(self, data: str) -> bool:
         wsapp = self.wsapp
@@ -193,103 +211,3 @@ class ThreadedWebSocketTransport:
         self.logger.error("%s", error)
         if self._on_error is not None:
             self._on_error(error)
-
-
-class WsConnectionParams(NamedTuple):
-    """Hashable identity of a websocket endpoint -- one per printer host."""
-
-    url: str
-
-    def __str__(self) -> str:
-        return self.url
-
-
-class WsConnection(Connection[WsConnectionParams]):
-    """A websocket-client connection, pooled like any other :class:`Connection`.
-
-    Composes the proven :class:`ThreadedWebSocketTransport` (which owns the one
-    unavoidable blocking ``run_forever`` daemon thread) and adapts its callbacks
-    onto the pool lifecycle: ``on_connected`` -> :meth:`handle_connected`,
-    ``on_message`` -> fan ``message_event`` to every client on this connection,
-    ``on_disconnected`` -> :meth:`handle_disconnected`. The blocking thread is
-    owned here, by the pool -- never by a brand client.
-
-    The optional ``app_ping`` is the brand keep-warm callback the transport fires
-    on its own cadence (e.g. a device that needs a periodic poke); leave it
-    ``None`` to rely on the WebSocket protocol ping alone.
-    """
-
-    def __init__(
-        self,
-        bucket: ClientBucket,
-        params: WsConnectionParams,
-        *,
-        connected_event: Hashable,
-        disconnected_event: Hashable,
-        message_event: Hashable,
-        app_ping: Optional[Callable[[], None]] = None,
-        app_ping_interval: float = 30.0,
-        header: Optional[Any] = None,
-        **kwargs: object,
-    ) -> None:
-        super().__init__(
-            bucket,
-            params,
-            connected_event=connected_event,
-            disconnected_event=disconnected_event,
-            **kwargs,
-        )
-
-        self.message_event = message_event
-        self.transport = ThreadedWebSocketTransport(
-            params.url,
-            logger=self.logger,
-            on_message=self._on_message,
-            on_connected=self.handle_connected,
-            on_disconnected=self._on_disconnected,
-            app_ping=app_ping,
-            app_ping_interval=app_ping_interval,
-            header=header,
-        )
-        self.transport.start()
-
-    @property
-    def connected(self) -> bool:
-        return self.transport.connected
-
-    def send(self, data: str) -> bool:
-        """Write a text frame over this connection."""
-        return self.transport.send(data)
-
-    def _on_message(self, message: str) -> None:
-        self.emit_sync_all(self.message_event, message)
-
-    def _on_disconnected(self, reason: str = "") -> None:
-        self.handle_disconnected(reason=reason)
-
-    def stop(self) -> None:
-        super().stop()
-        self.transport.stop()
-
-
-class WsConnectionManager(ConnectionManager[TClient, WsConnectionParams]):
-    """Connection manager for websocket-client transports.
-
-    Concrete brand managers set the event types + ``params_factory`` (as class
-    attributes) and override :attr:`connection_class` for a brand-specific
-    :class:`WsConnection`. WebSocket printers are 1:1 (one client per host), so
-    there is no topic routing and no subscribe step -- the manager just owns the
-    pooled connection's lifecycle and event fan-out.
-    """
-
-    connection_class: Type[WsConnection] = WsConnection
-
-    def _create_connection(self, params: WsConnectionParams) -> WsConnection:
-        return self.connection_class(
-            bucket=self.bucket,
-            params=params,
-            connected_event=self.connected_event,
-            disconnected_event=self.disconnected_event,
-            message_event=self.message_event,
-            parent_stoppable=self,
-        )

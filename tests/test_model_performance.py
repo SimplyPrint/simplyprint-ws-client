@@ -37,8 +37,6 @@ class _Ctx:
         pass
 
 
-
-
 class _Leaf(ReactiveModel):
     a: int = 0
     b: float = 0.0
@@ -93,8 +91,6 @@ def test_recursive_changeset_throughput():
         f"\nmodel_recursive_changeset: {iterations / elapsed:,.0f}/s ({elapsed:.3f}s)"
     )
     assert elapsed < 5.0, f"changeset walk regressed: {elapsed:.3f}s for {iterations}"
-
-
 
 
 class _DiffLeaf(BaseModel, SimpleUpdateModel):

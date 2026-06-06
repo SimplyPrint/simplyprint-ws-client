@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import (
+    TYPE_CHECKING,
     Union,
     Iterator,
     Iterable,
@@ -8,9 +9,13 @@ from typing import (
     AsyncIterator,
     Coroutine,
     ClassVar,
+    Optional,
 )
 
 from yarl import URL
+
+if TYPE_CHECKING:
+    from ..worker.context import ExecutionContext
 
 # Typically JPEG bytes.
 FrameT = Union[bytes, bytearray, memoryview]
@@ -48,6 +53,13 @@ class BaseCameraProtocol(ABC, Iterable[FrameT], AsyncIterable[FrameT]):
     """Camera polling mode"""
     is_async: ClassVar[bool] = False
     """Is the camera protocol async?"""
+
+    execution_context: ClassVar[Optional["ExecutionContext"]] = None
+    """Explicit override for where this protocol runs. When ``None`` the pool
+    routes it: an async protocol runs INLINE on the consumer loop (no process, no
+    pickle); a sync protocol runs in a worker PROCESS (CPU-isolated, the proven
+    path). Set it to ``THREAD`` to run an async camera in its own thread, or to
+    force any protocol onto a specific context."""
 
     uri: URL
     """Configuration URI for the camera protocol, and the only input we have access to."""

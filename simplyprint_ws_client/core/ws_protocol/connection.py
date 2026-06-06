@@ -21,12 +21,13 @@ from .messages import ClientMsg, ServerMsg, ClientMsgType
 from ..config import PrinterConfig
 from ...events import EventBus
 from ...shared.asyncio.continuous_task import ContinuousTask
+from ...shared.asyncio.courier import Courier, OverflowPolicy
 from ...shared.asyncio.event_loop_provider import EventLoopProvider
 from ...shared.sp.url_builder import SimplyPrintURL
 from ...shared.utils.backoff import ConstantBackoff
 from ...shared.utils.bounded_variable import BoundedInterval
 from ...contrib.logging import printer_logger
-from ...contrib.connection import (
+from ...contrib.connection.wire import (
     WS_CLOSE_OK,
     WS_CLOSE_PROTOCOL_ERROR,
     TransportError,
@@ -161,9 +162,35 @@ class Connection(
         self.event_bus = EventBus[ConnectionEvent]()
         self.event_bus.on(ConnectionOutgoingEvent, self.send)
 
+        # Lifetime/message events used to go out via `event_bus.emit_task`, which
+        # allocates a concurrent.futures.Future per event even though these run on
+        # the loop already. The courier delivers them with the same ordered,
+        # deferred, single-loop semantics -- no per-event Future, coalesced
+        # wakeups -- reusing the bus's own loop provider so resolution is
+        # identical. UNBOUNDED: dropping a lifetime event would desync `v`.
+        self._event_courier: Courier = Courier(
+            sink=self._emit_event,
+            is_async_sink=True,
+            provider=self.event_bus.event_loop_provider,
+            policy=OverflowPolicy.UNBOUNDED,
+        )
+
         self._state = State.NOT_CONNECTED
         self._queue = asyncio.Queue()
         self._loop_task = ContinuousTask(self._loop, provider=self)
+
+    async def _emit_event(self, item) -> None:
+        """Courier sink: re-emit one ``(event, args)`` on the event bus, in order."""
+        event, args = item
+        await self.event_bus.emit(event, *args)
+
+    def _post(self, event: object, *args: object) -> None:
+        """Queue a lifetime/message event for ordered delivery on the loop.
+
+        Drop-in for the old ``event_bus.emit_task(event, *args)`` at every site,
+        but coalesced and without a per-event future.
+        """
+        self._event_courier.post((event, args))
 
     def __hash__(self):
         return hash(id(self))
@@ -196,7 +223,7 @@ class Connection(
         await self.transport.close(code=code, reason=reason)
         self.transport = None
         self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
-        _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
+        self._post(ConnectionLostEvent(self.v))
         self.v += 1
         self.logger.info("Manually closed connection.")
 
@@ -330,7 +357,7 @@ class Connection(
                     wait_first_msg_task.discard()
                     has_first_msg = False
 
-                    _ = self.event_bus.emit_task(ConnectionEstablishedEvent(self.v))
+                    self._post(ConnectionEstablishedEvent(self.v))
 
                     self.logger.info(f"Connected to {self.url}")
 
@@ -367,7 +394,7 @@ class Connection(
             except WsConnectionErrors as e:
                 # Disconnect / No connection handling
                 self._state = State.NOT_CONNECTED
-                _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
+                self._post(ConnectionLostEvent(self.v))
                 self.v += 1
                 self.logger.info("%s: %s", type(e), e)
 
@@ -375,7 +402,7 @@ class Connection(
                 # This could be due to loss of network connectivity, server issues, etc.
                 # To allow external users to react to this, we emit a suspect event.
                 if suspect_bound.guard_until_bound():
-                    _ = self.event_bus.emit_task(ConnectionSuspectEvent, e)
+                    self._post(ConnectionSuspectEvent, e)
             except Exception as e:
                 self.logger.error("Other error.", exc_info=e)
 
@@ -392,6 +419,9 @@ class Connection(
         ws_connect_task.discard()
         wait_delay_task.discard()
         wait_stop_task.discard()
+
+        # Deliver the final (manual-close) ConnectionLostEvent, then stop.
+        self._event_courier.close(drain=True)
 
         self.logger.info("Connection stopped.")
 
@@ -456,7 +486,7 @@ class Connection(
         try:
             msg = ServerMsg.model_validate_json(data).root
             self._message_logger(msg).debug("received %s", msg)
-            _ = self.event_bus.emit_task(ConnectionIncomingEvent, msg, self.v)
+            self._post(ConnectionIncomingEvent, msg, self.v)
 
         except ValidationError as e:
             # Invalid message.

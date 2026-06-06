@@ -17,6 +17,7 @@ from simplyprint_ws_client.contrib.accounts.base import (
     LoginChallenge,
     LoginResult,
     LoginStatus,
+    PasswordChallengeAccountProvider,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "LoginChallenge",
     "LoginResult",
     "LoginStatus",
+    "PasswordChallengeAccountProvider",
 ]

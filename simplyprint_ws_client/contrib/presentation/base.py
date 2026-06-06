@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from simplyprint_ws_client import PrinterConfig
-
 
 @dataclass(frozen=True)
 class EditableFieldOption:
@@ -85,13 +83,5 @@ def public_secret(key: str, label: str, value) -> dict | None:
     return {"key": key, "label": label, "value": value}
 
 
-def default_printer_presentation(
-    image_url: str, config: PrinterConfig
-) -> PrinterPresentation:
-    data = config.as_dict()
-    host = _as_text(data.get("local_ip") or data.get("host"))
-
-    return PrinterPresentation(
-        image_url=image_url,
-        connection={"mode": "Local" if host else "Configured", "host": host},
-    )
+def default_printer_presentation(image_url: str) -> PrinterPresentation:
+    return PrinterPresentation(image_url=image_url)

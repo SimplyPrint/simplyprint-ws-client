@@ -16,6 +16,8 @@ import socket
 import threading
 import time
 
+import pytest
+
 from simplyprint_ws_client.events import Event
 
 from simplyprint_ws_client.contrib.discovery.service import DiscoveryService
@@ -105,6 +107,35 @@ def test_host_runs_two_listeners_on_one_thread_and_both_receive():
 
     # Shutdown joined the host thread.
     assert "discovery-host" not in _discovery_thread_names()
+
+
+def test_discovery_service_start_is_idempotent():
+    port = _free_udp_port()
+    service = DiscoveryService(
+        multicast_specs=[_passive_spec("alpha", port)],
+        restart_interval=0.2,
+    )
+    service.start()
+    try:
+        first_host = service._host
+        service.start()
+
+        assert service._host is first_host
+        assert _discovery_thread_names().count("discovery-host") == 1
+    finally:
+        service.stop()
+
+
+def test_discovery_service_rejects_duplicate_multicast_specs():
+    port_a, port_b = _free_udp_port(), _free_udp_port()
+
+    with pytest.raises(ValueError, match="duplicate multicast discovery spec: alpha"):
+        DiscoveryService(
+            multicast_specs=[
+                _passive_spec("alpha", port_a),
+                _passive_spec("alpha", port_b),
+            ],
+        )
 
 
 def test_host_restarts_a_stopped_listener_without_a_new_thread():

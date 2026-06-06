@@ -10,7 +10,7 @@ drive :class:`Connection` deterministically -- no real socket, no aiohttp/
 import asyncio
 from typing import List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.connection import (
+from simplyprint_ws_client.contrib.connection.wire import (
     TransportClosed,
     WebSocketTransport,
 )
@@ -49,7 +49,6 @@ class FakeTransport(WebSocketTransport):
     @property
     def is_open(self) -> bool:
         return self._open
-
 
     def open(self) -> "FakeTransport":
         """Mark connected without going through the loop (for unit tests)."""

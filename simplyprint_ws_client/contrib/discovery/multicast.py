@@ -182,7 +182,7 @@ class MulticastDiscoveryBackend(
             else:
                 await self.wait()
         finally:
-            transport.stop()
+            transport.close()
 
         self.logger.info("discovery for %s stopping", self.spec.brand)
 

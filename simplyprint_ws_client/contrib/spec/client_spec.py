@@ -98,7 +98,7 @@ class PrinterClientSpec(ClientSpec):
     # -- capability hooks: default "this type does not back the surface" --------
 
     @classmethod
-    def background_service(cls) -> "BackgroundService | None":
+    def background_service(cls, event_loop_provider=None) -> "BackgroundService | None":
         """A process-wide background service this client type needs (a connection
         manager or watchdog), or ``None``.
 
@@ -106,6 +106,9 @@ class PrinterClientSpec(ClientSpec):
         client factory -- never built in the factory, so two factory calls can't
         race to create one. Return a ready-to-register service (already started if
         it needs starting). Read off the *class* (no ``build``).
+
+        ``event_loop_provider`` is the app's loop provider, for a service whose
+        transport pool must deliver onto that loop (e.g. a connection manager).
         """
         return None
 
@@ -167,7 +170,7 @@ class PrinterClientSpec(ClientSpec):
             default_printer_presentation,
         )
 
-        return default_printer_presentation(cls.metadata.image_url, config)
+        return default_printer_presentation(cls.metadata.image_url)
 
     @classmethod
     def provides(cls, capability: str) -> bool:

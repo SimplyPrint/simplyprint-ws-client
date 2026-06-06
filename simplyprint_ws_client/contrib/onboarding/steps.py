@@ -1,24 +1,18 @@
-"""Shared building blocks for the per-brand add-printer flows.
+"""Shared building blocks for add-printer onboarding flows.
 
-Every brand opens the same way: pick the model (so the right guide shows and,
-where relevant, options gate), then enter the host -- prefilled when a discovered
-device carried it in, and skipped once nothing is left to ask. These helpers
-build those two steps from the generic step-kit, so a brand declares only its
-model list. No brand name appears here: a brand passes its own model choices. The
-state keys are ``device_type`` (a model string; ``""`` = "not sure / any") and
-``host``.
+The library owns neutral step construction only. Integrations adapt their own
+model catalogues, image URLs, state keys, and address field requirements before
+passing plain :class:`ModelChoice` objects into this module.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 from simplyprint_ws_client.contrib.flow import FieldsStep
-from pydantic import BaseModel, ConfigDict, Field
-
-from simplyprint_ws_client.contrib.onboarding.model_images import model_image_url
+from pydantic import ConfigDict, Field, create_model
 
 #: The trailing "I don't know my model" option every picker offers, so a user is
 #: never blocked and an unknown model falls back to the generic guide.
@@ -40,124 +34,136 @@ class ModelChoice:
     image: Optional[str] = None
 
 
-def model_choices_from_enum(
-    enum_cls, *, unknown: str = UNKNOWN_MODEL_LABEL
-) -> List[ModelChoice]:
-    """Model-picker options from a brand ``DeviceType`` enum (skipping ``Unknown``),
-    with the trailing 'not sure' fallback appended. Carries a per-model image when the
-    enum exposes ``get_image_url``. Only the neutral options cross into the flow; the
-    brand enum stays in the brand package."""
-    choices = [
-        ModelChoice(
-            value=member.value,
-            label=member.get_name(),
-            image=member.get_image_url() if hasattr(member, "get_image_url") else None,
-        )
-        for member in enum_cls
-        if member.name != "Unknown"
-    ]
-    choices.append(ModelChoice(value="", label=unknown))
-    return choices
+@dataclass(frozen=True)
+class ModelChoiceCatalog:
+    """Owns a model-picker catalogue and builds its onboarding step."""
 
+    choices: Tuple[ModelChoice, ...]
 
-def model_choices(
-    rows: Sequence[Tuple], *, unknown: str = UNKNOWN_MODEL_LABEL
-) -> List[ModelChoice]:
-    """Model-picker options from an authored list (for brands with no model enum),
-    with the trailing 'not sure' fallback appended. Each row is ``(value, label)`` or
-    ``(value, label, model_id)``; the optional SimplyPrint ``model_id`` resolves the
-    product photo the card grid shows (see :mod:`.model_images`)."""
-    choices = [
-        ModelChoice(
-            value=row[0],
-            label=row[1],
-            image=model_image_url(row[2])
-            if len(row) > 2 and row[2] is not None
-            else None,
-        )
-        for row in rows
-    ]
-    choices.append(ModelChoice(value="", label=unknown))
-    return choices
+    @classmethod
+    def from_rows(
+        cls, rows: Sequence[Tuple], *, unknown: str = UNKNOWN_MODEL_LABEL
+    ) -> "ModelChoiceCatalog":
+        choices = [
+            ModelChoice(
+                value=str(row[0]),
+                label=str(row[1]),
+                image=str(row[2]) if len(row) > 2 and row[2] is not None else None,
+            )
+            for row in rows
+        ]
+        choices.append(ModelChoice(value="", label=unknown))
+        return cls(tuple(choices))
 
+    @classmethod
+    def from_items(
+        cls,
+        items,
+        *,
+        value: Callable[[Any], str],
+        label: Callable[[Any], str],
+        image: Optional[Callable[[Any], Optional[str]]] = None,
+        include: Optional[Callable[[Any], bool]] = None,
+        unknown: str = UNKNOWN_MODEL_LABEL,
+    ) -> "ModelChoiceCatalog":
+        choices = [
+            ModelChoice(
+                value=str(value(item)),
+                label=str(label(item)),
+                image=image(item) if image is not None else None,
+            )
+            for item in items
+            if include is None or include(item)
+        ]
+        choices.append(ModelChoice(value="", label=unknown))
+        return cls(tuple(choices))
 
-def identify_step(
-    choices: Sequence[ModelChoice],
-    *,
-    label: str = "Which printer are you adding?",
-    content: Optional[Sequence[str]] = None,
-) -> FieldsStep:
-    """The model picker: a single ``select`` over ``choices``. Skipped when the model
-    is already known (a discovered/seeded ``device_type``), so it never interrupts a
-    quick-start. Belongs in the flow's ``identify`` phase."""
-
-    class IdentifyInput(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        device_type: str = Field(
-            default="",
-            title="Printer model",
-            json_schema_extra={
-                "ui": {
-                    # ``select`` keeps the terminal picker a dropdown; the web app
-                    # reads ``variant`` to render the same options as a card grid.
-                    "type": "select",
-                    "variant": "cards",
-                    "options": [
-                        {
-                            "value": choice.value,
-                            "label": choice.label,
-                            **({"image": choice.image} if choice.image else {}),
-                        }
-                        for choice in choices
-                    ],
-                }
+    def identify_step(
+        self,
+        *,
+        state_key: str = "device_type",
+        label: str = "Which printer are you adding?",
+        field_title: str = "Printer model",
+        content: Optional[Sequence[str]] = None,
+    ) -> FieldsStep:
+        options = [
+            {
+                "value": choice.value,
+                "label": choice.label,
+                **({"image": choice.image} if choice.image else {}),
+            }
+            for choice in self.choices
+        ]
+        input_model = create_model(
+            "IdentifyInput",
+            __config__=ConfigDict(extra="forbid"),
+            **{
+                state_key: (
+                    str,
+                    Field(
+                        default="",
+                        title=field_title,
+                        json_schema_extra={
+                            "ui": {
+                                "type": "select",
+                                "variant": "cards",
+                                "options": options,
+                            }
+                        },
+                    ),
+                )
             },
         )
 
-    return FieldsStep(
-        "identify",
-        label=label,
-        content=(
-            list(content)
-            if content is not None
-            else ["Pick your model so we can show the right setup steps."]
-        ),
-        input_model=IdentifyInput,
-        include=lambda s: not s.get("device_type"),
-    )
-
-
-def host_step(
-    *,
-    label: str = "Find your printer",
-    help_text: Optional[str] = None,
-    footer=None,
-) -> FieldsStep:
-    """A one-field host form for brands whose only manual input is the IP address.
-
-    ``help_text`` is the hint under the input (where to read the address off the
-    printer). The host is prefilled when a discovered device seeded it (shown as a
-    "detected" summary) and the step is skipped once the host is known -- so a
-    fully-discovered printer reaches verify with no screen. ``footer`` is markdown
-    (static or a callable of state) shown below the submit. Belongs in ``find``.
-    """
-    hint = help_text or "Your printer's address on the local network."
-
-    class HostInput(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        host: IPv4Address | IPv6Address = Field(
-            title="IP address",
-            description=hint,
-            json_schema_extra={"ui": {"placeholder": "192.168.1.42"}},
+        return FieldsStep(
+            "identify",
+            label=label,
+            content=(
+                list(content)
+                if content is not None
+                else ["Pick your model so we can show the right setup steps."]
+            ),
+            input_model=input_model,
+            include=lambda s: not s.get(state_key),
         )
 
-    return FieldsStep(
-        "find",
-        label=label,
-        input_model=HostInput,
-        input_values=lambda state: {"host": state.get("host")},
-        footer=footer,
-        include=lambda s: not s.get("host"),
-    )
+
+@dataclass(frozen=True)
+class ManualAddressStep:
+    """Owns a one-field manual address step."""
+
+    state_key: str = "host"
+    value_type: Any = IPv4Address | IPv6Address
+    step_id: str = "find"
+    label: str = "Find your printer"
+    field_title: str = "IP address"
+    help_text: Optional[str] = None
+    placeholder: Optional[str] = None
+    footer: Any = None
+
+    def build(self) -> FieldsStep:
+        hint = self.help_text or "Your printer's address on the local network."
+        ui = {"placeholder": self.placeholder} if self.placeholder else {}
+        input_model = create_model(
+            "ManualAddressInput",
+            __config__=ConfigDict(extra="forbid"),
+            **{
+                self.state_key: (
+                    self.value_type,
+                    Field(
+                        title=self.field_title,
+                        description=hint,
+                        json_schema_extra={"ui": ui} if ui else None,
+                    ),
+                )
+            },
+        )
+
+        return FieldsStep(
+            self.step_id,
+            label=self.label,
+            input_model=input_model,
+            input_values=lambda state: {self.state_key: state.get(self.state_key)},
+            footer=self.footer,
+            include=lambda s: not s.get(self.state_key),
+        )

@@ -31,8 +31,6 @@ def _record(name, message="msg", level=logging.INFO):
     return logging.LogRecord(name, level, __file__, 1, message, None, None)
 
 
-
-
 @pytest.mark.parametrize(
     "uid",
     ["simple", "a.b.c", "with space", "uuid/with/slash", "weird%.~-_chars"],
@@ -64,8 +62,6 @@ def test_json_formatter_tags_scope():
     system = json.loads(formatter.format(_record("supervisor", "boot")))
     assert system["scope"] == "system"
     assert "unique_id" not in system
-
-
 
 
 def _drain(handler):
@@ -248,8 +244,6 @@ def test_development_policy_keeps_noisy_debug_suppressed(tmp_path):
     system = (tmp_path / "BambuClient.log").read_text()
     assert "system debug" in system
     assert "websocket debug" not in system
-
-
 
 
 def _write(path, text):

@@ -72,7 +72,12 @@ class ClientApp(SyncStoppable):
             Sentry.initialize_sentry(settings)
 
         if self.settings.camera_workers is not None:
-            self.camera_pool = CameraPool(pool_size=self.settings.camera_workers)
+            # The scheduler is the app's EventLoopProvider; INLINE/THREAD cameras
+            # deliver frames onto its loop.
+            self.camera_pool = CameraPool(
+                pool_size=self.settings.camera_workers,
+                event_loop_provider=self.scheduler,
+            )
             self.camera_pool.protocols.extend(self.settings.camera_protocols or [])
 
     async def run(self):

@@ -44,10 +44,13 @@ class DiscoveryService:
     ) -> None:
         self.logger = logging.getLogger("discovery")
         self.event_bus = EventBus()
-        self._multicast = {
-            spec.brand: MulticastDiscoveryBackend(spec, self.event_bus)
-            for spec in multicast_specs
-        }
+        self._multicast = {}
+        for spec in multicast_specs:
+            if spec.brand in self._multicast:
+                raise ValueError(f"duplicate multicast discovery spec: {spec.brand}")
+            self._multicast[spec.brand] = MulticastDiscoveryBackend(
+                spec, self.event_bus
+            )
         self._restart_interval = restart_interval
         self._host: DiscoveryServiceHost | None = None
         self._subnet = {spec.brand: spec for spec in subnet_specs}
@@ -73,6 +76,8 @@ class DiscoveryService:
 
     def start(self) -> None:
         """Start the host that runs (and restarts on death) every multicast backend."""
+        if self._host is not None and not self._stopped:
+            return
         self._host = DiscoveryServiceHost(
             self._multicast.values(),
             restart_interval=self._restart_interval,
@@ -156,3 +161,4 @@ class DiscoveryService:
         self._stopped = True
         if self._host is not None:
             self._host.shutdown()
+            self._host = None

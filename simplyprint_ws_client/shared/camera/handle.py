@@ -1,15 +1,13 @@
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from .base import FrameT
 from .commands import (
-    Response,
     PollCamera,
     StartCamera,
     StopCamera,
     DeleteCamera,
-    ReceivedFrame,
 )
 from ..utils.stoppable import StoppableInterface
 
@@ -18,49 +16,56 @@ if TYPE_CHECKING:
 
 
 class CameraHandle(StoppableInterface):
+    """A client's view of one camera, independent of where it runs.
+
+    Frames arrive via :meth:`_set_frame` -- from the PROCESS pool's response
+    reader, or from an inline/thread :mod:`.backends` driver -- and the same
+    ``receive_frame`` / ``start`` / ``pause`` / ``stop`` surface drives whichever
+    backend this handle was created with. When ``driver`` is set the commands go
+    to that backend; otherwise they go to the worker ``pool``.
+    """
+
     pool: "CameraPool"
     id: int
 
     _waiters: List[asyncio.Future]
     _frame_time_window: List[float]
-    _last_poll_time: datetime.datetime
+    _last_poll_time: Optional[datetime.datetime] = None
     _cached_frame: Optional[FrameT] = None
 
-    def __init__(self, pool: "CameraPool", camera_id: int):
+    def __init__(
+        self, pool: "CameraPool", camera_id: int, driver: Optional[Any] = None
+    ):
         self.pool = pool
         self.id = camera_id
+        self._driver = driver
         self._frame_time_window = []
         self._waiters = []
 
-    def on_response(self, res: Response):
-        # Called from one thread only.
-        if not isinstance(res, ReceivedFrame):
-            return
-
-        # Keep track of last 10 frame times
-        self._frame_time_window.append(res.time)
-
+    def _set_frame(self, data: Optional[FrameT], timestamp: float) -> None:
+        """Deliver one frame to this handle. Called from one producer at a time
+        (the PROCESS response reader, an inline loop task, or a thread courier)."""
+        # Keep track of last 10 frame times for the FPS estimate.
+        self._frame_time_window.append(timestamp)
         if len(self._frame_time_window) > 10:
             self._frame_time_window.pop(0)
 
-        self._cached_frame = res.data
+        self._cached_frame = data
 
         while self._waiters:
             fut = self._waiters.pop(0)
-
             if fut.done():
                 continue
-
             loop = fut.get_loop()
-            loop.call_soon_threadsafe(fut.set_result, res.data)
+            loop.call_soon_threadsafe(fut.set_result, data)
 
     async def receive_frame(
         self, allow_cache_age: Optional[datetime.timedelta] = None
     ) -> FrameT:
-        # Always ask for a new frame
-        self.pool.submit_request(PollCamera(self.id))
+        # Always ask for a new frame.
+        self._poll()
 
-        # Although we might want to serve an old frame if it's not too old
+        # Although we might want to serve an old frame if it's not too old.
         if allow_cache_age is not None and self._cached_frame is not None:
             if (
                 self._last_poll_time is not None
@@ -77,14 +82,20 @@ class CameraHandle(StoppableInterface):
         return await fut
 
     def start(self):
-        self.pool.submit_request(StartCamera(self.id))
+        if self._driver is not None:
+            self._driver.start()
+        else:
+            self.pool.submit_request(StartCamera(self.id))
 
     def pause(self):
-        self.pool.submit_request(StopCamera(self.id))
+        if self._driver is not None:
+            self._driver.pause()
+        else:
+            self.pool.submit_request(StopCamera(self.id))
 
     @property
     def fps(self) -> float:
-        # Calculate the average FPS from the last 10 frames
+        # Calculate the average FPS from the last 10 frames.
         if len(self._frame_time_window) < 2:
             return 0
 
@@ -96,13 +107,22 @@ class CameraHandle(StoppableInterface):
 
         return num_intervals / elapsed_time
 
+    def _poll(self):
+        if self._driver is not None:
+            self._driver.poll()
+        else:
+            self.pool.submit_request(PollCamera(self.id))
+
     # Stoppable methods
 
     def is_stopped(self) -> bool:
         raise NotImplementedError()
 
     def stop(self) -> None:
-        self.pool.submit_request(DeleteCamera(self.id))
+        if self._driver is not None:
+            self._driver.stop()
+        else:
+            self.pool.submit_request(DeleteCamera(self.id))
 
     def clear(self) -> None:
         raise NotImplementedError()

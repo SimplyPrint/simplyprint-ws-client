@@ -15,11 +15,15 @@ are acceptable when the work calls for them.
   subclasses to talk to a *printer*: `PrinterClient` (lifecycle + status
   reduction), `FileTransfer` (prepare → download → transform → upload →
   await-firmware), `onboard_printer` (discover → verify → setup), the
-  swappable WebSocket `transport`, the threaded `connection` pool, the
-  reactive/diffable `model`, and the `logging` facility.
-- **`shared/`** — leaf primitives both layers use (asyncio helpers,
-  `Backoff`, `BoundedVariable`, `Synchronized`/`Stoppable`, file download,
-  hardware snapshot, SimplyPrint HTTP API, CLI).
+  `connection` subsystem (`PooledConnectionManager` over a `Pool` of pluggable
+  wire families — `sync_mqtt`/`async_mqtt`/`sync_ws` — leasing each client a
+  routed `Connection`), the reactive/diffable `model`, and the `logging`
+  facility.
+- **`shared/`** — leaf primitives both layers use (asyncio helpers including
+  the `Courier` homecoming primitive, the `worker` pool + zero-copy
+  `SharedSlabChannel` IPC, `Backoff`, `BoundedVariable`,
+  `Synchronized`/`Stoppable`, file download, hardware snapshot, SimplyPrint
+  HTTP API, CLI).
 
 ## The contrib boundary
 
@@ -70,7 +74,8 @@ this library is rewritten to the 3.9 floor**.
   clean. (No `[tool.ruff]` block exists yet — pass `--target-version` on
   the CLI; adding `target-version = "py39"` to `pyproject.toml` is a fine
   follow-up so the floor is enforced by default.)
-- `.venv/bin/python -m pytest -q` → **118 passed** is the green floor.
+- `.venv/bin/python -m pytest -q` → **294 passed / 1 skipped** is the green
+  floor (the new transport/connection/worker primitives raised it).
 - Use the `.venv` directly. **Do NOT use `uv run`/`uv sync`** — it would
   re-pin the editable install and break the integration's live source
   link.

@@ -21,7 +21,7 @@ from aiohttp import (
     WSMsgType,
 )
 
-from ..transport import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
+from .base import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
 
 if TYPE_CHECKING:
     from aiohttp import ClientWebSocketResponse

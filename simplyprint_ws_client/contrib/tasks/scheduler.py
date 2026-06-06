@@ -85,6 +85,7 @@ class SchedulerService:
         if self._started:
             return
         self._started = True
+        self._ready.clear()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, name="task-scheduler", daemon=True
@@ -108,6 +109,9 @@ class SchedulerService:
         loop.call_soon_threadsafe(_stop)
         if self._thread is not None:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                raise TimeoutError("task scheduler did not stop within 10 seconds")
+            self._thread = None
 
     def _run_loop(self) -> None:
         from apscheduler.events import EVENT_JOB_ERROR
@@ -127,9 +131,19 @@ class SchedulerService:
         try:
             self._loop.run_forever()
         finally:
-            for task in asyncio.all_tasks(self._loop):
+            pending = [
+                task for task in asyncio.all_tasks(self._loop) if not task.done()
+            ]
+            for task in pending:
                 task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             self._loop.close()
+            self._loop = None
+            self._scheduler = None
+            self._ready.clear()
 
     def _schedule_all(self) -> None:
         assert self._scheduler is not None

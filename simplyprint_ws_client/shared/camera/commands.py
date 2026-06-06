@@ -1,6 +1,6 @@
 from typing import Union, NamedTuple, Optional
 
-from .base import FrameT, BaseCameraProtocol
+from .base import BaseCameraProtocol
 
 
 class CreateCamera(NamedTuple):
@@ -32,12 +32,3 @@ Request = Union[
     StopCamera,
     DeleteCamera,
 ]
-
-
-class ReceivedFrame(NamedTuple):
-    id: int
-    time: float
-    data: Optional[FrameT]
-
-
-Response = Union[ReceivedFrame]

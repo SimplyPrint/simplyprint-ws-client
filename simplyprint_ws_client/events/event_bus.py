@@ -258,7 +258,8 @@ class EventBus(Emitter[TEvent]):
         if sync_only:
             if not blocking:
                 raise NotImplementedError(
-                    "Synchronous emitting is not supported without blocking, use EventBusWorker."
+                    "Synchronous emitting is not supported without blocking; "
+                    "use blocking=True, or deliver onto the loop via a Courier."
                 )
 
             emit_func = self.emit_sync

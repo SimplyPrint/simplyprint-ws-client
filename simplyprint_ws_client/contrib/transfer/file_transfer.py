@@ -34,7 +34,6 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import CancelledError
 from enum import Enum, auto
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
@@ -51,9 +50,14 @@ if TYPE_CHECKING:
 #: Seconds to wait, after the file reached the printer and the start command was
 #: sent, for the firmware to broadcast a started print state.
 DEFAULT_GRACE_SECONDS = 60.0
+PREEMPTION_GRACE_SECONDS = 0.05
 
 #: Prepared (dest, demand, md5) ready to print once a start is requested.
 PreparedPrint = Tuple[PurePosixPath, FileDemandData, str]
+
+
+class _TransferCancelled(Exception):
+    """Cooperative cancellation raised from synchronous progress callbacks."""
 
 
 class FirmwareStartOutcome(Enum):
@@ -99,7 +103,7 @@ class FileTransfer(ABC):
         self._download_canceller = threading.Event()
         # Strong ref to the scheduled task until it registers itself as
         # _download_task (asyncio only weakly references tasks).
-        self._download_dispatch: Optional["asyncio.Task"] = None
+        self._download_dispatch: Optional[object] = None
 
     @property
     def is_preparing_to_print(self) -> bool:
@@ -157,7 +161,29 @@ class FileTransfer(ABC):
         """Schedule the prepare-and-start on the client's event loop, returning
         immediately. A new call preempts any transfer still in flight (see
         :meth:`ensure_file_and_start`)."""
-        self._download_dispatch = asyncio.create_task(self.ensure_file_and_start(data))
+        coro = self.ensure_file_and_start(data)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        client_loop = getattr(self.client, "event_loop", None)
+        if running_loop is not None and (
+            client_loop is None or running_loop is client_loop
+        ):
+            self._download_dispatch = running_loop.create_task(coro)
+            return
+
+        submit_to_loop = getattr(self.client, "submit_to_loop", None)
+        if submit_to_loop is not None:
+            self._download_dispatch = submit_to_loop(coro)
+        elif client_loop is not None:
+            self._download_dispatch = asyncio.run_coroutine_threadsafe(
+                coro, client_loop
+            )
+        else:
+            coro.close()
+            raise RuntimeError("No running client event loop for file transfer")
 
     async def ensure_file_and_start(self, data: FileDemandData) -> None:
         """Ensure the SP file is on the printer and, if auto-start is set,
@@ -177,52 +203,74 @@ class FileTransfer(ABC):
 
         if prev is not None:
             try:
-                await prev
+                await asyncio.wait_for(
+                    asyncio.shield(prev), timeout=PREEMPTION_GRACE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                prev.cancel()
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 pass
 
         self._download_canceller.clear()
 
-        async with self._download_lock:
-            self._set_active_job_for_prepare(data.job_id, data.action_token)
+        try:
+            async with self._download_lock:
+                self._set_active_job_for_prepare(data.job_id, data.action_token)
 
-            try:
-                self.begin_prepare()
-                result = await self.ensure_file(data)
+                try:
+                    self.begin_prepare()
+                    result = await self.ensure_file(data)
 
-                if not result:
-                    self.end_prepare("ensure_file returned no result")
-                    return
+                    if not result:
+                        self.end_prepare("ensure_file returned no result")
+                        return
 
-                if self._download_canceller.is_set():
-                    self.client.logger.info("Download was cancelled")
-                    self.end_prepare("download cancelled")
-                    return
+                    if self._download_canceller.is_set():
+                        self.client.logger.info("Download was cancelled")
+                        self.end_prepare("download cancelled")
+                        return
 
-                dest, md5checksum = result
+                    dest, md5checksum = result
 
-                if not data.auto_start:
-                    self.next_to_print = (dest, data, md5checksum)
-                    self.client.printer.file_progress.percent = 100
-                    self.client.printer.file_progress.state = (
-                        FileProgressStateEnum.READY
+                    if not data.auto_start:
+                        self.next_to_print = (dest, data, md5checksum)
+                        self.client.printer.file_progress.percent = 100
+                        self.client.printer.file_progress.state = (
+                            FileProgressStateEnum.READY
+                        )
+                        self.end_prepare("file ready (no auto_start)")
+                        return
+
+                    # Hand off to firmware; on_print_changed ends the prepare once
+                    # the firmware reports a started (READY) or failed (ERROR) state.
+                    await self.start_print(dest, data, md5checksum)
+                    self.mark_transfer_complete()
+
+                except asyncio.CancelledError:
+                    if self._download_canceller.is_set():
+                        self.client.logger.info("Download was cancelled")
+                        self.end_prepare("download cancelled")
+                    else:
+                        self.fail_prepare(
+                            "File transfer was cancelled", "task cancelled"
+                        )
+                    raise
+                except Exception as e:
+                    self.client.logger.warning(
+                        f'Ensure file for "{data.file_name}" failed', exc_info=e
                     )
-                    self.end_prepare("file ready (no auto_start)")
-                    return
-
-                # Hand off to firmware; on_print_changed ends the prepare once
-                # the firmware reports a started (READY) or failed (ERROR) state.
-                await self.start_print(dest, data, md5checksum)
-                self.mark_transfer_complete()
-
-            except Exception as e:
-                self.client.logger.warning(
-                    f'Ensure file for "{data.file_name}" failed', exc_info=e
-                )
-                self.fail_prepare(
-                    f"Failed to download file: {e}",
-                    f"exception: {e}",
-                )
+                    self.fail_prepare(
+                        f"Failed to download file: {e}",
+                        f"exception: {e}",
+                    )
+        finally:
+            async with self._download_task_lock:
+                if self._download_task is asyncio.current_task():
+                    self._download_task = None
 
     async def ensure_file(
         self, data: FileDemandData
@@ -265,14 +313,14 @@ class FileTransfer(ABC):
                     (progress // 2) + 50, 100
                 )
                 if self._download_canceller.is_set():
-                    raise CancelledError("Upload cancelled")
+                    raise _TransferCancelled("Upload cancelled")
 
             try:
                 dest = (await self._upload(local_dest, on_progress)).relative_to("/")
                 # Hash the final (post-transform) file, off-loop, so a large
                 # gcode can't stall the firmware-ACK grace window.
                 return dest, await file_md5(local_dest)
-            except CancelledError:
+            except _TransferCancelled:
                 self.client.logger.info("Upload was cancelled")
                 return None
             except Exception as e:

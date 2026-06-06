@@ -248,7 +248,12 @@ class TestNoShims:
                 if name == rhs or rhs in SKIP_RHS:
                     continue
                 # Treat as a shim only if RHS looks like a type (CapWord or builtin)
-                looks_typeish = rhs[:1].isupper() or rhs in {"float", "int", "str", "bytes"}
+                looks_typeish = rhs[:1].isupper() or rhs in {
+                    "float",
+                    "int",
+                    "str",
+                    "bytes",
+                }
                 if not looks_typeish:
                     continue
                 rel = path.relative_to(LIB_PKG)
@@ -269,7 +274,9 @@ class TestNoShims:
             except SyntaxError:
                 continue
             for node in tree.body:
-                if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                if isinstance(node, ast.ImportFrom) and any(
+                    a.name == "*" for a in node.names
+                ):
                     rel = path.relative_to(LIB_PKG)
                     src = ("." * (node.level or 0)) + (node.module or "")
                     offenders.append(f"{rel}:{node.lineno}::star-from-{src}")
@@ -288,7 +295,7 @@ class TestImportDAG:
         try:
             tree = ast.parse(init.read_text(), str(init))
         except SyntaxError:
-            pytest.fail(f"contrib/__init__.py has syntax errors")
+            pytest.fail("contrib/__init__.py has syntax errors")
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module:
                 if node.module.startswith(".") or "contrib" in node.module:
@@ -317,7 +324,9 @@ class TestImportDAG:
             if not leaf.exists():
                 continue
             offenders = self._find_printer_client_imports(leaf)
-            assert not offenders, f"{leaf.name}/ has cycle imports of printer_client: {offenders}"
+            assert not offenders, (
+                f"{leaf.name}/ has cycle imports of printer_client: {offenders}"
+            )
 
     @staticmethod
     def _find_printer_client_imports(root: pathlib.Path) -> List[str]:

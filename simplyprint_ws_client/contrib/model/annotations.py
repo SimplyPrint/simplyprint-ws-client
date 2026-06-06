@@ -37,7 +37,6 @@ def _is_exclusive(field_info: FieldInfo) -> bool:
     return any(v is _ExclusiveSentinel for v in field_info.metadata)
 
 
-
 _UntrackedSentinel = object()
 _TUntracked = TypeVar("_TUntracked", bound=Any)
 Untracked = Annotated[_TUntracked, _UntrackedSentinel]
@@ -48,7 +47,6 @@ def _is_untracked(field_info: FieldInfo) -> bool:
     return any(v is _UntrackedSentinel for v in field_info.metadata)
 
 
-
 _AtomicSentinel = object()
 _TAtomic = TypeVar("_TAtomic", bound=Any)
 Atomic = Annotated[_TAtomic, _AtomicSentinel]
@@ -57,7 +55,6 @@ Atomic = Annotated[_TAtomic, _AtomicSentinel]
 @functools.lru_cache
 def is_atomic(field_info: FieldInfo) -> bool:
     return any(m is _AtomicSentinel for m in field_info.metadata)
-
 
 
 _ExtraSentinel = object()

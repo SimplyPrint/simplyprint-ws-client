@@ -37,11 +37,24 @@ class DiscoveryServiceHost:
         self._tasks: Dict[str, asyncio.Task] = {}
         self._started = False
 
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for backend in self._backends:
+            key = backend.spec.brand
+            if key in seen:
+                duplicates.add(key)
+            seen.add(key)
+        if duplicates:
+            raise ValueError(
+                "duplicate discovery backend key(s): " + ", ".join(sorted(duplicates))
+            )
+
     def start(self) -> None:
         """Spin up the host loop + thread and launch every backend (idempotent)."""
         if self._started:
             return
         self._started = True
+        self._ready.clear()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, name="discovery-host", daemon=True
@@ -56,6 +69,9 @@ class DiscoveryServiceHost:
             self._loop.run_until_complete(self._serve())
         finally:
             self._loop.close()
+            self._loop = None
+            self._host_stop = None
+            self._tasks.clear()
 
     async def _serve(self) -> None:
         self._host_stop = asyncio.Event()
@@ -106,6 +122,9 @@ class DiscoveryServiceHost:
             loop.call_soon_threadsafe(self._signal_stop)
         if self._thread is not None:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                raise TimeoutError("discovery host did not stop within 10 seconds")
+            self._thread = None
 
     def _signal_stop(self) -> None:
         if self._host_stop is not None:

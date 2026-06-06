@@ -9,7 +9,7 @@ idempotent close. Parametrizing over both is what proves the abstraction is real
 import pytest
 from websockets.asyncio.server import serve
 
-from simplyprint_ws_client.contrib.connection import (
+from simplyprint_ws_client.contrib.connection.wire import (
     AiohttpWebSocketTransport,
     TransportClosed,
     TransportError,

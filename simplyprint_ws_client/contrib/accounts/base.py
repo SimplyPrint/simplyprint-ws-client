@@ -72,10 +72,9 @@ class AccountDevice:
 
     Only the network-neutral facts every brand can supply: a stable ``serial``,
     a human ``name``/``model``, whether it is ``online``, and whether it is
-    ``paired`` (carries whatever the brand needs to connect -- the pairing secret
-    itself is never exposed). Brands that resolve a per-model image may surface
-    it through ``model_image_url`` so the add UI can show the right picture
-    without having to guess the convention.
+    ``paired`` (carries whatever the provider needs to connect -- the pairing
+    secret itself is never exposed). Providers that have a per-model image may
+    surface a resolved URL so the add UI does not guess any app convention.
     """
 
     serial: str
@@ -140,6 +139,29 @@ class LoginResult:
     challenge: Optional[LoginChallenge] = None
     message: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.status is LoginStatus.COMPLETED:
+            valid = self.account is not None and self.challenge is None
+        elif self.status is LoginStatus.CHALLENGE:
+            valid = self.account is None and self.challenge is not None
+        else:
+            valid = self.account is None and self.challenge is None
+
+        if not valid:
+            raise ValueError(f"invalid LoginResult for status {self.status.value}")
+
+    @classmethod
+    def completed(cls, account: AccountResource) -> "LoginResult":
+        return cls(LoginStatus.COMPLETED, account=account)
+
+    @classmethod
+    def challenge_required(cls, challenge: LoginChallenge) -> "LoginResult":
+        return cls(LoginStatus.CHALLENGE, challenge=challenge)
+
+    @classmethod
+    def failed(cls, message: str) -> "LoginResult":
+        return cls(LoginStatus.FAILED, message=message)
+
 
 class AccountError(RuntimeError):
     """Raised when an account operation cannot proceed (unknown region, the
@@ -165,23 +187,14 @@ class DeviceNotFound(AccountError):
 
 @runtime_checkable
 class AccountProvider(Protocol):
-    """Structural type for a brand's cloud-account capability.
+    """Structural type for saved-account/device adoption capability.
 
-    A :class:`~typing.Protocol`, deliberately **not** an ABC: a brand's concrete
-    capability (e.g. ``BambuAccountProvider``) satisfies it *by shape* and does
-    not inherit it -- so there are no abstract methods to fill, only a type the
-    registry and web surface annotate against. ``login``/``verify`` own the
-    provider's cloud-account behavior; a guided account-login flow can adapt those
-    methods into prompts without the provider knowing about the flow. The rest are
-    the saved-account store plus cloud-device adoption. Every method speaks the
-    neutral value objects above -- no brand type appears in a signature.
+    A :class:`~typing.Protocol`, deliberately **not** an ABC: a concrete
+    capability satisfies it *by shape* and does not inherit it. This base surface
+    avoids prescribing a login method; OAuth, device-code, API-key, and
+    password/challenge flows can each expose their own flow-owned authenticator
+    while still sharing saved-account storage and device adoption.
     """
-
-    async def login(self, region: str, username: str, password: str) -> LoginResult: ...
-
-    async def verify(self, challenge: LoginChallenge, code: str) -> LoginResult: ...
-
-    async def resend_code(self, challenge: LoginChallenge) -> bool: ...
 
     def get_accounts(self) -> List[AccountResource]: ...
 
@@ -190,3 +203,14 @@ class AccountProvider(Protocol):
     async def get_devices(self, uid: str) -> Optional[List[AccountDevice]]: ...
 
     async def adopt_device(self, uid: str, serial: str) -> "PrinterConfig": ...
+
+
+@runtime_checkable
+class PasswordChallengeAccountProvider(AccountProvider, Protocol):
+    """Optional credential shape for username/password plus code challenge flows."""
+
+    async def login(self, region: str, username: str, password: str) -> LoginResult: ...
+
+    async def verify(self, challenge: LoginChallenge, code: str) -> LoginResult: ...
+
+    async def resend_code(self, challenge: LoginChallenge) -> bool: ...

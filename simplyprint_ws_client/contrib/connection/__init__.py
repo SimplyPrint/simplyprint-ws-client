@@ -1,110 +1,64 @@
-"""Connect to a printer, fan its events, and keep the link alive.
+"""Pool many printer clients onto a smaller set of shared connections.
 
-This is the one home for "give me a connection to X and tell me what it says".
-It owns three layers, brand-agnostic throughout:
+This is the one home for "give me a live link to a printer, fan its messages to
+every client that shares it, and keep it alive." It is brand-agnostic throughout:
+the N printers on one host share a handful of real sockets rather than one apiece.
 
-* the **pool** -- :class:`ClientBucket`, :class:`Connection`,
-  :class:`ConnectionManager` -- lets many clients (one per printer) share a
-  smaller set of physical connections keyed by hashable params. Wire bindings
-  subclass the pool: :mod:`.mqtt` ships the paho-mqtt binding,
-  :mod:`.threaded_ws` the websocket-client binding.
-* the **transport** -- the async :class:`WebSocketTransport` ABC
-  (:mod:`.transport`) the SimplyPrint backend ``Connection`` drives, with the
-  two shipped wire leaves under :mod:`.transports` (``websockets`` / aiohttp).
-* the shared **vocabulary** -- :class:`ConnectionState`, the
-  :class:`TransportError` / :class:`TransportClosed` exceptions, the WS close
-  codes, and the :class:`Watchdog`.
+Layering (bottom -> top), all leaves brand-free:
 
-Every wire library (paho, websocket-client, websockets, aiohttp) is imported
-lazily (PEP 562 ``__getattr__``) so plain ``import
-simplyprint_ws_client.contrib.connection`` drags none of them; only the pool /
-state / transport-ABC / watchdog leaves load eagerly, and they carry no
-third-party imports.
+* :mod:`.transport` -- the wire *contract*: the :class:`TransportEvent` surface and
+  the :class:`Transport` / :class:`AsyncTransport` / :class:`Pool` / :class:`AsyncPool`
+  abstractions, plus :class:`Connection` (the per-client lease) and the
+  :class:`TransportRouter` that fans a shared transport's events to the right leases.
+* :mod:`.manager` -- :class:`PooledConnectionManager`, the brand-agnostic lifecycle:
+  it owns a :class:`Pool`, leases one :class:`Connection` per client, wires the
+  lease's events onto the client's bus, and runs keepalive / reconnect / the
+  registration-reconcile sweep. Brands subclass it (a few event types + a
+  ``params_factory``), they do not reimplement it.
+* the **wire families** that back a manager: :mod:`.sync_mqtt` (paho-mqtt, many
+  printers sharing one broker), :mod:`.async_mqtt` (the asyncio MQTT family), and
+  :mod:`.sync_ws` (websocket-client, one supervised socket per host), the last
+  wrapping the blocking :class:`.threaded_ws.ThreadedWebSocketTransport` wire.
+* :class:`ConnectionState` -- the shared "is this printer reachable" vocabulary.
+* :mod:`.wire` -- the raw async WebSocket wire the SimplyPrint backend socket rides.
+
+Off the wire, every cross-thread hop comes home on the consumer loop through one
+:class:`~simplyprint_ws_client.shared.asyncio.courier.Courier` -- no per-event
+future, no dedicated dispatch thread.
+
+The blocking wire libraries (paho-mqtt, websocket-client) are imported lazily
+(PEP 562 ``__getattr__`` here, plus lazy wire factories in the families) so a plain
+``import simplyprint_ws_client.contrib.connection`` drags neither; only the
+contract / manager / state leaves load eagerly, and they carry no third-party
+imports.
 """
 
-from typing import TYPE_CHECKING
-
-from simplyprint_ws_client.contrib.connection.pool import (
+from simplyprint_ws_client.contrib.connection.manager import (
     KEEPALIVE_TIMEOUT_MS,
-    ClientBucket,
-    Connection,
-    ConnectionManager,
-    EventBusWorker,
+    ConnectionAttemptsBoundedInterval,
     PoolClient,
+    PooledConnectionManager,
     now_ms,
 )
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import (
-    WS_CLOSE_OK,
-    WS_CLOSE_PROTOCOL_ERROR,
-    TransportClosed,
-    TransportError,
-    TransportFactory,
-    WebSocketTransport,
-)
-from simplyprint_ws_client.contrib.connection.watchdog import Watchdog
-
-if TYPE_CHECKING:  # eager names for IDEs / type checkers
-    from simplyprint_ws_client.contrib.connection.mqtt import (
-        MqttConnection,
-        MqttConnectionManager,
-        MqttConnectionParams,
-    )
-    from simplyprint_ws_client.contrib.connection.threaded_ws import (
-        ThreadedWebSocketTransport,
-        WsConnection,
-        WsConnectionManager,
-        WsConnectionParams,
-    )
-    from simplyprint_ws_client.contrib.connection.transports import (
-        AiohttpWebSocketTransport,
-        WebSocketsTransport,
-    )
 
 __all__ = [
-    "AiohttpWebSocketTransport",
-    "ClientBucket",
-    "Connection",
-    "ConnectionManager",
+    "ConnectionAttemptsBoundedInterval",
     "ConnectionState",
-    "EventBusWorker",
     "KEEPALIVE_TIMEOUT_MS",
-    "MqttConnection",
-    "MqttConnectionManager",
-    "MqttConnectionParams",
     "PoolClient",
+    "PooledConnectionManager",
     "ThreadedWebSocketTransport",
-    "TransportClosed",
-    "TransportError",
-    "TransportFactory",
-    "Watchdog",
-    "WebSocketsTransport",
-    "WebSocketTransport",
-    "WS_CLOSE_OK",
-    "WS_CLOSE_PROTOCOL_ERROR",
-    "WsConnection",
-    "WsConnectionManager",
-    "WsConnectionParams",
     "now_ms",
 ]
 
 
 def __getattr__(name: str):
-    if name in ("MqttConnection", "MqttConnectionManager", "MqttConnectionParams"):
-        from simplyprint_ws_client.contrib.connection import mqtt
-
-        return getattr(mqtt, name)
-    if name in (
-        "ThreadedWebSocketTransport",
-        "WsConnection",
-        "WsConnectionManager",
-        "WsConnectionParams",
-    ):
+    # The blocking websocket-client wire stays lazy: importing the package must
+    # not drag websocket-client. Reached as
+    # ``contrib.connection.ThreadedWebSocketTransport``.
+    if name == "ThreadedWebSocketTransport":
         from simplyprint_ws_client.contrib.connection import threaded_ws
 
-        return getattr(threaded_ws, name)
-    if name in ("WebSocketsTransport", "AiohttpWebSocketTransport"):
-        from simplyprint_ws_client.contrib.connection import transports
-
-        return getattr(transports, name)
+        return threaded_ws.ThreadedWebSocketTransport
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
