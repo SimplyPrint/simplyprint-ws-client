@@ -16,6 +16,7 @@ from simplyprint_ws_client.contrib.discovery.ssdp import SSDPRequest, SSDPReques
 from simplyprint_ws_client.contrib.discovery.model import DiscoveredRecord
 from simplyprint_ws_client.contrib.discovery.netif import local_subnets, scan_hosts
 from simplyprint_ws_client.contrib.discovery.spec import (
+    MDNSSpec,
     MulticastSpec,
     NetworkServiceSpec,
     SubnetScanSpec,
@@ -34,6 +35,12 @@ from simplyprint_ws_client.contrib.discovery.multicast import (
     MulticastDiscoveryBackend,
     scan_blocking,
 )
+from simplyprint_ws_client.contrib.discovery.mdns import (
+    MDNSDiscoveryBackend,
+    MDNSRecord,
+    MDNSResponse,
+    MDNSResponseParser,
+)
 from simplyprint_ws_client.contrib.discovery.subnet import SubnetScanBackend
 from simplyprint_ws_client.contrib.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.contrib.discovery.service import DiscoveryService
@@ -49,6 +56,11 @@ __all__ = [
     "SSDPRequestParser",
     "local_subnets",
     "scan_hosts",
+    "MDNSSpec",
+    "MDNSDiscoveryBackend",
+    "MDNSRecord",
+    "MDNSResponse",
+    "MDNSResponseParser",
     "MulticastSpec",
     "NetworkServiceSpec",
     "SubnetScanSpec",

@@ -27,6 +27,7 @@ dependencies = [
     "async-timeout ; python_version < '3.11'",
     "strenum ; python_version < '3.11'",
     "typing-extensions",
+    "dnspython>=2.6,<3",
 ]
 
 [project.urls]
