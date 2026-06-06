@@ -10,6 +10,7 @@ frames to a handle exactly like a process camera would.
 """
 
 import asyncio
+import multiprocessing as mp
 import os
 import time
 
@@ -29,6 +30,26 @@ def _shm_count():
     if not os.path.isdir("/dev/shm"):
         return None
     return len([n for n in os.listdir("/dev/shm") if n.startswith("psm_")])
+
+
+def _restore_start_method(method):
+    mp.set_start_method(method, force=True)
+
+
+async def _assert_process_camera_delivers_via_shared_memory():
+    before = _shm_count()
+    pool = _pool(asyncio.get_running_loop())
+    pool.protocols.append(_ProcessSnapshot)
+    handle = pool.create(URL("x://cam"))
+    try:
+        frame = await asyncio.wait_for(handle.receive_frame(), 10.0)
+        assert frame == b"PROCFRAME"
+    finally:
+        handle.stop()
+        pool.stop()  # joins the reader thread, which closes+unlinks the segment
+
+    if before is not None:
+        assert _shm_count() == before  # the worker's channel was not leaked
 
 
 class _ProcessSnapshot(BaseCameraProtocol):
@@ -177,16 +198,16 @@ async def test_no_protocol_match_raises():
 async def test_process_camera_delivers_via_shared_memory():
     # End-to-end PROCESS path: a real subprocess produces a frame that crosses the
     # zero-copy SharedSlabChannel and resolves the handle's receive_frame future.
-    before = _shm_count()
-    pool = _pool(asyncio.get_running_loop())
-    pool.protocols.append(_ProcessSnapshot)
-    handle = pool.create(URL("x://cam"))
-    try:
-        frame = await asyncio.wait_for(handle.receive_frame(), 10.0)
-        assert frame == b"PROCFRAME"
-    finally:
-        handle.stop()
-        pool.stop()  # joins the reader thread, which closes+unlinks the segment
+    await _assert_process_camera_delivers_via_shared_memory()
 
-    if before is not None:
-        assert _shm_count() == before  # the worker's channel was not leaked
+
+@pytest.mark.asyncio
+async def test_process_camera_starts_under_spawn():
+    # Spawn pickles the Process object. The parent-owned SharedSlabChannel contains
+    # a threading.Lock, so it must not be attached to the process until after start.
+    previous = mp.get_start_method(allow_none=True)
+    mp.set_start_method("spawn", force=True)
+    try:
+        await _assert_process_camera_delivers_via_shared_memory()
+    finally:
+        _restore_start_method(previous)

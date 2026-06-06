@@ -246,11 +246,14 @@ class CameraPool(ProcessStoppable, Synchronized):
 
             # Allocate the zero-copy frame channel lazily, only for a process that
             # actually starts (so an idle pool reserves no shared memory). The
-            # child inherits channel_args across the fork in start().
-            process.channel = SharedSlabChannel.create()
-            process.channel_args = process.channel.child_args()
+            # Only `channel_args` may be present on the process object during
+            # start(): spawn pickles that object, and the parent channel carries a
+            # threading.Lock. Attach the parent-owned channel after start.
+            channel = SharedSlabChannel.create()
+            process.channel_args = channel.child_args()
 
             process.start()
+            process.channel = channel
 
             process.thread = threading.Thread(
                 target=self._consume_responses,
