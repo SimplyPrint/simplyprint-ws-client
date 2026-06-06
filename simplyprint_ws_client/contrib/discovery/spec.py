@@ -11,7 +11,7 @@ is its ``brand`` routing label, supplied by the brand module.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Generic, Optional, TYPE_CHECKING, TypeVar
+from typing import Awaitable, Callable, Generic, Optional, Tuple, TYPE_CHECKING, TypeVar
 
 from simplyprint_ws_client.events import Event
 
@@ -19,6 +19,7 @@ from simplyprint_ws_client.contrib.discovery.ssdp import SSDPRequest
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.contrib.discovery.network import HostProbeContext
+    from simplyprint_ws_client.contrib.discovery.mdns import MDNSResponse
 
 DiscoveredRecord = TypeVar("DiscoveredRecord")
 
@@ -97,3 +98,33 @@ class SubnetScanSpec(Generic[DiscoveredRecord]):
     context_probe: Optional[
         Callable[["HostProbeContext"], Awaitable[Optional[DiscoveredRecord]]]
     ] = None
+
+
+@dataclass(frozen=True)
+class MDNSSpec(Generic[DiscoveredRecord]):
+    """How to discover one brand over mDNS / DNS-SD.
+
+    The backend multicasts each name in ``queries`` as a PTR question every
+    ``query_interval`` seconds. For every parsed response it calls ``follow_up``
+    (to chain DNS-SD service-type enumeration -- the default issues no follow-up)
+    and ``mapper`` (to extract a brand device record). All brand knowledge -- the
+    query names, the follow-up rule, the record mapping, the cache key -- lives in
+    these callables; the group/port default to the standard mDNS endpoint.
+    """
+
+    brand: str
+    #: PTR query names to multicast periodically (e.g. a DNS-SD service type).
+    queries: Tuple[str, ...]
+    #: Event emitted for each mapped device.
+    event_type: type[Event]
+    #: Parsed mDNS response + sender address -> a brand device record, or None.
+    mapper: Callable[["MDNSResponse", "tuple[str, int]"], Optional[DiscoveredRecord]]
+    #: Stable cache key for a mapped record (e.g. its serial or host).
+    key: Callable[[DiscoveredRecord], str]
+    #: Given a response, the additional PTR query names to issue (DNS-SD stage 2).
+    #: The default chains nothing -- single-stage brands omit it.
+    follow_up: Callable[["MDNSResponse"], "Tuple[str, ...]"] = lambda response: ()
+    group: str = "224.0.0.251"
+    port: int = 5353
+    query_interval: float = 30.0
+    multicast_ttl: Optional[int] = None

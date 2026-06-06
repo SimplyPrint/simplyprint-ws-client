@@ -51,3 +51,20 @@ def test_parse_ptr_srv_a_txt():
 
 def test_parse_garbage_returns_none():
     assert MDNSResponseParser.parse(b"not-a-dns-packet") is None
+
+
+def test_mdns_spec_defaults():
+    from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
+    from simplyprint_ws_client.events import Event
+
+    spec = MDNSSpec(
+        brand="acme",
+        queries=("_acme._tcp.local",),
+        event_type=Event,
+        mapper=lambda response, addr: None,
+        key=lambda record: "x",
+    )
+    assert spec.group == "224.0.0.251"
+    assert spec.port == 5353
+    assert spec.query_interval == 30.0
+    assert spec.follow_up(object()) == ()  # default: no DNS-SD chaining
