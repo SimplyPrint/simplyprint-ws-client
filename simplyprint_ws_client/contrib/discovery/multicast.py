@@ -66,7 +66,7 @@ class _MulticastProtocol(asyncio.DatagramProtocol):
             await self._emit(record)
 
     def error_received(self, exc) -> None:
-        if exc in (errno.EAGAIN, errno.EWOULDBLOCK):
+        if isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             return
         self._logger.error("multicast error for %s", self._spec.brand, exc_info=exc)
 
