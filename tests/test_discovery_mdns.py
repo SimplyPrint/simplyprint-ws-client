@@ -199,3 +199,19 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
     protocol.datagram_received(_dnssd_stage1(), ("192.0.2.9", 5353))
     await asyncio.sleep(0)
     assert len(transport.sent) == 1
+
+
+def test_printer_client_spec_mdns_hook_is_opt_in():
+    from simplyprint_ws_client.contrib.spec.client_spec import PrinterClientSpec
+
+    assert PrinterClientSpec.mdns_spec() is None
+    assert PrinterClientSpec.provides("mdns_spec") is False
+
+    class _Brand(PrinterClientSpec):
+        KEY = "brandx"
+
+        @classmethod
+        def mdns_spec(cls):
+            return "a-spec"
+
+    assert _Brand.provides("mdns_spec") is True

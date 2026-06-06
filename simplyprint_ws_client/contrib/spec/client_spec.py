@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from simplyprint_ws_client import PrinterConfig
     from simplyprint_ws_client.contrib.accounts import AccountProvider
     from simplyprint_ws_client.contrib.discovery.spec import (
+        MDNSSpec,
         MulticastSpec,
         NetworkServiceSpec,
         SubnetScanSpec,
@@ -120,6 +121,11 @@ class PrinterClientSpec(ClientSpec):
     @classmethod
     def multicast_spec(cls) -> "Optional[MulticastSpec]":
         """An always-on SSDP multicast discovery spec, or ``None``."""
+        return None
+
+    @classmethod
+    def mdns_spec(cls) -> "Optional[MDNSSpec]":
+        """An always-on mDNS / DNS-SD discovery spec, or ``None``."""
         return None
 
     @classmethod
