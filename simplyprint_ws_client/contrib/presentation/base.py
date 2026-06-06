@@ -61,6 +61,7 @@ NAME_FIELD = EditableField(
 @dataclass(frozen=True)
 class PrinterPresentation:
     image_url: str | None = None
+    model_name: str | None = None
     connection: dict | None = None
     badges: list[dict] = field(default_factory=list)
     secrets: list[dict] = field(default_factory=list)
