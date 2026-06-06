@@ -19,6 +19,7 @@ from typing import Iterable, Mapping
 from simplyprint_ws_client.events import EventBus
 
 from simplyprint_ws_client.contrib.discovery.host import DiscoveryServiceHost
+from simplyprint_ws_client.contrib.discovery.mdns import MDNSDiscoveryBackend
 from simplyprint_ws_client.contrib.discovery.multicast import MulticastDiscoveryBackend
 from simplyprint_ws_client.contrib.discovery.network import (
     HostDiagnostic,
@@ -27,6 +28,7 @@ from simplyprint_ws_client.contrib.discovery.network import (
     service_diagnostic_check,
 )
 from simplyprint_ws_client.contrib.discovery.spec import (
+    MDNSSpec,
     MulticastSpec,
     NetworkServiceSpec,
     SubnetScanSpec,
@@ -40,6 +42,7 @@ class DiscoveryService:
         multicast_specs: Iterable[MulticastSpec] = (),
         subnet_specs: Iterable[SubnetScanSpec] = (),
         network_services: Mapping[str, tuple[NetworkServiceSpec, ...]] | None = None,
+        mdns_specs: Iterable[MDNSSpec] = (),
         restart_interval: float = 5.0,
     ) -> None:
         self.logger = logging.getLogger("discovery")
@@ -51,6 +54,11 @@ class DiscoveryService:
             self._multicast[spec.brand] = MulticastDiscoveryBackend(
                 spec, self.event_bus
             )
+        self._mdns = {}
+        for spec in mdns_specs:
+            if spec.brand in self._mdns:
+                raise ValueError(f"duplicate mdns discovery spec: {spec.brand}")
+            self._mdns[spec.brand] = MDNSDiscoveryBackend(spec, self.event_bus)
         self._restart_interval = restart_interval
         self._host: DiscoveryServiceHost | None = None
         self._subnet = {spec.brand: spec for spec in subnet_specs}
@@ -79,7 +87,7 @@ class DiscoveryService:
         if self._host is not None and not self._stopped:
             return
         self._host = DiscoveryServiceHost(
-            self._multicast.values(),
+            list(self._multicast.values()) + list(self._mdns.values()),
             restart_interval=self._restart_interval,
             logger=self.logger,
         )
@@ -92,7 +100,7 @@ class DiscoveryService:
 
     def snapshot(self, brand: str) -> list:
         """Devices currently in a brand's passive cache (empty if none)."""
-        backend = self._multicast.get(brand)
+        backend = self._multicast.get(brand) or self._mdns.get(brand)
         return list(backend.get_devices()) if backend is not None else []
 
     async def scan(self, brand: str, timeout: float = 5.0) -> list:

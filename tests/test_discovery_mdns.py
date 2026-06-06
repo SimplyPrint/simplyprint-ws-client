@@ -201,6 +201,20 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
     assert len(transport.sent) == 1
 
 
+@pytest.mark.asyncio
+async def test_discovery_service_builds_mdns_backend_and_snapshots():
+    from simplyprint_ws_client.contrib.discovery.service import DiscoveryService
+
+    service = DiscoveryService(mdns_specs=[_single_stage_spec()])
+    backend = service._mdns["probe"]
+    protocol = backend._protocol_factory()
+    protocol.datagram_received(_ultimaker_response(), ("192.0.2.7", 5353))
+    await asyncio.sleep(0)
+    snapshot = service.snapshot("probe")
+    assert len(snapshot) == 1
+    assert snapshot[0]["host"] == "192.0.2.7"
+
+
 def test_printer_client_spec_mdns_hook_is_opt_in():
     from simplyprint_ws_client.contrib.spec.client_spec import PrinterClientSpec
 
