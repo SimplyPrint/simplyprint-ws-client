@@ -36,6 +36,58 @@ from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
 _DEVICE_TTL = 300
 
 
+def _clear_cache_flush(data: bytes) -> bytes:
+    """Normalise the mDNS cache-flush / unicast-response bit out of the wire.
+
+    Responders set the top bit of each resource record's CLASS field (so ``IN``
+    becomes ``0x8001``); a plain DNS parser treats that as an unknown class and
+    returns untyped generic rdata, losing the ``target``/``address`` fields. This
+    walks the message and clears that bit on every RR class so the datagram parses
+    as class ``IN`` (with proper name decompression). OPT records are left alone --
+    their CLASS field is a UDP payload size, not a class. Returns the input
+    unchanged if the structure can't be walked.
+    """
+    if len(data) < 12:
+        return data
+    try:
+        qd, an, ns, ar = struct.unpack_from("!4H", data, 4)
+    except struct.error:
+        return data
+
+    buf = bytearray(data)
+    end = len(buf)
+
+    def skip_name(p: int) -> int:
+        while p < end:
+            length = buf[p]
+            if length == 0:
+                return p + 1
+            if length & 0xC0 == 0xC0:
+                return p + 2
+            p += length + 1
+        return p
+
+    pos = 12
+    for _ in range(qd):
+        pos = skip_name(pos) + 4  # qtype + qclass
+        if pos > end:
+            return data
+    for _ in range(an + ns + ar):
+        pos = skip_name(pos)
+        if pos + 10 > end:
+            return data
+        rrtype = struct.unpack_from("!H", buf, pos)[0]
+        if rrtype != 41:  # not OPT (whose CLASS field is the UDP payload size)
+            rrclass = struct.unpack_from("!H", buf, pos + 2)[0]
+            if rrclass & 0x8000:
+                struct.pack_into("!H", buf, pos + 2, rrclass & 0x7FFF)
+        rdlen = struct.unpack_from("!H", buf, pos + 8)[0]
+        pos += 10 + rdlen
+        if pos > end:
+            return data
+    return bytes(buf)
+
+
 @dataclass(frozen=True)
 class MDNSRecord:
     name: str
@@ -101,7 +153,7 @@ class MDNSResponseParser:
     @classmethod
     def parse(cls, data: bytes) -> Optional[MDNSResponse]:
         try:
-            msg = dns.message.from_wire(data)
+            msg = dns.message.from_wire(_clear_cache_flush(data))
         except Exception:
             return None
 
@@ -112,37 +164,45 @@ class MDNSResponseParser:
                 continue
             name = rrset.name.to_text(omit_final_dot=True)
             for rdata in rrset:
-                records.append(cls._record(name, rtype, rdata))
+                record = cls._record(name, rtype, rdata)
+                if record is not None:
+                    records.append(record)
 
         if not records:
             return None
         return MDNSResponse(tuple(records))
 
     @staticmethod
-    def _record(name: str, rtype: str, rdata) -> MDNSRecord:
-        if rtype == "PTR":
-            return MDNSRecord(
-                name, rtype, target=rdata.target.to_text(omit_final_dot=True)
-            )
-        if rtype == "SRV":
-            return MDNSRecord(
-                name,
-                rtype,
-                target=rdata.target.to_text(omit_final_dot=True),
-                port=rdata.port,
-            )
-        if rtype == "A":
-            return MDNSRecord(name, rtype, address=rdata.address)
-        if rtype == "TXT":
-            txt: Dict[str, str] = {}
-            for chunk in rdata.strings:
-                text = chunk.decode("utf-8", "replace")
-                if "=" in text:
-                    key, value = text.split("=", 1)
-                    txt[key] = value
-                else:
-                    txt[text] = ""
-            return MDNSRecord(name, rtype, txt=txt)
+    def _record(name: str, rtype: str, rdata) -> Optional[MDNSRecord]:
+        # A record whose mDNS cache-flush class bit could not be normalised parses
+        # as an untyped generic rdata (no ``target``/``address``); skip it rather
+        # than crash the whole datagram.
+        try:
+            if rtype == "PTR":
+                return MDNSRecord(
+                    name, rtype, target=rdata.target.to_text(omit_final_dot=True)
+                )
+            if rtype == "SRV":
+                return MDNSRecord(
+                    name,
+                    rtype,
+                    target=rdata.target.to_text(omit_final_dot=True),
+                    port=rdata.port,
+                )
+            if rtype == "A":
+                return MDNSRecord(name, rtype, address=rdata.address)
+            if rtype == "TXT":
+                txt: Dict[str, str] = {}
+                for chunk in rdata.strings:
+                    text = chunk.decode("utf-8", "replace")
+                    if "=" in text:
+                        key, value = text.split("=", 1)
+                        txt[key] = value
+                    else:
+                        txt[text] = ""
+                return MDNSRecord(name, rtype, txt=txt)
+        except AttributeError:
+            return None
         return MDNSRecord(name, rtype)
 
     @staticmethod

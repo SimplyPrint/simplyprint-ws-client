@@ -53,6 +53,52 @@ def test_parse_garbage_returns_none():
     assert MDNSResponseParser.parse(b"not-a-dns-packet") is None
 
 
+def _set_cache_flush(data):
+    """Set the mDNS cache-flush bit (top of CLASS) on every RR — like a real
+    mDNS responder does, which a plain DNS parser turns into untyped rdata."""
+    import struct
+
+    qd, an, ns, ar = struct.unpack_from("!4H", data, 4)
+    buf = bytearray(data)
+    end = len(buf)
+
+    def skip_name(p):
+        while p < end:
+            length = buf[p]
+            if length == 0:
+                return p + 1
+            if length & 0xC0 == 0xC0:
+                return p + 2
+            p += length + 1
+        return p
+
+    pos = 12
+    for _ in range(qd):
+        pos = skip_name(pos) + 4
+    for _ in range(an + ns + ar):
+        pos = skip_name(pos)
+        cls = struct.unpack_from("!H", buf, pos + 2)[0]
+        struct.pack_into("!H", buf, pos + 2, cls | 0x8000)
+        rdlen = struct.unpack_from("!H", buf, pos + 8)[0]
+        pos += 10 + rdlen
+    return bytes(buf)
+
+
+def test_parse_normalises_cache_flush_bit():
+    # Real responders set the cache-flush bit; the parser must still return typed
+    # records (regression for the GenericRdata AttributeError crash on live LANs).
+    wire = _set_cache_flush(
+        _response_wire([
+            ("svc._x._tcp.local.", "SRV", "0 0 80 host.local."),
+            ("host.local.", "A", "192.0.2.5"),
+        ])
+    )
+    response = MDNSResponseParser.parse(wire)
+    assert response is not None
+    assert response.srv("svc._x._tcp.local") == ("host.local", 80)
+    assert response.address_for("host.local") == "192.0.2.5"
+
+
 def test_mdns_spec_defaults():
     from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
     from simplyprint_ws_client.events import Event
