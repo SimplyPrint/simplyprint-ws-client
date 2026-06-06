@@ -124,3 +124,78 @@ async def test_backend_caches_and_emits():
     assert len(devices) == 1
     assert devices[0]["host"] == "192.0.2.7"
     assert len(received) == 1
+
+
+def _dnssd_stage1():
+    return _response_wire([
+        ("_services._dns-sd._udp.local.", "PTR", "_acme-AA11._udp.local."),
+    ])
+
+
+def _dnssd_stage2():
+    return _response_wire([
+        ("_acme-AA11._udp.local.", "PTR", "p._acme-AA11._udp.local."),
+        ("p._acme-AA11._udp.local.", "SRV", "0 0 80 p.local."),
+        ("p.local.", "A", "192.0.2.9"),
+    ])
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.sent = []
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
+
+
+@pytest.mark.asyncio
+async def test_two_stage_follow_up_issues_stage2_query_and_maps():
+    from simplyprint_ws_client.contrib.discovery.mdns import MDNSDiscoveryBackend
+    from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
+
+    _DNSSD = "_services._dns-sd._udp.local"
+    _PREFIX = "_acme-"
+
+    def follow_up(response):
+        return tuple(
+            t for t in response.ptr_targets(_DNSSD) if t.startswith(_PREFIX)
+        )
+
+    def mapper(response, addr):
+        for srv in response.srv_records():
+            ip = response.address_for(srv.target) or addr[0]
+            return {"host": ip}
+        return None
+
+    spec = MDNSSpec(
+        brand="probe2",
+        queries=(_DNSSD,),
+        event_type=_ProbeEvent,
+        mapper=mapper,
+        key=lambda record: record["host"],
+        follow_up=follow_up,
+    )
+
+    backend = MDNSDiscoveryBackend(spec, EventBus())
+    protocol = backend._protocol_factory()
+    transport = _FakeTransport()
+    protocol.connection_made(transport)
+
+    # Stage 1 -> backend should issue a stage-2 PTR query for the discovered type.
+    protocol.datagram_received(_dnssd_stage1(), ("192.0.2.9", 5353))
+    await asyncio.sleep(0)
+    assert len(transport.sent) == 1
+    sent_query = dns.message.from_wire(transport.sent[0][0])
+    assert sent_query.question[0].name.to_text(omit_final_dot=True) == "_acme-AA11._udp.local"
+
+    # Stage 2 -> device is resolved and cached.
+    protocol.datagram_received(_dnssd_stage2(), ("192.0.2.9", 5353))
+    await asyncio.sleep(0)
+    devices = backend.get_devices()
+    assert len(devices) == 1
+    assert devices[0]["host"] == "192.0.2.9"
+
+    # Re-receiving stage 1 must NOT re-issue the same follow-up (dedup).
+    protocol.datagram_received(_dnssd_stage1(), ("192.0.2.9", 5353))
+    await asyncio.sleep(0)
+    assert len(transport.sent) == 1
