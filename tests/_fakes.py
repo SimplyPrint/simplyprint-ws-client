@@ -1,6 +1,6 @@
 """Test doubles for the WebSocket transport seam.
 
-``FakeTransport`` is an in-memory :class:`WebSocketTransport` that lets a test
+``FakeTransport`` is an in-memory :class:`WebSocket` that lets a test
 drive :class:`Connection` deterministically -- no real socket, no aiohttp/
 ``websockets`` involvement. ``connect`` opens it, ``send`` records into
 :attr:`sent`, and ``recv`` waits on an inbox the test feeds with
@@ -10,13 +10,13 @@ drive :class:`Connection` deterministically -- no real socket, no aiohttp/
 import asyncio
 from typing import List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.connection.wire import (
-    TransportClosed,
-    WebSocketTransport,
+from simplyprint_ws_client.contrib.connection.websocket.base import (
+    WebSocket,
+    WebSocketClosed,
 )
 
 
-class FakeTransport(WebSocketTransport):
+class FakeTransport(WebSocket):
     def __init__(self, logger=None) -> None:
         self.sent: List[str] = []
         self.connect_calls = 0
@@ -30,7 +30,7 @@ class FakeTransport(WebSocketTransport):
 
     async def send(self, data: str) -> None:
         if not self._open:
-            raise TransportClosed("not connected")
+            raise WebSocketClosed("not connected")
         self.sent.append(data)
 
     async def recv(self) -> Optional[str]:
@@ -60,5 +60,5 @@ class FakeTransport(WebSocketTransport):
         self._inbox.put_nowait(data)
 
     def queue_close(self, code: int = 1006) -> None:
-        """Make the next ``recv()`` raise ``TransportClosed`` (a dropped socket)."""
-        self._inbox.put_nowait(TransportClosed("peer closed", code=code))
+        """Make the next ``recv()`` raise ``WebSocketClosed`` (a dropped socket)."""
+        self._inbox.put_nowait(WebSocketClosed("peer closed", code=code))

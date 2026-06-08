@@ -241,7 +241,12 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             *(client.teardown() for client in self.client_list.values())
         )
         await asyncio.gather(
-            *(connection._loop_task.task for connection in self.manager.connections)
+            *(
+                task
+                for connection in self.manager.connections
+                if (task := connection.loop_task) is not None
+            ),
+            return_exceptions=True,  # stopped engines wind down via CancelledError
         )
 
     async def _schedule_loop(self):

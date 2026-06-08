@@ -12,11 +12,12 @@ import threading
 
 import pytest
 
-from simplyprint_ws_client.contrib.connection.async_mqtt import MqttParams
-from simplyprint_ws_client.contrib.connection.sync_mqtt import (
+from simplyprint_ws_client.contrib.connection.mqtt import (
+    MqttParams,
     MqttPool,
-    PahoMqttTransport,
+    MqttTransport,
 )
+from simplyprint_ws_client.contrib.connection.pool import DeliveryConfig
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
 
@@ -92,7 +93,7 @@ def _pool(loop, clients=None, **pool_kwargs):
     def transport_factory(params):
         client = FakePahoClient()
         created.append(client)
-        return PahoMqttTransport(params, client_factory=lambda p, log: client)
+        return MqttTransport(params, client_factory=lambda p, log: client)
 
     pool = MqttPool(
         transport_factory=transport_factory,
@@ -162,7 +163,7 @@ async def test_route_subscription_is_refcounted_and_removed():
 @pytest.mark.asyncio
 async def test_message_backlog_is_bounded_but_lifecycle_is_lossless():
     loop = asyncio.get_running_loop()
-    pool, clients = _pool(loop, message_maxsize=1)
+    pool, clients = _pool(loop, delivery=DeliveryConfig(message_maxsize=1))
     lease = pool.connect(MqttParams("broker", 8883), route="printer/a/report")
 
     messages = []

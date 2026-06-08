@@ -1,12 +1,12 @@
 """Brand-agnostic connection management on the transport/lease primitives.
 
-The successor to the ``ClientBucket`` + ``Connection`` + ``ConnectionManager``
+The successor to the ``ClientBucket`` + ``Lease`` + ``ConnectionManager``
 trio: :class:`PooledConnectionManager` owns the register / remove / refresh /
 keepalive lifecycle for many clients, but delegates transport *sharing* and
-message *routing* to a :class:`~.transport.Pool`'s ``connect() -> Connection``
+message *routing* to a :class:`~.transport.Pool`'s ``connect() -> Lease``
 lease. Each client gets a lease scoped to its route (an MQTT topic, or ``None``
 for a 1:1 socket); the lease delivers that client's messages and connect/
-disconnect events **on the consumer loop** (its courier does the hop), so the
+disconnect events **on the pool loop** (its courier does the hop), so the
 manager wires them straight to the client's own event bus -- there is no separate
 dispatch worker thread.
 
@@ -42,7 +42,7 @@ from simplyprint_ws_client.shared.utils.bounded_variable import (
 from simplyprint_ws_client.shared.utils.stoppable import SyncStoppable
 
 from simplyprint_ws_client.contrib.connection.transport import (
-    Connection,
+    Lease,
     Pool,
 )
 
@@ -111,7 +111,7 @@ class PooledConnectionManager(SyncStoppable, Generic[TClient, TParams]):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._pool: Pool = self._make_pool()
-        self._leases: Dict[TClient, Connection] = {}
+        self._leases: Dict[TClient, Lease] = {}
         self._params: Dict[TClient, TParams] = {}
         self._registering: Dict[TClient, object] = {}
         self._cancelled_registrations: Set[object] = set()
@@ -136,20 +136,14 @@ class PooledConnectionManager(SyncStoppable, Generic[TClient, TParams]):
     def _on_suspect(self, client: TClient, event: object) -> None:
         """A suspect connect for ``client`` (repeated failure / CONNACK reject).
         Default: no-op. A brand overrides to re-handshake / refresh credentials
-        (typically via :meth:`submit_to_consumer`)."""
+        (typically via :meth:`submit_to_loop`)."""
 
     def _emit_to_client(self, client: TClient, event: Hashable, *args: object) -> None:
         client.event_bus.emit_sync(event, *args)
 
     def _deliver(self, client: TClient, event: Hashable, *args: object) -> None:
-        def deliver() -> None:
-            self._emit_to_client(client, event, *args)
-
-        call_to_consumer = getattr(self._pool, "call_to_consumer", None)
-        if call_to_consumer is not None:
-            call_to_consumer(deliver)
-        else:
-            deliver()
+        # Hop onto the pool loop so the client's bus is emitted on one thread.
+        self._pool.call_on_loop(lambda: self._emit_to_client(client, event, *args))
 
     def add_client(self, client: TClient) -> None:
         # Idempotent: a reconcile sweep may race a successful registration.
@@ -245,7 +239,7 @@ class PooledConnectionManager(SyncStoppable, Generic[TClient, TParams]):
         if lease is not None:
             lease.close()
 
-    def get_connection_from_client(self, client: TClient) -> Optional[Connection]:
+    def get_connection_from_client(self, client: TClient) -> Optional[Lease]:
         """This client's lease, or ``None`` if it isn't registered/leased yet.
 
         The handle a client drives directly (e.g. ``send``); the manager owns its
@@ -274,16 +268,16 @@ class PooledConnectionManager(SyncStoppable, Generic[TClient, TParams]):
             # Give the printer a chance to answer before we poke again.
             client.last_message_at = now_ms() - (self.keepalive_timeout_ms // 2)
 
-    def submit_to_consumer(
+    def submit_to_loop(
         self,
         coro_factory: Callable[[], object],
         *,
         coalesce_key: Optional[Hashable] = None,
     ) -> None:
-        """Run async work on the consumer loop from a transport thread (the
+        """Run async work on the pool loop from a transport thread (the
         sanctioned cross-thread hop, e.g. an auth re-handshake). Delegates to the
-        pool's :class:`~.transport.ConsumerLoop`."""
-        self._pool.submit_to_consumer(coro_factory, coalesce_key=coalesce_key)
+        pool's :class:`~.loop.LoopBridge`."""
+        self._pool.submit_to_loop(coro_factory, coalesce_key=coalesce_key)
 
     def stop(self) -> None:
         self.logger.info("Stopping connection manager")
@@ -297,6 +291,4 @@ class PooledConnectionManager(SyncStoppable, Generic[TClient, TParams]):
             self._registering.clear()
         for lease in leases:
             lease.close()
-        pool_stop = getattr(self._pool, "stop", None)
-        if pool_stop is not None:
-            pool_stop()
+        self._pool.stop()

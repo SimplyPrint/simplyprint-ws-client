@@ -1,17 +1,16 @@
-"""The blocking websocket-client wire (the WS family's lowest leaf).
+"""The blocking websocket-client wire (the WebSocket family's lowest leaf).
 
 A single, supervised ``WebSocketApp`` on its own daemon thread: it owns the
 socket, the connect/reconnect loop, an optional app-level ping, and
 :class:`ConnectionState` tracking, and exposes three callbacks (``on_message`` /
 ``on_connected`` / ``on_disconnected``) plus ``send``. It knows nothing of pools,
-leases or events -- :class:`~.sync_ws.ThreadedWsTransport` wraps one of these and
-translates its callbacks into :class:`TransportEvent` s carried onto the consumer
-loop by a :class:`~simplyprint_ws_client.shared.asyncio.courier.Courier`.
+leases or events -- the sync :class:`~.sync.WebSocketTransport` wraps one of these
+and translates its callbacks into :class:`TransportEvent` s carried onto the
+consumer loop by a :class:`~simplyprint_ws_client.shared.asyncio.courier.Courier`.
 
-Note the deliberate name split from the async :class:`WebSocketTransport` ABC in
-:mod:`.transport`: that one is the asyncio backend transport; this one is the
-threaded, websocket-client-based printer wire. They share neither code nor
-execution model -- only the WebSocket protocol.
+This callback-based, thread-driven wire is deliberately separate from the async
+:class:`~.base.WebSocket` ABC (the ``websockets``/aiohttp sockets): they share
+neither code nor execution model -- only the WebSocket protocol.
 """
 
 from __future__ import annotations
@@ -23,10 +22,10 @@ import websocket
 
 from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
 
-from .state import ConnectionState
+from simplyprint_ws_client.contrib.connection.state import ConnectionState
 
 
-class ThreadedWebSocketTransport:
+class ThreadedImpl:
     """Owns a ``WebSocketApp`` running on a supervised daemon thread.
 
     The supervisor thread runs ``run_forever`` (which itself auto-reconnects on

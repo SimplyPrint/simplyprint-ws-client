@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-from simplyprint_ws_client.contrib.connection.async_mqtt import (
+from simplyprint_ws_client.contrib.connection.mqtt import (
     AsyncMqttPool,
     AsyncMqttTransport,
     MqttParams,
@@ -26,6 +26,7 @@ from simplyprint_ws_client.contrib.connection.transport import (
     MessageReceived,
     StateChanged,
 )
+from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
 
@@ -34,7 +35,7 @@ def test_importing_async_mqtt_does_not_load_aiomqtt():
     # building a transport) must not drag the optional dependency in.
     code = (
         "import sys\n"
-        "import simplyprint_ws_client.contrib.connection.async_mqtt as m\n"
+        "import simplyprint_ws_client.contrib.connection.mqtt.aio as m\n"
         "assert 'aiomqtt' not in sys.modules, 'aiomqtt eagerly imported'\n"
         "print('ok')\n"
     )
@@ -113,7 +114,7 @@ class _HoldingClient:
     async def _gen(self):
         await self._release.wait()
         return
-        yield  # noqa: unreachable -- marks _gen as an async generator
+        yield  # marks _gen as an async generator
 
 
 @pytest.mark.asyncio
@@ -191,23 +192,28 @@ async def test_pool_shares_one_transport_per_endpoint_and_refcounts():
     a = MqttParams("a", 8883)
     b = MqttParams("b", 8883)
 
-    t_a1 = await pool.acquire(a)
-    t_a2 = await pool.acquire(a)  # same endpoint -> same transport, not a new one
-    t_b = await pool.acquire(b)
+    c_a1 = await pool.connect(a)
+    c_a2 = await pool.connect(a)  # same endpoint -> same transport, not a new one
+    c_b = await pool.connect(b)
+    t_a1 = created[0]
+    t_b = created[1]
 
-    assert t_a1 is t_a2
     assert t_a1 is not t_b
-    assert t_a1.started == 1  # started once despite two acquires
+    assert len(created) == 2
+    assert t_a1.started == 1  # started once despite two leases
     assert t_b.started == 1
 
-    await pool.release(a)  # one holder remains
+    await c_a1.close()  # one holder remains
     assert t_a1.stopped == 0
-    await pool.release(a)  # last holder leaves -> torn down
+    await c_a2.close()  # last holder leaves -> torn down
     assert t_a1.stopped == 1
 
-    t_a3 = await pool.acquire(a)  # re-acquired -> a fresh transport
+    c_a3 = await pool.connect(a)  # re-acquired -> a fresh transport
+    t_a3 = created[2]
     assert t_a3 is not t_a1
     assert t_a3.started == 1
+    await c_a3.close()
+    await c_b.close()
 
 
 class _RecordingTransport:
@@ -215,11 +221,20 @@ class _RecordingTransport:
 
     def __init__(self, params):
         self.params = params
+        self.events = EventBus()
+        self.state = ConnectionState.OFFLINE
         self.started = 0
         self.stopped = 0
+        self._connected = False
+
+    @property
+    def connected(self):
+        return self._connected
 
     def start(self):
         self.started += 1
+        self._connected = True
 
     def stop(self):
         self.stopped += 1
+        self._connected = False

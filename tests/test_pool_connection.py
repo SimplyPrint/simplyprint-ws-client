@@ -2,7 +2,7 @@
 
 These pin the front-door contract: one shared transport per endpoint
 (ref-counted), per-lease topic routing (a client sees only its own messages, not
-every other client's), clean lease teardown, and the ``submit_to_consumer``
+every other client's), clean lease teardown, and the ``submit_to_loop``
 cross-thread coroutine hop that replaces every ad-hoc reach-into-a-client.
 
 Exercised with a fake aiomqtt-shaped transport, so no broker is involved.
@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from simplyprint_ws_client.contrib.connection.async_mqtt import (
+from simplyprint_ws_client.contrib.connection.mqtt import (
     AsyncMqttPool,
     MqttParams,
 )
@@ -214,7 +214,7 @@ async def test_async_message_handler_is_scheduled_on_the_loop():
 
 
 @pytest.mark.asyncio
-async def test_submit_to_consumer_runs_off_thread_and_coalesces():
+async def test_submit_to_loop_runs_off_thread_and_coalesces():
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     pool, _ = _pool_with_recorder(loop=loop)
@@ -235,13 +235,13 @@ async def test_submit_to_consumer_runs_off_thread_and_coalesces():
     def producer():
         # Two submissions with the same key while the first is in flight: the
         # second must be a no-op (coalesced). Both return immediately.
-        lease.submit_to_consumer(lambda: work("a"), coalesce_key="k")
-        lease.submit_to_consumer(lambda: work("b"), coalesce_key="k")
+        lease.submit_to_loop(lambda: work("a"), coalesce_key="k")
+        lease.submit_to_loop(lambda: work("b"), coalesce_key="k")
 
     t = threading.Thread(target=producer)
     t.start()
     t.join(1.0)
-    assert not t.is_alive()  # submit_to_consumer returned immediately
+    assert not t.is_alive()  # submit_to_loop returned immediately
 
     for _ in range(200):
         await asyncio.sleep(0.005)
@@ -254,6 +254,6 @@ async def test_submit_to_consumer_runs_off_thread_and_coalesces():
     allow_finish.set()
     await asyncio.sleep(0.02)  # let "a" finish and free the coalesce key
 
-    lease.submit_to_consumer(lambda: work("c"), coalesce_key="k")
+    lease.submit_to_loop(lambda: work("c"), coalesce_key="k")
     await asyncio.sleep(0.02)
     assert calls == ["a", "c"]  # key freed after completion -> runs again

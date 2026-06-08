@@ -1,7 +1,7 @@
-"""A :class:`WebSocketTransport` backed by aiohttp.
+"""A :class:`WebSocket` backed by aiohttp.
 
-This is the library's original WebSocket stack, now expressed behind the
-transport seam so it can be selected instead of (or alongside) the default
+This is the library's original WebSocket stack, now expressed behind the raw
+socket seam so it can be selected instead of (or alongside) the default
 ``websockets`` implementation. Useful when an integration already runs an
 aiohttp stack, or to A/B the two against the backend.
 """
@@ -17,20 +17,20 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     ClientWSTimeout,
-    WebSocketError,
     WSMsgType,
 )
+from aiohttp import WebSocketError as AiohttpWebSocketError
 
-from .base import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
+from .base import WS_CLOSE_OK, WebSocket, WebSocketClosed, WebSocketError
 
 if TYPE_CHECKING:
     from aiohttp import ClientWebSocketResponse
 
-__all__ = ["AiohttpWebSocketTransport"]
+__all__ = ["AiohttpImpl"]
 
 
-class AiohttpWebSocketTransport(WebSocketTransport):
-    """A :class:`WebSocketTransport` backed by aiohttp's ``ws_connect``."""
+class AiohttpImpl(WebSocket):
+    """A :class:`WebSocket` backed by aiohttp's ``ws_connect``."""
 
     def __init__(self, logger: logging.Logger = logging.getLogger("ws")) -> None:
         self._logger = logger
@@ -69,21 +69,21 @@ class AiohttpWebSocketTransport(WebSocketTransport):
                     ws_receive=None, ws_close=float(close_timeout or 10)
                 ),
             )
-        except (ClientError, WebSocketError, OSError, asyncio.TimeoutError) as e:
+        except (ClientError, AiohttpWebSocketError, OSError, asyncio.TimeoutError) as e:
             await self._close_session()
-            raise TransportError(str(e)) from e
+            raise WebSocketError(str(e)) from e
 
     async def send(self, data: str) -> None:
         if self._ws is None or self._ws.closed:
-            raise TransportClosed("not connected")
+            raise WebSocketClosed("not connected")
         try:
             await self._ws.send_str(data)
-        except (ConnectionError, ClientError, WebSocketError) as e:
-            raise TransportClosed(str(e)) from e
+        except (ConnectionError, ClientError, AiohttpWebSocketError) as e:
+            raise WebSocketClosed(str(e)) from e
 
     async def recv(self) -> Optional[str]:
         if self._ws is None:
-            raise TransportClosed("not connected")
+            raise WebSocketClosed("not connected")
         message = await self._ws.receive()
         if message.type in (
             WSMsgType.CLOSE,
@@ -91,7 +91,7 @@ class AiohttpWebSocketTransport(WebSocketTransport):
             WSMsgType.CLOSED,
             WSMsgType.ERROR,
         ):
-            raise TransportClosed(f"closed: {message.type}", code=self._ws.close_code)
+            raise WebSocketClosed(f"closed: {message.type}", code=self._ws.close_code)
         if message.type in (WSMsgType.TEXT, WSMsgType.BINARY):
             data = message.data
             return data.decode("utf-8", "replace") if isinstance(data, bytes) else data

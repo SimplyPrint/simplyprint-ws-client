@@ -1,22 +1,24 @@
-"""Contract tests for every concrete WebSocketTransport, against a real server.
+"""Contract tests for every concrete :class:`WebSocket` impl, against a real server.
 
-Both shipped implementations -- WebSocketsTransport (default) and
-AiohttpWebSocketTransport -- must satisfy the same contract: connect/send/recv/
-close roundtrip, connect failure -> TransportError, peer close -> TransportClosed,
-idempotent close. Parametrizing over both is what proves the abstraction is real.
+Both shipped implementations -- WebsocketsImpl (default) and AiohttpImpl -- must
+satisfy the same contract: connect/send/recv/close roundtrip, connect failure ->
+WebSocketError, peer close -> WebSocketClosed, idempotent close. Parametrizing over
+both is what proves the abstraction is real.
 """
 
 import pytest
 from websockets.asyncio.server import serve
 
-from simplyprint_ws_client.contrib.connection.wire import (
-    AiohttpWebSocketTransport,
-    TransportClosed,
-    TransportError,
-    WebSocketsTransport,
+from simplyprint_ws_client.contrib.connection.websocket import (
+    AiohttpImpl,
+    WebsocketsImpl,
+)
+from simplyprint_ws_client.contrib.connection.websocket.base import (
+    WebSocketClosed,
+    WebSocketError,
 )
 
-TRANSPORTS = [WebSocketsTransport, AiohttpWebSocketTransport]
+TRANSPORTS = [WebsocketsImpl, AiohttpImpl]
 IDS = ["websockets", "aiohttp"]
 
 
@@ -45,7 +47,7 @@ async def test_roundtrip_connect_send_recv_close(transport_cls):
 @pytest.mark.parametrize("transport_cls", TRANSPORTS, ids=IDS)
 async def test_connect_failure_raises_transport_error(transport_cls):
     transport = transport_cls()
-    with pytest.raises(TransportError):
+    with pytest.raises(WebSocketError):
         # Nothing is listening on port 1.
         await transport.connect("ws://127.0.0.1:1", open_timeout=0.5)
 
@@ -62,7 +64,7 @@ async def test_recv_raises_transport_closed_on_peer_close(transport_cls):
         transport = transport_cls()
         await transport.connect(f"ws://127.0.0.1:{port}")
 
-        with pytest.raises(TransportClosed):
+        with pytest.raises(WebSocketClosed):
             # Drain until the close handshake surfaces.
             for _ in range(20):
                 await transport.recv()

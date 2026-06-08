@@ -31,7 +31,7 @@ from . import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
     ".contrib.connection",
-    ".contrib.connection.wire",
+    ".contrib.connection.websocket",
     ".core.config",
     ".core.settings",
     ".core.state",
@@ -57,11 +57,11 @@ _PUBLIC = (
     "ClientSettings",
     "ClientSpec",
     "ConnectionMode",
-    "WebSocketTransport",
-    "WebSocketsTransport",
-    "AiohttpWebSocketTransport",
-    "TransportError",
-    "TransportClosed",
+    "WebSocket",
+    "WebsocketsImpl",
+    "AiohttpImpl",
+    "WebSocketError",
+    "WebSocketClosed",
     "PrinterConfig",
     "Config",
     "ConfigManager",
@@ -108,12 +108,12 @@ def __dir__():
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
     from .contrib.printer_client import PrinterClient  # noqa: F401
-    from .contrib.connection.wire import (  # noqa: F401
-        AiohttpWebSocketTransport,
-        TransportClosed,
-        TransportError,
-        WebSocketsTransport,
-        WebSocketTransport,
+    from .contrib.connection.websocket import (  # noqa: F401
+        AiohttpImpl,
+        WebSocket,
+        WebSocketClosed,
+        WebSocketError,
+        WebsocketsImpl,
     )
     from .core.app import *  # noqa: F401,F403
     from .core.client import *  # noqa: F401,F403

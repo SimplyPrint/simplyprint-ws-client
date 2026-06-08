@@ -1,20 +1,19 @@
-"""``contrib.connection.wire`` -- the raw async WebSocket wire.
+"""``contrib.connection.websocket`` -- the raw async WebSocket socket layer.
 
-The dumb socket the SimplyPrint backend ``Connection`` drives (an ABC + two
-async wire leaves), now living *inside* the connection subsystem rather than as
-a sibling package. The contract pinned here is import-purity: pulling the
-package (or its base ABC) must not eager-load either wire library -- ``websockets``
-and ``aiohttp`` stay lazy behind PEP 562 ``__getattr__`` so selecting one never
-drags in the other.
+The dumb socket the SimplyPrint backend ``Connection`` drives (the :class:`WebSocket`
+ABC + two async lib impls), living inside the WebSocket family. The contract pinned
+here is import-purity: pulling the package (or its base ABC) must not eager-load
+either wire library -- ``websockets`` and ``aiohttp`` stay lazy behind PEP 562
+``__getattr__`` so selecting one never drags in the other.
 """
 
 import subprocess
 import sys
 
-from simplyprint_ws_client.contrib.connection.wire import (
-    TransportClosed,
-    TransportError,
-    WebSocketTransport,
+from simplyprint_ws_client.contrib.connection.websocket.base import (
+    WebSocket,
+    WebSocketClosed,
+    WebSocketError,
 )
 
 
@@ -32,9 +31,9 @@ def _import_is_clean(import_line: str, *forbidden: str) -> None:
     )
 
 
-def test_wire_import_does_not_load_wire_libs():
+def test_websocket_package_does_not_load_wire_libs():
     _import_is_clean(
-        "import simplyprint_ws_client.contrib.connection.wire",
+        "import simplyprint_ws_client.contrib.connection.websocket",
         "websockets",
         "aiohttp",
     )
@@ -43,18 +42,18 @@ def test_wire_import_does_not_load_wire_libs():
 def test_base_abc_is_third_party_free():
     # The ABC + error vocabulary must be importable with neither wire lib present.
     _import_is_clean(
-        "from simplyprint_ws_client.contrib.connection.wire import base",
+        "from simplyprint_ws_client.contrib.connection.websocket import base",
         "websockets",
         "aiohttp",
     )
 
 
 def test_error_hierarchy():
-    assert issubclass(TransportClosed, TransportError)
+    assert issubclass(WebSocketClosed, WebSocketError)
 
 
 def test_abc_cannot_be_instantiated():
     import pytest
 
     with pytest.raises(TypeError):
-        WebSocketTransport()
+        WebSocket()

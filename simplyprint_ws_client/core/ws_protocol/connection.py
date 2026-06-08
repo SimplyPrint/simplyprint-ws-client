@@ -2,8 +2,8 @@ __all__ = ["Connection", "ConnectionHint", "ConnectionMode"]
 
 import asyncio
 import logging
-from enum import Enum, auto
-from typing import Optional, final, Hashable
+from enum import Enum
+from typing import Any, Hashable, Optional, final
 
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
@@ -11,31 +11,35 @@ from yarl import URL
 
 from .events import (
     ConnectionEvent,
-    ConnectionIncomingEvent,
-    ConnectionOutgoingEvent,
     ConnectionEstablishedEvent,
+    ConnectionIncomingEvent,
     ConnectionLostEvent,
+    ConnectionOutgoingEvent,
     ConnectionSuspectEvent,
 )
-from .messages import ClientMsg, ServerMsg, ClientMsgType
+from .messages import ClientMsg, ClientMsgType, ServerMsg
 from ..config import PrinterConfig
 from ...events import EventBus
-from ...shared.asyncio.continuous_task import ContinuousTask
 from ...shared.asyncio.courier import Courier, OverflowPolicy
 from ...shared.asyncio.event_loop_provider import EventLoopProvider
 from ...shared.sp.url_builder import SimplyPrintURL
 from ...shared.utils.backoff import ConstantBackoff
 from ...shared.utils.bounded_variable import BoundedInterval
-from ...contrib.logging import printer_logger
-from ...contrib.connection.wire import (
-    WS_CLOSE_OK,
-    WS_CLOSE_PROTOCOL_ERROR,
-    TransportError,
-    TransportFactory,
-    WebSocketsTransport,
-    WebSocketTransport,
-)
 from ...shared.utils.stoppable import AsyncStoppable
+from ...contrib.logging import printer_logger
+from ...contrib.connection.events import (
+    Connected,
+    ConnectionSuspect,
+    Disconnected,
+    MessageReceived,
+)
+from ...contrib.connection.reconnect import Link, ReconnectingTransport
+from ...contrib.connection.websocket.base import (
+    WebSocket,
+    WebSocketError,
+    WebSocketFactory,
+)
+from ...contrib.connection.websocket.websockets_impl import WebsocketsImpl
 
 
 class ConnectionMode(Enum):
@@ -65,26 +69,7 @@ class ConnectionHint:
         )
 
 
-class Action(Enum):
-    INTERRUPT = auto()
-    PAUSE = auto()
-    RESUME = auto()
-
-    def transition(self, state: "State"):
-        return {
-            self.PAUSE: State.PAUSED,
-            self.RESUME: State.NOT_CONNECTED,
-        }.get(self, state)
-
-
-class State(Enum):
-    NOT_CONNECTED = auto()
-    CONNECTING = auto()
-    CONNECTED = auto()
-    PAUSED = auto()
-
-
-# WebSocket transport parameters, passed to ``WebSocketTransport.connect``.
+# WebSocket transport parameters, passed to ``WebSocket.connect``.
 # Mirrors the previous aiohttp settings: a 30s ping heartbeat, unbounded message
 # size, a 60s connect timeout and a 10s close timeout.
 TransportParams = {
@@ -95,57 +80,110 @@ TransportParams = {
     "max_size": None,
 }
 
-# Errors we treat as a closed connection.
+# Errors we treat as a closed connection when sending.
 WsConnectionErrors = (
     OSError,
     ConnectionError,  # Technically a subset of OSError, but more specific.
     asyncio.TimeoutError,
     asyncio.CancelledError,
-    TransportError,  # Base of TransportClosed -- covers both.
+    WebSocketError,  # Base of WebSocketClosed -- covers both.
 )
 
+# How often a stuck-connecting socket is flagged ``suspect`` (every Nth failure),
+# and how long after connect a silent server gets before the link is recycled.
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
 WsFirstMessageTimeout = 30.0
+
+
+class _ServerLink(Link):
+    """One backend connection attempt -- the raw :class:`WebSocket` socket adapted
+    to the engine's neutral :class:`Link`.
+
+    ``open`` builds a fresh socket via the connection's factory and publishes it as
+    :attr:`Connection.transport`, so the version-targeted :meth:`Connection.send`
+    and :attr:`Connection.connected` read the live socket directly; ``recv`` yields
+    raw text the connection parses into a :class:`ServerMsg`; ``close`` tears the
+    socket down and clears the published handle. The link owns no reconnect /
+    backoff / version logic -- that is the :class:`~...contrib.connection.reconnect.ReconnectingTransport`
+    engine's job.
+    """
+
+    def __init__(self, connection: "Connection") -> None:
+        self._conn = connection
+        self._socket: Optional[WebSocket] = None
+
+    async def open(self) -> None:
+        socket = self._conn.transport_factory(self._conn.logger)
+        await socket.connect(str(self._conn.url), **TransportParams)
+        self._socket = socket
+        self._conn.transport = socket
+
+    async def recv(self) -> Optional[str]:
+        assert self._socket is not None
+        return await self._socket.recv()
+
+    async def send(self, payload: Any) -> None:
+        assert self._socket is not None
+        await self._socket.send(payload)
+
+    async def close(self) -> None:
+        socket, self._socket = self._socket, None
+        # Only retract the published handle if it is still ours: a freshly-opened
+        # attempt may have already replaced it (resume races a winding-down drop).
+        if self._conn.transport is socket:
+            self._conn.transport = None
+        if socket is not None:
+            await socket.close()
+
+    @property
+    def is_open(self) -> bool:
+        return self._socket is not None and self._socket.is_open
 
 
 @final
 class Connection(
     AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop], Hashable
 ):
-    """Underlying connection to the SimplyPrint server. Manages the WebSocket connection and dispatches
-    both event and messages to power client functionality. Receives outgoing messages, and is stateless
-    by design.
+    """The link to the SimplyPrint server: the connection *protocol* over a shared
+    reconnection engine.
 
-    It manages one primary task that is the main `connect` loop, which is created on its first invocation.
-    Additional calls to `connect` and `disconnect` modify the behavior of the initial task. It is then finally
-    fully stopped (permanently) by calling `stop` from `AsyncStoppable`.
+    The reconnect/backoff/liveness/generation loop is no longer hand-rolled here --
+    it is a :class:`~...contrib.connection.reconnect.ReconnectingTransport` transport driving
+    a fresh :class:`_ServerLink` per attempt. ``Connection`` keeps only what is
+    genuinely SimplyPrint-specific: the URL, version-targeted ``send`` + JSON
+    (de)serialization, ``ServerMsg`` parsing, per-printer log routing, and the
+    ordered lifetime/message event delivery on its own UNBOUNDED :class:`Courier`.
+
+    It maps the engine's brand-free :class:`TransportEvent` s onto the protocol's
+    events: ``Connected`` -> :class:`ConnectionEstablishedEvent` (``v``); a parsed
+    ``MessageReceived`` -> :class:`ConnectionIncomingEvent` (``msg``, ``v``);
+    ``Disconnected`` -> :class:`ConnectionLostEvent` (``v``) **then** ``v += 1``
+    (the single version-bump site -- structurally one bump per ended attempt, so
+    the historic double-increment cannot recur); ``ConnectionSuspect`` ->
+    :class:`ConnectionSuspectEvent`. ``connect`` / ``disconnect`` start / stop the
+    engine; ``stop`` (from :class:`AsyncStoppable`) tears it down permanently.
 
     Attributes:
-        v: Version representing the connection generation, on every disconnect this value is incremented to invalidate previous versions.
-        transport: The underlying WebSocket transport (rebuilt per connection attempt).
+        v: Connection generation, incremented on every ended attempt to invalidate
+            messages targeted at a since-dropped link.
+        transport: The live underlying socket (published by the engine's link,
+            ``None`` while down) -- what ``send`` / ``connected`` read.
         hint: Connection hint from which the URL is derived.
-        logger: Logger for connection events.
-        event_bus: ConnectionEvent bus for lifetime events and message events.
-        _state: State of connection, allows us to resume whatever action was interrupted.
-        _queue: Allows us to signal the main loop to either pause, resume or re-check connectivity.
-        _loop_task: Main task that manages the connection loop.
     """
 
     v: int
-    transport: Optional[WebSocketTransport]
-    transport_factory: TransportFactory
+    transport: Optional[WebSocket]
+    transport_factory: WebSocketFactory
     hint: ConnectionHint
     logger: logging.Logger
 
     event_bus: EventBus[ConnectionEvent]
 
-    _state: State
-    _queue: asyncio.Queue
-    _loop_task: ContinuousTask[None]
+    _engine: Optional[ReconnectingTransport]
 
     def __init__(
         self,
-        transport_factory: TransportFactory = WebSocketsTransport,
+        transport_factory: WebSocketFactory = WebsocketsImpl,
         hint: Optional[ConnectionHint] = None,
         logger: logging.Logger = logging.getLogger("ws"),
         **kwargs,
@@ -175,9 +213,7 @@ class Connection(
             policy=OverflowPolicy.UNBOUNDED,
         )
 
-        self._state = State.NOT_CONNECTED
-        self._queue = asyncio.Queue()
-        self._loop_task = ContinuousTask(self._loop, provider=self)
+        self._engine = None
 
     async def _emit_event(self, item) -> None:
         """Courier sink: re-emit one ``(event, args)`` on the event bus, in order."""
@@ -196,7 +232,14 @@ class Connection(
         return hash(id(self))
 
     def __await__(self):
-        return self._loop_task.task.__await__()
+        task = self.loop_task
+        if task is None:
+
+            async def _done() -> None:
+                return None
+
+            return _done().__await__()
+        return task.__await__()
 
     @property
     def url(self) -> URL:
@@ -211,250 +254,61 @@ class Connection(
     @property
     def running(self):
         """Whether the connection loop is running."""
-        return self._loop_task.task is not None and not self._loop_task.done()
+        task = self.loop_task
+        return task is not None and not task.done()
 
-    async def _close_ws(self, code: int = WS_CLOSE_OK, reason: str = ""):
+    @property
+    def loop_task(self) -> Optional[asyncio.Task]:
+        """The engine's supervision task, while running -- the handle the scheduler
+        awaits at teardown. ``None`` before the first ``connect`` / after ``stop``."""
+        return self._engine.task if self._engine is not None else None
+
+    def _build_engine(self) -> ReconnectingTransport:
+        """Build (once) the reconnection engine and wire its events to ours.
+
+        Built lazily on first ``connect`` so module-level knobs
+        (``WsFirstMessageTimeout``) are read at connect time, the way the previous
+        loop read them -- which is what the patch-based tests rely on.
         """
-        Close WebSocket connection manually, typically used when we are paused or
-        stopped and no reconnections are taking place.
-        """
-        if not self.connected:
-            return
-        await self.transport.close(code=code, reason=reason)
-        self.transport = None
-        self.logger.debug("Emitting ConnectionLostEvent due to manual close.")
+        engine: ReconnectingTransport = ReconnectingTransport(
+            str(self.url),
+            lambda: _ServerLink(self),
+            logger=self.logger,
+            backoff=ConstantBackoff(),
+            suspect_after=WsSuspectConnectionBoundedInterval,
+            first_message_timeout=WsFirstMessageTimeout,
+        )
+        engine.events.on(Connected, self._on_connected)
+        engine.events.on(Disconnected, self._on_disconnected)
+        engine.events.on(MessageReceived, self._on_message)
+        engine.events.on(ConnectionSuspect, self._on_suspect)
+        return engine
+
+    def _on_connected(self, _event: Connected) -> None:
+        self._post(ConnectionEstablishedEvent(self.v))
+        self.logger.info("Connected to %s", self.url)
+
+    def _on_disconnected(self, _event: Disconnected) -> None:
+        # The single version-bump site: one ended attempt -> one Lost(v) -> v += 1,
+        # preserving the Established(g)...Lost(g) pairing the consumer relies on.
+        self.logger.debug("Emitting ConnectionLostEvent.")
         self._post(ConnectionLostEvent(self.v))
         self.v += 1
-        self.logger.info("Manually closed connection.")
 
-    async def _open_transport(self) -> WebSocketTransport:
-        """Build a fresh transport and open it. Returns the connected transport.
-
-        Raised :class:`TransportError` propagates into the loop's reconnect path.
-        """
-        transport = self.transport_factory(self.logger)
-        await transport.connect(str(self.url), **TransportParams)
-        return transport
-
-    async def _loop(self):
-        """Connection main loop - only run once per instance."""
-        if self._loop_task.task != asyncio.current_task():
-            raise RuntimeError("Connection task already running.")
-
-        backoff = ConstantBackoff()
-        suspect_bound = WsSuspectConnectionBoundedInterval.create_variable(0)
-        action: Optional[Action] = None
-
-        queue_task = ContinuousTask(self._queue.get, provider=self)
-        poll_task = ContinuousTask(self.poll, provider=self)
-        ws_connect_task = ContinuousTask(self._open_transport, provider=self)
-        wait_delay_task = ContinuousTask(lambda d: self.wait(d), provider=self)
-        wait_stop_task = ContinuousTask(self.wait, provider=self)
-
-        wait_first_msg_task = ContinuousTask(lambda d: self.wait(d), provider=self)
-        has_first_msg = False
-
-        # Flat main loop. Handles all states correctly.
-        # First, PAUSED is excluded and handled.
-        # Then NOT_CONNECTED is transformed to CONNECTING.
-        # Then CONNECTING sis transformed to CONNECTED.
-        # In the case where `send` sets connected = False we get an interrupt,
-        # call `poll()` which will fail for us, which then sets the state to NOT_CONNECTED.
-        while not self.is_stopped():
-            try:
-                # Deal with any actions that were queued.
-                if action is not None:
-                    self._state = action.transition(self._state)
-                    action = None
-                    continue
-
-                # When we are paused we just have to wait until we are resumed.
-                if self._state == State.PAUSED:
-                    # Stop connecting and polling while paused.
-                    poll_task.discard()
-                    ws_connect_task.discard()
-                    wait_delay_task.discard()
-
-                    # Disconnect if we are paused and connected.
-                    await self._close_ws()
-
-                    self.logger.info("Paused.")
-
-                    # Wait for next action.
-                    await queue_task
-                    continue
-
-                # Once we are in this state we need to be connected
-                # and actively poll the connection.
-
-                # We split up connection into two phases both managing
-                # a shared `ws_connect_task`.
-
-                # Phase 1: Goal `CONNECTING`: When we are not in progress of connecting,
-                # we need to start a new connection. Clear previous connection task,
-                # deal with backoff and schedule the connection attempt.
-                # This can be interrupted by a queue action.
-                if not self.connected and self._state == State.NOT_CONNECTED:
-                    ws_connect_task.discard()
-
-                    # All connections except the first are subject to backoff.
-                    if self.v != 0:
-                        resumed = wait_delay_task.task is not None
-
-                        if not resumed:
-                            delay = backoff.delay()
-                            self.logger.info(f"Reconnecting in {delay} seconds.")
-                        else:
-                            delay = None
-                            self.logger.info("Reconnecting (resumed).")
-
-                        await asyncio.wait(
-                            [
-                                wait_delay_task.schedule(
-                                    delay
-                                ),  # wait task with delay (sleep for delay seconds)
-                                queue_task.schedule(),
-                            ],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-
-                        # Handle more immediate actions.
-                        if self.is_stopped() or queue_task.done():
-                            continue
-
-                        # Either way next time we hit this block the delay is over.
-                        wait_delay_task.discard()
-
-                    self.logger.info(f"Connecting to {self.url}")
-
-                    self._state = State.CONNECTING
-
-                # Phase 2: Goal `CONNECTED`: When we are in progress with connecting,
-                # we need to wait for the connection to be established.
-                # this can also be interrupted by a queue action.
-                if not self.connected and self._state == State.CONNECTING:
-                    await asyncio.wait(
-                        [
-                            ws_connect_task.schedule(),
-                            queue_task.schedule(),
-                            wait_stop_task.schedule(),
-                            # wait task without any delay (wait forever for stop event)
-                        ],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    # Queue action interrupted us, deal with it.
-                    if not ws_connect_task.done():
-                        continue
-
-                    self.transport = ws_connect_task.pop().result()
-
-                    self._state = State.CONNECTED
-
-                    backoff.reset()
-                    suspect_bound.reset()
-                    # Begin waiting for first message.
-                    wait_first_msg_task.discard()
-                    has_first_msg = False
-
-                    self._post(ConnectionEstablishedEvent(self.v))
-
-                    self.logger.info(f"Connected to {self.url}")
-
-                if not self.connected:
-                    raise ConnectionResetError("Invalid connection state.")
-
-                tasks = [queue_task.schedule(), poll_task.schedule()]
-
-                # Wait for up to 30 seconds for first message, after we have connected.
-                if not has_first_msg:
-                    tasks.append(wait_first_msg_task.schedule(WsFirstMessageTimeout))
-
-                # In this state we are connected and actively polling the connection.
-                # Poll for messages and interrupt on queue action.
-                await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                # Ensure all exceptions from poll task are propagated so we can detect connection closure.
-                # This is allowed to fail to trigger a reconnect.
-                if poll_task.done():
-                    poll_task.pop().result()
-                    has_first_msg = True
-
-                # Reset connection if waiter is done without having received first message.
-                if not has_first_msg and wait_first_msg_task.done():
-                    await self._close_ws(
-                        code=WS_CLOSE_PROTOCOL_ERROR,
-                        reason="Did not receive first message in time.",
-                    )
-                    self._state = State.NOT_CONNECTED
-
-            except WsConnectionErrors as e:
-                # Disconnect / No connection handling
-                self._state = State.NOT_CONNECTED
-                self._post(ConnectionLostEvent(self.v))
-                self.v += 1
-                self.logger.info("%s: %s", type(e), e)
-
-                # For repeated connection failures, we suspect the ability to connect might be compromised.
-                # This could be due to loss of network connectivity, server issues, etc.
-                # To allow external users to react to this, we emit a suspect event.
-                if suspect_bound.guard_until_bound():
-                    self._post(ConnectionSuspectEvent, e)
-            except Exception as e:
-                self.logger.error("Other error.", exc_info=e)
-
-            finally:
-                # If an action arrived while we were polling, we need to handle it.
-                if queue_task.done() and queue_task.exception() is None:
-                    action = queue_task.pop().result()
-                    self._queue.task_done()
-
-        # Clean up.
-        await self._close_ws()
-
-        poll_task.discard()
-        ws_connect_task.discard()
-        wait_delay_task.discard()
-        wait_stop_task.discard()
-
-        # Deliver the final (manual-close) ConnectionLostEvent, then stop.
-        self._event_courier.close(drain=True)
-
-        self.logger.info("Connection stopped.")
-
-    async def connect(self, hint: Optional[ConnectionHint] = None):
-        """Create or resume the connection loop."""
-        self.hint = hint or self.hint
-
-        # Task is already running.
-        if self.running:
-            # Resume the task if it is paused.
-            if self._state == State.PAUSED:
-                await self._queue.put(Action.RESUME)
-
+    def _on_message(self, event: MessageReceived) -> None:
+        data = event.payload
+        if data is None:
             return
+        try:
+            msg = ServerMsg.model_validate_json(data).root
+        except ValidationError as e:
+            self.logger.error("Invalid message: %s", data, exc_info=e)
+            return
+        self._message_logger(msg).debug("received %s", msg)
+        self._post(ConnectionIncomingEvent, msg, self.v)
 
-        # If the loop task is done, we need to pop it
-        # before being able to restart it. Note this will do
-        # nothing if the connection is stopped.
-        if self._loop_task.done():
-            self._loop_task.discard()
-
-        # Ensure connection loop is running.
-        self._loop_task.schedule()
-
-    async def disconnect(self):
-        """Pause (disconnect) the connection loop, no reconnection attempts will be made until resumed."""
-        if self.running and self._state != State.PAUSED:
-            await self._queue.put(Action.PAUSE)
-
-    async def interrupt(self):
-        """Issue an interrupt to the connection thread, which makes it check for connection state changes."""
-        if self.running:
-            await self._queue.put(Action.INTERRUPT)
+    def _on_suspect(self, event: ConnectionSuspect) -> None:
+        self._post(ConnectionSuspectEvent, event.error)
 
     def _message_logger(self, msg) -> logging.Logger:
         """Route a WS message's log line to the printer it belongs to.
@@ -473,25 +327,6 @@ class Connection(
             return printer_logger(str(client_id), "ws")
         return self.logger
 
-    async def poll(self) -> None:
-        """
-        Raises:
-         TransportClosed: Signal that the connection is closed.
-        """
-        data = await self.transport.recv()
-
-        if data is None:
-            return
-
-        try:
-            msg = ServerMsg.model_validate_json(data).root
-            self._message_logger(msg).debug("received %s", msg)
-            self._post(ConnectionIncomingEvent, msg, self.v)
-
-        except ValidationError as e:
-            # Invalid message.
-            self.logger.error("Invalid message: %s", data, exc_info=e)
-
     async def send(
         self, msg: ClientMsg[ClientMsgType], v: Optional[int] = None
     ) -> None:
@@ -503,7 +338,6 @@ class Connection(
         # We drop messages if we are not connected.
         if not self.connected:
             self.logger.warning("Dropped message %s, not connected.", msg)
-            await self.interrupt()
             return
 
         # Optionally, specify a connection version the message was targeted for.
@@ -526,10 +360,35 @@ class Connection(
             self.logger.error("Serialization error.", exc_info=e)
 
         except WsConnectionErrors:
-            await self.interrupt()
+            # The link dropped mid-send; the engine's recv loop sees the same drop
+            # and reconnects on its own -- nothing to poke here.
+            pass
+
+    async def connect(self, hint: Optional[ConnectionHint] = None):
+        """Start (or resume) the connection: spin up the reconnection engine.
+
+        Idempotent -- ``start`` is a no-op while the engine is already supervising,
+        and re-creates the task after a ``disconnect`` (the resume path).
+        """
+        self.hint = hint or self.hint
+
+        if self.is_stopped():
+            return
+
+        if self._engine is None:
+            self._engine = self._build_engine()
+
+        self._engine.start()
+
+    async def disconnect(self):
+        """Pause (disconnect) the connection: stop the engine, no reconnection
+        attempts until ``connect`` is called again."""
+        if self._engine is not None:
+            self._engine.stop()
 
     def stop(self):
+        """Permanently tear the connection down and drain pending events."""
         super().stop()
-
-        if self.event_loop_is_running():
-            asyncio.run_coroutine_threadsafe(self.interrupt(), self.event_loop)
+        if self._engine is not None:
+            self._engine.stop()
+        self._event_courier.close(drain=True)

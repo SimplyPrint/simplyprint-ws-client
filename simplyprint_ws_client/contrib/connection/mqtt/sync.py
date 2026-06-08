@@ -1,13 +1,13 @@
 """Synchronous MQTT transport + pool (paho-mqtt) -- the sync family on the Courier.
 
 paho drives its own network thread, so it is the *synchronous* :class:`Transport`
-family (vs. the aiomqtt :class:`AsyncTransport` in :mod:`.async_mqtt`). Both speak
+family (vs. the aiomqtt :class:`AsyncTransport` in :mod:`.aio`). Both speak
 the same :class:`TransportEvent` surface; the difference is where the events are
-born. aiomqtt emits on the consumer loop (zero hops). paho emits on its network
+born. aiomqtt emits on the pool loop (zero hops). paho emits on its network
 thread -- so :class:`MqttPool` wires a :class:`Courier` between the transport's
-event bus and the per-lease router: each event is posted to the courier on the
-paho thread (a deque append + at most one ``call_soon_threadsafe``) and the router
-fans it to leases *on the consumer loop*.
+event bus and the fan-out: each event is posted to the courier on the paho thread
+(a deque append + at most one ``call_soon_threadsafe``) and the fan-out broadcasts
+it to every lease *on the pool loop*, where each lease keeps only its own topic.
 
 That replaces the old path -- paho thread -> ``queue.Queue`` -> a dedicated
 dispatch thread -> ``run_coroutine_threadsafe`` (a ``Future`` per event) -> loop
@@ -25,36 +25,34 @@ import threading
 from typing import Any, Callable, Dict, Hashable, Optional
 
 from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
-from simplyprint_ws_client.contrib.connection.async_mqtt import MqttParams
 from simplyprint_ws_client.contrib.connection.manager import PooledConnectionManager
-from simplyprint_ws_client.contrib.connection.mqtt_topics import mqtt_topic_matches
+from simplyprint_ws_client.contrib.connection.mqtt.common import (
+    MqttParams,
+    mqtt_topic_matches,
+    topic_of,
+)
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import (
+from simplyprint_ws_client.contrib.connection.events import (
     Connected,
-    Connection,
-    ConnectSuspect,
-    ConsumerLoop,
+    ConnectionSuspect,
     Disconnected,
     MessageReceived,
-    Pool,
     StateChanged,
-    Transport,
     TransportEvent,
-    TransportRouter,
-    _SyncLease,
+)
+from simplyprint_ws_client.contrib.connection.pool import (
+    DeliveryConfig,
+    TransportPool,
+)
+from simplyprint_ws_client.contrib.connection.transport import (
+    Lease,
+    Transport,
 )
 
-#: Builds (but does not connect) a paho client for ``params``. Injectable for tests.
-PahoClientFactory = Callable[[MqttParams, logging.Logger], Any]
-
-
-def _mqtt_topic_of(payload: Any) -> Optional[str]:
-    """The pool's topic extractor: a paho ``MQTTMessage`` carries ``.topic``."""
-    topic = getattr(payload, "topic", None)
-    return str(topic) if topic is not None else None
+#: Builds (but does not connect) the sync MQTT client for ``params``. Injectable for tests.
+MqttClientFactory = Callable[[MqttParams, logging.Logger], Any]
 
 
 def _default_client_factory(params: MqttParams, _logger: logging.Logger) -> Any:
@@ -86,12 +84,12 @@ def _connect_rejected(reason_code: Any) -> bool:
         return False
 
 
-class PahoMqttTransport(Transport[MqttParams]):
+class MqttTransport(Transport[MqttParams]):
     """A supervised paho link. paho owns the reconnect loop and the network
     thread; we translate its callbacks into :class:`TransportEvent` s.
 
     The caller only ``send`` s, ``subscribe`` s, and listens on :attr:`events`.
-    The events are emitted on paho's thread -- crossing onto the consumer loop is
+    The events are emitted on paho's thread -- crossing onto the pool loop is
     the pool's courier's job, not the transport's.
     """
 
@@ -100,13 +98,14 @@ class PahoMqttTransport(Transport[MqttParams]):
         params: MqttParams,
         *,
         logger: Optional[logging.Logger] = None,
-        client_factory: PahoClientFactory = _default_client_factory,
+        client_factory: MqttClientFactory = _default_client_factory,
         keepalive: int = 60,
     ) -> None:
         self.params = params
         self.events: EventBus[TransportEvent] = EventBus()
         self.state = ConnectionState.OFFLINE
-        self._logger = logger or logging.getLogger("paho_mqtt")
+        self.generation = 0
+        self._logger = logger or logging.getLogger("mqtt.sync")
         self._client_factory = client_factory
         self._keepalive = keepalive
         self._client: Any = None
@@ -173,11 +172,8 @@ class PahoMqttTransport(Transport[MqttParams]):
                 self._topics[topic] = refs - 1
                 return
         client = self._client
-        unsubscribe = (
-            getattr(client, "unsubscribe", None) if client is not None else None
-        )
-        if unsubscribe is not None and client.is_connected():
-            unsubscribe(topic)
+        if client is not None and client.is_connected():
+            client.unsubscribe(topic)
 
     def send(self, payload: Any) -> bool:
         client = self._client
@@ -185,7 +181,7 @@ class PahoMqttTransport(Transport[MqttParams]):
             return False
         topic, data = payload
         info = client.publish(topic, data)
-        return getattr(info, "rc", 0) == 0
+        return info.rc == 0
 
     def _set_state(self, state: ConnectionState) -> None:
         if state is not self.state:
@@ -199,7 +195,7 @@ class PahoMqttTransport(Transport[MqttParams]):
             self._logger.warning(
                 "Connection rejected by %s: %s", self.params, reason_code
             )
-            self._emit(ConnectSuspect())
+            self._emit(ConnectionSuspect())
             return
         live = self._client
         if live is not None:
@@ -207,11 +203,12 @@ class PahoMqttTransport(Transport[MqttParams]):
                 topics = list(self._topics.keys())
             for topic in topics:
                 live.subscribe(topic)  # (re)assert subscriptions on (re)connect
+        self.generation += 1  # paho self-heals; a new connect == a new generation
         self._set_state(ConnectionState.ONLINE)
         self._emit(Connected())
 
     def _on_connect_fail(self, client, userdata, *args, **kwargs):  # noqa: ANN001
-        self._emit(ConnectSuspect())
+        self._emit(ConnectionSuspect())
 
     def _on_message(self, client, userdata, message, *args, **kwargs):  # noqa: ANN001
         self._emit(MessageReceived(message))
@@ -222,140 +219,46 @@ class PahoMqttTransport(Transport[MqttParams]):
         self._emit(Disconnected(reason="MQTT disconnect", transient=True))
 
 
-#: Builds a :class:`PahoMqttTransport` for ``params``. Injectable for tests.
-MqttTransportFactory = Callable[[MqttParams], PahoMqttTransport]
+#: Builds a :class:`MqttTransport` for ``params``. Injectable for tests.
+MqttTransportFactory = Callable[[MqttParams], MqttTransport]
 
 
-class MqttPool(Pool[MqttParams, PahoMqttTransport]):
+class MqttPool(TransportPool[MqttParams, MqttTransport]):
     """Pooling for the sync paho transport -- the sync sibling of ``AsyncMqttPool``.
 
     One transport per broker endpoint, ref-counted, plus the courier that carries
-    its paho-thread events onto the consumer loop. :meth:`connect` hands back a
-    :class:`Connection` lease scoped to a topic.
+    its paho-thread events onto the pool loop. :meth:`connect` hands back a
+    :class:`Lease` scoped to a topic.
     """
 
     def __init__(
         self,
         *,
+        delivery: DeliveryConfig = DeliveryConfig(),
         logger: Optional[logging.Logger] = None,
         transport_factory: Optional[MqttTransportFactory] = None,
         event_loop_provider: Optional[EventLoopProvider] = None,
-        message_overflow: OverflowPolicy = OverflowPolicy.DROP_OLDEST,
-        message_maxsize: int = 1024,
-        lifecycle_overflow: OverflowPolicy = OverflowPolicy.UNBOUNDED,
-        lifecycle_maxsize: int = 1024,
     ) -> None:
-        self._logger = logger or logging.getLogger("mqtt_pool")
-        self._transport_factory = transport_factory or self._build_transport
-        self._provider = event_loop_provider or EventLoopProvider.default()
-        self._consumer = ConsumerLoop(
-            self._provider, logger=self._logger.getChild("consumer")
+        super().__init__(
+            delivery=delivery,
+            logger=logger or logging.getLogger("mqtt.sync.pool"),
+            transport_factory=transport_factory,
+            event_loop_provider=event_loop_provider,
         )
-        self._message_overflow = message_overflow
-        self._message_maxsize = message_maxsize
-        self._lifecycle_overflow = lifecycle_overflow
-        self._lifecycle_maxsize = lifecycle_maxsize
-        self._transports: Dict[MqttParams, PahoMqttTransport] = {}
-        self._refs: Dict[MqttParams, int] = {}
-        self._routers: Dict[MqttParams, TransportRouter] = {}
-        self._lock = threading.Lock()
 
-    def _build_transport(self, params: MqttParams) -> PahoMqttTransport:
-        return PahoMqttTransport(params, logger=self._logger.getChild(str(params)))
+    def _build_transport(self, params: MqttParams) -> MqttTransport:
+        return MqttTransport(params, logger=self._logger.getChild(str(params)))
 
-    def submit_to_consumer(
-        self,
-        coro_factory: Callable[[], Any],
-        *,
-        coalesce_key: Optional[Hashable] = None,
-    ) -> None:
-        """Run async work on the consumer loop from a transport thread."""
-        self._consumer.submit(coro_factory, coalesce_key=coalesce_key)
+    def _lease_filter(self):
+        # A pooled broker is topic-routed: each lease keeps only its own topic.
+        return (topic_of, mqtt_topic_matches)
 
-    def call_to_consumer(self, fn: Callable[[], None]) -> None:
-        self._consumer.call(fn)
-
-    def connect(
-        self, params: MqttParams, *, route: Optional[Hashable] = None
-    ) -> Connection:
-        transport = self.acquire(params)
-        with self._lock:
-            router = self._routers.get(params)
-            if router is None:
-                router = TransportRouter(
-                    transport, topic_of=_mqtt_topic_of, matcher=mqtt_topic_matches
-                )
-                message_courier: Courier = Courier(
-                    sink=router.dispatch,
-                    provider=self._provider,
-                    policy=self._message_overflow,
-                    maxsize=self._message_maxsize,
-                )
-                lifecycle_courier: Courier = Courier(
-                    sink=router.dispatch,
-                    provider=self._provider,
-                    policy=self._lifecycle_overflow,
-                    maxsize=self._lifecycle_maxsize,
-                )
-                router.attach(
-                    message_courier=message_courier,
-                    lifecycle_courier=lifecycle_courier,
-                )
-                self._routers[params] = router
-        lease = _SyncLease(
-            pool=self,
-            params=params,
-            transport=transport,
-            router=router,
-            consumer=self._consumer,
-            route=route,
-        )
-        router.add(lease)
+    def _after_connect(self, lease: Lease, route: Optional[Hashable]) -> None:
         if route is not None:
             lease.subscribe(str(route))
-        return lease
-
-    def acquire(self, params: MqttParams) -> PahoMqttTransport:
-        with self._lock:
-            transport = self._transports.get(params)
-            if transport is None:
-                transport = self._transport_factory(params)
-                self._transports[params] = transport
-                self._refs[params] = 0
-                transport.start()
-            self._refs[params] += 1
-            return transport
-
-    def release(self, params: MqttParams) -> None:
-        transport = None
-        router = None
-        with self._lock:
-            if params not in self._refs:
-                return
-            self._refs[params] -= 1
-            if self._refs[params] <= 0:
-                self._refs.pop(params, None)
-                transport = self._transports.pop(params, None)
-                router = self._routers.pop(params, None)
-        if router is not None:
-            router.detach()
-        if transport is not None:
-            transport.stop()
-
-    def stop(self) -> None:
-        with self._lock:
-            transports = list(self._transports.values())
-            routers = list(self._routers.values())
-            self._transports.clear()
-            self._refs.clear()
-            self._routers.clear()
-        for router in routers:
-            router.detach()
-        for transport in transports:
-            transport.stop()
 
 
-class PooledMqttConnectionManager(PooledConnectionManager):
+class MqttConnectionManager(PooledConnectionManager):
     """A :class:`PooledConnectionManager` backed by the sync paho :class:`MqttPool`.
 
     The base for brand MQTT managers: a subclass sets the event types,
@@ -368,27 +271,18 @@ class PooledMqttConnectionManager(PooledConnectionManager):
         *,
         event_loop_provider: Optional[EventLoopProvider] = None,
         logger: Optional[logging.Logger] = None,
-        message_overflow: OverflowPolicy = OverflowPolicy.DROP_OLDEST,
-        message_maxsize: int = 1024,
-        lifecycle_overflow: OverflowPolicy = OverflowPolicy.UNBOUNDED,
-        lifecycle_maxsize: int = 1024,
+        delivery: DeliveryConfig = DeliveryConfig(),
         **kwargs: object,
     ) -> None:
         # Set before super().__init__ -> _make_pool() reads it.
         self._event_loop_provider = event_loop_provider
         self._pool_logger = logger
-        self._message_overflow = message_overflow
-        self._message_maxsize = message_maxsize
-        self._lifecycle_overflow = lifecycle_overflow
-        self._lifecycle_maxsize = lifecycle_maxsize
+        self._delivery = delivery
         super().__init__(**kwargs)
 
     def _make_pool(self) -> MqttPool:
         return MqttPool(
             event_loop_provider=self._event_loop_provider,
             logger=self._pool_logger,
-            message_overflow=self._message_overflow,
-            message_maxsize=self._message_maxsize,
-            lifecycle_overflow=self._lifecycle_overflow,
-            lifecycle_maxsize=self._lifecycle_maxsize,
+            delivery=self._delivery,
         )

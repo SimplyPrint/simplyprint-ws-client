@@ -266,7 +266,7 @@ async def test_poll_failure_increments_version_via_exception_handler(
     Integration test for poll() failure path.
 
     Tests the exception handler flow that catches WsConnectionErrors during
-    poll() (now a dropped transport -> TransportClosed) and increments version.
+    poll() (now a dropped transport -> WebSocketClosed) and increments version.
 
     Verifies that version is incremented exactly once when poll() fails, not
     twice (which would indicate a double-increment bug).
@@ -295,7 +295,7 @@ async def test_poll_failure_increments_version_via_exception_handler(
 
         assert connection.connected and connection.v == 0, "Should be connected at v=0"
 
-        # Make the next recv() raise TransportClosed -> exception handler increments v
+        # Make the next recv() raise WebSocketClosed -> exception handler increments v
         fake_transport.queue_close()
 
         # Wait for poll to fail and exception handler to increment v

@@ -17,7 +17,7 @@ from simplyprint_ws_client.contrib.connection.manager import (
     now_ms,
 )
 from simplyprint_ws_client.contrib.connection.transport import (
-    ConnectSuspect,
+    ConnectionSuspect,
     Disconnected,
 )
 from simplyprint_ws_client.events import EventBus
@@ -49,7 +49,7 @@ class FakeConnection:
 
     def fire_suspect(self):
         for h in list(self._sus):
-            h(ConnectSuspect())
+            h(ConnectionSuspect())
 
     @property
     def connected(self):
@@ -85,8 +85,11 @@ class FakePool:
         self.conns.append(conn)
         return conn
 
-    def submit_to_consumer(self, coro_factory, *, coalesce_key=None):
+    def submit_to_loop(self, coro_factory, *, coalesce_key=None):
         self.submitted.append((coro_factory, coalesce_key))
+
+    def call_on_loop(self, fn):
+        fn()  # no real loop in the fake; run inline
 
     def stop(self):
         self.stopped = True
@@ -250,12 +253,12 @@ def test_remove_is_not_resurrected_by_reconcile():
 
 
 @pytest.mark.asyncio
-async def test_submit_to_consumer_delegates_to_pool():
+async def test_submit_to_loop_delegates_to_pool():
     pool = FakePool()
     mgr = _manager(pool)
 
     async def work():
         return None
 
-    mgr.submit_to_consumer(work, coalesce_key="k")
+    mgr.submit_to_loop(work, coalesce_key="k")
     assert pool.submitted == [(work, "k")]

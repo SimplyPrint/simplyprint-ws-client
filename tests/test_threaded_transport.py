@@ -1,5 +1,5 @@
-"""``ThreadedWebSocketTransport`` -- the threaded, websocket-client-based printer
-transport (distinct from the async :class:`WebSocketTransport` ABC).
+"""``ThreadedImpl`` -- the threaded, websocket-client-based printer wire
+(distinct from the async :class:`WebSocket` ABC).
 
 websocket-client is an optional extra, so these skip when it isn't installed.
 The behavioural depth lives in the integrations that compose this transport;
@@ -12,14 +12,14 @@ import pytest
 
 pytest.importorskip("websocket")
 
-from simplyprint_ws_client.contrib.connection import (  # noqa: E402
-    ThreadedWebSocketTransport,
+from simplyprint_ws_client.contrib.connection.websocket import (  # noqa: E402
+    ThreadedImpl,
 )
 from simplyprint_ws_client.contrib.connection.state import ConnectionState  # noqa: E402
 
 
 def _make():
-    return ThreadedWebSocketTransport(
+    return ThreadedImpl(
         "ws://127.0.0.1:9/ws",
         logger=logging.getLogger("test-ws"),
         on_message=lambda _msg: None,
@@ -51,5 +51,5 @@ def test_no_close_alias():
     # The backwards-compat ``close = stop`` alias was deleted per S-close;
     # ``stop()`` is the sole canonical shutdown method. Guard against the
     # alias creeping back in.
-    assert not hasattr(ThreadedWebSocketTransport, "close")
+    assert not hasattr(ThreadedImpl, "close")
     assert callable(t.stop)

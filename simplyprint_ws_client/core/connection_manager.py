@@ -1,11 +1,29 @@
-"""
-Class managing connection strategies.
+"""Connection strategy: allocate / deallocate a client onto a backend socket.
 
-Supports two functionalities.
+This is the SimplyPrint **protocol** multiplexing layer, and it lives in ``core``
+on purpose -- it is *not* the brand-free transport pool
+(:mod:`...contrib.connection.pool`) and must not be folded into it. The two share
+a vague silhouette ("fan one socket to N consumers") but differ in the essential
+logic, which is the test for whether things are the same (they are not):
 
-- Allocate client
-- Deallocate client
+* The brand-free pool routes by one rule -- ``topic_of(payload) == lease.route`` --
+  and is forbidden from knowing any message type. The backend's MULTI routing is
+  protocol-aware: a global ``ConnectedMsg`` is *broadcast* to every client as
+  :class:`ConnectionEstablishedEvent`; ``MultiPrinterAdded/RemovedMsg`` route by a
+  *different* field (``msg.data.unique_id``); ordinary messages route by
+  ``for_client``; the raw transport ``ConnectionEstablishedEvent`` is *suppressed*
+  in favour of ``ConnectedMsg``; ``ConnectionLostEvent`` is broadcast. Broadcast,
+  multi-field routing, and event translation have no expression in the pool's
+  single-key model -- and teaching it ``ConnectedMsg``/``for_client`` would breach
+  the no-brand-leak rule. So this stays here.
 
+* **Reconnection is not duplicated here.** Each backend :class:`Connection` rides
+  the shared :class:`~...contrib.connection.reconnect.ReconnectingTransport` engine (connect /
+  backoff / liveness / single version bump). In MULTI mode the one shared
+  ``Connection`` gets that for free; :class:`ClientView` only fans its events to the
+  right client(s). There is no PAUSE state: a client's "pause" is releasing its hold
+  (``deallocate``), and when the last client leaves a view its ``Connection`` is
+  disconnected (``engine.stop()``) -- the refcount/lease lifecycle, protocol-side.
 """
 
 __all__ = ["ClientConnectionManager", "ClientList", "ClientView"]
@@ -77,7 +95,14 @@ class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
 
 
 class ClientView(Emitter, MutableSet[Client], Hashable):
-    """View over a set of clients, deals with connection message routing."""
+    """The protocol-aware fan-out over the clients sharing one backend
+    :class:`Connection` -- the multiplexing the brand-free pool deliberately does
+    not do (see the module docstring). :meth:`emit` is the routing brain: it
+    broadcasts the global handshake, routes per-printer messages by ``for_client``
+    (or ``data.unique_id`` for add/remove), suppresses the raw transport
+    ``established``, and broadcasts ``lost`` -- delivering each onto the target
+    client's own event bus. Reconnection is the ``Connection``'s engine's job, not
+    this object's; a view only decides *who hears what*."""
 
     mode: ConnectionMode
     connection: Connection
@@ -275,8 +300,19 @@ class ClientConnectionManager(
         if self.is_stopped():
             raise RuntimeError("Cannot allocate connections when stopped.")
 
-        # TODO Logic for using existing connection.
-        # For now we have many single connections and one multi.
+        # --- The N:M load-balancing seam (B3, design-only) ---
+        # Today the policy is the two extremes: SINGLE gives every client its own
+        # connection (1:1); MULTI funnels every client onto the one shared socket
+        # (N:1, the branch below). A middle ground -- N clients spread across M
+        # shared sockets -- would slot in *here*, and nowhere else: this method is
+        # the sole connection-selection point, so a strategy ("pick the least-loaded
+        # view, or open a new one past a per-socket client cap") changes only this
+        # return. Nothing downstream assumes one-MULTI-view: ``views`` is already a
+        # set, ``connections`` already maps over all of them, and each view owns its
+        # own ``Connection`` + engine, so M sockets each reconnect independently.
+        # Deliberately not built -- one shared socket is sufficient at current scale,
+        # and a balancer with no measured need is the speculative abstraction we
+        # avoid. The seam is what we keep; the policy is what we'd add.
         if self.mode == ConnectionMode.MULTI and len(self.views) > 0:
             return next(iter(self.views))
 

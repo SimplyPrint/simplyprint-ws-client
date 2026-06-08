@@ -1,4 +1,4 @@
-"""A :class:`WebSocketTransport` backed by the ``websockets`` library (default)."""
+"""A :class:`WebSocket` backed by the ``websockets`` library (default)."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.protocol import State
 
-from .base import WS_CLOSE_OK, TransportClosed, TransportError, WebSocketTransport
+from .base import WS_CLOSE_OK, WebSocketClosed, WebSocketError, WebSocket
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
-__all__ = ["WebSocketsTransport"]
+__all__ = ["WebsocketsImpl"]
 
 
 def _close_code(exc: ConnectionClosed) -> Optional[int]:
@@ -24,8 +24,8 @@ def _close_code(exc: ConnectionClosed) -> Optional[int]:
     return frame.code if frame is not None else None
 
 
-class WebSocketsTransport(WebSocketTransport):
-    """A :class:`WebSocketTransport` backed by the ``websockets`` library."""
+class WebsocketsImpl(WebSocket):
+    """A :class:`WebSocket` backed by the ``websockets`` library."""
 
     def __init__(self, logger: logging.Logger = logging.getLogger("ws")) -> None:
         self._logger = logger
@@ -52,23 +52,23 @@ class WebSocketsTransport(WebSocketTransport):
                 max_size=max_size,
             )
         except (WebSocketException, OSError, asyncio.TimeoutError) as e:
-            raise TransportError(str(e)) from e
+            raise WebSocketError(str(e)) from e
 
     async def send(self, data: str) -> None:
         if self._conn is None:
-            raise TransportClosed("not connected")
+            raise WebSocketClosed("not connected")
         try:
             await self._conn.send(data)
         except ConnectionClosed as e:
-            raise TransportClosed(str(e), code=_close_code(e)) from e
+            raise WebSocketClosed(str(e), code=_close_code(e)) from e
 
     async def recv(self) -> Optional[str]:
         if self._conn is None:
-            raise TransportClosed("not connected")
+            raise WebSocketClosed("not connected")
         try:
             message = await self._conn.recv()
         except ConnectionClosed as e:
-            raise TransportClosed(str(e), code=_close_code(e)) from e
+            raise WebSocketClosed(str(e), code=_close_code(e)) from e
         if isinstance(message, bytes):
             return message.decode("utf-8", "replace")
         return message

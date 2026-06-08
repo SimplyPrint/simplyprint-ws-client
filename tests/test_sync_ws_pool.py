@@ -1,4 +1,4 @@
-"""Brand-free tests for the threaded WS ``WsPool`` on the Courier.
+"""Brand-free tests for the threaded WS ``WebSocketPool`` on the Courier.
 
 A WS link is 1:1, and its wire fires callbacks on its own daemon thread; these
 pin that a lease delivers on the consumer loop, ref-counts the transport, and
@@ -10,10 +10,10 @@ import threading
 
 import pytest
 
-from simplyprint_ws_client.contrib.connection.sync_ws import (
-    ThreadedWsTransport,
+from simplyprint_ws_client.contrib.connection.websocket import (
+    WebSocketPool,
+    WebSocketTransport,
     WsParams,
-    WsPool,
 )
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
@@ -64,9 +64,9 @@ def _pool(loop):
     def transport_factory(params):
         wire = FakeWire()
         wires.append(wire)
-        return ThreadedWsTransport(params, wire_factory=lambda p, log: wire)
+        return WebSocketTransport(params, wire_factory=lambda p, log: wire)
 
-    pool = WsPool(
+    pool = WebSocketPool(
         transport_factory=transport_factory,
         event_loop_provider=EventLoopProvider(loop=loop),
     )

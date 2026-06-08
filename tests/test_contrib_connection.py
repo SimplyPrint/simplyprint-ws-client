@@ -45,6 +45,7 @@ def test_transport_import_does_not_load_optional_libs():
     _import_is_clean(
         "import simplyprint_ws_client.contrib.connection",
         "websocket",
+        "websockets",
         "aiohttp",
         "paho",
         "paho.mqtt.client",
@@ -69,7 +70,7 @@ def test_connection_state_usable():
 
 
 def test_mqtt_topic_matcher_only_applies_mqtt_wildcard_suffix():
-    from simplyprint_ws_client.contrib.connection.mqtt_topics import mqtt_topic_matches
+    from simplyprint_ws_client.contrib.connection.mqtt import mqtt_topic_matches
 
     assert mqtt_topic_matches("devices/a/report", "devices/a/report")
     assert mqtt_topic_matches("devices/a/#", "devices/a/report")
