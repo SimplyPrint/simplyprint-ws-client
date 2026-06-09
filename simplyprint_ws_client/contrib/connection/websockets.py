@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Union
 
 import yarl
 
@@ -35,6 +35,7 @@ from simplyprint_ws_client.contrib.connection.messages import (
     WsMessage,
     ws_message_for_payload,
 )
+from simplyprint_ws_client.contrib.connection.errors import ErrorCode
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
 from simplyprint_ws_client.contrib.connection.transport import (
@@ -75,7 +76,7 @@ class Websockets(WsTransport, Reconnecting):
     whose loop the supervision task runs on, a ``connect`` factory (defaulting to
     the library's, resolved lazily), and connect keyword arguments passed to that
     factory on every attempt. :meth:`start` it and drive it by events;
-    :meth:`route` stays ``None`` so every frame broadcasts to every lease.
+    the pool has no route function, so every frame broadcasts to every lease.
     """
 
     def __init__(
@@ -86,15 +87,20 @@ class Websockets(WsTransport, Reconnecting):
         *,
         connect_factory: Optional[ConnectFactory] = None,
         connect_kwargs: Optional[dict] = None,
+        first_message_timeout: Optional[float] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
-            url, policy, provider, logger=logger or logging.getLogger("conn.websockets")
+            url,
+            policy,
+            provider,
+            first_message_timeout=first_message_timeout,
+            logger=logger or logging.getLogger("conn.websockets"),
         )
         self.connect_factory = connect_factory
         self.connect_kwargs = dict(connect_kwargs or {})
         #: The live ``websockets`` connection, or ``None`` while disconnected.
-        self.socket: Optional[Any] = None
+        self.socket: Optional["ClientConnection"] = None
 
     async def open(self) -> None:
         """Open the live connection. A failure raises and triggers a retry."""
@@ -102,7 +108,7 @@ class Websockets(WsTransport, Reconnecting):
         try:
             self.socket = await factory(str(self.url), **self.connect_kwargs)
         except Exception as error:  # noqa: BLE001 -- any wire failure -> retry
-            raise TransientError(str(error)) from error
+            raise TransientError.wrap(error)
 
     async def recv(self) -> WsMessage:
         """Return the next inbound frame; a closed socket ends the attempt.
@@ -117,9 +123,9 @@ class Websockets(WsTransport, Reconnecting):
         try:
             return ws_message_for_payload(await socket.recv())
         except Exception as error:  # noqa: BLE001 -- ConnectionClosed et al. -> retry
-            raise TransientError(str(error)) from error
+            raise TransientError.wrap(error, code=websocket_close_code(error))
 
-    async def write(self, message: object) -> None:
+    async def write(self, message: Union[str, bytes, bytearray, memoryview]) -> None:
         """Put one frame on the live wire.
 
         ``str`` is sent as a text frame and ``bytes`` as a binary frame. The
@@ -144,7 +150,7 @@ class Websockets(WsTransport, Reconnecting):
             self.logger.debug("websocket %s close failed", self.url, exc_info=True)
 
 
-def as_frame(message: object) -> Union[str, bytes]:
+def as_frame(message: Union[str, bytes, bytearray, memoryview]) -> Union[str, bytes]:
     """Reduce an outbound message to the ``str``/``bytes`` the wire accepts.
 
     A ``str`` is a text frame; ``bytes`` (or ``bytearray``/``memoryview``) is a
@@ -156,3 +162,18 @@ def as_frame(message: object) -> Union[str, bytes]:
     if isinstance(message, (bytes, bytearray, memoryview)):
         return bytes(message)
     raise TypeError(f"cannot send {type(message).__name__} over a websocket")
+
+
+def websocket_close_code(error: Exception) -> Optional[ErrorCode]:
+    """Extract a websockets close code when the native exception carries one."""
+    try:
+        from websockets.exceptions import ConnectionClosed
+    except ImportError:
+        return None
+
+    if not isinstance(error, ConnectionClosed):
+        return None
+    close = error.rcvd or error.sent
+    if close is None:
+        return None
+    return close.code

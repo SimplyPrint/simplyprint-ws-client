@@ -88,6 +88,30 @@ async def test_drop_oldest_keeps_the_newest_and_recycles_the_rest():
 
 
 @pytest.mark.asyncio
+async def test_drop_oldest_preserves_lossless_items():
+    got = []
+    dropped = []
+    courier = Courier(
+        sink=got.append,
+        policy=OverflowPolicy.DROP_OLDEST,
+        maxsize=2,
+        lossless=lambda item: item[0] == "lifecycle",
+        on_drop=dropped.append,
+    )
+
+    courier.post(("message", 0))
+    courier.post(("message", 1))
+    courier.post(("lifecycle", "connected"))
+    courier.post(("message", 2))
+    courier.post(("message", 3))
+
+    await asyncio.sleep(0.01)
+
+    assert got == [("lifecycle", "connected"), ("message", 2), ("message", 3)]
+    assert dropped == [("message", 0), ("message", 1)]
+
+
+@pytest.mark.asyncio
 async def test_drop_newest_rejects_incoming_and_reports_false():
     got = []
     dropped = []
@@ -274,6 +298,35 @@ async def test_close_without_drain_recycles_pending():
 
     assert got == []  # nothing delivered
     assert dropped == list(range(5))  # all recycled via on_drop
+
+
+@pytest.mark.asyncio
+async def test_close_without_drain_cancels_active_async_sink():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def sink(_item):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    courier = Courier(sink=sink, is_async_sink=True, policy=OverflowPolicy.UNBOUNDED)
+    courier.post(1)
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert started.is_set()
+
+    courier.close(drain=False)
+    for _ in range(200):
+        if cancelled.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert cancelled.is_set()
 
 
 def test_close_during_concurrent_posts_is_safe():

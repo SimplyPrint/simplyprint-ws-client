@@ -24,10 +24,12 @@ awaited in a single serialized drain task so ordering across events is exact and
 async listeners are never silently dropped.
 
 Backpressure is a configurable :class:`OverflowPolicy`. The hot-path default is
-latest-wins (drop the oldest queued item); the lifecycle-event path that must
-never lose an event uses ``UNBOUNDED``. Dropped items are handed to an optional
-``on_drop`` callback -- that is how the camera layer recycles a shared-memory
-slab whose frame was superseded before the loop consumed it.
+latest-wins (drop the oldest queued item). A caller may mark individual items as
+lossless; bounded overflow then applies only to ordinary items, so lifecycle events
+can share one courier with sheddable telemetry without being evicted by it.
+Dropped items are handed to an optional ``on_drop`` callback -- that is how the
+camera layer recycles a shared-memory slab whose frame was superseded before the
+loop consumed it.
 """
 
 from __future__ import annotations
@@ -104,6 +106,7 @@ class Courier(Generic[T]):
         loop: Optional[asyncio.AbstractEventLoop] = None,
         policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST,
         maxsize: int = 1024,
+        lossless: Optional[Callable[[T], bool]] = None,
         on_drop: Optional[Callable[[T], None]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -115,10 +118,12 @@ class Courier(Generic[T]):
         self._is_async_sink = is_async_sink
         self._policy = policy
         self._maxsize = 0 if policy is OverflowPolicy.UNBOUNDED else maxsize
+        self._lossless = lossless
         self._on_drop = on_drop
         self._logger = logger or logging.getLogger("courier")
 
         self._queue: Deque[T] = deque()
+        self._bounded = 0
         self._lock = threading.Lock()
         self._not_full = threading.Condition(self._lock)
         self._scheduled = False
@@ -144,10 +149,6 @@ class Courier(Generic[T]):
         except RuntimeError:
             return EventLoopProvider.default()
 
-    # ------------------------------------------------------------------ #
-    # Producer side -- callable from ANY thread.
-    # ------------------------------------------------------------------ #
-
     def post(self, item: T) -> bool:
         """Enqueue ``item`` for delivery on the loop. Non-blocking (unless the
         policy is ``BLOCK``). Returns ``False`` if the item was dropped/rejected
@@ -160,7 +161,8 @@ class Courier(Generic[T]):
             if self._closed:
                 return False
 
-            if self._maxsize and len(self._queue) >= self._maxsize:
+            lossless = self._is_lossless(item)
+            if not lossless and self._maxsize and self._bounded >= self._maxsize:
                 if self._policy is OverflowPolicy.DROP_NEWEST:
                     rejected = True
                     dropped = item
@@ -168,14 +170,17 @@ class Courier(Generic[T]):
                     self._raise_if_on_loop()
                     while (
                         self._maxsize
-                        and len(self._queue) >= self._maxsize
+                        and self._bounded >= self._maxsize
                         and not self._closed
                     ):
                         self._not_full.wait()
                     if self._closed:
                         return False
                 else:  # DROP_OLDEST
-                    dropped = self._queue.popleft()
+                    dropped = self._drop_oldest_bounded()
+                    if dropped is _NOTHING:
+                        rejected = True
+                        dropped = item
 
             if rejected:
                 self._dropped += 1
@@ -183,6 +188,8 @@ class Courier(Generic[T]):
                 if dropped is not _NOTHING:
                     self._dropped += 1
                 self._queue.append(item)
+                if not lossless:
+                    self._bounded += 1
                 if not self._scheduled:
                     self._scheduled = True
                     schedule = True
@@ -202,14 +209,14 @@ class Courier(Generic[T]):
         """Count of items dropped/rejected by the overflow policy."""
         return self._dropped
 
-    # ------------------------------------------------------------------ #
-    # Scheduling + draining -- the loop-thread side.
-    # ------------------------------------------------------------------ #
-
     def _schedule_drain(self) -> None:
         callback = self._spawn_async_drain if self._is_async_sink else self._drain_sync
         try:
-            self._provider.event_loop.call_soon_threadsafe(callback)
+            loop = self._provider.event_loop
+            if self._on_target_loop(loop):
+                loop.call_soon(callback)
+            else:
+                loop.call_soon_threadsafe(callback)
         except RuntimeError:
             # No loop yet, or the loop is closing. Release the flag so the next
             # post retries; the queued items stay put until then.
@@ -223,6 +230,7 @@ class Courier(Generic[T]):
         with self._lock:
             batch = list(self._queue)
             self._queue.clear()
+            self._bounded = 0
             self._not_full.notify_all()
             # Cleared AFTER taking the batch, under the lock: any item appended
             # from here on sees _scheduled False and reschedules -> no lost wakeup.
@@ -249,6 +257,7 @@ class Courier(Generic[T]):
             with self._lock:
                 batch = list(self._queue)
                 self._queue.clear()
+                self._bounded = 0
                 self._not_full.notify_all()
                 if not batch:
                     # Keep _scheduled and _drain_task True/alive until we observe
@@ -258,10 +267,6 @@ class Courier(Generic[T]):
                     return
             for item in batch:
                 await self._safe_invoke_async(item)
-
-    # ------------------------------------------------------------------ #
-    # Sink/callback invocation -- never let a handler crash the courier.
-    # ------------------------------------------------------------------ #
 
     def _safe_invoke_sync(self, item: T) -> None:
         try:
@@ -299,10 +304,6 @@ class Courier(Generic[T]):
                 "OverflowPolicy.BLOCK cannot block on the target loop thread"
             )
 
-    # ------------------------------------------------------------------ #
-    # Shutdown.
-    # ------------------------------------------------------------------ #
-
     def close(self, *, drain: bool = True) -> None:
         """Stop accepting posts. With ``drain`` (default) deliver whatever is
         queued; otherwise hand the queued items to ``on_drop``.
@@ -317,7 +318,11 @@ class Courier(Generic[T]):
             self._not_full.notify_all()  # release any BLOCK-ed producer
             pending = list(self._queue)
             self._queue.clear()
+            self._bounded = 0
             self._scheduled = False
+
+        if not drain:
+            self._cancel_drain_task()
 
         if not pending:
             return
@@ -334,7 +339,11 @@ class Courier(Generic[T]):
             return
 
         try:
-            self._provider.event_loop.call_soon_threadsafe(self._final_drain, pending)
+            loop = self._provider.event_loop
+            if self._on_target_loop(loop):
+                loop.call_soon(self._final_drain, pending)
+            else:
+                loop.call_soon_threadsafe(self._final_drain, pending)
         except RuntimeError:
             for item in pending:
                 self._safe_on_drop(item)
@@ -349,3 +358,40 @@ class Courier(Generic[T]):
     async def _final_drain_async(self, pending: "list[T]") -> None:
         for item in pending:
             await self._safe_invoke_async(item)
+
+    def _is_lossless(self, item: T) -> bool:
+        return self._lossless is not None and self._lossless(item)
+
+    @staticmethod
+    def _on_target_loop(loop: asyncio.AbstractEventLoop) -> bool:
+        try:
+            return asyncio.get_running_loop() is loop
+        except RuntimeError:
+            return False
+
+    def _drop_oldest_bounded(self) -> object:
+        for index, item in enumerate(self._queue):
+            if not self._is_lossless(item):
+                del self._queue[index]
+                self._bounded -= 1
+                return item
+        return _NOTHING
+
+    def _cancel_drain_task(self) -> None:
+        task = self._drain_task
+        self._drain_task = None
+        if task is None or task.done():
+            return
+        try:
+            if asyncio.current_task(loop=task.get_loop()) is task:
+                return
+        except RuntimeError:
+            pass
+        try:
+            loop = task.get_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+                return
+        except RuntimeError:
+            pass
+        task.cancel()

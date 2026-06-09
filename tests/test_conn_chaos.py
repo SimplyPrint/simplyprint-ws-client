@@ -12,7 +12,8 @@ What each region pins (the engine's contract, read straight off ``reconnect.py``
 * ``open`` raising then succeeding -> the loop retries and eventually connects,
   and the generation only bumps on the *successful* open;
 * ``recv`` raising mid-stream -> the live attempt ends, ``Disconnected`` is tagged
-  with the raised error, and a fresh attempt brings the wire back;
+  with a structured error preserving the native exception, and a fresh attempt
+  brings the wire back;
 * ``recv`` returning ``None`` -> the frame is skipped (no ``MessageReceived``), the
   stream keeps flowing, and no generation churn happens;
 * ``write`` raising -> it propagates to the ``send`` caller and does *not* by
@@ -22,7 +23,7 @@ What each region pins (the engine's contract, read straight off ``reconnect.py``
   stays ``DISCONNECTED``, ``supervising()`` is ``False``, and a lease's
   ``ready()`` resolves ``False``;
 * ``FatalError`` vs ``TransientError`` -> both keep retrying, both ride through to
-  ``Disconnected.code`` verbatim;
+  ``Disconnected.code``;
 * generation bumps exactly once per *established* attempt, and ``Disconnected``
   carries the generation of the link that dropped;
 * cancellation at every await point (open / recv / backoff sleep / stop) leaves no
@@ -246,8 +247,12 @@ async def test_recv_raises_midstream_drops_and_reconnects_fresh():
         wire.inbox.put_nowait(boom)  # ends attempt 1 from inside consume()
 
         await wait_for(lambda: len(downs) == 1)
-        # The Disconnected carries the dropped link's generation and the raised err.
-        assert downs[0] == (1, boom)
+        # The Disconnected carries the dropped link's generation and wraps the
+        # native error without losing the original exception object.
+        assert downs[0][0] == 1
+        assert isinstance(downs[0][1], TransientError)
+        assert downs[0][1].transport_error is boom
+        assert downs[0][1].__cause__ is boom
 
         await wait_for(lambda: wire.generation == 2 and wire.connected)
         assert ups == [1, 2]  # one bump per established attempt, no double-bump
@@ -791,14 +796,14 @@ async def test_aclose_raising_on_a_failed_open_is_swallowed():
 
 
 # --------------------------------------------------------------------------- #
-# Any exception kind ends an attempt and rides through to Disconnected.code --
-# the engine does not privilege Transient/Fatal over a plain Exception.
+# Any exception kind ends an attempt and rides through Disconnected.code as a
+# structured transport error that preserves the native exception.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_plain_exception_from_open_retries_and_tags_code_verbatim():
-    """A bare Exception (not Transient/Fatal) from open() retries and is tagged."""
+async def test_plain_exception_from_open_retries_and_wraps_native_error():
+    """A bare Exception from open() retries and is preserved under the wrapper."""
     downs: List[Any] = []
     boom = ValueError("not a typed wire error at all")
     wire = make_wire(open_script=[boom])  # one plain failure, then success
@@ -808,15 +813,17 @@ async def test_plain_exception_from_open_retries_and_tags_code_verbatim():
         await wait_for(lambda: wire.connected)
         assert wire.opens == 2  # retried past the plain Exception
         assert wire.generation == 1
-        assert downs == [boom]  # the exact object rode through to the code
-        assert type(downs[0]) is ValueError  # not coerced to Transient/Fatal
+        assert len(downs) == 1
+        assert isinstance(downs[0], TransientError)
+        assert downs[0].transport_error is boom
+        assert downs[0].__cause__ is boom
     finally:
         await wire.stop()
 
 
 @pytest.mark.asyncio
-async def test_plain_exception_from_recv_retries_and_tags_code_verbatim():
-    """A bare Exception raised mid-stream from recv() drops, tags, and reconnects."""
+async def test_plain_exception_from_recv_retries_and_wraps_native_error():
+    """A bare Exception from recv() drops, reconnects, and preserves the native error."""
     downs: List[Any] = []
     wire = make_wire()
     wire.events.on(Disconnected, lambda e: downs.append(e.code))
@@ -826,7 +833,9 @@ async def test_plain_exception_from_recv_retries_and_tags_code_verbatim():
         boom = KeyError("weird mid-stream failure")
         wire.inbox.put_nowait(boom)
         await wait_for(lambda: len(downs) == 1)
-        assert downs[0] is boom  # verbatim, not wrapped
+        assert isinstance(downs[0], TransientError)
+        assert downs[0].transport_error is boom
+        assert downs[0].__cause__ is boom
         await wait_for(lambda: wire.generation == 2 and wire.connected)
     finally:
         await wire.stop()

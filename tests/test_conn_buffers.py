@@ -54,6 +54,15 @@ def current_provider() -> EventLoopProvider:
     return EventLoopProvider(loop=asyncio.get_event_loop())
 
 
+async def wait_for(predicate, timeout: float = 2.0) -> None:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not met in time")
+
+
 def build_pool(transports: List[FakeTransport]) -> Pool:
     def build(url: yarl.URL, params: object) -> FakeTransport:
         transport = FakeTransport(url)
@@ -68,7 +77,7 @@ def build_pool(transports: List[FakeTransport]) -> Pool:
 
 
 @pytest.mark.asyncio
-async def test_pool_awaits_async_lease_handlers():
+async def test_pool_queues_async_lease_handlers():
     transports: List[FakeTransport] = []
     pool = build_pool(transports)
     lease = pool.connect(yarl.URL("ws://host/path"))
@@ -82,6 +91,7 @@ async def test_pool_awaits_async_lease_handlers():
 
     await transports[0].events.emit(MessageReceived(1, "frame"))
 
+    await wait_for(lambda: handled == ["frame"])
     assert handled == ["frame"]
     await lease.close()
 
@@ -108,6 +118,9 @@ async def test_pool_preserves_delivery_order():
     await transports[0].events.emit(MessageReceived(1, "one"))
     await transports[0].events.emit(MessageReceived(1, "two"))
 
+    await wait_for(
+        lambda: order == [("connected", 1), ("message", "one"), ("message", "two")]
+    )
     assert order == [("connected", 1), ("message", "one"), ("message", "two")]
     await lease.close()
 
@@ -143,9 +156,61 @@ async def test_one_bad_lease_listener_does_not_block_other_leases():
 
     await transports[0].events.emit(MessageReceived(1, "frame"))
 
+    await wait_for(lambda: got == ["frame"])
     assert got == ["frame"]
     await bad.close()
     await good.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_lease_handler_does_not_block_pool_fanout():
+    transports: List[FakeTransport] = []
+    pool = build_pool(transports)
+    lease = pool.connect(yarl.URL("ws://host/path"))
+    release = asyncio.Event()
+    handled = []
+
+    async def slow(event: MessageReceived) -> None:
+        handled.append(event.message)
+        await release.wait()
+
+    lease.event_bus.on(MessageReceived, slow)
+
+    await transports[0].events.emit(MessageReceived(1, "one"))
+    await wait_for(lambda: handled == ["one"])
+
+    await asyncio.wait_for(
+        transports[0].events.emit(MessageReceived(1, "two")), timeout=0.1
+    )
+    assert handled == ["one"]
+
+    release.set()
+    await wait_for(lambda: handled == ["one", "two"])
+    await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_close_cancels_owned_delivery_task():
+    transports: List[FakeTransport] = []
+    pool = build_pool(transports)
+    lease = pool.connect(yarl.URL("ws://host/path"))
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def never_finishes(_event: MessageReceived) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    lease.event_bus.on(MessageReceived, never_finishes)
+    await transports[0].events.emit(MessageReceived(1, "frame"))
+    await wait_for(started.is_set)
+
+    await lease.close()
+    await wait_for(cancelled.is_set)
 
 
 @pytest.mark.asyncio

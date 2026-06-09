@@ -6,7 +6,7 @@ A printer client reaches a WebSocket endpoint through one call::
     conn = ws.connect(yarl.URL("wss://host/path"))
     conn.event_bus.on(MessageReceived, handler)
     await conn.ready()
-    await conn.send(WsTextMessage("hello"))     # or just: await conn.send("hello")
+    await conn.send(WsMessage.text("hello"))    # or just: await conn.send("hello")
     await conn.close()
 
 The wire underneath is one of two async libraries -- ``websockets`` (the default)
@@ -25,30 +25,36 @@ one socket across every lease on the same endpoint.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Union
+from dataclasses import replace
+from typing import Dict, Hashable, Optional, Union
 
 import yarl
 
-from simplyprint_ws_client.contrib.connection.aiohttp import Aiohttp
+from simplyprint_ws_client.contrib.connection.aiohttp import (
+    Aiohttp,
+    default_aiohttp_connect,
+)
 from simplyprint_ws_client.contrib.connection.connection import WsConnection
+from simplyprint_ws_client.contrib.connection.keepalive import Keepalive
 from simplyprint_ws_client.contrib.connection.messages import (
-    WsBytesMessage,
     WsKind,
     WsMessage,
-    WsTextMessage,
     as_ws_message,
     ws_message_for_payload,
 )
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.pool import Pool
+from simplyprint_ws_client.contrib.connection.options import (
+    ConnectionOptions,
+    WireKeepalive,
+)
 from simplyprint_ws_client.contrib.connection.transport import WsTransport
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
+from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
 __all__ = [
     "WsKind",
     "WsMessage",
-    "WsTextMessage",
-    "WsBytesMessage",
     "WsConnection",
     "connect",
     "shutdown",
@@ -69,7 +75,12 @@ def frame_of(payload: Union[str, bytes]) -> WsMessage:
     return ws_message_for_payload(payload)
 
 
-def build_pool(impl: str, pool: Optional[Pool[WsTransport]]) -> Pool[WsTransport]:
+def build_pool(
+    impl: str,
+    pool: Optional[Pool[WsTransport]],
+    provider: Optional[EventLoopProvider] = None,
+    wire_keepalive: Optional[WireKeepalive] = None,
+) -> Pool[WsTransport]:
     """The :class:`Pool` to lease from -- the caller's, or a default for ``impl``.
 
     A default pool is keyed by the full URL (one socket per endpoint) and hands out
@@ -80,16 +91,29 @@ def build_pool(impl: str, pool: Optional[Pool[WsTransport]]) -> Pool[WsTransport
     if pool is not None:
         return pool
 
-    existing = DEFAULT_POOLS.get(impl)
+    pool_key: Hashable = _pool_key(impl, provider, wire_keepalive)
+    existing = DEFAULT_POOLS.get(pool_key)
     if existing is not None:
         return existing
 
     def make_transport(url: yarl.URL, params: object) -> WsTransport:
         retry = params if isinstance(params, RetryPolicy) else RetryPolicy()
         if impl == "websockets":
-            return Websockets(url, retry)
+            return Websockets(
+                url,
+                retry,
+                provider,
+                connect_kwargs=_websockets_keepalive_kwargs(wire_keepalive),
+            )
         if impl == "aiohttp":
-            return Aiohttp(url, retry)
+            return Aiohttp(
+                url,
+                retry,
+                provider,
+                connect_factory=lambda u, logger: default_aiohttp_connect(
+                    u, logger, heartbeat=_aiohttp_heartbeat(wire_keepalive)
+                ),
+            )
         raise ValueError(
             f"ws.connect: unknown impl {impl!r} (use 'websockets'/'aiohttp')"
         )
@@ -98,14 +122,15 @@ def build_pool(impl: str, pool: Optional[Pool[WsTransport]]) -> Pool[WsTransport
         build=make_transport,
         key=lambda url, params: str(url),
         lease_class=WsConnection,
+        provider=provider,
     )
-    DEFAULT_POOLS[impl] = built
+    DEFAULT_POOLS[pool_key] = built
     return built
 
 
 #: One default pool per ``impl``, created on first use and torn down by
 #: :func:`shutdown`. A caller that passes its own ``pool`` never touches these.
-DEFAULT_POOLS: Dict[str, Pool[WsTransport]] = {}
+DEFAULT_POOLS: Dict[Hashable, Pool[WsTransport]] = {}
 
 
 def connect(
@@ -114,6 +139,10 @@ def connect(
     impl: str = "websockets",
     retry: Optional[RetryPolicy] = None,
     pool: Optional[Pool[WsTransport]] = None,
+    provider: Optional[EventLoopProvider] = None,
+    keepalive: Optional[Keepalive] = None,
+    wire_keepalive: Optional[WireKeepalive] = None,
+    options: Optional[ConnectionOptions] = None,
 ) -> WsConnection:
     """Lease a self-healing WebSocket to ``url`` and return the connection handle.
 
@@ -132,10 +161,67 @@ def connect(
             f"unknown websocket impl {impl!r}; choose one of {SUPPORTED_IMPLS}"
         )
 
-    pool = build_pool(impl, pool)
-    lease = pool.connect(url, retry or RetryPolicy())
+    options = _resolve_options(options, retry, provider, keepalive, wire_keepalive)
+    pool = build_pool(impl, pool, options.provider, options.wire_keepalive)
+    lease = pool.connect(url, options.retry or RetryPolicy())
     assert isinstance(lease, WsConnection)
+    if options.app_keepalive is not None:
+        lease.keepalive(options.app_keepalive)
     return lease
+
+
+def _resolve_options(
+    options: Optional[ConnectionOptions],
+    retry: Optional[RetryPolicy],
+    provider: Optional[EventLoopProvider],
+    keepalive: Optional[Keepalive],
+    wire_keepalive: Optional[WireKeepalive],
+) -> ConnectionOptions:
+    resolved = options or ConnectionOptions()
+    if retry is not None:
+        resolved = replace(resolved, retry=retry)
+    if provider is not None:
+        resolved = replace(resolved, provider=provider)
+    if keepalive is not None:
+        resolved = replace(resolved, app_keepalive=keepalive)
+    if wire_keepalive is not None:
+        resolved = replace(resolved, wire_keepalive=wire_keepalive)
+    return resolved
+
+
+def _pool_key(
+    impl: str,
+    provider: Optional[EventLoopProvider],
+    wire_keepalive: Optional[WireKeepalive],
+) -> Hashable:
+    if provider is None and wire_keepalive is None:
+        return impl
+    provider_key: object = None
+    if provider is not None:
+        try:
+            provider_key = id(provider.event_loop)
+        except RuntimeError:
+            provider_key = id(provider)
+    return impl, provider_key, wire_keepalive
+
+
+def _websockets_keepalive_kwargs(
+    wire_keepalive: Optional[WireKeepalive],
+) -> dict:
+    if wire_keepalive is None:
+        return {}
+    kwargs = {}
+    if wire_keepalive.interval is not None:
+        kwargs["ping_interval"] = wire_keepalive.interval
+    if wire_keepalive.timeout is not None:
+        kwargs["ping_timeout"] = wire_keepalive.timeout
+    return kwargs
+
+
+def _aiohttp_heartbeat(wire_keepalive: Optional[WireKeepalive]) -> Optional[float]:
+    if wire_keepalive is None:
+        return None
+    return wire_keepalive.interval
 
 
 def shutdown() -> None:

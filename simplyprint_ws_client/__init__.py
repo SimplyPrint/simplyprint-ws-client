@@ -31,7 +31,6 @@ from . import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
 # Modules whose public names are re-exported, tried light-first so resolving a
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
-    ".core.ws_protocol.backend",
     ".core.config",
     ".core.settings",
     ".core.state",
@@ -55,11 +54,6 @@ _PUBLIC = (
     "ClientSettings",
     "ClientSpec",
     "ConnectionMode",
-    "BackendTransport",
-    "WebsocketsBackend",
-    "AiohttpBackend",
-    "BackendError",
-    "BackendClosed",
     "PrinterConfig",
     "Config",
     "ConfigManager",
@@ -105,13 +99,6 @@ def __dir__():
 
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
-    from .core.ws_protocol.backend import (  # noqa: F401
-        AiohttpBackend,
-        BackendClosed,
-        BackendError,
-        BackendTransport,
-        WebsocketsBackend,
-    )
     from .core.app import *  # noqa: F401,F403
     from .core.client import *  # noqa: F401,F403
     from .core.config import *  # noqa: F401,F403

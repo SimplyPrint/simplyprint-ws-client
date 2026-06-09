@@ -38,6 +38,10 @@ from simplyprint_ws_client.contrib.connection.events import (
     Disconnected,
     MessageReceived,
 )
+from simplyprint_ws_client.contrib.connection.keepalive import (
+    Keepalive,
+    KeepaliveTimeout,
+)
 from simplyprint_ws_client.contrib.connection.messages import QoS
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.pool import Pool
@@ -56,8 +60,9 @@ from simplyprint_ws_client.contrib.connection.aiomqtt import AioMqtt
 from simplyprint_ws_client.contrib.connection.mqtt import (
     MqttBroker,
     MqttMessage,
+    mqtt_message_route,
 )
-from simplyprint_ws_client.contrib.connection.websocket import WsBytesMessage
+from simplyprint_ws_client.contrib.connection.websocket import WsMessage
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
 from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
@@ -154,9 +159,6 @@ class FakeRoutedTransport(FakeTransport, MqttTransport):
     async def unsubscribe(self, topic: str) -> None:  # pragma: no cover - unused
         pass
 
-    def route(self, message: object) -> Optional[str]:
-        return getattr(message, "topic", None)
-
 
 def build_pool(transports: List[FakeTransport], *, routed: bool = False) -> Pool:
     """A pool keyed by URL string that records the transports it builds."""
@@ -170,6 +172,7 @@ def build_pool(transports: List[FakeTransport], *, routed: bool = False) -> Pool
     return Pool(
         build=build,
         key=lambda url, params: str(url),
+        route=(lambda message: message.topic) if routed else None,
         provider=current_provider(),
     )
 
@@ -189,7 +192,7 @@ async def test_pool_shares_one_transport_per_endpoint():
     b = pool.connect(url)
 
     assert len(transports) == 1  # one wire built for the endpoint
-    assert a.backend is b.backend  # both leases share it
+    assert a.transport is b.transport  # both leases share it
     assert transports[0].starts == 1  # started once, by the first lease
     assert a is not b
 
@@ -203,7 +206,7 @@ async def test_pool_distinct_endpoints_get_distinct_transports():
     b = pool.connect(yarl.URL("ws://host/two"))
 
     assert len(transports) == 2
-    assert a.backend is not b.backend
+    assert a.transport is not b.transport
 
 
 @pytest.mark.asyncio
@@ -227,8 +230,31 @@ async def test_pool_refcounts_and_tears_down_on_last_close():
     # A fresh connect after teardown builds a brand-new transport.
     c = pool.connect(url)
     assert len(transports) == 2
-    assert c.backend is not transport
+    assert c.transport is not transport
     await c.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_keepalive_probes_and_times_out_when_idle():
+    transports: List[FakeTransport] = []
+    pool = build_pool(transports)
+    lease = pool.connect(yarl.URL("ws://host/path"))
+    probes: List[Connection] = []
+    disconnected: List[object] = []
+
+    lease.event_bus.on(Disconnected, lambda event: disconnected.append(event.code))
+    lease.keepalive(
+        Keepalive(interval=0.01, max_misses=1, probe=lambda conn: probes.append(conn))
+    )
+
+    await transports[0].go_up()
+
+    await wait_for(lambda: probes)
+    await wait_for(lambda: disconnected)
+    assert probes == [lease]
+    assert isinstance(disconnected[-1], KeepaliveTimeout)
+
+    await lease.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +331,7 @@ async def test_reconnecting_drop_emits_disconnected_and_reconnects_once():
         provider=current_provider(),
     )
     wire.events.on(Connected, lambda e: ups.append(e.generation))
-    wire.events.on(Disconnected, lambda e: downs.append((e.generation, type(e.code))))
+    wire.events.on(Disconnected, lambda e: downs.append((e.generation, e.code)))
     wire.start()
     try:
         await wait_for(lambda: wire.generation == 1 and wire.connected)
@@ -315,7 +341,9 @@ async def test_reconnecting_drop_emits_disconnected_and_reconnects_once():
         # The drop announces Disconnected tagged with the failure, then a fresh
         # attempt brings the wire back on the next generation.
         await wait_for(lambda: len(downs) == 1)
-        assert downs[0] == (1, RuntimeError)  # generation of the dropped link
+        assert downs[0][0] == 1  # generation of the dropped link
+        assert isinstance(downs[0][1], TransientError)
+        assert isinstance(downs[0][1].transport_error, RuntimeError)
 
         await wait_for(lambda: wire.generation == 2 and wire.connected)
         assert ups == [1, 2]  # generation bumped exactly once per attempt
@@ -391,7 +419,7 @@ async def test_reconnecting_gives_up_when_policy_exhausted():
 
 
 # --------------------------------------------------------------------------- #
-# Connection lease: inbound delivery, ready(), send(), transport().
+# Connection lease: inbound delivery, ready(), send(), ready_transport().
 # --------------------------------------------------------------------------- #
 
 
@@ -480,7 +508,7 @@ async def test_lease_transport_awaits_live_connection():
     transport = FakeTransport(yarl.URL("ws://x"))
     lease = lease_on(transport)
 
-    waiter = asyncio.ensure_future(lease.transport())
+    waiter = asyncio.ensure_future(lease.ready_transport())
     await asyncio.sleep(0)
     assert not waiter.done()  # blocks while down
     transport.generation = 1
@@ -566,6 +594,7 @@ def build_mqtt_pool(clients: List[FakeAioMqttClient]) -> Pool:
     return Pool(
         build=build,
         key=key,
+        route=mqtt_message_route,
         lease_class=MqttConnection,
         provider=current_provider(),
     )
@@ -607,7 +636,7 @@ async def test_mqtt_two_leases_each_get_only_their_topic():
 
     first = pool.connect(url, broker)
     second = pool.connect(url, broker)
-    assert first.backend is second.backend  # one shared broker socket
+    assert first.transport is second.transport  # one shared broker socket
 
     got_first: List[str] = []
     got_second: List[str] = []
@@ -714,7 +743,7 @@ async def test_ws_broadcast_every_lease_gets_every_message():
 
     one = pool.connect(url)
     two = pool.connect(url)
-    assert one.backend is two.backend  # one shared socket
+    assert one.transport is two.transport  # one shared socket
     assert len(sockets) == 0  # built lazily on the first open
 
     got_one: List[str] = []
@@ -744,13 +773,13 @@ async def test_ws_send_routes_to_the_wire():
 
     await lease.send("hi")  # bare str -> text frame
     await lease.send(b"bytes")  # bare bytes -> binary frame
-    await lease.send(WsBytesMessage(b"explicit"))
+    await lease.send(WsMessage.binary(b"explicit"))
 
     # The front-door lease reduces a WsMessage to the raw str/bytes the wire sends.
     socket = sockets[0]
     assert socket.sent[0] == "hi"  # text frame
     assert socket.sent[1] == b"bytes"  # binary frame
-    assert socket.sent[2] == b"explicit"  # explicit WsBytesMessage -> its bytes
+    assert socket.sent[2] == b"explicit"  # explicit WsMessage -> its bytes
 
     await lease.close()
 
@@ -901,6 +930,6 @@ async def test_front_doors_share_one_transport_per_endpoint():
     url = yarl.URL("wss://host/socket")
     a = ws.connect(url, pool=pool)
     b = ws.connect(url, pool=pool)
-    assert a.backend is b.backend
+    assert a.transport is b.transport
     await a.close()
     await b.close()

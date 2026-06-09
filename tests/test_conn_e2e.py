@@ -48,10 +48,8 @@ from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 from simplyprint_ws_client.contrib.connection.transport import WsTransport
 from simplyprint_ws_client.contrib.connection.websocket import (
-    WsBytesMessage,
     WsKind,
     WsMessage,
-    WsTextMessage,
 )
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
 
@@ -568,8 +566,8 @@ async def test_front_door_send_str_and_wsmessage(impl, server: LoopbackServer) -
         assert await conn.ready(timeout=3.0)
 
         await conn.send("bare-str")
-        await conn.send(WsTextMessage("wrapped"))
-        await conn.send(WsBytesMessage(b"rawbytes"))
+        await conn.send(WsMessage.text("wrapped"))
+        await conn.send(WsMessage.binary(b"rawbytes"))
 
         await wait_until(
             lambda: {
@@ -629,7 +627,7 @@ async def test_front_door_pool_shares_one_socket(impl, server: LoopbackServer) -
         assert await first.ready(timeout=3.0)
         assert await second.ready(timeout=3.0)
         # Both leases ride the SAME transport instance.
-        assert first.backend is second.backend
+        assert first.transport is second.transport
         await server.current()
         assert server.accept_count == 1  # one real socket for two leases
     finally:
@@ -651,17 +649,17 @@ async def test_front_door_last_close_tears_socket_down(
     try:
         assert await first.ready(timeout=3.0)
         assert await second.ready(timeout=3.0)
-        backend = first.backend
+        transport = first.transport
 
         await first.close()
         # One lease left: the socket stays up.
         await asyncio.sleep(0.1)
-        assert backend.connected
+        assert transport.connected
         assert len(server.connections) == 1
 
         await second.close()
         # Last lease gone: transport stopped, server-side socket closes.
-        await wait_until(lambda: not backend.connected)
+        await wait_until(lambda: not transport.connected)
         await wait_until(lambda: len(server.connections) == 0)
     finally:
         with contextlib.suppress(Exception):
@@ -791,7 +789,7 @@ async def test_front_door_two_leases_both_receive_broadcast(
     try:
         assert await first.ready(timeout=3.0)
         assert await second.ready(timeout=3.0)
-        assert first.backend is second.backend
+        assert first.transport is second.transport
 
         await push_server.push("broadcast")
         await wait_until(lambda: got_first and got_second)
@@ -824,7 +822,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
     transport = make(yarl.URL(f"ws://127.0.0.1:{dead_port}/"), policy)
 
     # Drive ready() through a real lease over the transport (no pool needed here:
-    # ready() reads supervising()/connected/Disconnected straight off the backend).
+    # ready() reads supervising()/connected/Disconnected straight off the transport).
     from simplyprint_ws_client.contrib.connection.pool import Pool
 
     pool: Pool = Pool(
@@ -862,7 +860,7 @@ async def test_front_door_ready_timeout_false_while_still_retrying(impl) -> None
         result = await conn.ready(timeout=0.3)
         assert result is False
         # Still supervising (never gave up): a later connect could still succeed.
-        assert conn.backend.supervising()
+        assert conn.transport.supervising()
 
 
 @pytest.mark.asyncio
@@ -1005,7 +1003,7 @@ async def test_front_door_ready_false_on_give_up(impl) -> None:
     bounded = RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=2)
     async with front_door(url, impl=impl, retry=bounded) as conn:
         assert await conn.ready(timeout=5.0) is False
-        assert not conn.backend.supervising()
+        assert not conn.transport.supervising()
         assert conn.state is ConnectionState.DISCONNECTED
 
 
@@ -1042,7 +1040,7 @@ async def test_at_most_once_outbound_still_sends(impl, server: LoopbackServer) -
     async with front_door(server.url, impl=impl) as conn:
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
-        await conn.send(WsTextMessage("amo", qos=QoS.AT_MOST_ONCE))
+        await conn.send(WsMessage.text("amo", qos=QoS.AT_MOST_ONCE))
         await wait_until(
             lambda: any(
                 isinstance(m, WsMessage) and m.payload == "echo:amo" for m in received

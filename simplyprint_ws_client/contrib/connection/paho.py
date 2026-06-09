@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
 
 import yarl
 
@@ -40,7 +40,11 @@ from simplyprint_ws_client.contrib.connection.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.messages import MqttMessage
+from simplyprint_ws_client.contrib.connection.errors import ErrorCode, TransportError
+from simplyprint_ws_client.contrib.connection.messages import (
+    MqttMessage,
+    mqtt_message_from_inbound,
+)
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 from simplyprint_ws_client.contrib.connection.transport import (
     FatalError,
@@ -51,12 +55,64 @@ from simplyprint_ws_client.contrib.connection.transport import (
 
 __all__ = ["Paho", "PahoClientFactory", "default_paho_client"]
 
+if TYPE_CHECKING:
+    from paho.mqtt.client import MQTTMessage
+    from paho.mqtt.reasoncodes import ReasonCode
+
+PahoReasonCode = Optional[Union[int, "ReasonCode"]]
+
+
+class PahoPublishInfo(Protocol):
+    """Publish result surface used by this transport."""
+
+    rc: int
+
+    def wait_for_publish(self) -> None: ...
+
+
+class PahoClient(Protocol):
+    """paho client surface used by this transport."""
+
+    on_pre_connect: Optional[Callable[..., None]]
+    on_connect: Optional[Callable[..., None]]
+    on_connect_fail: Optional[Callable[..., None]]
+    on_message: Optional[Callable[..., None]]
+    on_disconnect: Optional[Callable[..., None]]
+
+    def username_pw_set(
+        self, username: Optional[str], password: Optional[str]
+    ) -> None: ...
+
+    def connect_async(self, host: Optional[str], port: int, keepalive: int) -> None: ...
+
+    def loop_start(self) -> int: ...
+
+    def loop_stop(self) -> int: ...
+
+    def disconnect(self) -> None: ...
+
+    def is_connected(self) -> bool: ...
+
+    def subscribe(self, topic: str) -> object: ...
+
+    def unsubscribe(self, topic: str) -> object: ...
+
+    def publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: int,
+        retain: bool,
+    ) -> PahoPublishInfo: ...
+
+
 #: Builds (but does not connect) a paho client for a URL. Injectable for tests so
 #: the adapter can be exercised without a broker or even paho installed.
-PahoClientFactory = Callable[[yarl.URL, logging.Logger], Any]
+PahoClientFactory = Callable[[yarl.URL, logging.Logger], PahoClient]
 
 
-def default_paho_client(url: yarl.URL, logger: logging.Logger) -> Any:
+def default_paho_client(url: yarl.URL, logger: logging.Logger) -> PahoClient:
     """Build a real ``paho.mqtt.client.Client``, TLS-enabled for ``mqtts://``.
 
     Imported lazily so merely importing this module never requires paho. paho
@@ -96,6 +152,7 @@ class Paho(MqttTransport):
         provider: Optional[EventLoopProvider] = None,
         client_factory: PahoClientFactory = default_paho_client,
         keepalive: int = 60,
+        connect_failure_limit: int = 3,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.url = url
@@ -105,15 +162,18 @@ class Paho(MqttTransport):
         self.provider = provider or EventLoopProvider.default()
         self.client_factory = client_factory
         self.keepalive = keepalive
+        self.connect_failure_limit = connect_failure_limit
         self.logger = logger or logging.getLogger("conn.paho")
         #: The live paho client, or ``None`` while stopped.
-        self.client: Any = None
+        self.client: Optional[PahoClient] = None
         #: topic -> lease refcount; re-asserted on every (re)connect.
         self.subscriptions: Dict[str, int] = {}
         #: Guards the client handle and the subscription table against the paho
         #: network thread racing the loop thread.
         self.lock = threading.Lock()
         self.started = False
+        self.connect_failures = 0
+        self.connect_failure_reported = False
         #: Carries paho-thread events onto the loop; created on :meth:`start`.
         self.courier: Optional[Courier[ConnectionEvent]] = None
 
@@ -139,7 +199,9 @@ class Paho(MqttTransport):
         )
 
         client = self.client_factory(self.url, self.logger)
+        client.on_pre_connect = self.on_pre_connect
         client.on_connect = self.on_connect
+        client.on_connect_fail = self.on_connect_fail
         client.on_message = self.on_message
         client.on_disconnect = self.on_disconnect
         if self.url.user or self.url.password:
@@ -147,10 +209,16 @@ class Paho(MqttTransport):
         with self.lock:
             self.client = client
 
-        self.state = ConnectionState.CONNECTING
-        self.post(Connecting(self.generation))
+        self.mark_connecting()
         client.connect_async(self.url.host, self.port(), keepalive=self.keepalive)
-        client.loop_start()
+        rc = client.loop_start()
+        if rc != 0:
+            self.started = False
+            with self.lock:
+                self.client = None
+            error = FatalError(f"paho loop_start failed (rc={rc})", code=rc)
+            self.mark_disconnected(error)
+            raise RuntimeError(str(error))
 
     async def stop(self) -> None:
         """Tear the paho client down and close the courier. Idempotent."""
@@ -172,7 +240,7 @@ class Paho(MqttTransport):
             self.courier = None
         self.state = ConnectionState.DISCONNECTED
 
-    async def send(self, message: Any) -> None:
+    async def send(self, message: MqttMessage) -> None:
         """Publish ``message`` on the live socket (raises if the link is down).
 
         ``message`` is wire-shaped (a topic + payload, with a ``qos`` enum and a
@@ -183,8 +251,6 @@ class Paho(MqttTransport):
         client = self.client
         if client is None or not client.is_connected():
             raise NotConnected("paho transport not connected")
-        if not isinstance(message, MqttMessage):
-            raise TypeError("paho transport sends MqttMessage instances")
         info = client.publish(
             message.topic,
             message.payload,
@@ -192,7 +258,7 @@ class Paho(MqttTransport):
             retain=message.retain,
         )
         if info.rc != 0:
-            raise NotConnected(f"paho publish rejected (rc={info.rc})")
+            raise NotConnected(f"paho publish rejected (rc={info.rc})", code=info.rc)
         if message.qos.value > 0:
             await self.provider.event_loop.run_in_executor(None, info.wait_for_publish)
 
@@ -221,49 +287,121 @@ class Paho(MqttTransport):
         if client is not None and client.is_connected():
             client.unsubscribe(topic)
 
-    def route(self, message: Any) -> Optional[str]:
-        """The inbound message's topic -- the key the pool routes leases by."""
-        return str(message.topic)
+    def on_pre_connect(self, client: PahoClient, userdata: object = None) -> None:
+        """paho is about to attempt a connection or reconnection."""
+        if self.started:
+            self.mark_connecting()
 
     def on_connect(
         self,
-        client: Any,
-        userdata: Any = None,
-        flags: Any = None,
-        reason_code: Any = None,
-        properties: Any = None,
+        client: PahoClient,
+        userdata: object = None,
+        flags: object = None,
+        reason_code: PahoReasonCode = None,
+        properties: object = None,
     ) -> None:
         """paho established (or re-established) the link: re-assert subscriptions,
         bump the generation, and announce :class:`Connected`."""
+        if not self.started:
+            return
         if connect_rejected(reason_code):
-            self.logger.warning("paho %s rejected: %s", self.url, reason_code)
-            self.state = ConnectionState.DISCONNECTED
-            self.post(Disconnected(self.generation, code=FatalError(str(reason_code))))
+            self.record_connect_failure(
+                FatalError(
+                    f"paho rejected: {reason_code}",
+                    code=paho_reason_code(reason_code),
+                )
+            )
             return
         with self.lock:
             topics = list(self.subscriptions)
         for topic in topics:
             client.subscribe(topic)
-        self.generation += 1
-        self.state = ConnectionState.CONNECTED
-        self.post(Connected(self.generation))
+        self.mark_connected()
 
-    def on_message(self, client: Any, userdata: Any, message: Any, *extra: Any) -> None:
+    def on_connect_fail(
+        self,
+        client: PahoClient,
+        userdata: object = None,
+    ) -> None:
+        """paho failed one connect attempt and will retry by itself."""
+        if self.started:
+            self.record_connect_failure(TransientError("paho connect failed"))
+
+    def on_message(
+        self,
+        client: PahoClient,
+        userdata: object,
+        message: "MQTTMessage",
+        *extra: Any,
+    ) -> None:
         """An inbound broker message -- forwarded wire-shaped (paho ``MQTTMessage``)."""
-        self.post(MessageReceived(self.generation, message))
+        if self.started:
+            parsed = mqtt_message_from_inbound(message)
+            self.post(MessageReceived(self.generation, parsed, parsed.qos))
 
     def on_disconnect(
         self,
-        client: Any,
-        userdata: Any = None,
-        flags: Any = None,
-        reason_code: Any = None,
-        properties: Any = None,
+        client: PahoClient,
+        userdata: object = None,
+        flags: object = None,
+        reason_code: PahoReasonCode = None,
+        properties: object = None,
     ) -> None:
         """The socket dropped. paho will reconnect on its own; we surface it as a
         transient :class:`Disconnected` and wait for the next ``on_connect``."""
-        self.state = ConnectionState.DISCONNECTED
-        self.post(Disconnected(self.generation, code=TransientError(str(reason_code))))
+        if not self.started:
+            return
+        error = TransientError(
+            f"paho disconnected: {reason_code}",
+            code=paho_reason_code(reason_code),
+        )
+        if self.state is ConnectionState.CONNECTING and not client.is_connected():
+            self.record_connect_failure(error)
+            return
+        if self.state is ConnectionState.DISCONNECTED:
+            return
+        self.mark_disconnected(error)
+
+    def mark_connecting(self) -> None:
+        if self.state is not ConnectionState.CONNECTING:
+            self.transition(ConnectionState.CONNECTING, Connecting(self.generation))
+
+    def mark_connected(self) -> None:
+        self.connect_failures = 0
+        self.connect_failure_reported = False
+        self.generation += 1
+        self.transition(ConnectionState.CONNECTED, Connected(self.generation))
+
+    def mark_disconnected(self, code: TransportError) -> None:
+        self.transition(
+            ConnectionState.DISCONNECTED, Disconnected(self.generation, code)
+        )
+
+    def transition(self, state: ConnectionState, event: ConnectionEvent) -> None:
+        self.state = state
+        self.post(event)
+
+    def record_connect_failure(self, error: TransportError) -> None:
+        self.connect_failures += 1
+        if self.connect_failures < self.connect_failure_limit:
+            self.logger.debug(
+                "paho %s connect failed (%s/%s): %s",
+                self.url,
+                self.connect_failures,
+                self.connect_failure_limit,
+                error,
+            )
+            return
+        if self.connect_failure_reported:
+            return
+        self.connect_failure_reported = True
+        self.logger.warning(
+            "paho %s connect failed %s times: %s",
+            self.url,
+            self.connect_failures,
+            error,
+        )
+        self.mark_disconnected(error)
 
     def post(self, event: ConnectionEvent) -> None:
         """Hand an event to the courier for delivery on the loop.
@@ -287,7 +425,7 @@ class Paho(MqttTransport):
         return 8883 if self.url.scheme == "mqtts" else 1883
 
 
-def connect_rejected(reason_code: Any) -> bool:
+def connect_rejected(reason_code: PahoReasonCode) -> bool:
     """Whether a CONNACK reason code means the broker refused the connection.
 
     paho's VERSION2 reason code exposes ``is_failure``; older shapes are an int
@@ -295,11 +433,18 @@ def connect_rejected(reason_code: Any) -> bool:
     """
     if reason_code is None:
         return False
+    if isinstance(reason_code, int):
+        return reason_code != 0
+    return reason_code.is_failure
+
+
+def paho_reason_code(reason_code: PahoReasonCode) -> Optional[ErrorCode]:
+    """Normalize paho's native reason code into a stable error code."""
+    if reason_code is None:
+        return None
+    if isinstance(reason_code, int):
+        return reason_code
     try:
-        return bool(reason_code.is_failure)
-    except AttributeError:
-        pass
-    try:
-        return int(reason_code) != 0
+        return int(reason_code)
     except (TypeError, ValueError):
-        return False
+        return str(reason_code)

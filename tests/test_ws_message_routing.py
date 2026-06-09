@@ -19,7 +19,9 @@ from simplyprint_ws_client.core.ws_protocol.connection import (
 def test_multi_mode_routes_message_to_its_printer():
     conn = Connection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
     msg = SimpleNamespace(for_client="printer-9")
-    assert conn._message_logger(msg).name == printer_logger_name("printer-9", "ws")
+    assert conn.protocol._message_logger(msg).name == printer_logger_name(
+        "printer-9", "ws"
+    )
     conn.stop()
 
 
@@ -27,7 +29,7 @@ def test_multi_mode_global_message_stays_global():
     conn = Connection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
     msg = SimpleNamespace(for_client=None)
     # No printer association -> the connection's (system-scope) ws logger.
-    assert conn._message_logger(msg) is conn.logger
+    assert conn.protocol._message_logger(msg) is conn.logger
     conn.stop()
 
 
@@ -37,5 +39,7 @@ def test_single_mode_routes_to_the_connection_printer():
     conn = Connection(hint=ConnectionHint(mode=ConnectionMode.SINGLE, config=config))
     # SINGLE: one printer; every message belongs to it, regardless of for_client.
     msg = SimpleNamespace(for_client=None)
-    assert conn._message_logger(msg).name == printer_logger_name(config.unique_id, "ws")
+    assert conn.protocol._message_logger(msg).name == printer_logger_name(
+        config.unique_id, "ws"
+    )
     conn.stop()

@@ -1,67 +1,74 @@
-"""Test doubles for the backend transport seam.
+"""Test doubles for the core WS transport seam."""
 
-``FakeBackend`` is an in-memory :class:`BackendTransport` that lets a test
-drive :class:`Connection` deterministically -- no real backend, no aiohttp/
-``websockets`` involvement. ``connect`` opens it, ``send`` records into
-:attr:`sent`, and ``recv`` waits on an inbox the test feeds with
-:meth:`queue_message` / :meth:`queue_close`.
-"""
+from __future__ import annotations
 
 import asyncio
+import logging
 from typing import List, Optional, Tuple
 
-from simplyprint_ws_client.core.ws_protocol.backend import (
-    BackendClosed,
-    BackendTransport,
+import yarl
+
+from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
+from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
+from simplyprint_ws_client.contrib.connection.state import ConnectionState
+from simplyprint_ws_client.contrib.connection.transport import (
+    TransientError,
+    WsTransport,
 )
+from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
 
-class FakeBackend(BackendTransport):
-    def __init__(self, logger=None) -> None:
+class FakeTransport(WsTransport, Reconnecting):
+    def __init__(
+        self,
+        url: yarl.URL = yarl.URL("ws://fake"),
+        provider: Optional[EventLoopProvider] = None,
+        logger: logging.Logger = logging.getLogger("test.fake_transport"),
+        *,
+        first_message_timeout: Optional[float] = None,
+    ) -> None:
+        super().__init__(
+            url,
+            RetryPolicy(backoff=ConstantBackoff(0.01)),
+            provider,
+            first_message_timeout=first_message_timeout,
+            logger=logger,
+        )
         self.sent: List[str] = []
         self.connect_calls = 0
         self.closed_with: Optional[Tuple[int, str]] = None
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._open = False
 
-    async def connect(self, url: str, **params) -> None:
+    async def open(self) -> None:
         self.connect_calls += 1
         self._open = True
 
-    async def send(self, data: str) -> None:
+    async def write(self, data: object) -> None:
         if not self._open:
-            raise BackendClosed("not connected")
-        self.sent.append(data)
+            raise TransientError("not connected")
+        self.sent.append(str(data))
 
     async def recv(self) -> Optional[str]:
         item = await self._inbox.get()
         if isinstance(item, BaseException):
-            # Observing a close means the socket is now dead (mirrors websockets:
-            # the connection is CLOSED once recv() raises ConnectionClosed).
             self._open = False
             raise item
         return item
 
-    async def close(self, code: int = 1000, reason: str = "") -> None:
-        self.closed_with = (code, reason)
+    async def aclose(self) -> None:
+        self.closed_with = (1000, "")
         self._open = False
 
-    @property
-    def is_open(self) -> bool:
-        return self._open
-
-    def open(self) -> "FakeBackend":
-        """Mark connected without going through the loop (for unit tests)."""
+    def open_for_test(self) -> "FakeTransport":
         self._open = True
+        self.live = True
+        self.state = ConnectionState.CONNECTED
         return self
 
     def queue_message(self, data: str) -> None:
-        """Make the next ``recv()`` return ``data``."""
         self._inbox.put_nowait(data)
 
-    def queue_close(self, code: int = 1006) -> None:
-        """Make the next ``recv()`` raise ``BackendClosed`` (a dropped backend)."""
-        self._inbox.put_nowait(BackendClosed("peer closed", code=code))
-
-
-FakeTransport = FakeBackend
+    def queue_close(self) -> None:
+        self._inbox.put_nowait(TransientError("peer closed"))

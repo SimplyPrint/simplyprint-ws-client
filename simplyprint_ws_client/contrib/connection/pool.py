@@ -9,8 +9,8 @@ once to its event bus; the last lease to close stops and drops the transport.
 The pool subscribes to a transport's events exactly once and fans each event to
 that transport's leases: lifecycle events (``Connecting`` / ``Connected`` /
 ``Disconnected``) go to every lease, while a ``MessageReceived`` goes only to the
-leases whose subscription set matches ``transport.route(message)`` (a ``None``
-route -- a 1:1 wire -- reaches every lease). The per-lease bounded, QoS-governed
+leases whose subscription set matches the pool route function (no route function
+means a 1:1 wire and reaches every lease). The per-lease bounded, QoS-governed
 delivery of those events to async handlers lives in :mod:`connection`.
 
 The pool is pure sync bookkeeping: ``connect`` and lease release only touch a
@@ -47,6 +47,8 @@ T = TypeVar("T", bound=Transport)
 TransportBuilder = Callable[[yarl.URL, object], "Transport"]
 #: Maps a URL and params to the hashable endpoint key the pool shares by.
 EndpointKey = Callable[[yarl.URL, object], Hashable]
+#: Maps an inbound message to the route leases match against. ``None`` broadcasts.
+MessageRoute = Callable[[object], Optional[Hashable]]
 
 
 class Endpoint(Generic[T]):
@@ -54,15 +56,58 @@ class Endpoint(Generic[T]):
 
     The pool keeps one of these per endpoint key. It subscribes to the
     transport's event bus once (on creation) and detaches on teardown, fanning
-    each event out to its leases.
+    each event into each lease's owned delivery drain.
     """
 
-    def __init__(self, key: Hashable, transport: T, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        key: Hashable,
+        transport: T,
+        route: Optional[MessageRoute],
+        logger: logging.Logger,
+    ) -> None:
         self.key = key
         self.transport = transport
+        self.route = route
         self.logger = logger
         self.leases: Set["Connection[T]"] = set()
+        self.unfiltered_leases: Set["Connection[T]"] = set()
+        self.route_leases: Dict[Hashable, Set["Connection[T]"]] = {}
+        self.wildcard_leases: Set["Connection[T]"] = set()
         self.refs = 0
+
+    def add_lease(self, lease: "Connection[T]") -> None:
+        self.leases.add(lease)
+        if not lease.topics:
+            self.unfiltered_leases.add(lease)
+
+    def remove_lease(self, lease: "Connection[T]") -> None:
+        self.leases.discard(lease)
+        self.unfiltered_leases.discard(lease)
+        self.wildcard_leases.discard(lease)
+        for route, leases in list(self.route_leases.items()):
+            leases.discard(lease)
+            if not leases:
+                self.route_leases.pop(route, None)
+
+    def add_route(self, lease: "Connection[T]", route: Hashable) -> None:
+        self.unfiltered_leases.discard(lease)
+        if isinstance(route, str) and route.endswith("/#"):
+            self.wildcard_leases.add(lease)
+            return
+        self.route_leases.setdefault(route, set()).add(lease)
+
+    def remove_route(self, lease: "Connection[T]", route: Hashable) -> None:
+        if isinstance(route, str) and route.endswith("/#"):
+            self.wildcard_leases.discard(lease)
+        else:
+            leases = self.route_leases.get(route)
+            if leases is not None:
+                leases.discard(lease)
+                if not leases:
+                    self.route_leases.pop(route, None)
+        if lease in self.leases and not lease.topics:
+            self.unfiltered_leases.add(lease)
 
     def attach(self) -> None:
         """Begin fanning the transport's events out to the leases."""
@@ -88,10 +133,19 @@ class Endpoint(Generic[T]):
 
         A ``None`` routing key (a 1:1 wire) reaches every lease.
         """
-        route = self.transport.route(event.message)
-        for lease in tuple(self.leases):
-            if route is None or lease.wants(route):
-                await self.emit_to_lease(lease, event)
+        route = self.route(event.message) if self.route is not None else None
+        if route is None:
+            leases = tuple(self.leases)
+        else:
+            targeted = set(self.unfiltered_leases)
+            targeted.update(self.route_leases.get(route, ()))
+            if self.wildcard_leases:
+                targeted.update(
+                    lease for lease in self.wildcard_leases if lease.wants(route)
+                )
+            leases = tuple(targeted)
+        for lease in leases:
+            await self.emit_to_lease(lease, event)
 
     async def emit_to_lease(
         self, lease: "Connection[T]", event: ConnectionEvent
@@ -99,7 +153,7 @@ class Endpoint(Generic[T]):
         if lease.closed:
             return
         try:
-            await lease.event_bus.emit(event)
+            lease.deliver(event)
         except Exception:  # noqa: BLE001 -- one bad lease must not drop the transport
             self.logger.warning("connection listener failed", exc_info=True)
 
@@ -118,12 +172,14 @@ class Pool(Generic[T]):
         *,
         build: TransportBuilder,
         key: EndpointKey,
+        route: Optional[MessageRoute] = None,
         lease_class: Optional[type] = None,
         provider: Optional[EventLoopProvider] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.build = build
         self.key = key
+        self.route = route
         #: The lease flavour to hand out -- :class:`Connection` by default, or a
         #: protocol-specific subclass (``MqttConnection`` / ``WsConnection``) a
         #: front door passes so callers get ``subscribe`` / framed ``send``.
@@ -152,7 +208,7 @@ class Pool(Generic[T]):
             endpoint = self.endpoints.get(endpoint_key)
             if endpoint is None:
                 transport = self.build(parsed, params)
-                endpoint = Endpoint(endpoint_key, transport, self.logger)
+                endpoint = Endpoint(endpoint_key, transport, self.route, self.logger)
                 endpoint.attach()
                 self.endpoints[endpoint_key] = endpoint
                 started = transport
@@ -160,7 +216,7 @@ class Pool(Generic[T]):
             lease = self.lease_class(
                 self, endpoint.transport, parsed, endpoint_key, provider=self.provider
             )
-            endpoint.leases.add(lease)
+            endpoint.add_lease(lease)
 
         if started is not None:
             started.start()
@@ -176,7 +232,7 @@ class Pool(Generic[T]):
             endpoint = self.endpoints.get(lease.endpoint_key)
             if endpoint is None or lease not in endpoint.leases:
                 return None
-            endpoint.leases.discard(lease)
+            endpoint.remove_lease(lease)
             endpoint.refs -= 1
             if endpoint.refs > 0:
                 return None
@@ -200,3 +256,15 @@ class Pool(Generic[T]):
             for endpoint in self.endpoints.values():
                 endpoint.detach()
             self.endpoints.clear()
+
+    def add_route(self, lease: "Connection[T]", route: Hashable) -> None:
+        with self.lock:
+            endpoint = self.endpoints.get(lease.endpoint_key)
+            if endpoint is not None:
+                endpoint.add_route(lease, route)
+
+    def remove_route(self, lease: "Connection[T]", route: Hashable) -> None:
+        with self.lock:
+            endpoint = self.endpoints.get(lease.endpoint_key)
+            if endpoint is not None:
+                endpoint.remove_route(lease, route)

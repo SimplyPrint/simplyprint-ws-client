@@ -100,16 +100,16 @@ class PrinterClientSpec(ClientSpec):
 
     @classmethod
     def background_service(cls, event_loop_provider=None) -> "BackgroundService | None":
-        """A process-wide background service this client type needs (a connection
-        manager or watchdog), or ``None``.
+        """A process-wide background service this client type needs (for example a
+        watchdog), or ``None``.
 
         Constructed once by the app's supervisor at startup and read back by the
         client factory -- never built in the factory, so two factory calls can't
         race to create one. Return a ready-to-register service (already started if
         it needs starting). Read off the *class* (no ``build``).
 
-        ``event_loop_provider`` is the app's loop provider, for a service whose
-        transport pool must deliver onto that loop (e.g. a connection manager).
+        ``event_loop_provider`` is the app's loop provider, for services that must
+        deliver work onto that loop.
         """
         return None
 

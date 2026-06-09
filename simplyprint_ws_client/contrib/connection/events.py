@@ -18,6 +18,9 @@ from typing import Optional
 
 from simplyprint_ws_client.events import Event
 
+from simplyprint_ws_client.contrib.connection.errors import TransportError
+from simplyprint_ws_client.contrib.connection.messages import QoS
+
 
 @dataclass(frozen=True, eq=False)
 class ConnectionEvent(Event):
@@ -44,15 +47,12 @@ class Connected(ConnectionEvent):
 class Disconnected(ConnectionEvent):
     """The live wire went down.
 
-    ``code`` is the library-specific reason the attempt ended -- typically the
-    exception raised from the wire (a
-    :class:`~simplyprint_ws_client.contrib.connection.transport.TransientError` or
-    :class:`~simplyprint_ws_client.contrib.connection.transport.FatalError`), or ``None``
-    for a clean teardown. It is informational only: the reconnect loop keeps retrying
-    regardless of what ended the attempt.
+    ``code`` is the standardized reason the attempt ended, preserving any native
+    wire exception on ``code.transport_error``. It is informational only: the
+    reconnect loop keeps retrying regardless of what ended the attempt.
     """
 
-    code: Optional[object] = None
+    code: Optional[TransportError] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -64,3 +64,8 @@ class MessageReceived(ConnectionEvent):
     """
 
     message: object
+    qos: QoS = QoS.AT_LEAST_ONCE
+
+    @property
+    def lossless(self) -> bool:
+        return self.qos is QoS.AT_LEAST_ONCE

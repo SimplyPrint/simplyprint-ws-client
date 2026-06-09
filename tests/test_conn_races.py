@@ -48,6 +48,7 @@ from simplyprint_ws_client.contrib.connection.events import (
 )
 from simplyprint_ws_client.contrib.connection.mqtt import (
     MqttBroker,
+    mqtt_message_route,
 )
 from simplyprint_ws_client.contrib.connection.paho import Paho
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
@@ -56,6 +57,7 @@ from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 from simplyprint_ws_client.contrib.connection.transport import (
     NotConnected,
+    TransientError,
     Transport,
 )
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
@@ -278,7 +280,7 @@ async def test_pool_release_during_stop_does_not_double_start_same_endpoint():
     await settle()
 
     # B got a brand-new transport (the old one was on its way out).
-    assert b.backend is not old
+    assert b.transport is not old
     assert len(transports) == 2
     new = transports[1]
     assert new.starts == 1, "new transport started wrong number of times"
@@ -671,6 +673,7 @@ def mqtt_pool(
     return Pool(
         build=build,
         key=key,
+        route=mqtt_message_route,
         lease_class=MqttConnection,
         provider=current_provider(),
     )
@@ -691,8 +694,8 @@ async def test_subscribe_refcount_survives_concurrent_leases_same_topic():
     broker = MqttBroker.from_url(url)
 
     leases = [pool.connect(url, broker) for _ in range(20)]
-    transport = leases[0].backend
-    assert all(lease.backend is transport for lease in leases)
+    transport = leases[0].transport
+    assert all(lease.transport is transport for lease in leases)
     await wait_for(lambda: leases[0].connected)
     assert len(clients) == 1
     client = clients[0]
@@ -731,7 +734,7 @@ async def test_interleaved_sub_unsub_never_drives_refcount_negative():
     broker = MqttBroker.from_url(url)
 
     leases = [pool.connect(url, broker) for _ in range(12)]
-    transport = leases[0].backend
+    transport = leases[0].transport
     await wait_for(lambda: leases[0].connected)
     client = clients[0]
 
@@ -774,7 +777,7 @@ async def test_subscribe_during_reconnect_reasserts_exactly_the_live_set():
     broker = MqttBroker.from_url(url)
 
     lease = pool.connect(url, broker)
-    transport = lease.backend
+    transport = lease.transport
     await wait_for(lambda: lease.connected)
     await lease.subscribe("first")
     await wait_for(lambda: "first" in clients[0].subscribed)
@@ -824,7 +827,7 @@ async def test_distinct_leases_subscribe_distinct_topics_concurrently():
     await asyncio.gather(*(lease.subscribe(f"t/{i}") for i, lease in enumerate(leases)))
 
     expected = {f"t/{i}": 1 for i in range(len(leases))}
-    transport = leases[0].backend
+    transport = leases[0].transport
     assert transport.subscriptions == expected, transport.subscriptions
     assert sorted(client.subscribed) == sorted(expected), client.subscribed
 
@@ -900,7 +903,7 @@ async def test_closed_lease_stops_receiving_mid_fanout():
 
     keep = pool.connect(url, broker)
     drop = pool.connect(url, broker)
-    assert keep.backend is drop.backend
+    assert keep.transport is drop.transport
     await keep.subscribe("room/#")
     await drop.subscribe("room/#")
     await wait_for(lambda: keep.connected)
@@ -948,7 +951,7 @@ async def test_message_never_delivered_with_stale_generation():
     seen: List[int] = []
     lease.event_bus.on(MessageReceived, lambda e: seen.append(e.generation))
 
-    transport = lease.backend
+    transport = lease.transport
     gen1 = transport.generation
     clients[0].inbox.put_nowait(WireMqttMessage("room/a", b"1"))
     await wait_for(lambda: len(seen) == 1)
@@ -1109,21 +1112,21 @@ async def test_ws_rapid_connect_disconnect_cycles_one_socket_no_orphan():
     pool = ws_pool(sockets)
     url = yarl.URL("ws://host/rapid")
     baseline = live_tasks()
-    #: Strong refs to every backend so identities cannot be recycled by GC.
-    backends_seen: List[object] = []
+    #: Strong refs to every transport so identities cannot be recycled by GC.
+    transports_seen: List[object] = []
 
     for _ in range(20):
         lease = pool.connect(url)
-        backends_seen.append(lease.backend)
+        transports_seen.append(lease.transport)
         await wait_for(lambda: lease.connected)
         await lease.close()
         await wait_for(lambda: str(url) not in pool.endpoints)
 
     await settle()
     # Each cycle built a fresh transport (the prior one was fully torn down first).
-    assert len({id(b) for b in backends_seen}) == len(backends_seen), (
-        "a transport instance was reused across teardown"
-    )
+    assert len({id(transport) for transport in transports_seen}) == len(
+        transports_seen
+    ), "a transport instance was reused across teardown"
     opened = [s for s in sockets if s is not None]
     assert opened, "no wire ever opened"
     for s in opened:
@@ -1208,14 +1211,17 @@ async def test_ws_broadcast_reaches_every_lease_during_join_churn():
 class FakePahoClient:
     """A paho-shaped client whose callbacks a test fires from any thread.
 
-    Matches what :class:`Paho` calls on its ``client`` attribute: the three
-    callbacks (``on_connect`` / ``on_message`` / ``on_disconnect``),
+    Matches what :class:`Paho` calls on its ``client`` attribute: the callbacks
+    (``on_pre_connect`` / ``on_connect`` / ``on_connect_fail`` / ``on_message`` /
+    ``on_disconnect``),
     ``connect_async`` / ``loop_start`` / ``loop_stop`` / ``disconnect`` /
     ``is_connected`` / ``subscribe`` / ``unsubscribe`` / ``publish``.
     """
 
     def __init__(self) -> None:
+        self.on_pre_connect: Optional[Callable[..., None]] = None
         self.on_connect: Optional[Callable[..., None]] = None
+        self.on_connect_fail: Optional[Callable[..., None]] = None
         self.on_message: Optional[Callable[..., None]] = None
         self.on_disconnect: Optional[Callable[..., None]] = None
         self.connected = False
@@ -1271,8 +1277,13 @@ class FakePahoClient:
     # -- callback fan, driven by a test from a foreign thread ------------------ #
 
     def fire_connect(self, reason_code: int = 0) -> None:
+        self.on_pre_connect(self, None)
         self.connected = True
         self.on_connect(self, None, {}, reason_code, None)
+
+    def fire_connect_fail(self) -> None:
+        self.on_pre_connect(self, None)
+        self.on_connect_fail(self, None)
 
     def fire_message(self, message: Any) -> None:
         self.on_message(self, None, message)
@@ -1311,6 +1322,7 @@ def paho_pool(clients: List[FakePahoClient]) -> Pool:
     return Pool(
         build=build,
         key=key,
+        route=mqtt_message_route,
         lease_class=MqttConnection,
         provider=current_provider(),
     )
@@ -1333,7 +1345,7 @@ async def test_paho_callbacks_from_thread_deliver_on_loop_and_bump_generation():
 
     lease = pool.connect(url, broker)
     await lease.subscribe("room/a")
-    transport = lease.backend
+    transport = lease.transport
     client = clients[0]
 
     got: List[tuple] = []
@@ -1375,7 +1387,7 @@ async def test_paho_reconnect_callbacks_keep_generation_monotonic():
     broker = MqttBroker.from_url(url)
 
     lease = pool.connect(url, broker)
-    transport = lease.backend
+    transport = lease.transport
     client = clients[0]
 
     gens: List[int] = []
@@ -1402,6 +1414,43 @@ async def test_paho_reconnect_callbacks_keep_generation_monotonic():
 
 
 @pytest.mark.asyncio
+async def test_paho_connect_failures_emit_disconnect_once_after_threshold():
+    """paho connect failures are gated like the old MQTT implementation.
+
+    paho may call ``on_connect_fail`` repeatedly while it retries. The transport
+    should not spam ``Disconnected`` for every failed attempt; it reports once
+    after the configured threshold and resets that gate after a successful connect.
+    """
+    clients: List[FakePahoClient] = []
+    pool = paho_pool(clients)
+    lease = pool.connect(yarl.URL("mqtt://broker/"), MqttBroker("broker", 1883))
+    client = clients[0]
+    disconnected: List[Disconnected] = []
+    lease.event_bus.on(Disconnected, lambda event: disconnected.append(event))
+
+    from_thread(client.fire_connect_fail)
+    from_thread(client.fire_connect_fail)
+    await settle()
+    assert disconnected == []
+
+    from_thread(client.fire_connect_fail)
+    await wait_for(lambda: len(disconnected) == 1)
+    assert isinstance(disconnected[0].code, TransientError)
+
+    from_thread(client.fire_connect_fail)
+    await settle()
+    assert len(disconnected) == 1
+
+    from_thread(client.fire_connect)
+    await wait_for(lambda: lease.connected)
+    from_thread(client.fire_disconnect)
+    await wait_for(lambda: len(disconnected) == 2)
+
+    await lease.close()
+    await settle()
+
+
+@pytest.mark.asyncio
 async def test_paho_subscribe_refcounted_across_leases_on_shared_socket():
     """Concurrent subscribe/unsubscribe across paho leases keeps one wire sub.
 
@@ -1417,7 +1466,7 @@ async def test_paho_subscribe_refcounted_across_leases_on_shared_socket():
 
     a = pool.connect(url, broker)
     b = pool.connect(url, broker)
-    assert a.backend is b.backend
+    assert a.transport is b.transport
     client = clients[0]
     from_thread(client.fire_connect)
     await wait_for(lambda: a.connected)
@@ -1485,8 +1534,8 @@ async def test_front_door_shared_socket_across_concurrent_connects():
     leases = [mqtt_door.connect(u, pool=pool) for u in urls]
 
     # All three resolve to the same broker -> one shared transport instance.
-    backends = {id(lease.backend) for lease in leases}
-    assert len(backends) == 1, "front-door connects did not share one socket"
+    transports = {id(lease.transport) for lease in leases}
+    assert len(transports) == 1, "front-door connects did not share one socket"
     await wait_for(lambda: leases[0].connected)
     assert len(clients) == 1, f"built {len(clients)} sockets for one broker"
 

@@ -8,10 +8,10 @@ serialization, and the wire untouched.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class ConnectionState(str, Enum):
+class ConnectionState(StrEnum):
     """Where a link is in its lifecycle.
 
     ``CONNECTING`` is the active reach for a wire (the first attempt or any

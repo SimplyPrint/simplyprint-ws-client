@@ -13,8 +13,8 @@ and the live websocket response (:attr:`Aiohttp.ws`) -- with no wrapper around t
 * :meth:`~Aiohttp.write` -- put a text or binary frame on the link;
 * :meth:`~Aiohttp.aclose` -- tear the link and its session down.
 
-It is a 1:1 wire: :meth:`route` stays ``None`` (inherited), so the pool broadcasts
-every frame to every lease. ``aiohttp`` is imported lazily -- importing this module
+It is a 1:1 wire: the pool has no route function, so every frame broadcasts to
+every lease. ``aiohttp`` is imported lazily -- importing this module
 never drags the wire library -- and the connect step is injectable, so a test can
 drive the transport against a fake socket with no real server.
 """
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Tuple, Union
 
 import yarl
 
@@ -48,11 +48,14 @@ __all__ = ["Aiohttp", "AiohttpConnectFactory", "default_aiohttp_connect"]
 #: Opens a connected aiohttp websocket for a URL, awaiting to ``(session, ws)``:
 #: the session and the live response, so :meth:`Aiohttp.aclose` can close both.
 #: Raise to trigger a retry. Injectable so a test hands in a fake pair.
-AiohttpConnectFactory = Callable[[yarl.URL, logging.Logger], Awaitable[Tuple[Any, Any]]]
+AiohttpConnectFactory = Callable[
+    [yarl.URL, logging.Logger],
+    Awaitable[Tuple["ClientSession", "ClientWebSocketResponse"]],
+]
 
 
 async def default_aiohttp_connect(
-    url: yarl.URL, logger: logging.Logger
+    url: yarl.URL, logger: logging.Logger, heartbeat: Optional[float] = None
 ) -> Tuple["ClientSession", "ClientWebSocketResponse"]:
     """Open an aiohttp session + websocket for ``url`` (the default factory).
 
@@ -66,10 +69,12 @@ async def default_aiohttp_connect(
 
     session = ClientSession()
     try:
-        ws = await session.ws_connect(url, autoclose=True, autoping=True)
+        ws = await session.ws_connect(
+            url, autoclose=True, autoping=True, heartbeat=heartbeat
+        )
     except (ClientError, AiohttpWebSocketError, OSError, asyncio.TimeoutError) as error:
         await session.close()
-        raise TransientError(str(error)) from error
+        raise TransientError.wrap(error)
     return session, ws
 
 
@@ -92,19 +97,21 @@ class Aiohttp(WsTransport, Reconnecting):
         provider: Optional[EventLoopProvider] = None,
         *,
         connect_factory: AiohttpConnectFactory = default_aiohttp_connect,
+        first_message_timeout: Optional[float] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
             url,
             policy,
             provider,
+            first_message_timeout=first_message_timeout,
             logger=logger or logging.getLogger("conn.aiohttp"),
         )
         self.connect_factory = connect_factory
         #: The aiohttp session backing the live socket, or ``None`` when down.
-        self.session: Optional[Any] = None
+        self.session: Optional["ClientSession"] = None
         #: The live websocket response, or ``None`` when down.
-        self.ws: Optional[Any] = None
+        self.ws: Optional["ClientWebSocketResponse"] = None
 
     async def open(self) -> None:
         """Open the live session + websocket via the factory."""
@@ -133,14 +140,21 @@ class Aiohttp(WsTransport, Reconnecting):
             WSMsgType.CLOSED,
             WSMsgType.ERROR,
         ):
-            raise TransientError(f"websocket closed: {kind}")
+            close_code = ws.close_code
+            code = close_code if close_code is not None else int(kind)
+            native_error = ws.exception() if kind == WSMsgType.ERROR else None
+            raise TransientError(
+                f"websocket closed: {kind}",
+                code=code,
+                transport_error=native_error,
+            )
 
         if kind in (WSMsgType.TEXT, WSMsgType.BINARY):
             return ws_message_for_payload(frame.data)
 
         return None
 
-    async def write(self, message: object) -> None:
+    async def write(self, message: Union[str, bytes, bytearray]) -> None:
         """Put one ``message`` on the link: ``str`` as a text frame, ``bytes`` as a
         binary frame."""
         ws = self.ws

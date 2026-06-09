@@ -199,12 +199,13 @@ class EventBus(Emitter[TEvent]):
             self.event_klass = Event
 
     async def emit(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        if event not in self.listeners and len(self.middleware) == 0:
+        listeners = self._listeners_for(event)
+        if listeners is None and len(self.middleware) == 0:
             return
 
         generator = _EmitGenerator(
             self,
-            chain(self.middleware, self.listeners.get(event, [])),
+            chain(self.middleware, listeners or []),
             event,
             args,
             kwargs,
@@ -215,7 +216,8 @@ class EventBus(Emitter[TEvent]):
             generator.update(ret)
 
     def emit_sync(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        if event not in self.listeners and len(self.middleware) == 0:
+        listeners = self._listeners_for(event)
+        if listeners is None and len(self.middleware) == 0:
             return
 
         # Only invoke non-async functions.
@@ -223,7 +225,7 @@ class EventBus(Emitter[TEvent]):
             self,
             chain(
                 self.middleware,
-                filter(lambda lst: not lst.is_async, self.listeners.get(event, [])),
+                filter(lambda lst: not lst.is_async, listeners or []),
             ),
             event,
             args,
@@ -298,6 +300,19 @@ class EventBus(Emitter[TEvent]):
         """Clear all listeners for a given event type."""
         for event_type in event_types:
             self.listeners.pop(event_type, None)
+
+    @staticmethod
+    def _event_key(event: Union[Hashable, TEvent]) -> Hashable:
+        if isinstance(event, Event):
+            return event.__class__
+        return event
+
+    def _listeners_for(self, event: Union[Hashable, TEvent]) -> Optional[EventBusListeners]:
+        event_key = self._event_key(event)
+        listeners = self.listeners.get(event_key)
+        if listeners is None and event_key is not event:
+            listeners = self.listeners.get(event)
+        return listeners
 
     def _register_listeners(
         self,

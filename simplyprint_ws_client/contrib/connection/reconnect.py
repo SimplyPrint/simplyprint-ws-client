@@ -34,9 +34,15 @@ from simplyprint_ws_client.contrib.connection.events import (
     Disconnected,
     MessageReceived,
 )
+from simplyprint_ws_client.contrib.connection.errors import TransportError
+from simplyprint_ws_client.contrib.connection.messages import message_qos
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import NotConnected, Transport
+from simplyprint_ws_client.contrib.connection.transport import (
+    NotConnected,
+    TransientError,
+    Transport,
+)
 
 __all__ = ["Reconnecting"]
 
@@ -60,6 +66,7 @@ class Reconnecting(Transport):
         policy: Optional[RetryPolicy] = None,
         provider: Optional[EventLoopProvider[asyncio.AbstractEventLoop]] = None,
         *,
+        first_message_timeout: Optional[float] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.url = url
@@ -68,6 +75,7 @@ class Reconnecting(Transport):
         self.events: EventBus[ConnectionEvent] = EventBus()
         self.policy = policy or RetryPolicy()
         self.provider = provider or EventLoopProvider.default()
+        self.first_message_timeout = first_message_timeout
         self.logger = logger or logging.getLogger("conn.reconnect")
         self.live = False
         self.stopped = False
@@ -148,21 +156,17 @@ class Reconnecting(Transport):
         attempt = self.policy.attempt()
         try:
             while not self.stopped:
-                self.state = ConnectionState.CONNECTING
-                await self.events.emit(Connecting(self.generation))
-                code: Optional[object] = None
+                await self.mark_connecting()
+                code: Optional[TransportError] = None
                 try:
                     await self.open()
-                    self.generation += 1
-                    self.live = True
-                    self.state = ConnectionState.CONNECTED
-                    await self.events.emit(Connected(self.generation))
+                    await self.mark_connected()
                     attempt.reset()
                     await self.consume()
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 -- supervised: any error retries
-                    code = error
+                    code = self.transport_error(error)
                     self.logger.debug("wire %s dropped: %s", self.url, error)
                 finally:
                     self.live = False
@@ -176,8 +180,7 @@ class Reconnecting(Transport):
                 # (``supervising()`` is False on a give-up).
                 delay = attempt.next_delay()
                 self.gave_up = delay is None
-                self.state = ConnectionState.DISCONNECTED
-                await self.events.emit(Disconnected(self.generation, code=code))
+                await self.mark_disconnected(code)
 
                 if delay is None:
                     self.logger.debug("wire %s gave up retrying", self.url)
@@ -188,14 +191,48 @@ class Reconnecting(Transport):
             # state to DISCONNECTED on EVERY exit, including a stop() that cancels
             # this task mid-open or mid-recv (the cancellation re-raises past the
             # loop body, so this finally is the only spot that always runs).
-            self.state = ConnectionState.DISCONNECTED
+            self.set_state(ConnectionState.DISCONNECTED)
+
+    def set_state(self, state: ConnectionState) -> None:
+        self.state = state
+
+    async def transition(self, state: ConnectionState, event: ConnectionEvent) -> None:
+        self.set_state(state)
+        await self.events.emit(event)
+
+    async def mark_connecting(self) -> None:
+        await self.transition(ConnectionState.CONNECTING, Connecting(self.generation))
+
+    async def mark_connected(self) -> None:
+        self.generation += 1
+        self.live = True
+        await self.transition(ConnectionState.CONNECTED, Connected(self.generation))
+
+    async def mark_disconnected(self, code: Optional[TransportError]) -> None:
+        await self.transition(
+            ConnectionState.DISCONNECTED,
+            Disconnected(self.generation, code=code),
+        )
+
+    @staticmethod
+    def transport_error(error: Exception) -> TransportError:
+        if isinstance(error, TransportError):
+            return error
+        return TransientError.wrap(error)
 
     async def consume(self) -> None:
         """Stream :meth:`recv` as :class:`MessageReceived` until the wire drops."""
+        if self.first_message_timeout is not None:
+            await asyncio.wait_for(self.consume_one(), self.first_message_timeout)
         while not self.stopped:
-            message = await self.recv()
-            if message is not None:
-                await self.events.emit(MessageReceived(self.generation, message))
+            await self.consume_one()
+
+    async def consume_one(self) -> None:
+        message = await self.recv()
+        if message is not None:
+            await self.events.emit(
+                MessageReceived(self.generation, message, message_qos(message))
+            )
 
     async def teardown(self) -> None:
         """Close the wire without letting :meth:`aclose` break the loop."""

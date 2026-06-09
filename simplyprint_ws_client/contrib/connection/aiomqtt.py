@@ -23,39 +23,67 @@ import asyncio
 import logging
 import ssl
 from typing import (
-    Any,
+    AsyncIterable,
     AsyncContextManager,
     AsyncIterator,
     Callable,
     Dict,
     Optional,
+    Protocol,
 )
 
 import yarl
 
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
-from simplyprint_ws_client.contrib.connection.messages import MqttMessage
+from simplyprint_ws_client.contrib.connection.messages import (
+    MqttInboundMessage,
+    MqttMessage,
+    mqtt_message_from_inbound,
+)
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
 from simplyprint_ws_client.contrib.connection.transport import (
     FatalError,
     MqttTransport,
     TransientError,
+    TransportError,
 )
 
 __all__ = ["AioMqtt", "MqttClientFactory", "default_aiomqtt_client"]
+
+
+class AioMqttClient(Protocol):
+    """aiomqtt client surface used by this transport."""
+
+    messages: AsyncIterable[MqttInboundMessage]
+
+    async def subscribe(self, topic: str) -> None: ...
+
+    async def unsubscribe(self, topic: str) -> None: ...
+
+    async def publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: int,
+        retain: bool,
+    ) -> None: ...
+
 
 #: An aiomqtt client is an async context manager (``async with`` is one
 #: connection) exposing ``.messages``, ``.subscribe``/``.unsubscribe`` and
 #: ``.publish``. The factory builds a fresh one per connect attempt; injectable so
 #: a test hands in a fake with neither a broker nor aiomqtt installed.
-MqttClientFactory = Callable[[yarl.URL, logging.Logger], AsyncContextManager[Any]]
+MqttClientFactory = Callable[
+    [yarl.URL, logging.Logger], AsyncContextManager[AioMqttClient]
+]
 
 
 def default_aiomqtt_client(
-    url: yarl.URL, logger: logging.Logger
-) -> AsyncContextManager[Any]:
+    url: yarl.URL, logger: logging.Logger, keepalive: Optional[int] = None
+) -> AsyncContextManager[AioMqttClient]:
     """Build a real ``aiomqtt.Client`` from ``url`` (aiomqtt imported lazily).
 
     A ``mqtts://`` scheme enables TLS (matching the broker the printer fleet uses);
@@ -66,6 +94,9 @@ def default_aiomqtt_client(
 
     tls = url.scheme == "mqtts"
     tls_params = aiomqtt.TLSParameters(cert_reqs=ssl.CERT_NONE) if tls else None
+    kwargs = {}
+    if keepalive is not None:
+        kwargs["keepalive"] = keepalive
     return aiomqtt.Client(
         hostname=url.host,
         port=url.port or (8883 if tls else 1883),
@@ -73,6 +104,7 @@ def default_aiomqtt_client(
         password=url.password or None,
         tls_params=tls_params,
         tls_insecure=tls or None,
+        **kwargs,
     )
 
 
@@ -105,9 +137,9 @@ class AioMqtt(MqttTransport, Reconnecting):
         #: topic -> refcount across leases; re-asserted on every (re)connect.
         self.subscriptions: Dict[str, int] = {}
         #: The live aiomqtt client, or ``None`` while disconnected.
-        self.client: Optional[Any] = None
-        self.context: Optional[AsyncContextManager[Any]] = None
-        self.stream: Optional[AsyncIterator[Any]] = None
+        self.client: Optional[AioMqttClient] = None
+        self.context: Optional[AsyncContextManager[AioMqttClient]] = None
+        self.stream: Optional[AsyncIterator[MqttInboundMessage]] = None
 
     async def open(self) -> None:
         """Enter a fresh aiomqtt client's context and (re)assert tracked topics.
@@ -121,14 +153,14 @@ class AioMqtt(MqttTransport, Reconnecting):
         try:
             client = await context.__aenter__()
         except Exception as error:  # noqa: BLE001 -- classify, then re-raise to retry
-            raise self.classify(error) from error
+            raise self.classify(error)
         self.context = context
         self.client = client
         self.stream = None
         for topic in list(self.subscriptions):
             await client.subscribe(topic)
 
-    async def recv(self) -> Optional[Any]:
+    async def recv(self) -> Optional[MqttMessage]:
         """Pull the next inbound message from ``client.messages``.
 
         Raises ``StopAsyncIteration`` (re-raised as a transient drop) when the
@@ -139,16 +171,14 @@ class AioMqtt(MqttTransport, Reconnecting):
         if self.stream is None:
             self.stream = self.client.messages.__aiter__()
         try:
-            return await self.stream.__anext__()
+            return mqtt_message_from_inbound(await self.stream.__anext__())
         except StopAsyncIteration as end:
-            raise TransientError("message stream ended") from end
+            raise TransientError("message stream ended", transport_error=end)
 
-    async def write(self, message: Any) -> None:
+    async def write(self, message: MqttMessage) -> None:
         """Publish one outbound message (topic + payload) on the live client."""
         if self.client is None:
             raise TransientError("no live client")
-        if not isinstance(message, MqttMessage):
-            raise TypeError("aiomqtt transport sends MqttMessage instances")
         await self.client.publish(
             message.topic,
             message.payload,
@@ -196,12 +226,8 @@ class AioMqtt(MqttTransport, Reconnecting):
         if self.client is not None:
             await self.client.unsubscribe(topic)
 
-    def route(self, message: Any) -> Optional[str]:
-        """The inbound message's topic -- the key the pool routes leases by."""
-        return str(message.topic)
-
     @staticmethod
-    def classify(error: Exception) -> Exception:
+    def classify(error: Exception) -> TransportError:
         """Tag a connect failure as fatal (auth) or transient (everything else).
 
         The reconnect loop retries regardless; the tag only rides through to
@@ -210,5 +236,5 @@ class AioMqtt(MqttTransport, Reconnecting):
         """
         text = str(error).lower()
         if "auth" in text or "not authorized" in text or "password" in text:
-            return FatalError(str(error))
-        return TransientError(str(error))
+            return FatalError.wrap(error)
+        return TransientError.wrap(error)

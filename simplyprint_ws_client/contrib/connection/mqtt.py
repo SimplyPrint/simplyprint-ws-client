@@ -18,17 +18,27 @@ library lazily so importing this module needs neither installed.
 
 from __future__ import annotations
 
-from typing import Dict, List, NamedTuple, Optional, Union
+from dataclasses import replace
+from typing import Dict, Hashable, List, NamedTuple, Optional, Union
 
 import yarl
 
-from simplyprint_ws_client.contrib.connection.aiomqtt import AioMqtt
+from simplyprint_ws_client.contrib.connection.aiomqtt import (
+    AioMqtt,
+    default_aiomqtt_client,
+)
 from simplyprint_ws_client.contrib.connection.connection import MqttConnection
+from simplyprint_ws_client.contrib.connection.keepalive import Keepalive
 from simplyprint_ws_client.contrib.connection.messages import MqttMessage
+from simplyprint_ws_client.contrib.connection.options import (
+    ConnectionOptions,
+    WireKeepalive,
+)
 from simplyprint_ws_client.contrib.connection.paho import Paho
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.pool import Pool
 from simplyprint_ws_client.contrib.connection.transport import MqttTransport
+from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
 __all__ = [
     "MqttMessage",
@@ -84,6 +94,8 @@ def build_pool(
     impl: str,
     retry: RetryPolicy,
     pool: Optional[Pool[MqttTransport]],
+    provider: Optional[EventLoopProvider] = None,
+    wire_keepalive: Optional[WireKeepalive] = None,
 ) -> Pool[MqttTransport]:
     """The :class:`Pool` to lease from -- the caller's, or a default for ``impl``.
 
@@ -95,15 +107,25 @@ def build_pool(
     if pool is not None:
         return pool
 
-    existing = DEFAULT_POOLS.get(impl)
+    pool_key: Hashable = _pool_key(impl, provider, wire_keepalive)
+    existing = DEFAULT_POOLS.get(pool_key)
     if existing is not None:
         return existing
 
+    mqtt_keepalive = _mqtt_keepalive_seconds(wire_keepalive)
+
     def make_transport(url: yarl.URL, params: object) -> MqttTransport:
         if impl == "paho":
-            return Paho(url)
+            return Paho(url, provider=provider, keepalive=mqtt_keepalive or 60)
         if impl == "aiomqtt":
-            return AioMqtt(url, retry)
+            return AioMqtt(
+                url,
+                retry,
+                provider,
+                client_factory=lambda u, logger: default_aiomqtt_client(
+                    u, logger, keepalive=mqtt_keepalive
+                ),
+            )
         raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'aiomqtt'/'paho')")
 
     def endpoint_key(url: yarl.URL, params: object) -> MqttBroker:
@@ -112,14 +134,16 @@ def build_pool(
     built: Pool[MqttTransport] = Pool(
         build=make_transport,
         key=endpoint_key,
+        route=mqtt_message_route,
         lease_class=MqttConnection,
+        provider=provider,
     )
-    DEFAULT_POOLS[impl] = built
+    DEFAULT_POOLS[pool_key] = built
     return built
 
 
 #: Process-wide default pools, one per impl, created lazily by :func:`connect`.
-DEFAULT_POOLS: Dict[str, Pool[MqttTransport]] = {}
+DEFAULT_POOLS: Dict[Hashable, Pool[MqttTransport]] = {}
 
 
 def connect(
@@ -128,6 +152,10 @@ def connect(
     impl: str = "aiomqtt",
     retry: Optional[RetryPolicy] = None,
     pool: Optional[Pool[MqttTransport]] = None,
+    provider: Optional[EventLoopProvider] = None,
+    keepalive: Optional[Keepalive] = None,
+    wire_keepalive: Optional[WireKeepalive] = None,
+    options: Optional[ConnectionOptions] = None,
 ) -> MqttConnection:
     """Lease a pooled, self-healing MQTT connection to ``url``.
 
@@ -142,9 +170,10 @@ def connect(
     :class:`ValueError` on a URL with no host or an unknown ``impl``.
     """
     url = yarl.URL(url) if isinstance(url, str) else url
-    retry = retry or RetryPolicy()
+    options = _resolve_options(options, retry, provider, keepalive, wire_keepalive)
+    retry = options.retry or RetryPolicy()
     broker = MqttBroker.from_url(url)
-    pool = build_pool(impl, retry, pool)
+    pool = build_pool(impl, retry, pool, options.provider, options.wire_keepalive)
 
     lease = pool.connect(url, broker)
     assert isinstance(lease, MqttConnection)
@@ -155,12 +184,61 @@ def connect(
     # the instant the link comes up (and re-asserted on every (re)connect).
     topics = initial_topics(url)
     if topics:
-        loop = lease.provider.event_loop
         for topic in topics:
             lease.topics.add(topic)
-            loop.create_task(lease.backend.subscribe(topic))
+            lease.pool.add_route(lease, topic)
+            lease.create_task(lease.transport.subscribe(topic))
+
+    if options.app_keepalive is not None:
+        lease.keepalive(options.app_keepalive)
 
     return lease
+
+
+def _resolve_options(
+    options: Optional[ConnectionOptions],
+    retry: Optional[RetryPolicy],
+    provider: Optional[EventLoopProvider],
+    keepalive: Optional[Keepalive],
+    wire_keepalive: Optional[WireKeepalive],
+) -> ConnectionOptions:
+    resolved = options or ConnectionOptions()
+    if retry is not None:
+        resolved = replace(resolved, retry=retry)
+    if provider is not None:
+        resolved = replace(resolved, provider=provider)
+    if keepalive is not None:
+        resolved = replace(resolved, app_keepalive=keepalive)
+    if wire_keepalive is not None:
+        resolved = replace(resolved, wire_keepalive=wire_keepalive)
+    return resolved
+
+
+def _pool_key(
+    impl: str,
+    provider: Optional[EventLoopProvider],
+    wire_keepalive: Optional[WireKeepalive],
+) -> Hashable:
+    if provider is None and wire_keepalive is None:
+        return impl
+    provider_key: object = None
+    if provider is not None:
+        try:
+            provider_key = id(provider.event_loop)
+        except RuntimeError:
+            provider_key = id(provider)
+    return impl, provider_key, wire_keepalive
+
+
+def _mqtt_keepalive_seconds(wire_keepalive: Optional[WireKeepalive]) -> Optional[int]:
+    if wire_keepalive is None or wire_keepalive.interval is None:
+        return None
+    return int(wire_keepalive.interval)
+
+
+def mqtt_message_route(message: MqttMessage) -> str:
+    """Route an inbound MQTT message by its topic."""
+    return message.topic
 
 
 def shutdown() -> None:

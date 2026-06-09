@@ -13,14 +13,14 @@ from .events import (
     Disconnected,
     MessageReceived,
 )
+from .keepalive import ConnectionKeepalive, Keepalive, KeepaliveTimeout
 from .messages import (
     MqttMessage,
     QoS,
-    WsBytesMessage,
     WsKind,
     WsMessage,
-    WsTextMessage,
 )
+from .options import ConnectionOptions, WireKeepalive
 from .paho import Paho
 from .policy import RetryPolicy
 from .pool import Endpoint, Pool
@@ -35,6 +35,7 @@ from .transport import (
     WsTransport,
     topic_matches,
 )
+from .errors import ErrorCode, TransportError
 from .websockets import Websockets
 
 ws = websocket
@@ -50,10 +51,15 @@ __all__ = [
     "Connecting",
     "Connection",
     "ConnectionEvent",
+    "ConnectionKeepalive",
+    "ConnectionOptions",
     "ConnectionState",
     "Disconnected",
     "Endpoint",
+    "ErrorCode",
     "FatalError",
+    "Keepalive",
+    "KeepaliveTimeout",
     "MessageReceived",
     "MqttConnection",
     "MqttMessage",
@@ -65,13 +71,13 @@ __all__ = [
     "Reconnecting",
     "RetryPolicy",
     "TransientError",
+    "TransportError",
     "Transport",
     "Websockets",
-    "WsBytesMessage",
+    "WireKeepalive",
     "WsConnection",
     "WsKind",
     "WsMessage",
-    "WsTextMessage",
     "WsTransport",
     "topic_matches",
 ]

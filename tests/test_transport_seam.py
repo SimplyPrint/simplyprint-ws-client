@@ -1,39 +1,37 @@
-"""Tests that :class:`Connection` drives the transport seam correctly.
-
-Connection must build its backend only through the injected backend factory and
-rebuild a fresh backend on every reconnect attempt. That keeps the wire library
-swappable and the protocol/version logic in ``Connection``.
-"""
+"""Tests that :class:`Connection` composes protocol over a transport."""
 
 import asyncio
 from unittest.mock import patch
 
 import pytest
 
+from simplyprint_ws_client.core.ws_protocol import connection as conn_mod
 from simplyprint_ws_client.core.ws_protocol.connection import (
     Connection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.core.ws_protocol.events import (
-    ConnectionEstablishedEvent,
-)
+from simplyprint_ws_client.core.ws_protocol.events import ConnectionEstablishedEvent
 from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
-from tests._fakes import FakeBackend
+from tests._fakes import FakeTransport
 
 
 def _connection_with_recording_factory():
-    """A Connection whose factory records every backend it builds."""
     built = []
 
-    def factory(logger):
-        backend = FakeBackend(logger)
-        built.append(backend)
-        return backend
+    def factory(url, provider, logger):
+        transport = FakeTransport(
+            url,
+            provider,
+            logger,
+            first_message_timeout=conn_mod.WsFirstMessageTimeout,
+        )
+        built.append(transport)
+        return transport
 
     conn = Connection(
-        backend_factory=factory,
+        transport_factory=factory,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
     conn.use_running_loop()
@@ -41,23 +39,19 @@ def _connection_with_recording_factory():
 
 
 @pytest.mark.asyncio
-async def test_connect_builds_transport_via_factory():
+async def test_connect_builds_transport_via_factory_once():
     conn, built = _connection_with_recording_factory()
     established = []
     conn.event_bus.on(ConnectionEstablishedEvent, lambda e: established.append(e.v))
 
     with patch(
-        "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout",
-        10.0,
+        "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout", 10.0
     ):
         await conn.connect()
-        for _ in range(50):
-            await asyncio.sleep(0.05)
-            if built and built[0].is_open and conn.v == 0:
-                break
+        await asyncio.sleep(0.05)
 
-        assert len(built) == 1, "exactly one backend built for the first connect"
-        assert built[0].is_open
+        assert len(built) == 1
+        assert built[0].connected
         assert conn.connected
         assert established == [0]
 
@@ -67,7 +61,7 @@ async def test_connect_builds_transport_via_factory():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_builds_a_fresh_transport():
+async def test_transport_reconnect_advances_protocol_version():
     conn, built = _connection_with_recording_factory()
 
     with (
@@ -78,22 +72,19 @@ async def test_reconnect_builds_a_fresh_transport():
         patch.object(ConstantBackoff, "delay", return_value=0.01),
     ):
         await conn.connect()
-        for _ in range(50):
-            await asyncio.sleep(0.05)
-            if built and built[0].is_open and conn.v == 0:
-                break
+        await asyncio.sleep(0.05)
         assert len(built) == 1 and conn.v == 0
 
-        # Drop the live backend -> Connection must rebuild via the factory.
         built[0].queue_close()
         for _ in range(100):
             await asyncio.sleep(0.05)
-            if len(built) >= 2 and built[1].is_open:
+            if built[0].connect_calls >= 2 and conn.v == 1:
                 break
 
-        assert len(built) >= 2, "reconnect must build a fresh backend, not reuse"
-        assert conn.v == 1, "exactly one version bump for the single drop"
-        assert built[1].is_open
+        assert len(built) == 1
+        assert built[0].connect_calls >= 2
+        assert conn.v == 1
+        assert built[0].connected
 
         await conn.disconnect()
 
