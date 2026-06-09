@@ -239,16 +239,22 @@ class _ProcessBackend(_Backend):
 class WorkerHandle:
     """The parent-side handle for one allocated producer."""
 
-    def __init__(self, worker_id: int, backend: _Backend) -> None:
+    def __init__(
+        self, worker_id: int, backend: _Backend, release: Callable[[int], None]
+    ) -> None:
         self.id = worker_id
         self._backend = backend
+        self._release = release
         self._stopped = False
 
     def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        self._backend.stop()
+        try:
+            self._backend.stop()
+        finally:
+            self._release(self.id)
 
 
 class WorkerPool:
@@ -324,11 +330,15 @@ class WorkerPool:
         with self._lock:
             worker_id = self._next_id
             self._next_id += 1
-            handle = WorkerHandle(worker_id, backend)
+            handle = WorkerHandle(worker_id, backend, self._release)
             self._handles[worker_id] = handle
 
         backend.start()
         return handle
+
+    def _release(self, worker_id: int) -> None:
+        with self._lock:
+            self._handles.pop(worker_id, None)
 
     def stop(self) -> None:
         with self._lock:

@@ -1,6 +1,7 @@
 from ipaddress import IPv4Address
+from typing import Union
 
-from simplyprint_ws_client.contrib.onboarding import (
+from simplyprint_ws_client.contrib.flow import (
     ManualAddressStep,
     ModelChoiceCatalog,
 )
@@ -42,7 +43,7 @@ def test_model_choice_catalog_builds_identify_step_with_configurable_state_key()
 def test_manual_address_step_can_collect_dns_or_ip_with_custom_key():
     step = ManualAddressStep(
         state_key="address",
-        value_type=str | IPv4Address,
+        value_type=Union[str, IPv4Address],
         placeholder="printer.local",
     ).build()
 

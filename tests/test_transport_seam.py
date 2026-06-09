@@ -1,9 +1,8 @@
 """Tests that :class:`Connection` drives the transport seam correctly.
 
-Connection must build its socket only through the injected transport factory and
-rebuild a *fresh* transport on every (re)connect attempt -- the property that
-keeps the socket library swappable and the reconnect/version logic in
-``Connection`` rather than in the transport.
+Connection must build its backend only through the injected backend factory and
+rebuild a fresh backend on every reconnect attempt. That keeps the wire library
+swappable and the protocol/version logic in ``Connection``.
 """
 
 import asyncio
@@ -21,20 +20,20 @@ from simplyprint_ws_client.core.ws_protocol.events import (
 )
 from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
-from tests._fakes import FakeTransport
+from tests._fakes import FakeBackend
 
 
 def _connection_with_recording_factory():
-    """A Connection whose factory records every transport it builds."""
+    """A Connection whose factory records every backend it builds."""
     built = []
 
     def factory(logger):
-        transport = FakeTransport(logger)
-        built.append(transport)
-        return transport
+        backend = FakeBackend(logger)
+        built.append(backend)
+        return backend
 
     conn = Connection(
-        transport_factory=factory,
+        backend_factory=factory,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
     conn.use_running_loop()
@@ -57,7 +56,7 @@ async def test_connect_builds_transport_via_factory():
             if built and built[0].is_open and conn.v == 0:
                 break
 
-        assert len(built) == 1, "exactly one transport built for the first connect"
+        assert len(built) == 1, "exactly one backend built for the first connect"
         assert built[0].is_open
         assert conn.connected
         assert established == [0]
@@ -85,14 +84,14 @@ async def test_reconnect_builds_a_fresh_transport():
                 break
         assert len(built) == 1 and conn.v == 0
 
-        # Drop the live socket -> Connection must rebuild via the factory.
+        # Drop the live backend -> Connection must rebuild via the factory.
         built[0].queue_close()
         for _ in range(100):
             await asyncio.sleep(0.05)
             if len(built) >= 2 and built[1].is_open:
                 break
 
-        assert len(built) >= 2, "reconnect must build a fresh transport, not reuse"
+        assert len(built) >= 2, "reconnect must build a fresh backend, not reuse"
         assert conn.v == 1, "exactly one version bump for the single drop"
         assert built[1].is_open
 

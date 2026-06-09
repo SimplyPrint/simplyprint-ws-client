@@ -1,209 +1,205 @@
-"""Reconnection as a composable transport.
+"""The supervised reconnect loop -- one asyncio task that keeps a wire alive.
 
-A :class:`ReconnectingTransport` transport keeps a live link to one endpoint by rebuilding
-it from a factory whenever it drops -- backoff, a generation counter, liveness, and
-crash recovery -- so a wire that is merely "one connection" (open / recv / send /
-close) becomes self-healing without anyone writing the loop. Wires that already
-self-heal (paho's network thread, websocket-client's ``run_forever``) do NOT use
-this; they are complete transports on their own.
+This is the heart of the async wire families. A :class:`Reconnecting` transport is
+itself an asyncio-native wire: a concrete subclass fills FOUR hooks on itself --
+:meth:`~Reconnecting.open`, :meth:`~Reconnecting.recv`, :meth:`~Reconnecting.write`,
+:meth:`~Reconnecting.aclose` -- and this base supplies everything around them: a
+single supervision task, the connect/consume/drop/backoff cycle, the generation
+counter, state, and the lifecycle events. There is no separate "link" object; the
+hooks are methods on the concrete impl, so a wire is one class top to bottom.
 
-Brand-free: a :class:`Link` yields opaque payloads and this module knows nothing of
-any protocol, route, URL, or message shape. Reconnection and routing/pooling are
-orthogonal -- a :class:`ReconnectingTransport` is used directly for a 1:1 link, or stored in a
-:class:`~.pool.Pool` like any other transport when many clients share one socket.
+The loop always keeps retrying. The :class:`~simplyprint_ws_client.contrib.connection.policy.RetryPolicy`
+only decides the pace and, optionally, when to give up entirely -- at which point
+the loop stops and the transport stays ``DISCONNECTED``. ``open`` and ``recv`` may
+raise to end an attempt; the kind of exception is carried through to
+``Disconnected.code`` but never changes the decision to retry.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from abc import abstractmethod
+from typing import Optional
+
+import yarl
 
 from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
-from simplyprint_ws_client.shared.utils.bounded_variable import BoundedInterval
+from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.events import (
     Connected,
-    ConnectionSuspect,
+    Connecting,
+    ConnectionEvent,
     Disconnected,
     MessageReceived,
-    StateChanged,
-    TransportEvent,
 )
+from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import AsyncTransport, TParams
+from simplyprint_ws_client.contrib.connection.transport import NotConnected, Transport
 
-__all__ = ["Link", "LinkFactory", "ReconnectingTransport"]
-
-
-class Link(ABC):
-    """One live connection -- the per-attempt wire a :class:`ReconnectingTransport` drives.
-
-    A fresh ``Link`` is built per attempt and is single-use (``open`` -> ``recv``\\*
-    / ``send`` -> ``close``); it owns no reconnect / backoff / generation logic. The
-    existing raw WebSocket socket already has this shape; an async MQTT session wraps
-    aiomqtt to match.
-    """
-
-    @abstractmethod
-    async def open(self) -> None:
-        """Establish the connection. Raise on failure (drives the reconnect path)."""
-
-    @abstractmethod
-    async def recv(self) -> Optional[Any]:
-        """Return the next inbound payload (``None`` skips an uninteresting frame).
-
-        Raise when the link drops -- that ends the attempt and triggers a reconnect.
-        """
-
-    @abstractmethod
-    async def send(self, payload: Any) -> None:
-        """Send ``payload`` on the live link; raise if it is unusable."""
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Tear the connection down. Idempotent; never raises."""
-
-    @property
-    @abstractmethod
-    def is_open(self) -> bool:
-        """Whether the link currently holds a live connection."""
-
-    async def on_connected(self) -> None:
-        """Optional post-open work on the live link before consuming begins -- e.g.
-        an MQTT session (re)subscribes its topics here. Default: nothing."""
+__all__ = ["Reconnecting"]
 
 
-#: Builds a fresh, fully-configured :class:`Link` for one connection attempt.
-LinkFactory = Callable[[], Link]
+class Reconnecting(Transport):
+    """A :class:`Transport` that keeps one wire alive on a single asyncio task.
 
-
-class ReconnectingTransport(AsyncTransport[TParams]):
-    """An :class:`AsyncTransport` that keeps a live :class:`Link`, rebuilding on drop.
-
-    Per attempt: build a fresh link, ``open`` it, go ``ONLINE`` + emit
-    :class:`Connected` + reset backoff + ``on_connected``, then stream ``recv()`` as
-    :class:`MessageReceived` until the link drops. On any drop / error / idle-timeout:
-    ``close`` the link, bump :attr:`generation` **once**, go ``OFFLINE`` + emit
-    :class:`Disconnected` (``transient``) and -- if a ``suspect_after`` bound is set --
-    a periodic :class:`ConnectionSuspect`, then back off and retry. Crash-safe (any error
-    reconnects), cancel-safe (``stop`` cancels the task), idempotent ``start``/``stop``.
+    Subclass it and implement the four wire hooks; the base owns the loop. Per
+    attempt it emits :class:`Connecting`, calls :meth:`open`, then on success bumps
+    the generation, goes ``CONNECTED``, emits :class:`Connected`, resets the
+    backoff, and streams :meth:`recv` as :class:`MessageReceived` until the wire
+    drops. On any drop it tears the wire down with :meth:`aclose`, goes
+    ``DISCONNECTED`` with a :class:`Disconnected` tagged by the failure, then backs
+    off and retries -- unless the policy's give-up bound is exhausted, in which case
+    it stops and stays ``DISCONNECTED``.
     """
 
     def __init__(
         self,
-        params: TParams,
-        link_factory: LinkFactory,
+        url: yarl.URL,
+        policy: Optional[RetryPolicy] = None,
+        provider: Optional[EventLoopProvider[asyncio.AbstractEventLoop]] = None,
         *,
         logger: Optional[logging.Logger] = None,
-        backoff: Optional[Backoff] = None,
-        suspect_after: Optional[BoundedInterval[int]] = None,
-        first_message_timeout: Optional[float] = None,
     ) -> None:
-        self.params = params
-        self.events: EventBus[TransportEvent] = EventBus()
-        self.state = ConnectionState.OFFLINE
+        self.url = url
+        self.state = ConnectionState.DISCONNECTED
         self.generation = 0
-        self._link_factory = link_factory
-        self._logger = logger or logging.getLogger("transport.reconnect")
-        self._backoff = backoff or ConstantBackoff()
-        self._suspect_after = suspect_after
-        self._first_message_timeout = first_message_timeout
-        self._link: Optional[Link] = None
-        self._task: Optional[asyncio.Task] = None
-        self._stop = False
+        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.policy = policy or RetryPolicy()
+        self.provider = provider or EventLoopProvider.default()
+        self.logger = logger or logging.getLogger("conn.reconnect")
+        self.live = False
+        self.stopped = False
+        self.gave_up = False
+        self.task: Optional[asyncio.Task] = None
+
+    @abstractmethod
+    async def open(self) -> None:
+        """Establish the live wire. Raise to end the attempt and trigger a retry.
+
+        Raise :class:`~simplyprint_ws_client.contrib.connection.transport.TransientError`
+        / :class:`~simplyprint_ws_client.contrib.connection.transport.FatalError` to tag
+        the reason on ``Disconnected.code``; any other exception is treated the
+        same (the reconnect loop still retries).
+        """
+
+    @abstractmethod
+    async def recv(self) -> Optional[object]:
+        """Return the next inbound message (``None`` to skip an uninteresting
+        frame). Raise when the wire drops -- that ends the attempt."""
+
+    @abstractmethod
+    async def write(self, message: object) -> None:
+        """Put one ``message`` on the live wire."""
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Tear the live wire down. Idempotent; must never raise."""
 
     @property
     def connected(self) -> bool:
-        link = self._link
-        return (
-            self.state is ConnectionState.ONLINE and link is not None and link.is_open
-        )
+        return self.state is ConnectionState.CONNECTED and self.live
 
-    @property
-    def task(self) -> Optional[asyncio.Task]:
-        """The supervision task, while running -- so an owner can await its
-        wind-down at teardown. ``None`` before :meth:`start` / after :meth:`stop`."""
-        return self._task
+    def supervising(self) -> bool:
+        """``True`` while the loop will still try to reconnect; ``False`` once it
+        has permanently given up (retry policy exhausted), been stopped, or its
+        supervision task has otherwise finished.
+
+        The last clause keeps the answer honest if the task dies for a reason the
+        flags do not capture -- e.g. a wire hook that violates the contract by
+        raising :class:`asyncio.CancelledError` itself. A finished task is not
+        going to reconnect, so a waiter must not believe one is still in flight."""
+        if self.gave_up or self.stopped:
+            return False
+        return self.task is None or not self.task.done()
 
     def start(self) -> None:
-        if self._task is not None and not self._task.done():
+        if self.task is not None and not self.task.done():
             return
-        self._stop = False
-        self._task = asyncio.get_running_loop().create_task(self._run())
+        self.stopped = False
+        self.gave_up = False
+        self.task = self.provider.event_loop.create_task(self.supervise())
 
-    def stop(self) -> None:
-        self._stop = True
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-        self._task = None
+    async def stop(self) -> None:
+        self.stopped = True
+        task = self.task
+        self.task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
-    async def send(self, payload: Any) -> None:
-        link = self._link
-        if link is None or self.state is not ConnectionState.ONLINE:
-            raise ConnectionError("transport not connected")
-        await link.send(payload)
+    async def send(self, message: object) -> None:
+        if not self.connected:
+            raise NotConnected("transport not connected")
+        await self.write(message)
 
-    def _set_state(self, state: ConnectionState) -> None:
-        if state is not self.state:
-            self.state = state
-            self._emit(StateChanged(state))
+    async def supervise(self) -> None:
+        """The one task: keep a live wire up, retrying per the policy.
 
-    async def _run(self) -> None:
-        suspect = (
-            self._suspect_after.create_variable(0)
-            if self._suspect_after is not None
-            else None
-        )
-        while not self._stop:
-            link = self._link_factory()
-            was_connected = False
-            try:
-                await link.open()
-                self._link = link
-                was_connected = True
-                self._set_state(ConnectionState.ONLINE)
-                self._emit(Connected())
-                self._backoff.reset()
-                if suspect is not None:
-                    suspect.reset()
-                await link.on_connected()
-                await self._consume(link)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 -- supervised: any error reconnects
-                self._logger.debug("link %s dropped: %s", self.params, e)
-                if not self._stop and (suspect is None or suspect.guard_until_bound()):
-                    self._emit(ConnectionSuspect(error=e))
-            finally:
-                # Single generation-bump site: exactly once per ended attempt,
-                # regardless of how it ended (clean drop, error, or liveness timeout).
-                self._link = None
+        Each iteration is one connection attempt. The generation is bumped exactly
+        once -- on a successful open -- so every :class:`Connected` and
+        :class:`MessageReceived` for that link shares one epoch.
+        """
+        attempt = self.policy.attempt()
+        try:
+            while not self.stopped:
+                self.state = ConnectionState.CONNECTING
+                await self.events.emit(Connecting(self.generation))
+                code: Optional[object] = None
                 try:
-                    await link.close()
+                    await self.open()
+                    self.generation += 1
+                    self.live = True
+                    self.state = ConnectionState.CONNECTED
+                    await self.events.emit(Connected(self.generation))
+                    attempt.reset()
+                    await self.consume()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 -- supervised: any error retries
+                    code = error
+                    self.logger.debug("wire %s dropped: %s", self.url, error)
                 finally:
-                    if was_connected or not self._stop:
-                        self.generation += 1
-                        self._set_state(ConnectionState.OFFLINE)
-                        self._emit(Disconnected(reason="link down", transient=True))
-            if not self._stop:
-                await asyncio.sleep(self._backoff.delay())
+                    self.live = False
+                    await self.teardown()
 
-    async def _consume(self, link: Link) -> None:
-        # A liveness deadline applies only until the first real message arrives; if
-        # none does in time the attempt is dropped (and reconnected) like any other.
-        if self._first_message_timeout is not None:
-            await asyncio.wait_for(self._await_first(link), self._first_message_timeout)
-        while not self._stop:
-            payload = await link.recv()
-            if payload is not None:
-                self._emit(MessageReceived(payload))
+                if self.stopped:
+                    break
 
-    async def _await_first(self, link: Link) -> None:
-        while not self._stop:
-            payload = await link.recv()
-            if payload is not None:
-                self._emit(MessageReceived(payload))
-                return
+                # Decide whether to retry *before* announcing the drop, so the
+                # Disconnected a waiter sees already carries the terminal verdict
+                # (``supervising()`` is False on a give-up).
+                delay = attempt.next_delay()
+                self.gave_up = delay is None
+                self.state = ConnectionState.DISCONNECTED
+                await self.events.emit(Disconnected(self.generation, code=code))
+
+                if delay is None:
+                    self.logger.debug("wire %s gave up retrying", self.url)
+                    break
+                await asyncio.sleep(delay)
+        finally:
+            # A stopped or given-up link has no live wire -- settle the public
+            # state to DISCONNECTED on EVERY exit, including a stop() that cancels
+            # this task mid-open or mid-recv (the cancellation re-raises past the
+            # loop body, so this finally is the only spot that always runs).
+            self.state = ConnectionState.DISCONNECTED
+
+    async def consume(self) -> None:
+        """Stream :meth:`recv` as :class:`MessageReceived` until the wire drops."""
+        while not self.stopped:
+            message = await self.recv()
+            if message is not None:
+                await self.events.emit(MessageReceived(self.generation, message))
+
+    async def teardown(self) -> None:
+        """Close the wire without letting :meth:`aclose` break the loop."""
+        try:
+            await self.aclose()
+        except Exception:  # noqa: BLE001 -- aclose must never break supervision
+            self.logger.debug("wire %s aclose failed", self.url, exc_info=True)

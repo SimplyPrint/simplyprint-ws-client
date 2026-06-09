@@ -6,7 +6,7 @@ Tests ensure that:
 - Messages are dropped when targeting a stale version
 - Multiple disconnect/reconnect cycles maintain version consistency
 
-These drive :class:`Connection` through a :class:`FakeTransport`, so they pin the
+These drive :class:`Connection` through a :class:`FakeBackend`, so they pin the
 version/state contract independently of the concrete socket library.
 """
 
@@ -30,20 +30,20 @@ from simplyprint_ws_client.core.ws_protocol.messages import (
     PingMsg,
 )
 
-from tests._fakes import FakeTransport
+from tests._fakes import FakeBackend
 
 
 @pytest_asyncio.fixture
-async def fake_transport():
-    """Provide a fake transport instance."""
-    return FakeTransport()
+async def fake_backend():
+    """Provide a fake backend instance."""
+    return FakeBackend()
 
 
 @pytest_asyncio.fixture
-async def connection(fake_transport):
-    """Create a Connection whose transport factory yields the fake transport."""
+async def connection(fake_backend):
+    """Create a Connection whose backend factory yields the fake backend."""
     conn = Connection(
-        transport_factory=lambda logger: fake_transport,
+        backend_factory=lambda logger: fake_backend,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
 
@@ -63,7 +63,7 @@ async def test_initial_version_is_zero(connection):
 
 
 @pytest.mark.asyncio
-async def test_message_dropped_when_version_mismatch(connection, fake_transport):
+async def test_message_dropped_when_version_mismatch(connection, fake_backend):
     """Test that messages are dropped when targeting a different version."""
     # Start with version 0
     assert connection.v == 0
@@ -73,19 +73,19 @@ async def test_message_dropped_when_version_mismatch(connection, fake_transport)
 
     # Send message targeting version 0 - should be dropped (not connected)
     await connection.send(test_msg, v=0)
-    assert len(fake_transport.sent) == 0  # Not connected, message dropped
+    assert len(fake_backend.sent) == 0  # Not connected, message dropped
 
     # Now connect (fake) and try targeting wrong version
-    connection.transport = fake_transport.open()
+    connection.backend = fake_backend.open()
     await connection.send(test_msg, v=1)
-    assert len(fake_transport.sent) == 0  # Version mismatch, dropped
+    assert len(fake_backend.sent) == 0  # Version mismatch, dropped
 
 
 @pytest.mark.asyncio
-async def test_message_sent_when_version_matches(connection, fake_transport):
+async def test_message_sent_when_version_matches(connection, fake_backend):
     """Test that messages are sent when version matches."""
     # Setup: fake a connected state
-    connection.transport = fake_transport.open()
+    connection.backend = fake_backend.open()
     connection.v = 0
 
     # Create a test message
@@ -93,19 +93,19 @@ async def test_message_sent_when_version_matches(connection, fake_transport):
 
     # Send message targeting matching version
     await connection.send(test_msg, v=0)
-    assert len(fake_transport.sent) == 1
+    assert len(fake_backend.sent) == 1
 
     # Increment version and try again - should fail
     connection.v = 1
     await connection.send(test_msg, v=0)
-    assert len(fake_transport.sent) == 1  # Not sent due to version mismatch
+    assert len(fake_backend.sent) == 1  # Not sent due to version mismatch
 
 
 @pytest.mark.asyncio
-async def test_message_sent_without_version_constraint(connection, fake_transport):
+async def test_message_sent_without_version_constraint(connection, fake_backend):
     """Test that messages without version constraint are sent when connected."""
     # Setup: fake a connected state
-    connection.transport = fake_transport.open()
+    connection.backend = fake_backend.open()
     connection.v = 0
 
     # Create a test message
@@ -113,12 +113,12 @@ async def test_message_sent_without_version_constraint(connection, fake_transpor
 
     # Send message without version constraint
     await connection.send(test_msg, v=None)
-    assert len(fake_transport.sent) == 1
+    assert len(fake_backend.sent) == 1
 
     # Change version - message should still be sent since no constraint
     connection.v = 5
     await connection.send(test_msg, v=None)
-    assert len(fake_transport.sent) == 2
+    assert len(fake_backend.sent) == 2
 
 
 @pytest.mark.asyncio
@@ -195,9 +195,9 @@ async def test_version_isolation_between_connections():
 
 @pytest.mark.asyncio
 async def test_message_dropped_when_not_connected(connection):
-    """Test that messages are dropped when the transport is not connected."""
+    """Test that messages are dropped when the backend is not connected."""
     # Ensure not connected
-    connection.transport = None
+    connection.backend = None
     connection.v = 0
 
     test_msg = PingMsg()
@@ -260,13 +260,13 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
 
 @pytest.mark.asyncio
 async def test_poll_failure_increments_version_via_exception_handler(
-    connection, fake_transport
+    connection, fake_backend
 ):
     """
     Integration test for poll() failure path.
 
     Tests the exception handler flow that catches WsConnectionErrors during
-    poll() (now a dropped transport -> WebSocketClosed) and increments version.
+    poll() (now a dropped backend -> BackendClosed) and increments version.
 
     Verifies that version is incremented exactly once when poll() fails, not
     twice (which would indicate a double-increment bug).
@@ -295,8 +295,8 @@ async def test_poll_failure_increments_version_via_exception_handler(
 
         assert connection.connected and connection.v == 0, "Should be connected at v=0"
 
-        # Make the next recv() raise WebSocketClosed -> exception handler increments v
-        fake_transport.queue_close()
+        # Make the next recv() raise BackendClosed -> exception handler increments v
+        fake_backend.queue_close()
 
         # Wait for poll to fail and exception handler to increment v
         for _ in range(50):

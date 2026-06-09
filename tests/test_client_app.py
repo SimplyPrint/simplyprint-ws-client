@@ -1,5 +1,4 @@
 import pytest
-from dataclasses import dataclass
 
 from simplyprint_ws_client import (
     ClientSettings,
@@ -16,7 +15,6 @@ class FirstClient(DefaultClient[PrinterConfig]): ...
 class SecondClient(DefaultClient[PrinterConfig]): ...
 
 
-@dataclass
 class SecondConfig(PrinterConfig):
     marker: str | None = None
 

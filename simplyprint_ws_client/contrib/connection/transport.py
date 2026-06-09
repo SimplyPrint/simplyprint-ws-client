@@ -1,303 +1,170 @@
-"""The transport contract: ask for a link to an endpoint, get a handle you drive
-by *events* -- never a thread.
+"""The wire contract the pool drives, and the exceptions wires raise.
 
-This module is the **contract surface** a wire implements and a consumer programs
-against; the pooling/routing machinery that fulfils it lives in :mod:`.pool`, the
-event vocabulary in :mod:`.events`, the cross-thread hop in :mod:`.loop`. A
-**transport** is a supervised, self-healing link to ONE endpoint (an MQTT broker,
-a WebSocket host, ...). It owns the whole reliability story -- connect, reconnect
-with backoff, liveness, crash recovery, state -- so no consumer writes that twice
-and no consumer ever touches a thread.
+A :class:`Transport` is a supervised link to ONE endpoint that the
+:class:`~simplyprint_ws_client.contrib.connection.pool.Pool` shares across leases. It
+owns the whole reliability story -- connect, reconnect, state, generation -- and
+publishes :class:`~simplyprint_ws_client.contrib.connection.events.ConnectionEvent` s on
+its :attr:`~Transport.events` bus so a consumer drives it by events, never by a
+thread. Where the work runs (a paho network thread, an asyncio task) is the
+transport's private business and never leaks across this seam.
 
-Two separations are deliberate:
-
-* **Where the work runs is the transport's private business.** paho drives its
-  own network thread; a websocket-client wire supervises a daemon thread; an
-  asyncio wire runs on the harness loop. None of that leaks across the seam: a
-  consumer only subscribes to :class:`TransportEvent` s and calls ``send``. That
-  is what lets one brand's code sit on a threaded paho transport *or* an async
-  WebSocket transport unchanged -- the event surface is the single language. It
-  is also what "the harness owns the threads" means: the library may spawn and
-  supervise threads inside a transport; an integration never does.
-
-* **Sync vs async is a real, kept distinction -- not a wart to paper over.**
-  :class:`AsyncTransport` is the ideal (``await send``) for asyncio-native wires
-  (``websockets``/aiohttp). :class:`Transport` is the synchronous form for wires
-  that are inherently thread-driven (paho), where wrapping them in async buys
-  nothing and costs clarity and performance. Both emit the *same* events, so a
-  consumer that only listens is agnostic to which it got.
-
-**Pooling is a capability layered on top** (see :class:`Pool` / :class:`AsyncPool`,
-implemented in :mod:`.pool`): the same transport contract is handed out *shared by
-endpoint* (many printers, one broker socket -- the performance win) or *dedicated*
-(the backend's 1:1 socket). A dedicated transport is just a pool of one. The front
-door is :meth:`Pool.connect`: an endpoint in, a :class:`Lease` out.
+:class:`MqttTransport` adds topic subscription and routes a message by its topic;
+:class:`WsTransport` has no topics and broadcasts every message to every lease.
+The exceptions here are the small taxonomy a wire raises: :class:`NotConnected`
+when a send hits a down link, and :class:`TransientError` / :class:`FatalError`
+to *tag* why an attempt ended. The reconnect loop keeps retrying -- the
+transient/fatal distinction is carried through to ``Disconnected.code`` purely as
+information.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Generic, Hashable, Optional, TypeVar
+from typing import Optional
+
+import yarl
 
 from simplyprint_ws_client.events import EventBus
 
-from simplyprint_ws_client.contrib.connection.events import (
-    Connected,
-    ConnectionSuspect,
-    Disconnected,
-    MessageReceived,
-    StateChanged,
-    TransportEvent,
-)
-from simplyprint_ws_client.contrib.connection.loop import CoroFactory
+from simplyprint_ws_client.contrib.connection.events import ConnectionEvent
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 
 __all__ = [
-    # event vocabulary (re-exported from .events for one import site)
-    "TransportEvent",
-    "Connected",
-    "Disconnected",
-    "MessageReceived",
-    "ConnectionSuspect",
-    "StateChanged",
-    # transport contract
-    "BaseTransport",
+    "NotConnected",
+    "TransientError",
+    "FatalError",
     "Transport",
-    "AsyncTransport",
-    # lease contract
-    "BaseLease",
-    "Lease",
-    "AsyncLease",
-    "LeaseHandler",
-    "Unsubscribe",
-    # pool contract
-    "Pool",
-    "AsyncPool",
+    "MqttTransport",
+    "WsTransport",
+    "topic_matches",
 ]
 
-TParams = TypeVar("TParams", bound=Hashable)
+
+class NotConnected(Exception):
+    """Raised by :meth:`Transport.send` when there is no live wire to send on."""
 
 
-class BaseTransport(ABC, Generic[TParams]):
-    """A supervised link to one endpoint, driven by events.
+class TransientError(Exception):
+    """A wire failure the reconnect loop retries from, tagged as recoverable.
 
-    Subclasses own the wire and the reliability loop (connect, reconnect with
-    backoff, liveness, crash recovery) and publish :class:`TransportEvent` s on
-    :attr:`events`. The execution model -- a library thread, a supervised daemon
-    thread, an asyncio task on the harness loop -- is the subclass's private
-    business and must never leak to consumers.
-
-    ``params`` is the endpoint identity and MUST be hashable: it is the key a
-    :class:`Pool` shares transports by.
+    A dropped socket, a refused connection, a read timeout -- the ordinary blips a
+    reconnect heals. Raised from a wire's ``open``/``recv`` and surfaced on
+    ``Disconnected.code``.
     """
 
-    #: Hashable endpoint identity (broker tuple, ws url, ...). The pool key.
-    params: TParams
-    #: Where consumers subscribe (``Connected`` / ``Disconnected`` /
-    #: ``MessageReceived`` / ``ConnectionSuspect`` / ``StateChanged``).
-    events: EventBus[TransportEvent]
-    #: Last-known reachability; also published via :class:`StateChanged`.
+
+class FatalError(Exception):
+    """A wire failure that looks unrecoverable (bad credentials, rejected URL).
+
+    The reconnect loop still keeps retrying -- the only difference from
+    :class:`TransientError` is that this tag rides through to ``Disconnected.code``
+    so a consumer can distinguish "the broker is slow" from "the broker said no".
+    """
+
+
+class Transport(ABC):
+    """A supervised link to one endpoint, driven by events.
+
+    A concrete transport owns its wire and its reliability loop and publishes
+    lifecycle/message events on :attr:`events`. ``state`` and ``generation`` are
+    read-only to consumers; ``generation`` advances once per established
+    connection so a consumer can tell one live link from the next.
+    """
+
+    #: The endpoint this transport is bound to.
+    url: yarl.URL
+    #: Last-known lifecycle state (also published via the events).
     state: ConnectionState
-    #: Monotonic connection epoch, read-only to consumers. Changes once per
-    #: (re)connect so a consumer can tell one live link from the next (e.g. to
-    #: drop work queued for a link that has since dropped). A self-healing wire
-    #: bumps it on each connect; a :class:`~.reconnect.ReconnectingTransport` wire bumps it
-    #: once per dropped attempt. Default 0 (never connected).
-    generation: int = 0
+    #: Monotonic connection epoch; advances once per established connection.
+    generation: int
+    #: Where consumers subscribe -- keyed by event type.
+    events: EventBus[ConnectionEvent]
 
     @property
     @abstractmethod
     def connected(self) -> bool:
-        """Whether the underlying wire currently holds a live connection."""
+        """Whether the wire currently holds a live, usable connection."""
 
     @abstractmethod
     def start(self) -> None:
-        """Begin supervising the link (connect, then auto-reconnect). Idempotent.
+        """Begin keeping the link up (connect, then auto-reconnect).
 
-        For an async transport this schedules the loop task on the harness event
-        loop; for a sync transport it starts the library/supervisor thread. Either
-        way it returns immediately -- readiness is reported via :class:`Connected`.
+        Idempotent and fire-and-forget: it returns immediately and readiness is
+        reported through :class:`~simplyprint_ws_client.contrib.connection.events.Connected`.
         """
 
     @abstractmethod
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Tear the link down permanently and release resources. Idempotent."""
 
-    def subscribe(self, topic: str) -> None:
-        """Register interest in ``topic`` -- topic-routed wires only.
+    @abstractmethod
+    async def send(self, message: object) -> None:
+        """Send ``message`` over the wire.
 
-        A 1:1 wire (WebSocket) has no topics and keeps this no-op; a broker
-        transport (MQTT) overrides it to (re)assert the subscription on the
-        shared socket. Concrete (not abstract) so a lease can always call it."""
-
-    def unsubscribe(self, topic: str) -> None:
-        """Drop interest in ``topic`` -- the no-op/override mirror of :meth:`subscribe`."""
-
-    def _emit(self, event: TransportEvent) -> None:
-        """Publish ``event`` on :attr:`events`.
-
-        Keyed by the event's *type*, so a consumer subscribes with
-        ``transport.events.on(Connected, handler)`` and ``handler`` receives the
-        typed event instance. Every transport publishes through this one seam so
-        the event surface stays identical across the sync and async families.
+        Raises :class:`NotConnected` if there is no live link. For a message whose
+        QoS requires an acknowledgement the call awaits that ack.
         """
-        self.events.emit_sync(type(event), event)
+
+    def route(self, message: object) -> Optional[str]:
+        """The routing key for an inbound ``message``.
+
+        The pool delivers a message only to leases whose subscription set matches
+        this key. ``None`` -- the default and the only answer for a 1:1 wire --
+        means broadcast to every lease.
+        """
+        return None
+
+    def supervising(self) -> bool:
+        """Whether the transport is still trying to keep the link up.
+
+        ``True`` by default (a self-healing wire never stops on its own). A
+        :class:`~simplyprint_ws_client.contrib.connection.reconnect.Reconnecting`
+        transport returns ``False`` once its retry policy is exhausted and it has
+        permanently given up -- the signal a waiter uses to resolve "gave up".
+        """
+        return True
 
 
-class Transport(BaseTransport[TParams]):
-    """A **synchronous** transport for inherently thread-driven wires (paho,
-    websocket-client).
+class MqttTransport(Transport):
+    """A broker transport: many topics multiplexed over one shared socket.
 
-    It owns and supervises its own thread(s) internally; the caller only
-    ``send`` s and listens on :attr:`events`. ``send`` is best-effort and never
-    blocks on reconnect.
+    Subscriptions are refcounted across leases by the pool; :meth:`route` returns
+    the message's topic so the pool can scope it to interested leases.
     """
 
     @abstractmethod
-    def send(self, payload: Any) -> bool:
-        """Send ``payload`` over the wire. Returns ``False`` if the link is down."""
-
-
-class AsyncTransport(BaseTransport[TParams]):
-    """An **asynchronous** transport for asyncio-native wires (``websockets``,
-    aiohttp), driven on the harness event loop."""
+    async def subscribe(self, topic: str) -> None:
+        """Assert a subscription for ``topic`` on the shared socket."""
 
     @abstractmethod
-    async def send(self, payload: Any) -> None:
-        """Send ``payload`` over the wire; raises if the link is unusable."""
+    async def unsubscribe(self, topic: str) -> None:
+        """Drop a subscription for ``topic`` from the shared socket."""
+
+    @abstractmethod
+    def route(self, message: object) -> Optional[str]:
+        """Return the message's topic -- the key the pool routes leases by."""
 
 
-TTransport = TypeVar("TTransport", bound=BaseTransport)
+class WsTransport(Transport):
+    """A 1:1 WebSocket transport: no topics, every message is the lease's.
 
-
-class Pool(ABC, Generic[TParams, TTransport]):
-    """Pooling for synchronous transports.
-
-    Hands out ONE :class:`Transport` per endpoint (keyed by ``params``), shared
-    by every client that resolves to the same endpoint, and owns the
-    sharing/routing/keepalive/registration lifecycle. A *dedicated* link is just
-    a pool entry with a single client.
-
-    The front door is :meth:`connect`: it hands back a :class:`Lease`
-    -- a per-client view that ``send`` s, subscribes to *its* messages, and
-    ``close`` s its own hold. The implementation is :class:`.pool.TransportPool`.
+    :meth:`route` stays ``None`` (inherited), so the pool broadcasts every inbound
+    frame to every lease on the link.
     """
 
-    @abstractmethod
-    def connect(self, params: TParams, *, route: Optional[Hashable] = None) -> "Lease":
-        """Lease the shared transport for ``params`` as a :class:`Lease`.
 
-        ``route`` (e.g. an MQTT topic) scopes which inbound messages this lease
-        receives; ``None`` (the dedicated/1:1 case) receives them all.
-        """
+def topic_matches(subscription: str, topic: str) -> bool:
+    """Whether an incoming ``topic`` is covered by an MQTT ``subscription``.
 
-    @abstractmethod
-    def stop(self) -> None:
-        """Tear down the pool: close every transport and release resources."""
-
-    @abstractmethod
-    def submit_to_loop(
-        self, coro_factory: CoroFactory, *, coalesce_key: Optional[Hashable] = None
-    ) -> None:
-        """Run a coroutine on the pool loop from a transport thread, coalesced by
-        ``coalesce_key`` (the one sanctioned cross-thread hop; see :class:`.loop.LoopBridge`)."""
-
-    @abstractmethod
-    def call_on_loop(self, fn: Callable[[], None]) -> None:
-        """Run a sync callable on the pool loop -- event-bus delivery from a worker
-        or transport thread, without a per-call future."""
-
-
-class AsyncPool(ABC, Generic[TParams, TTransport]):
-    """Pooling for asynchronous transports -- the async sibling of :class:`Pool`
-    (implemented by :class:`.pool.AsyncTransportPool`)."""
-
-    @abstractmethod
-    async def connect(
-        self, params: TParams, *, route: Optional[Hashable] = None
-    ) -> "AsyncLease":
-        """Lease the shared async transport for ``params`` as an
-        :class:`AsyncLease`. See :meth:`Pool.connect`."""
-
-
-#: A handler for a connection event. May be sync, or return a coroutine that is
-#: scheduled on the pool loop. Receives the event payload: ``on_message`` ->
-#: the wire message; ``on_connected`` -> nothing; ``on_disconnected`` -> the
-#: :class:`Disconnected` event.
-LeaseHandler = Callable[..., Any]
-Unsubscribe = Callable[[], None]
-
-
-class BaseLease(ABC, Generic[TParams]):
-    """A per-client lease over a (possibly shared) transport.
-
-    A consumer never touches the transport's raw event bus or its thread; it
-    drives THIS handle: ``send``, subscribe to *its own* messages via
-    :meth:`on_message`, and :meth:`close` its hold. The pool routes a shared
-    transport's messages to the right lease(s) by ``route`` -- so a client no
-    longer sees (and filters) every other client's traffic.
+    Supports the trailing multi-level ``#`` wildcard: ``foo/#`` matches ``foo``
+    itself and anything beneath it (``foo/bar``, ``foo/bar/baz``). An exact
+    string match always wins.
     """
+    if subscription == topic:
+        return True
 
-    params: TParams
+    if not subscription.endswith("/#"):
+        return False
 
-    @abstractmethod
-    def on_message(self, handler: LeaseHandler) -> Unsubscribe:
-        """Receive this lease's inbound messages. Returns an unsubscribe callable."""
-
-    @abstractmethod
-    def on_connected(self, handler: LeaseHandler) -> Unsubscribe:
-        """Called when the shared link comes up. Returns an unsubscribe callable."""
-
-    @abstractmethod
-    def on_disconnected(self, handler: LeaseHandler) -> Unsubscribe:
-        """Called when the shared link drops. Returns an unsubscribe callable."""
-
-    @abstractmethod
-    def on_suspect(self, handler: LeaseHandler) -> Unsubscribe:
-        """Called on a suspect connect (repeated failure / CONNACK reject). The
-        handler receives the :class:`ConnectionSuspect` event. Returns an unsubscribe."""
-
-    @property
-    @abstractmethod
-    def connected(self) -> bool:
-        """Whether the underlying shared transport currently holds a live link."""
-
-    @abstractmethod
-    def subscribe(self, topic: str) -> None:
-        """Register interest in ``topic`` on a shared transport (no-op on a 1:1)."""
-
-    @abstractmethod
-    def submit_to_loop(
-        self, coro_factory: CoroFactory, *, coalesce_key: Optional[Hashable] = None
-    ) -> None:
-        """Run async work on the pool's event loop from a transport thread.
-
-        The one sanctioned cross-thread coroutine hop -- the pool owns the loop,
-        so the caller never reaches for one. ``coalesce_key`` makes a second
-        submission while one is in flight a no-op (replacing hand-rolled
-        in-flight guards). Returns immediately; failures are logged by the pool.
-        """
-
-
-class Lease(BaseLease[TParams]):
-    """A **synchronous** lease (paho family)."""
-
-    @abstractmethod
-    def send(self, payload: Any) -> bool:
-        """Send ``payload`` over the shared link. ``False`` if the link is down."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Release this lease; the pool tears the transport down with the last."""
-
-
-class AsyncLease(BaseLease[TParams]):
-    """An **asynchronous** lease (``websockets`` / aiomqtt family)."""
-
-    @abstractmethod
-    async def send(self, payload: Any) -> None:
-        """Send ``payload`` over the shared link; raises if unusable."""
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Release this lease; the pool tears the transport down with the last."""
+    prefix = subscription[:-2]
+    return topic == prefix or topic.startswith(f"{prefix}/")

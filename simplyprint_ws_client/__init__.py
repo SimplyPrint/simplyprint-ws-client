@@ -2,9 +2,10 @@
 
 The names below are the supported, author-facing public API. In short:
 
-* Subclass :class:`PrinterClient` (the headline base) -- or the lower-level
-  :class:`DefaultClient`/:class:`PhysicalClient` -- to boil your device into a
-  :class:`PrinterState`, and mark demand/message handlers with :func:`configure`.
+* Subclass :class:`DefaultClient` (or the lower-level :class:`PhysicalClient`) to
+  boil your device into a :class:`PrinterState`, and mark demand/message handlers
+  with :func:`configure`. (An integration typically grows its own printer-client
+  base on top of these.)
 * Declare your client type with a :class:`ClientSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
@@ -30,8 +31,7 @@ from . import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
 # Modules whose public names are re-exported, tried light-first so resolving a
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
-    ".contrib.connection",
-    ".contrib.connection.websocket",
+    ".core.ws_protocol.backend",
     ".core.config",
     ".core.settings",
     ".core.state",
@@ -39,7 +39,6 @@ _REEXPORT_MODULES = (
     ".core.ws_protocol.connection",
     ".core.ws_protocol.models",
     ".core.ws_protocol.messages",
-    ".contrib.printer_client",
     ".core.client",
     ".core.app",
 )
@@ -47,7 +46,6 @@ _REEXPORT_MODULES = (
 # The curated, documented public surface. Other public names remain importable
 # (resolved lazily by __getattr__), just not advertised by ``import *``.
 _PUBLIC = (
-    "PrinterClient",
     "Client",
     "DefaultClient",
     "PhysicalClient",
@@ -57,11 +55,11 @@ _PUBLIC = (
     "ClientSettings",
     "ClientSpec",
     "ConnectionMode",
-    "WebSocket",
-    "WebsocketsImpl",
-    "AiohttpImpl",
-    "WebSocketError",
-    "WebSocketClosed",
+    "BackendTransport",
+    "WebsocketsBackend",
+    "AiohttpBackend",
+    "BackendError",
+    "BackendClosed",
     "PrinterConfig",
     "Config",
     "ConfigManager",
@@ -107,13 +105,12 @@ def __dir__():
 
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
-    from .contrib.printer_client import PrinterClient  # noqa: F401
-    from .contrib.connection.websocket import (  # noqa: F401
-        AiohttpImpl,
-        WebSocket,
-        WebSocketClosed,
-        WebSocketError,
-        WebsocketsImpl,
+    from .core.ws_protocol.backend import (  # noqa: F401
+        AiohttpBackend,
+        BackendClosed,
+        BackendError,
+        BackendTransport,
+        WebsocketsBackend,
     )
     from .core.app import *  # noqa: F401,F403
     from .core.client import *  # noqa: F401,F403

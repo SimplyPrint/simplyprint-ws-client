@@ -3,7 +3,7 @@
 These tests enforce the rules from CLAUDE.md and decisions.md:
   LEAK  — no brand identifiers (NAME tokens) in contrib/ + shared/
   SHIM  — no re-export aliases or star imports (both @ module-level)
-  DAG   — contrib/__init__ import-free; core+leaves never import contrib.printer_client
+  DAG   — contrib/__init__ import-free; library never ships/imports contrib.printer_client
 
 The production code is brand-free by hand; these tests turn that into a machine-checked invariant
 so future edits (especially migrations from integrations) cannot regress the abstraction.
@@ -284,7 +284,9 @@ class TestNoShims:
 
 
 class TestImportDAG:
-    """DAG — import-graph acyclicity: contrib/__init__ import-free, core+leaves never import PrinterClient."""
+    """DAG — import-graph acyclicity: contrib/__init__ import-free; the high-level
+    printer-client base was promoted out to the integration, so the library must
+    neither ship nor import ``contrib.printer_client``."""
 
     def test_contrib_init_is_import_free(self):
         """contrib/__init__.py must not import anything (internal or relative)."""
@@ -306,27 +308,20 @@ class TestImportDAG:
                         offenders.append(f"line {node.lineno}: {a.name}")
         assert not offenders, f"contrib/__init__.py is not import-free: {offenders}"
 
-    def test_core_does_not_import_printer_client(self):
-        """core/ must never import contrib.printer_client (cycle)."""
-        offenders = self._find_printer_client_imports(LIB_PKG / "core")
-        assert not offenders, f"core/ has cycle imports of printer_client: {offenders}"
+    def test_printer_client_promoted_out_of_library(self):
+        """The high-level printer-client base was promoted to the integration.
 
-    def test_contrib_leaves_do_not_import_printer_client(self):
-        """contrib leaf modules must not import contrib.printer_client (cycle)."""
-        leaves = [
-            LIB_PKG / "contrib" / "connection",
-            LIB_PKG / "contrib" / "model",
-            LIB_PKG / "contrib" / "transfer",
-            LIB_PKG / "contrib" / "onboarding",
-            LIB_PKG / "contrib" / "logging",
-        ]
-        for leaf in leaves:
-            if not leaf.exists():
-                continue
-            offenders = self._find_printer_client_imports(leaf)
-            assert not offenders, (
-                f"{leaf.name}/ has cycle imports of printer_client: {offenders}"
-            )
+        It must stay deleted in the library (re-shipping it would re-introduce the
+        core<->contrib cycle it imports back into), and nothing in the library may
+        import ``contrib.printer_client`` either.
+        """
+        module = LIB_PKG / "contrib" / "printer_client.py"
+        assert not module.exists(), (
+            "contrib/printer_client.py was relocated to the integration; it must "
+            "stay deleted in the library (no re-export shim)."
+        )
+        offenders = self._find_printer_client_imports(LIB_PKG)
+        assert not offenders, f"library still imports printer_client: {offenders}"
 
     @staticmethod
     def _find_printer_client_imports(root: pathlib.Path) -> List[str]:

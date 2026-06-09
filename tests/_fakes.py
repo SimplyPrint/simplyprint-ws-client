@@ -1,7 +1,7 @@
-"""Test doubles for the WebSocket transport seam.
+"""Test doubles for the backend transport seam.
 
-``FakeTransport`` is an in-memory :class:`WebSocket` that lets a test
-drive :class:`Connection` deterministically -- no real socket, no aiohttp/
+``FakeBackend`` is an in-memory :class:`BackendTransport` that lets a test
+drive :class:`Connection` deterministically -- no real backend, no aiohttp/
 ``websockets`` involvement. ``connect`` opens it, ``send`` records into
 :attr:`sent`, and ``recv`` waits on an inbox the test feeds with
 :meth:`queue_message` / :meth:`queue_close`.
@@ -10,13 +10,13 @@ drive :class:`Connection` deterministically -- no real socket, no aiohttp/
 import asyncio
 from typing import List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.connection.websocket.base import (
-    WebSocket,
-    WebSocketClosed,
+from simplyprint_ws_client.core.ws_protocol.backend import (
+    BackendClosed,
+    BackendTransport,
 )
 
 
-class FakeTransport(WebSocket):
+class FakeBackend(BackendTransport):
     def __init__(self, logger=None) -> None:
         self.sent: List[str] = []
         self.connect_calls = 0
@@ -30,7 +30,7 @@ class FakeTransport(WebSocket):
 
     async def send(self, data: str) -> None:
         if not self._open:
-            raise WebSocketClosed("not connected")
+            raise BackendClosed("not connected")
         self.sent.append(data)
 
     async def recv(self) -> Optional[str]:
@@ -50,7 +50,7 @@ class FakeTransport(WebSocket):
     def is_open(self) -> bool:
         return self._open
 
-    def open(self) -> "FakeTransport":
+    def open(self) -> "FakeBackend":
         """Mark connected without going through the loop (for unit tests)."""
         self._open = True
         return self
@@ -60,5 +60,8 @@ class FakeTransport(WebSocket):
         self._inbox.put_nowait(data)
 
     def queue_close(self, code: int = 1006) -> None:
-        """Make the next ``recv()`` raise ``WebSocketClosed`` (a dropped socket)."""
-        self._inbox.put_nowait(WebSocketClosed("peer closed", code=code))
+        """Make the next ``recv()`` raise ``BackendClosed`` (a dropped backend)."""
+        self._inbox.put_nowait(BackendClosed("peer closed", code=code))
+
+
+FakeTransport = FakeBackend

@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import threading
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from .base import FrameT
@@ -41,21 +42,25 @@ class CameraHandle(StoppableInterface):
         self._driver = driver
         self._frame_time_window = []
         self._waiters = []
+        self._lock = threading.Lock()
 
     def _set_frame(self, data: Optional[FrameT], timestamp: float) -> None:
         """Deliver one frame to this handle. Called from one producer at a time
         (the PROCESS response reader, an inline loop task, or a thread courier)."""
-        # Keep track of last 10 frame times for the FPS estimate.
-        self._frame_time_window.append(timestamp)
-        if len(self._frame_time_window) > 10:
-            self._frame_time_window.pop(0)
+        ready = []
+        with self._lock:
+            self._frame_time_window.append(timestamp)
+            if len(self._frame_time_window) > 10:
+                self._frame_time_window.pop(0)
 
-        self._cached_frame = data
+            self._cached_frame = data
 
-        while self._waiters:
-            fut = self._waiters.pop(0)
-            if fut.done():
-                continue
+            while self._waiters:
+                fut = self._waiters.pop(0)
+                if not fut.done():
+                    ready.append(fut)
+
+        for fut in ready:
             loop = fut.get_loop()
             loop.call_soon_threadsafe(fut.set_result, data)
 
@@ -66,20 +71,31 @@ class CameraHandle(StoppableInterface):
         self._poll()
 
         # Although we might want to serve an old frame if it's not too old.
-        if allow_cache_age is not None and self._cached_frame is not None:
-            if (
-                self._last_poll_time is not None
-                and self._last_poll_time + allow_cache_age > datetime.datetime.now()
-            ):
-                return self._cached_frame
+        now = datetime.datetime.now()
+        with self._lock:
+            if allow_cache_age is not None and self._cached_frame is not None:
+                if (
+                    self._last_poll_time is not None
+                    and self._last_poll_time + allow_cache_age > now
+                ):
+                    return self._cached_frame
 
-            self._cached_frame = None
+                self._cached_frame = None
 
-        self._last_poll_time = datetime.datetime.now()
+            self._last_poll_time = now
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        self._waiters.append(fut)
-        return await fut
+        with self._lock:
+            self._waiters.append(fut)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            with self._lock:
+                try:
+                    self._waiters.remove(fut)
+                except ValueError:
+                    pass
+            raise
 
     def start(self):
         if self._driver is not None:
@@ -96,11 +112,12 @@ class CameraHandle(StoppableInterface):
     @property
     def fps(self) -> float:
         # Calculate the average FPS from the last 10 frames.
-        if len(self._frame_time_window) < 2:
-            return 0
+        with self._lock:
+            if len(self._frame_time_window) < 2:
+                return 0
 
-        elapsed_time = self._frame_time_window[-1] - self._frame_time_window[0]
-        num_intervals = len(self._frame_time_window) - 1
+            elapsed_time = self._frame_time_window[-1] - self._frame_time_window[0]
+            num_intervals = len(self._frame_time_window) - 1
 
         if elapsed_time <= 0:
             return 0

@@ -8,8 +8,10 @@ prompt/answer plumbing and resumability; a brand supplies only the steps and the
 terminal fold. Continuation state is plain data, so a stateless web caller can
 seal it and resume.
 
-See :mod:`simplyprint_ws_client.contrib.flow.base` for the engine and
-:mod:`simplyprint_ws_client.contrib.flow.steps` for the reusable step kit.
+See :mod:`simplyprint_ws_client.contrib.flow.base` for the engine,
+:mod:`simplyprint_ws_client.contrib.flow.steps` for the reusable step kit, and
+:mod:`simplyprint_ws_client.contrib.flow.onboarding_steps` for the add-printer
+step builders (model picker, manual address) brands compose.
 """
 
 from simplyprint_ws_client.contrib.flow.base import (
@@ -50,6 +52,12 @@ from simplyprint_ws_client.contrib.flow.steps import (
     ChoiceStep,
     FieldsStep,
     SelectStep,
+)
+from simplyprint_ws_client.contrib.flow.onboarding_steps import (
+    UNKNOWN_MODEL_LABEL,
+    ManualAddressStep,
+    ModelChoice,
+    ModelChoiceCatalog,
 )
 
 __all__ = [
@@ -93,4 +101,9 @@ __all__ = [
     "ChoiceStep",
     "SelectStep",
     "ActionStep",
+    # add-printer onboarding step kit
+    "ModelChoice",
+    "ModelChoiceCatalog",
+    "ManualAddressStep",
+    "UNKNOWN_MODEL_LABEL",
 ]

@@ -13,8 +13,9 @@ class DiscoveredDevice:
     Only the network-neutral facts every integration can supply: a reachable
     ``host`` (IP or hostname) plus an optional human ``name`` and ``serial``.
     Integration-specific discovery payload (model codes, signed tokens, SSDP
-    headers) rides in ``extra`` so callers can read it back without this neutral
-    type ever naming vendor fields.
+    headers, a ``mac``) rides in ``extra`` so callers can read it back without this
+    neutral type ever naming vendor fields. The integration decides how to turn
+    these facts into a config's hardware-match id (serial, else MAC).
     """
 
     host: str

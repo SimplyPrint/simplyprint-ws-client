@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 __all__ = ["Connection", "ConnectionHint", "ConnectionMode"]
 
 import asyncio
 import logging
 from enum import Enum
-from typing import Any, Hashable, Optional, final
+from typing import Hashable, Optional, final
 
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
@@ -18,9 +20,14 @@ from .events import (
     ConnectionSuspectEvent,
 )
 from .messages import ClientMsg, ClientMsgType, ServerMsg
+from .backend import (
+    BackendError,
+    BackendFactory,
+    BackendTransport,
+    WebsocketsBackend,
+)
 from ..config import PrinterConfig
 from ...events import EventBus
-from ...shared.asyncio.courier import Courier, OverflowPolicy
 from ...shared.asyncio.event_loop_provider import EventLoopProvider
 from ...shared.sp.url_builder import SimplyPrintURL
 from ...shared.utils.backoff import ConstantBackoff
@@ -29,17 +36,12 @@ from ...shared.utils.stoppable import AsyncStoppable
 from ...contrib.logging import printer_logger
 from ...contrib.connection.events import (
     Connected,
-    ConnectionSuspect,
     Disconnected,
     MessageReceived,
 )
-from ...contrib.connection.reconnect import Link, ReconnectingTransport
-from ...contrib.connection.websocket.base import (
-    WebSocket,
-    WebSocketError,
-    WebSocketFactory,
-)
-from ...contrib.connection.websocket.websockets_impl import WebsocketsImpl
+from ...contrib.connection.policy import RetryPolicy
+from ...contrib.connection.reconnect import Reconnecting
+from ...contrib.connection.transport import TransientError, WsTransport
 
 
 class ConnectionMode(Enum):
@@ -69,7 +71,7 @@ class ConnectionHint:
         )
 
 
-# WebSocket transport parameters, passed to ``WebSocket.connect``.
+# WebSocket transport parameters, passed to ``BackendTransport.connect``.
 # Mirrors the previous aiohttp settings: a 30s ping heartbeat, unbounded message
 # size, a 60s connect timeout and a 10s close timeout.
 TransportParams = {
@@ -86,104 +88,152 @@ WsConnectionErrors = (
     ConnectionError,  # Technically a subset of OSError, but more specific.
     asyncio.TimeoutError,
     asyncio.CancelledError,
-    WebSocketError,  # Base of WebSocketClosed -- covers both.
+    BackendError,
 )
 
-# How often a stuck-connecting socket is flagged ``suspect`` (every Nth failure),
+# How often a stuck-connecting backend is flagged ``suspect`` (every Nth failure),
 # and how long after connect a silent server gets before the link is recycled.
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
 WsFirstMessageTimeout = 30.0
 
 
-class _ServerLink(Link):
-    """One backend connection attempt -- the raw :class:`WebSocket` socket adapted
-    to the engine's neutral :class:`Link`.
+class ServerTransport(WsTransport, Reconnecting):
+    """The SimplyPrint backend transport.
 
-    ``open`` builds a fresh socket via the connection's factory and publishes it as
-    :attr:`Connection.transport`, so the version-targeted :meth:`Connection.send`
-    and :attr:`Connection.connected` read the live socket directly; ``recv`` yields
-    raw text the connection parses into a :class:`ServerMsg`; ``close`` tears the
-    socket down and clears the published handle. The link owns no reconnect /
-    backoff / version logic -- that is the :class:`~...contrib.connection.reconnect.ReconnectingTransport`
-    engine's job.
+    This is the transport the protocol :class:`Connection` drives. It is a
+    :class:`~simplyprint_ws_client.contrib.connection.reconnect.Reconnecting` transport that
+    fills the four wire hooks (``open`` / ``recv`` / ``write`` / ``aclose``) on
+    *itself* -- no separate link object -- holding the raw :class:`BackendTransport`
+    as a plain attribute. The reconnect base owns the whole reliability story
+    (connect, reconnect, backoff, generation, lifecycle events); this class adds only
+    the two SimplyPrint-specific socket behaviours the brand-free base deliberately
+    omits:
+
+    * a fresh socket per attempt, built via the connection's
+      :data:`~simplyprint_ws_client.core.ws_protocol.backend.BackendFactory` and
+      published as :attr:`Connection.transport` so the version-targeted
+      :meth:`Connection.send` and :attr:`Connection.connected` read the live socket
+      directly;
+    * a *first-message* deadline -- the attempt is dropped (and reconnected) if no
+      real message arrives within :attr:`first_message_timeout` of connecting.
+
+    Parsing, the version counter, and event translation stay in :class:`Connection`.
     """
 
     def __init__(self, connection: "Connection") -> None:
-        self._conn = connection
-        self._socket: Optional[WebSocket] = None
+        super().__init__(
+            connection.url,
+            RetryPolicy(backoff=ConstantBackoff()),
+            provider=connection,
+            logger=connection.logger,
+        )
+        self.connection = connection
+        self.first_message_timeout: Optional[float] = WsFirstMessageTimeout
+        #: The live raw backend for this attempt, or ``None`` while down.
+        self.backend: Optional[BackendTransport] = None
 
     async def open(self) -> None:
-        socket = self._conn.transport_factory(self._conn.logger)
-        await socket.connect(str(self._conn.url), **TransportParams)
-        self._socket = socket
-        self._conn.transport = socket
+        """Build a fresh socket via the factory, connect it, and publish it as the
+        connection's live :attr:`~Connection.transport`."""
+        backend = self.connection.backend_factory(self.connection.logger)
+        await backend.connect(str(self.connection.url), **TransportParams)
+        self.backend = backend
+        self.connection.backend = backend
 
     async def recv(self) -> Optional[str]:
-        assert self._socket is not None
-        return await self._socket.recv()
+        """Return the next inbound text frame; a dropped socket ends the attempt."""
+        backend = self.backend
+        if backend is None:
+            raise TransientError("websocket not connected")
+        return await backend.recv()
 
-    async def send(self, payload: Any) -> None:
-        assert self._socket is not None
-        await self._socket.send(payload)
+    async def write(self, message: object) -> None:
+        """Put one frame on the live socket."""
+        backend = self.backend
+        if backend is None:
+            raise TransientError("websocket not connected")
+        await backend.send(message)
 
-    async def close(self) -> None:
-        socket, self._socket = self._socket, None
+    async def aclose(self) -> None:
+        """Tear the backend down and retract the published handle. Never raises."""
+        backend, self.backend = self.backend, None
         # Only retract the published handle if it is still ours: a freshly-opened
         # attempt may have already replaced it (resume races a winding-down drop).
-        if self._conn.transport is socket:
-            self._conn.transport = None
-        if socket is not None:
-            await socket.close()
+        if self.connection.backend is backend:
+            self.connection.backend = None
+        if backend is not None:
+            try:
+                await backend.close()
+            except Exception:  # noqa: BLE001 -- aclose must never break supervision
+                self.logger.debug("websocket %s close failed", self.url, exc_info=True)
 
-    @property
-    def is_open(self) -> bool:
-        return self._socket is not None and self._socket.is_open
+    async def consume(self) -> None:
+        """Stream inbound frames, with a deadline on the *first* real message.
+
+        A liveness deadline applies only until the first message arrives; if none
+        does in time the attempt is dropped (and reconnected) like any other. After
+        the first message the stream falls back to the brand-free base behaviour.
+        """
+        if self.first_message_timeout is not None:
+            await asyncio.wait_for(self.await_first(), self.first_message_timeout)
+        await super().consume()
+
+    async def await_first(self) -> None:
+        """Block until one real message arrives, emitting it like the base loop."""
+        while not self.stopped:
+            message = await self.recv()
+            if message is not None:
+                await self.events.emit(MessageReceived(self.generation, message))
+                return
 
 
 @final
 class Connection(
     AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop], Hashable
 ):
-    """The link to the SimplyPrint server: the connection *protocol* over a shared
-    reconnection engine.
+    """The SimplyPrint server protocol over a reconnecting transport.
 
     The reconnect/backoff/liveness/generation loop is no longer hand-rolled here --
-    it is a :class:`~...contrib.connection.reconnect.ReconnectingTransport` transport driving
-    a fresh :class:`_ServerLink` per attempt. ``Connection`` keeps only what is
-    genuinely SimplyPrint-specific: the URL, version-targeted ``send`` + JSON
-    (de)serialization, ``ServerMsg`` parsing, per-printer log routing, and the
-    ordered lifetime/message event delivery on its own UNBOUNDED :class:`Courier`.
+    it is a :class:`ServerTransport` riding the brand-free
+    :class:`~simplyprint_ws_client.contrib.connection.reconnect.Reconnecting` loop.
+    ``Connection`` keeps only what is genuinely SimplyPrint-specific: the URL,
+    version-targeted ``send`` + JSON (de)serialization, ``ServerMsg`` parsing,
+    per-printer log routing, and the suspect-after-N-failures advisory.
 
-    It maps the engine's brand-free :class:`TransportEvent` s onto the protocol's
-    events: ``Connected`` -> :class:`ConnectionEstablishedEvent` (``v``); a parsed
-    ``MessageReceived`` -> :class:`ConnectionIncomingEvent` (``msg``, ``v``);
-    ``Disconnected`` -> :class:`ConnectionLostEvent` (``v``) **then** ``v += 1``
-    (the single version-bump site -- structurally one bump per ended attempt, so
-    the historic double-increment cannot recur); ``ConnectionSuspect`` ->
-    :class:`ConnectionSuspectEvent`. ``connect`` / ``disconnect`` start / stop the
-    engine; ``stop`` (from :class:`AsyncStoppable`) tears it down permanently.
+    It maps the transport's brand-free events onto the protocol's events:
+    :class:`~simplyprint_ws_client.contrib.connection.events.Connected` ->
+    :class:`ConnectionEstablishedEvent` (``v``); a parsed
+    :class:`~simplyprint_ws_client.contrib.connection.events.MessageReceived` ->
+    :class:`ConnectionIncomingEvent` (``msg``, ``v``);
+    :class:`~simplyprint_ws_client.contrib.connection.events.Disconnected` ->
+    :class:`ConnectionLostEvent` (``v``) **then** ``v += 1`` (the single version-bump
+    site -- structurally one bump per ended attempt, so the historic
+    double-increment cannot recur). A run of failed attempts (a ``Disconnected`` that
+    carried an error code) raises :class:`ConnectionSuspectEvent` every Nth.
+    ``connect`` / ``disconnect`` start / stop the transport; ``stop`` (from
+    :class:`AsyncStoppable`) tears it down permanently.
 
     Attributes:
         v: Connection generation, incremented on every ended attempt to invalidate
             messages targeted at a since-dropped link.
-        transport: The live underlying socket (published by the engine's link,
+        backend: The live underlying connection (published by the transport,
             ``None`` while down) -- what ``send`` / ``connected`` read.
         hint: Connection hint from which the URL is derived.
     """
 
     v: int
-    transport: Optional[WebSocket]
-    transport_factory: WebSocketFactory
+    backend: Optional[BackendTransport]
+    backend_factory: BackendFactory
     hint: ConnectionHint
     logger: logging.Logger
 
     event_bus: EventBus[ConnectionEvent]
 
-    _engine: Optional[ReconnectingTransport]
+    _transport: Optional[ServerTransport]
 
     def __init__(
         self,
-        transport_factory: WebSocketFactory = WebsocketsImpl,
+        backend_factory: BackendFactory = WebsocketsBackend,
         hint: Optional[ConnectionHint] = None,
         logger: logging.Logger = logging.getLogger("ws"),
         **kwargs,
@@ -192,41 +242,19 @@ class Connection(
         EventLoopProvider.__init__(self, **kwargs)
 
         self.v = 0
-        self.transport = None
-        self.transport_factory = transport_factory
+        self.backend = None
+        self.backend_factory = backend_factory
         self.hint = hint or ConnectionHint()
         self.logger = logger
 
         self.event_bus = EventBus[ConnectionEvent]()
         self.event_bus.on(ConnectionOutgoingEvent, self.send)
 
-        # Lifetime/message events used to go out via `event_bus.emit_task`, which
-        # allocates a concurrent.futures.Future per event even though these run on
-        # the loop already. The courier delivers them with the same ordered,
-        # deferred, single-loop semantics -- no per-event Future, coalesced
-        # wakeups -- reusing the bus's own loop provider so resolution is
-        # identical. UNBOUNDED: dropping a lifetime event would desync `v`.
-        self._event_courier: Courier = Courier(
-            sink=self._emit_event,
-            is_async_sink=True,
-            provider=self.event_bus.event_loop_provider,
-            policy=OverflowPolicy.UNBOUNDED,
-        )
+        # Tracks runs of failed connection attempts so a stuck endpoint raises a
+        # periodic ConnectionSuspectEvent (every Nth failure); reset on a connect.
+        self._suspect = WsSuspectConnectionBoundedInterval.create_variable(0)
 
-        self._engine = None
-
-    async def _emit_event(self, item) -> None:
-        """Courier sink: re-emit one ``(event, args)`` on the event bus, in order."""
-        event, args = item
-        await self.event_bus.emit(event, *args)
-
-    def _post(self, event: object, *args: object) -> None:
-        """Queue a lifetime/message event for ordered delivery on the loop.
-
-        Drop-in for the old ``event_bus.emit_task(event, *args)`` at every site,
-        but coalesced and without a per-event future.
-        """
-        self._event_courier.post((event, args))
+        self._transport = None
 
     def __hash__(self):
         return hash(id(self))
@@ -249,7 +277,7 @@ class Connection(
     def connected(self):
         """This has nothing to do with our `Connection` state and everything to do
         with the real, physical underlying connection state."""
-        return self.transport is not None and self.transport.is_open
+        return self.backend is not None and self.backend.is_open
 
     @property
     def running(self):
@@ -259,44 +287,42 @@ class Connection(
 
     @property
     def loop_task(self) -> Optional[asyncio.Task]:
-        """The engine's supervision task, while running -- the handle the scheduler
+        """The transport's supervision task, while running -- the handle the scheduler
         awaits at teardown. ``None`` before the first ``connect`` / after ``stop``."""
-        return self._engine.task if self._engine is not None else None
+        return self._transport.task if self._transport is not None else None
 
-    def _build_engine(self) -> ReconnectingTransport:
-        """Build (once) the reconnection engine and wire its events to ours.
+    def _build_transport(self) -> ServerTransport:
+        """Build (once) the reconnecting transport and wire its events to ours.
 
         Built lazily on first ``connect`` so module-level knobs
         (``WsFirstMessageTimeout``) are read at connect time, the way the previous
         loop read them -- which is what the patch-based tests rely on.
         """
-        engine: ReconnectingTransport = ReconnectingTransport(
-            str(self.url),
-            lambda: _ServerLink(self),
-            logger=self.logger,
-            backoff=ConstantBackoff(),
-            suspect_after=WsSuspectConnectionBoundedInterval,
-            first_message_timeout=WsFirstMessageTimeout,
-        )
-        engine.events.on(Connected, self._on_connected)
-        engine.events.on(Disconnected, self._on_disconnected)
-        engine.events.on(MessageReceived, self._on_message)
-        engine.events.on(ConnectionSuspect, self._on_suspect)
-        return engine
+        transport = ServerTransport(self)
+        transport.events.on(Connected, self._on_connected)
+        transport.events.on(Disconnected, self._on_disconnected)
+        transport.events.on(MessageReceived, self._on_message)
+        return transport
 
-    def _on_connected(self, _event: Connected) -> None:
-        self._post(ConnectionEstablishedEvent(self.v))
+    async def _on_connected(self, _event: Connected) -> None:
+        self._suspect.reset()
+        await self.event_bus.emit(ConnectionEstablishedEvent(self.v))
         self.logger.info("Connected to %s", self.url)
 
-    def _on_disconnected(self, _event: Disconnected) -> None:
+    async def _on_disconnected(self, event: Disconnected) -> None:
         # The single version-bump site: one ended attempt -> one Lost(v) -> v += 1,
         # preserving the Established(g)...Lost(g) pairing the consumer relies on.
         self.logger.debug("Emitting ConnectionLostEvent.")
-        self._post(ConnectionLostEvent(self.v))
+        await self.event_bus.emit(ConnectionLostEvent(self.v))
         self.v += 1
 
-    def _on_message(self, event: MessageReceived) -> None:
-        data = event.payload
+        # An attempt that ended in an error (a dropped/failed socket) feeds the
+        # suspect run; every Nth such failure raises an advisory ConnectionSuspectEvent.
+        if event.code is not None and self._suspect.guard_until_bound():
+            await self.event_bus.emit(ConnectionSuspectEvent, event.code)
+
+    async def _on_message(self, event: MessageReceived) -> None:
+        data = event.message
         if data is None:
             return
         try:
@@ -305,10 +331,7 @@ class Connection(
             self.logger.error("Invalid message: %s", data, exc_info=e)
             return
         self._message_logger(msg).debug("received %s", msg)
-        self._post(ConnectionIncomingEvent, msg, self.v)
-
-    def _on_suspect(self, event: ConnectionSuspect) -> None:
-        self._post(ConnectionSuspectEvent, event.error)
+        await self.event_bus.emit(ConnectionIncomingEvent, msg, self.v)
 
     def _message_logger(self, msg) -> logging.Logger:
         """Route a WS message's log line to the printer it belongs to.
@@ -320,7 +343,7 @@ class Connection(
         global; in SINGLE mode every message belongs to the connection's printer.
         """
         if self.hint.mode == ConnectionMode.MULTI:
-            client_id = getattr(msg, "for_client", None)
+            client_id = msg.for_client
         else:
             client_id = self.hint.config.unique_id
         if client_id:
@@ -350,7 +373,7 @@ class Connection(
 
         try:
             data = msg.model_dump_json()
-            await self.transport.send(data)
+            await self.backend.send(data)
             self._message_logger(msg).debug(
                 "sent %s", data if len(data) < 1024 else msg.msg_type()
             )
@@ -360,14 +383,14 @@ class Connection(
             self.logger.error("Serialization error.", exc_info=e)
 
         except WsConnectionErrors:
-            # The link dropped mid-send; the engine's recv loop sees the same drop
+            # The link dropped mid-send; the transport recv loop sees the same drop
             # and reconnects on its own -- nothing to poke here.
             pass
 
     async def connect(self, hint: Optional[ConnectionHint] = None):
-        """Start (or resume) the connection: spin up the reconnection engine.
+        """Start (or resume) the reconnecting transport.
 
-        Idempotent -- ``start`` is a no-op while the engine is already supervising,
+        Idempotent -- ``start`` is a no-op while the transport is already supervising,
         and re-creates the task after a ``disconnect`` (the resume path).
         """
         self.hint = hint or self.hint
@@ -375,20 +398,26 @@ class Connection(
         if self.is_stopped():
             return
 
-        if self._engine is None:
-            self._engine = self._build_engine()
+        if self._transport is None:
+            self._transport = self._build_transport()
 
-        self._engine.start()
+        self._transport.start()
 
     async def disconnect(self):
-        """Pause (disconnect) the connection: stop the engine, no reconnection
+        """Pause (disconnect) the connection: stop the transport, no reconnection
         attempts until ``connect`` is called again."""
-        if self._engine is not None:
-            self._engine.stop()
+        if self._transport is not None:
+            await self._transport.stop()
 
     def stop(self):
-        """Permanently tear the connection down and drain pending events."""
+        """Permanently tear the connection down."""
         super().stop()
-        if self._engine is not None:
-            self._engine.stop()
-        self._event_courier.close(drain=True)
+        if self._transport is not None:
+            # Sync teardown: flag stopped and cancel the supervision task without
+            # awaiting (the async stop() is for the disconnect path). The transport's
+            # own finally settles the public state to DISCONNECTED.
+            self._transport.stopped = True
+            task = self._transport.task
+            self._transport.task = None
+            if task is not None and not task.done():
+                task.cancel()

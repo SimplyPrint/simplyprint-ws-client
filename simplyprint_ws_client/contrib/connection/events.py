@@ -1,74 +1,66 @@
-"""The transport event vocabulary -- the single language every wire speaks.
+"""The connection event vocabulary -- the single language every wire speaks.
 
-A transport (sync or async, MQTT or WebSocket) publishes these on its event bus;
-a consumer subscribes and never learns which wire produced them. That uniformity
-is what lets a brand sit on a threaded paho link or an async WebSocket link
-unchanged. They are frozen dataclasses keyed by type, so a consumer subscribes
-with ``bus.on(Connected, handler)`` and the handler receives the typed instance.
+A transport publishes these on an :class:`~simplyprint_ws_client.events.EventBus`,
+keyed by type, so a consumer subscribes with ``bus.on(Connected, handler)`` and
+the handler receives the typed instance. The same four events flow whether the
+wire underneath is MQTT or WebSocket, sync or async -- a consumer that only
+listens never learns which it got.
+
+Every event carries the :attr:`~ConnectionEvent.generation` it belongs to: a
+monotonic epoch that the transport bumps once per established attempt. A consumer
+compares it to discard work queued against a link that has since dropped.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
-
-__all__ = [
-    "TransportEvent",
-    "Connected",
-    "Disconnected",
-    "MessageReceived",
-    "ConnectionSuspect",
-    "StateChanged",
-]
+from simplyprint_ws_client.events import Event
 
 
-@dataclass(frozen=True)
-class TransportEvent:
-    """Base of every event a transport publishes on its ``events`` bus."""
+@dataclass(frozen=True, eq=False)
+class ConnectionEvent(Event):
+    """Base of every event a transport publishes."""
+
+    generation: int
 
 
-@dataclass(frozen=True)
-class Connected(TransportEvent):
-    """The link is up (first connect or a recovery)."""
+@dataclass(frozen=True, eq=False)
+class Connecting(ConnectionEvent):
+    """The transport began reaching for the endpoint (first try or a recovery)."""
 
 
-@dataclass(frozen=True)
-class Disconnected(TransportEvent):
-    """The link went down.
+@dataclass(frozen=True, eq=False)
+class Connected(ConnectionEvent):
+    """A live wire is up and able to carry messages.
 
-    ``transient`` marks a drop the transport is already recovering from on its
-    own -- a consumer can tolerate it until the failures pile up, rather than
-    treating every blip as a hard disconnect.
+    Its :attr:`generation` is the epoch the wire just entered -- the value
+    subsequent :class:`MessageReceived` events for this link will carry.
     """
 
-    reason: str = ""
-    transient: bool = False
 
+@dataclass(frozen=True, eq=False)
+class Disconnected(ConnectionEvent):
+    """The live wire went down.
 
-@dataclass(frozen=True)
-class MessageReceived(TransportEvent):
-    """An inbound message.
-
-    ``payload`` is wire-shaped -- text for a WebSocket, the broker message for
-    MQTT. The transport does not parse brand protocol; routing a pooled
-    endpoint's message to the right client is the pool's job.
+    ``code`` is the library-specific reason the attempt ended -- typically the
+    exception raised from the wire (a
+    :class:`~simplyprint_ws_client.contrib.connection.transport.TransientError` or
+    :class:`~simplyprint_ws_client.contrib.connection.transport.FatalError`), or ``None``
+    for a clean teardown. It is informational only: the reconnect loop keeps retrying
+    regardless of what ended the attempt.
     """
 
-    payload: Any
+    code: Optional[object] = None
 
 
-@dataclass(frozen=True)
-class ConnectionSuspect(TransportEvent):
-    """Repeated connect failures: the endpoint may be unreachable. Advisory --
-    the transport keeps retrying regardless."""
+@dataclass(frozen=True, eq=False)
+class MessageReceived(ConnectionEvent):
+    """An inbound wire message, tagged with the generation it arrived on.
 
-    error: Optional[BaseException] = None
+    ``message`` is wire-shaped (a decoded MQTT message, a WebSocket frame); the
+    transport does not parse any brand protocol.
+    """
 
-
-@dataclass(frozen=True)
-class StateChanged(TransportEvent):
-    """The transport's :class:`ConnectionState` changed."""
-
-    state: ConnectionState
+    message: object

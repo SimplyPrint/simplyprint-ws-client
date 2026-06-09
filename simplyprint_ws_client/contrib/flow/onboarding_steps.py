@@ -1,18 +1,21 @@
 """Shared building blocks for add-printer onboarding flows.
 
-The library owns neutral step construction only. Integrations adapt their own
-model catalogues, image URLs, state keys, and address field requirements before
-passing plain :class:`ModelChoice` objects into this module.
+These sit on top of the generic :mod:`~simplyprint_ws_client.contrib.flow` engine:
+they are factories that build add-printer :class:`FieldsStep` s (a model picker, a
+manual-address field). The library owns neutral step construction only --
+integrations adapt their own model catalogues, image URLs, state keys, and address
+field requirements before passing plain :class:`ModelChoice` objects into here.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
-from simplyprint_ws_client.contrib.flow import FieldsStep
 from pydantic import ConfigDict, Field, create_model
+
+from simplyprint_ws_client.contrib.flow.steps import FieldsStep
 
 #: The trailing "I don't know my model" option every picker offers, so a user is
 #: never blocked and an unknown model falls back to the generic guide.
@@ -133,7 +136,7 @@ class ManualAddressStep:
     """Owns a one-field manual address step."""
 
     state_key: str = "host"
-    value_type: Any = IPv4Address | IPv6Address
+    value_type: Any = Union[IPv4Address, IPv6Address]
     step_id: str = "find"
     label: str = "Find your printer"
     field_title: str = "IP address"

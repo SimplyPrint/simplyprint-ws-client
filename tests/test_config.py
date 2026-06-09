@@ -1,11 +1,9 @@
-import hashlib
-from dataclasses import dataclass
+import uuid
 from typing import Optional
 
 from simplyprint_ws_client import PrinterConfig
 
 
-@dataclass
 class _HwConfig(PrinterConfig):
     """A config whose stable hardware id is its serial (test double)."""
 
@@ -35,6 +33,7 @@ def test_config_fields():
         "short_id": None,
         "unique_id": config1.unique_id,
         "public_ip": None,
+        "mac": None,
     }
 
     config1.id = 1
@@ -83,72 +82,34 @@ def test_config_fields():
 
 
 def test_stable_hardware_id_default_is_none():
-    """The base hook has no hardware id; brands override it."""
+    """The base hook has no brand hardware id; brands override it. The neutral
+    ``mac`` fallback is applied by the matching seam, not here."""
     assert PrinterConfig.get_blank().stable_hardware_id() is None
+    assert _HwConfig.get_blank().stable_hardware_id() is None
 
 
-def test_derive_unique_id_is_salted_sha1_of_hardware_id():
-    cfg = _HwConfig.get_blank()
-    cfg.serial = "SN-123"
-
-    expected = hashlib.sha1(b"saltvalue:SN-123").hexdigest()
-    # Pins the exact formula: sha1(salt + ":" + hardware_id).
-    assert cfg.derive_unique_id("saltvalue") == expected
-    # Deterministic for the same (salt, device).
-    assert cfg.derive_unique_id("saltvalue") == expected
-    # Installation-scoped: a different salt derives a different id.
-    assert cfg.derive_unique_id("other-salt") != expected
-    # Device-scoped: a different hardware id derives a different id.
-    cfg.serial = "SN-999"
-    assert cfg.derive_unique_id("saltvalue") != expected
-
-
-def test_derive_unique_id_is_none_without_hardware_id():
-    assert _HwConfig.get_blank().derive_unique_id("salt") is None
-    assert PrinterConfig.get_blank().derive_unique_id("salt") is None
-
-
-def test_ensure_unique_id_prefers_derived_while_pending():
-    cfg = _HwConfig.get_blank()
-    cfg.serial = "SN-123"
-
-    assigned = cfg.ensure_unique_id("salt")
-    assert assigned == hashlib.sha1(b"salt:SN-123").hexdigest()
-    assert cfg.unique_id == assigned
-
-
-def test_ensure_unique_id_replaces_placeholder_while_pending():
-    # get_new mints a random placeholder; while the printer is still in setup
-    # (id == 0) the seam swaps it for the stable hardware-derived id.
+def test_get_new_mints_a_stable_unique_id_uuid():
+    # unique_id is the slot reference: a proper UUID, minted once at creation and
+    # then stable (it is stored, not re-derived). get_blank leaves it unset so an
+    # empty placeholder config stays empty.
     cfg = _HwConfig.get_new()
-    placeholder = cfg.unique_id
-    assert placeholder
-    cfg.serial = "SN-123"
-
-    derived = cfg.ensure_unique_id("salt")
-    assert derived == hashlib.sha1(b"salt:SN-123").hexdigest()
-    assert derived != placeholder
+    assert uuid.UUID(cfg.unique_id)  # a valid UUID
+    assert cfg.unique_id == cfg.unique_id  # stable
+    assert PrinterConfig.get_blank().unique_id is None
 
 
-def test_ensure_unique_id_never_rekeys_a_registered_printer():
-    cfg = _HwConfig.get_new()
-    cfg.serial = "SN-123"
-    cfg.id = 42  # backend-assigned -> registered, no longer pending
-
-    existing = cfg.unique_id
-    # Even with a stable hardware id available, a registered printer keeps its
-    # id (re-keying would orphan backend correlation and logs).
-    assert cfg.ensure_unique_id("salt") == existing
-    assert cfg.unique_id == existing
+def test_unique_id_is_independent_of_the_hardware_id():
+    # Two printers that happen to share a serial still get distinct slot ids
+    # (the slot id is not derived from the hardware id).
+    a, b = _HwConfig.get_new(), _HwConfig.get_new()
+    a.serial = b.serial = "SN-123"
+    assert a.unique_id != b.unique_id
 
 
-def test_ensure_unique_id_falls_back_to_random_without_hardware_id():
+def test_mac_is_the_neutral_hardware_fallback_field():
+    # The MAC is stored separately from the slot id, for matching a re-discovered
+    # device when the brand exposes no serial/guid.
     cfg = PrinterConfig.get_blank()
-    assert cfg.unique_id is None
-
-    assigned = cfg.ensure_unique_id("salt")
-    assert assigned and assigned == cfg.unique_id
-    # No hardware id to derive from, so the assigned id is a random fallback.
-    assert cfg.derive_unique_id("salt") is None
-    # Idempotent while pending with no hardware id: it keeps the random id.
-    assert cfg.ensure_unique_id("salt") == assigned
+    assert cfg.mac is None
+    cfg.mac = "aa:bb:cc:dd:ee:ff"
+    assert cfg.as_dict()["mac"] == "aa:bb:cc:dd:ee:ff"

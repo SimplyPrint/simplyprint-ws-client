@@ -1,11 +1,11 @@
 __all__ = ["Config", "PrinterConfig"]
 
-import hashlib
 import json
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, fields
 from typing import Optional, Tuple
+
+from pydantic import BaseModel
 
 try:
     from typing import Self
@@ -103,43 +103,42 @@ class Config(ABC):
         raise NotImplementedError()
 
 
-@dataclass
-class PrinterConfig(Config):
-    """
-    Configuration object for printers.
+class PrinterConfig(BaseModel, Config):
+    """Configuration object for printers (a pydantic model).
+
+    Every concrete config is a pydantic model: brands subclass this directly and
+    add their own fields. (``id``/``token`` stay nullable: a not-yet-keyed config
+    legitimately carries ``None`` for them.)
     """
 
-    id: int
-    token: str
+    id: Optional[int]
+    token: Optional[str]
 
     name: Optional[str] = None
     in_setup: Optional[bool] = None
     short_id: Optional[str] = None
     public_ip: Optional[str] = None
     unique_id: Optional[str] = None
+    #: The device's MAC address, captured at onboarding when the brand exposes no
+    #: serial/guid. A neutral, stable hardware identifier (separate from the slot's
+    #: ``unique_id``) so a re-discovered printer can be matched to its config by
+    #: MAC -- see ``stable_hardware_id``.
+    mac: Optional[str] = None
 
     @staticmethod
     def keys() -> tuple:
         return "id", "token"
 
     def is_empty(self) -> bool:
-        data = self.as_dict()
-        data = {k: v for k, v in data.items() if v is not None}
-
+        data = {k: v for k, v in self.as_dict().items() if v is not None}
         return self.is_default() and len(set(data.keys()) - {"id", "token"}) == 0
 
     def as_dict(self) -> dict:
-        data = {}
-
-        for field in fields(self):
-            value = getattr(self, field.name)
-            data[field.name] = value
-
-        return data
+        return self.model_dump(mode="json")
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
-        return cls(**data)
+        return cls.model_validate(data)
 
     def is_pending(self) -> bool:
         return self.id == 0 or self.id is None or self.in_setup
@@ -156,50 +155,23 @@ class PrinterConfig(Config):
         return cls(id=0, token="0", unique_id=str(uuid.uuid4()))
 
     # -- Identity ----------------------------------------------------------
-    # A printer's ``unique_id`` should be *stable* across re-discovery so the
-    # backend (and discovery's de-dup) can correlate a re-found printer to its
-    # existing config. A bare random id cannot do that. The contract below
-    # lets a brand supply a stable hardware id and derive the unique id from
-    # it; brands without one fall back to a random id.
+    # Two separate identities, on purpose:
+    #   * ``unique_id`` is the *slot* reference -- a stable UUID assigned once and
+    #     never re-keyed. It is the ``client_list`` key and the backend's handle,
+    #     and it survives both an IP change and a physical-printer swap.
+    #   * ``stable_hardware_id`` is the *device* identity (serial/guid/MAC) used
+    #     only to correlate a re-discovered physical printer back to its slot.
+    # Keeping them apart means swapping the printer in a slot keeps the slot's id,
+    # while re-discovery still finds the right slot by hardware identity.
 
     def stable_hardware_id(self) -> Optional[str]:
-        """A brand-stable hardware identifier for this printer, or ``None``.
+        """The brand's own immutable device id for this printer, or ``None``.
 
-        Override per brand to return the device's own immutable id (serial,
-        board uniqueId, system guid, ...). The default has none, so identity
-        falls back to a random id. This is *hardware* identity, never a
-        credential (access codes / auth keys are not identity).
+        Override per brand to return the device's hardware id (serial, board
+        uniqueId, system guid, ...). When a brand has none, the neutral
+        :attr:`mac` -- captured at onboarding -- is the fallback the matching seam
+        applies, so a re-discovered device is still found without a serial. This
+        is *hardware* identity for correlation -- never a credential (access codes
+        / auth keys are not identity) and never the ``unique_id`` slot ref.
         """
         return None
-
-    def derive_unique_id(self, salt: str) -> Optional[str]:
-        """Derive an installation-scoped unique id from the hardware id.
-
-        ``sha1(salt + ":" + hardware_id)`` -- deterministic for a given
-        (installation salt, device), so re-discovering the same printer
-        derives the same id and discovery correlates it to its config. The
-        salt keeps the id installation-scoped (the same physical device on two
-        connectors derives different ids, so they never collide). Returns
-        ``None`` when the device exposes no stable hardware id.
-        """
-        hardware_id = self.stable_hardware_id()
-        if not hardware_id:
-            return None
-        return hashlib.sha1(f"{salt}:{hardware_id}".encode("utf-8")).hexdigest()
-
-    def ensure_unique_id(self, salt: str) -> str:
-        """Assign and return ``unique_id``, called once at the persist seam.
-
-        While a printer is still in setup (no backend id yet) it prefers a
-        stable hardware-derived id so the backend can correlate it across
-        re-discovery, replacing any placeholder id minted at config creation.
-        A registered printer (past setup, real id) is *never* re-keyed --
-        re-keying would orphan backend correlation and logs. Falls back to a
-        random id only when the device exposes no stable hardware id.
-        """
-        if self.unique_id and not self.is_pending():
-            return self.unique_id
-        self.unique_id = (
-            self.derive_unique_id(salt) or self.unique_id or str(uuid.uuid4())
-        )
-        return self.unique_id
