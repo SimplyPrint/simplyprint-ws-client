@@ -10,12 +10,14 @@ Useful knobs::
     .venv/bin/python scripts/bench_conn.py --topics 2000 --transports 20 --topic-messages 200000
     .venv/bin/python scripts/bench_conn.py --json
 
-The benchmark uses only fake in-process transports. It measures:
+The default benchmark uses fake in-process transports. Opt-in flags add real
+loopback WebSocket and caller-provided MQTT broker scenarios. It measures:
 
 * end-to-end connection delivery throughput, CPU time, and tracemalloc peak;
 * complete message-event processing through sync and async handlers;
 * paho-style producer-thread event delivery through Courier + transport fanout;
 * MQTT-style topic routing across 1000+ topics over many pooled transports;
+* flaky pooled transports that disconnect/reconnect while messages are routed;
 * sheddable ``AT_MOST_ONCE`` delivery under a slow consumer;
 * lossless ``AT_LEAST_ONCE`` delivery under the same slow consumer;
 * direct ``Courier`` ``BLOCK`` backpressure cost from a producer thread.
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import gc
 import json
 import sys
@@ -42,15 +45,26 @@ import yarl
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.shared.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
 
+from simplyprint_ws_client.contrib.connection import mqtt, ws
 from simplyprint_ws_client.contrib.connection.connection import Connection
 from simplyprint_ws_client.contrib.connection.connection import MqttConnection
 from simplyprint_ws_client.contrib.connection.events import (
+    Connected,
+    Connecting,
     ConnectionEvent,
+    Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.messages import MqttMessage, QoS, WsMessage
+from simplyprint_ws_client.contrib.connection.errors import TransportError
+from simplyprint_ws_client.contrib.connection.messages import (
+    MqttMessage,
+    QoS,
+    WsMessage,
+)
 from simplyprint_ws_client.contrib.connection.mqtt import mqtt_message_route
+from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.pool import Pool
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 from simplyprint_ws_client.contrib.connection.transport import (
@@ -66,6 +80,10 @@ DEFAULT_BLOCK_MESSAGES = 10_000
 DEFAULT_TOPICS = 1_000
 DEFAULT_TRANSPORTS = 10
 DEFAULT_TOPIC_MESSAGES = 100_000
+DEFAULT_FLAKY_MESSAGES = 100_000
+DEFAULT_FLAKY_INTERVAL = 1_000
+DEFAULT_ACTUAL_WS_MESSAGES = 20_000
+DEFAULT_ACTUAL_MQTT_MESSAGES = 20_000
 
 
 @dataclass(frozen=True)
@@ -154,6 +172,87 @@ class FakeMqttTransport(MqttTransport):
     async def push(self, message: MqttMessage) -> None:
         await self.events.emit(MessageReceived(self.generation, message, message.qos))
 
+    async def cycle(self) -> None:
+        previous_generation = self.generation
+        self.live = False
+        self.state = ConnectionState.DISCONNECTED
+        await self.events.emit(
+            Disconnected(
+                previous_generation,
+                TransportError("flaky benchmark drop", code="benchmark_drop"),
+            )
+        )
+
+        self.generation += 1
+        self.state = ConnectionState.CONNECTING
+        await self.events.emit(Connecting(self.generation))
+
+        self.live = True
+        self.state = ConnectionState.CONNECTED
+        await self.events.emit(Connected(self.generation))
+
+
+class ActualWsServer:
+    """Tiny loopback server for opt-in real WebSocket transport benchmarks."""
+
+    def __init__(self) -> None:
+        self.server = None
+        self.host = "127.0.0.1"
+        self.port = 0
+        self.connections: List = []
+        self.connected = asyncio.Event()
+
+    async def start(self) -> None:
+        from websockets.asyncio.server import serve
+
+        self.server = await serve(self.handler, self.host, 0)
+        sock = next(iter(self.server.sockets))
+        self.port = sock.getsockname()[1]
+
+    @property
+    def url(self) -> yarl.URL:
+        return yarl.URL(f"ws://{self.host}:{self.port}/")
+
+    async def handler(self, connection) -> None:
+        self.connections.append(connection)
+        self.connected.set()
+        try:
+            async for _frame in connection:
+                pass
+        except Exception:  # noqa: BLE001 -- client teardown is normal here
+            pass
+        finally:
+            with contextlib.suppress(ValueError):
+                self.connections.remove(connection)
+
+    async def push(self, payload: str) -> None:
+        connection = await self.current()
+        await connection.send(payload)
+
+    async def drop_current(self) -> None:
+        connection = await self.current()
+        await connection.close(code=1011, reason="flaky benchmark drop")
+
+    async def current(self, timeout: float = 5.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not self.connections:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("no websocket client connected")
+            self.connected.clear()
+            await asyncio.wait_for(self.connected.wait(), remaining)
+        return self.connections[-1]
+
+    async def stop(self) -> None:
+        if self.server is None:
+            return
+        for connection in list(self.connections):
+            with contextlib.suppress(Exception):
+                await connection.close()
+        self.server.close()
+        await self.server.wait_closed()
+        self.server = None
+
 
 def build_pool(transports: List[FakeTransport]) -> Pool[FakeTransport]:
     def build(url: yarl.URL, _params: object) -> FakeTransport:
@@ -229,7 +328,9 @@ async def connection_throughput(total: int) -> Metric:
     tracemalloc.stop()
 
     await close_lease(lease)
-    return metric("connection sync handler processed", total, delivered, 0, wall, cpu, peak)
+    return metric(
+        "connection sync handler processed", total, delivered, 0, wall, cpu, peak
+    )
 
 
 async def connection_async_handler_throughput(total: int) -> Metric:
@@ -375,11 +476,10 @@ async def mqtt_topic_pool_throughput(
         leases.append(lease)
         topics.append(topic)
 
-    messages = [
-        MqttMessage(topic, b"x", qos=QoS.AT_LEAST_ONCE)
-        for topic in topics
+    messages = [MqttMessage(topic, b"x", qos=QoS.AT_LEAST_ONCE) for topic in topics]
+    transport_by_topic = [
+        transports[index % transport_count] for index in range(topic_count)
     ]
-    transport_by_topic = [transports[index % transport_count] for index in range(topic_count)]
 
     gc.collect()
     tracemalloc.start()
@@ -410,6 +510,389 @@ async def mqtt_topic_pool_throughput(
         peak,
         "one lease per topic, routed by topic",
     )
+
+
+async def mqtt_flaky_topic_pool_throughput(
+    total: int,
+    topic_count: int,
+    transport_count: int,
+    interval: int,
+) -> Metric:
+    """Route messages while pooled MQTT transports disconnect and reconnect."""
+    if topic_count <= 0:
+        raise ValueError("topic_count must be positive")
+    if transport_count <= 0:
+        raise ValueError("transport_count must be positive")
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+
+    transports: List[FakeMqttTransport] = []
+    pool = build_mqtt_pool(transports)
+    transport_count = min(transport_count, topic_count)
+    leases: List[MqttConnection] = []
+    topics: List[str] = []
+    lease_counts = [0 for _ in range(transport_count)]
+    processed = 0
+    connecting = 0
+    connected = 0
+    disconnected = 0
+
+    def on_message(_event: MessageReceived) -> None:
+        nonlocal processed
+        processed += 1
+
+    def on_connecting(_event: Connecting) -> None:
+        nonlocal connecting
+        connecting += 1
+
+    def on_connected(_event: Connected) -> None:
+        nonlocal connected
+        connected += 1
+
+    def on_disconnected(_event: Disconnected) -> None:
+        nonlocal disconnected
+        disconnected += 1
+
+    for index in range(topic_count):
+        endpoint = index % transport_count
+        topic = f"bench/flaky/{endpoint}/{index}"
+        lease = pool.connect(yarl.URL(f"mqtt://flaky-broker-{endpoint}/"))
+        if not isinstance(lease, MqttConnection):
+            raise TypeError("mqtt pool did not return an MqttConnection")
+        await lease.subscribe(topic)
+        lease.event_bus.on(MessageReceived, on_message)
+        lease.event_bus.on(Connecting, on_connecting)
+        lease.event_bus.on(Connected, on_connected)
+        lease.event_bus.on(Disconnected, on_disconnected)
+        leases.append(lease)
+        topics.append(topic)
+        lease_counts[endpoint] += 1
+
+    messages = [MqttMessage(topic, b"x", qos=QoS.AT_LEAST_ONCE) for topic in topics]
+    transport_by_topic = [
+        transports[index % transport_count] for index in range(topic_count)
+    ]
+
+    gc.collect()
+    tracemalloc.start()
+    tracemalloc.clear_traces()
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
+
+    cycles = 0
+    expected_lifecycle = 0
+    for index in range(total):
+        topic_index = index % topic_count
+        await transport_by_topic[topic_index].push(messages[topic_index])
+        sent = index + 1
+        if sent < total and sent % interval == 0:
+            await wait_for(lambda: processed == sent, timeout=120.0)
+            transport_index = cycles % transport_count
+            expected_lifecycle += lease_counts[transport_index]
+            await transports[transport_index].cycle()
+            cycles += 1
+
+    await wait_for(lambda: processed == total, timeout=120.0)
+    await wait_for(
+        lambda: connecting == expected_lifecycle
+        and connected == expected_lifecycle
+        and disconnected == expected_lifecycle,
+        timeout=120.0,
+    )
+
+    cpu = time.process_time() - cpu_start
+    wall = time.perf_counter() - wall_start
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    for lease in leases:
+        await close_lease(lease)
+
+    return metric(
+        f"mqtt flaky pool {topic_count:,} topics / {transport_count:,} transports",
+        total,
+        processed,
+        0,
+        wall,
+        cpu,
+        peak,
+        (
+            f"{cycles:,} drops/reconnects, "
+            f"{expected_lifecycle * 3:,} lifecycle handler calls"
+        ),
+    )
+
+
+def fast_retry() -> RetryPolicy:
+    return RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=3)
+
+
+def skipped_metric(name: str, notes: str) -> Metric:
+    return Metric(
+        name=name,
+        messages=0,
+        delivered=0,
+        dropped=0,
+        wall_seconds=0.0,
+        cpu_seconds=0.0,
+        input_per_second=0.0,
+        msg_per_second=0.0,
+        cpu_msg_per_second=0.0,
+        peak_bytes=0,
+        notes=notes,
+    )
+
+
+async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
+    """Measure a real ws:// loopback through the public ws.connect front door."""
+    server = ActualWsServer()
+    lease = None
+    pool = None
+    try:
+        await server.start()
+    except ImportError as error:
+        return skipped_metric(f"actual websocket {impl}", f"skipped: {error}")
+
+    try:
+        provider = EventLoopProvider(loop=asyncio.get_running_loop())
+        pool = ws.build_pool(impl, None, provider)
+        lease = ws.connect(
+            server.url,
+            impl=impl,
+            retry=fast_retry(),
+            pool=pool,
+            provider=provider,
+        )
+        processed = 0
+
+        def handler(_event: MessageReceived) -> None:
+            nonlocal processed
+            processed += 1
+
+        lease.event_bus.on(MessageReceived, handler)
+        if not await lease.ready(timeout=5.0):
+            return skipped_metric(
+                f"actual websocket {impl}",
+                "skipped: connection did not become ready",
+            )
+
+        gc.collect()
+        tracemalloc.start()
+        tracemalloc.clear_traces()
+        wall_start = time.perf_counter()
+        cpu_start = time.process_time()
+
+        for _ in range(total):
+            await server.push("x")
+        await wait_for(lambda: processed == total, timeout=120.0)
+
+        cpu = time.process_time() - cpu_start
+        wall = time.perf_counter() - wall_start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        return metric(
+            f"actual websocket {impl}",
+            total,
+            processed,
+            0,
+            wall,
+            cpu,
+            peak,
+            "real loopback server push through ws.connect",
+        )
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        if lease is not None:
+            await close_lease(lease)
+        if pool is not None:
+            pool.stop()
+        await server.stop()
+
+
+async def actual_ws_flaky_loopback_throughput(
+    total: int,
+    impl: str,
+    interval: int,
+) -> Metric:
+    """Measure real WebSocket reconnect churn through the public front door."""
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+
+    server = ActualWsServer()
+    lease = None
+    pool = None
+    try:
+        await server.start()
+    except ImportError as error:
+        return skipped_metric(f"actual websocket flaky {impl}", f"skipped: {error}")
+
+    try:
+        provider = EventLoopProvider(loop=asyncio.get_running_loop())
+        pool = ws.build_pool(impl, None, provider)
+        lease = ws.connect(
+            server.url,
+            impl=impl,
+            retry=fast_retry(),
+            pool=pool,
+            provider=provider,
+        )
+        processed = 0
+        connected = 0
+        disconnected = 0
+
+        def on_message(_event: MessageReceived) -> None:
+            nonlocal processed
+            processed += 1
+
+        def on_connected(_event: Connected) -> None:
+            nonlocal connected
+            connected += 1
+
+        def on_disconnected(_event: Disconnected) -> None:
+            nonlocal disconnected
+            disconnected += 1
+
+        lease.event_bus.on(MessageReceived, on_message)
+        lease.event_bus.on(Connected, on_connected)
+        lease.event_bus.on(Disconnected, on_disconnected)
+        if not await lease.ready(timeout=5.0):
+            return skipped_metric(
+                f"actual websocket flaky {impl}",
+                "skipped: connection did not become ready",
+            )
+
+        connected_before = connected
+        disconnected_before = disconnected
+        gc.collect()
+        tracemalloc.start()
+        tracemalloc.clear_traces()
+        wall_start = time.perf_counter()
+        cpu_start = time.process_time()
+
+        sent = 0
+        cycles = 0
+        while sent < total:
+            batch = min(interval, total - sent)
+            for _ in range(batch):
+                await server.push("x")
+            sent += batch
+            await wait_for(lambda: processed == sent, timeout=120.0)
+            if sent < total:
+                old_generation = lease.generation
+                await server.drop_current()
+                cycles += 1
+                await wait_for(
+                    lambda: lease.connected and lease.generation > old_generation,
+                    timeout=10.0,
+                )
+                await server.current()
+
+        await wait_for(lambda: processed == total, timeout=120.0)
+        await wait_for(
+            lambda: connected - connected_before >= cycles
+            and disconnected - disconnected_before >= cycles,
+            timeout=120.0,
+        )
+
+        cpu = time.process_time() - cpu_start
+        wall = time.perf_counter() - wall_start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        return metric(
+            f"actual websocket flaky {impl}",
+            total,
+            processed,
+            0,
+            wall,
+            cpu,
+            peak,
+            f"{cycles:,} server-side drops and reconnects",
+        )
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        if lease is not None:
+            await close_lease(lease)
+        if pool is not None:
+            pool.stop()
+        await server.stop()
+
+
+async def actual_mqtt_broker_throughput(
+    total: int,
+    url: str,
+    impl: str,
+    topic: Optional[str],
+) -> Metric:
+    """Measure a real broker only when the caller provides one explicitly."""
+    parsed = yarl.URL(url)
+    benchmark_topic = topic or f"simplyprint/bench/{time.monotonic_ns()}"
+    lease = None
+    pool = None
+    try:
+        provider = EventLoopProvider(loop=asyncio.get_running_loop())
+        retry = fast_retry()
+        pool = mqtt.build_pool(impl, retry, None, provider)
+        lease = mqtt.connect(
+            parsed,
+            impl=impl,
+            retry=retry,
+            pool=pool,
+            provider=provider,
+        )
+        processed = 0
+
+        def handler(_event: MessageReceived) -> None:
+            nonlocal processed
+            processed += 1
+
+        lease.event_bus.on(MessageReceived, handler)
+        if not await lease.ready(timeout=5.0):
+            return skipped_metric(
+                f"actual mqtt {impl}",
+                "skipped: connection did not become ready",
+            )
+        await lease.subscribe(benchmark_topic)
+
+        message = MqttMessage(benchmark_topic, b"x", qos=QoS.AT_LEAST_ONCE)
+
+        gc.collect()
+        tracemalloc.start()
+        tracemalloc.clear_traces()
+        wall_start = time.perf_counter()
+        cpu_start = time.process_time()
+
+        for _ in range(total):
+            await lease.send(message)
+        await wait_for(lambda: processed == total, timeout=120.0)
+
+        cpu = time.process_time() - cpu_start
+        wall = time.perf_counter() - wall_start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        return metric(
+            f"actual mqtt {impl}",
+            total,
+            processed,
+            0,
+            wall,
+            cpu,
+            peak,
+            f"broker {parsed.host}:{parsed.port or 1883}, topic {benchmark_topic}",
+        )
+    except ImportError as error:
+        return skipped_metric(f"actual mqtt {impl}", f"skipped: {error}")
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        if lease is not None:
+            await close_lease(lease)
+        if pool is not None:
+            pool.stop()
 
 
 async def connection_slow_consumer(total: int, qos: QoS) -> Metric:
@@ -606,9 +1089,47 @@ async def run_benchmarks(args: argparse.Namespace) -> List[Metric]:
             args.transports,
         )
     )
+    metrics.append(
+        await mqtt_flaky_topic_pool_throughput(
+            args.flaky_messages,
+            args.topics,
+            args.transports,
+            args.flaky_interval,
+        )
+    )
     metrics.append(await connection_slow_consumer(args.slow_messages, QoS.AT_MOST_ONCE))
-    metrics.append(await connection_slow_consumer(args.slow_messages, QoS.AT_LEAST_ONCE))
-    metrics.append(await courier_block_backpressure(args.block_messages, args.block_maxsize))
+    metrics.append(
+        await connection_slow_consumer(args.slow_messages, QoS.AT_LEAST_ONCE)
+    )
+    metrics.append(
+        await courier_block_backpressure(args.block_messages, args.block_maxsize)
+    )
+    if args.actual_ws:
+        impls = (
+            ("websockets", "aiohttp")
+            if args.actual_ws_impl == "both"
+            else (args.actual_ws_impl,)
+        )
+        for impl in impls:
+            metrics.append(
+                await actual_ws_loopback_throughput(args.actual_ws_messages, impl)
+            )
+            metrics.append(
+                await actual_ws_flaky_loopback_throughput(
+                    args.actual_ws_messages,
+                    impl,
+                    args.flaky_interval,
+                )
+            )
+    if args.actual_mqtt_url:
+        metrics.append(
+            await actual_mqtt_broker_throughput(
+                args.actual_mqtt_messages,
+                args.actual_mqtt_url,
+                args.actual_mqtt_impl,
+                args.actual_mqtt_topic,
+            )
+        )
     return metrics
 
 
@@ -621,7 +1142,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topics", type=int, default=DEFAULT_TOPICS)
     parser.add_argument("--transports", type=int, default=DEFAULT_TRANSPORTS)
     parser.add_argument("--topic-messages", type=int, default=DEFAULT_TOPIC_MESSAGES)
-    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument("--flaky-messages", type=int, default=DEFAULT_FLAKY_MESSAGES)
+    parser.add_argument("--flaky-interval", type=int, default=DEFAULT_FLAKY_INTERVAL)
+    parser.add_argument("--actual-ws", action="store_true")
+    parser.add_argument(
+        "--actual-ws-impl",
+        choices=("websockets", "aiohttp", "both"),
+        default="websockets",
+    )
+    parser.add_argument(
+        "--actual-ws-messages", type=int, default=DEFAULT_ACTUAL_WS_MESSAGES
+    )
+    parser.add_argument("--actual-mqtt-url")
+    parser.add_argument(
+        "--actual-mqtt-impl",
+        choices=("aiomqtt", "paho"),
+        default="aiomqtt",
+    )
+    parser.add_argument("--actual-mqtt-topic")
+    parser.add_argument(
+        "--actual-mqtt-messages", type=int, default=DEFAULT_ACTUAL_MQTT_MESSAGES
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="print machine-readable JSON"
+    )
     return parser.parse_args()
 
 
@@ -633,7 +1177,7 @@ def main() -> None:
         return
 
     print(f"connection runtime benchmark (python {sys.version.split()[0]})")
-    print("fake in-process transports; compare relative changes on the same host")
+    print("fake by default; optional real sockets; compare changes on the same host")
     print()
     print_table(metrics)
 

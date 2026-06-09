@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+import simplyprint_ws_client.core.connection_manager as connection_manager_module
 from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.connection_manager import (
@@ -10,7 +11,13 @@ from simplyprint_ws_client.core.connection_manager import (
     ClientView,
 )
 from simplyprint_ws_client.core.ws_protocol.connection import ConnectionMode
-from simplyprint_ws_client.core.ws_protocol.events import ConnectionLostEvent
+from simplyprint_ws_client.core.ws_protocol.events import (
+    ConnectionIncomingEvent,
+    ConnectionLostEvent,
+    ConnectionOutgoingEvent,
+)
+from simplyprint_ws_client.core.ws_protocol.messages import PingMsg
+from simplyprint_ws_client.events import EventBus
 
 
 class _DummyConnection:
@@ -19,6 +26,30 @@ class _DummyConnection:
 
     async def disconnect(self):
         self.disconnect_calls += 1
+
+
+class _RecordingConnection:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.event_bus = EventBus()
+        self.connected = False
+        self.v = 0
+        self.connect_hints = []
+        self.disconnect_calls = 0
+        self.stop_calls = 0
+        self.loop_task = None
+        self.url = "ws://fake"
+        type(self).instances.append(self)
+
+    async def connect(self, hint=None):
+        self.connect_hints.append(hint)
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
 
 
 class _DummyView:
@@ -31,6 +62,22 @@ class _DummyView:
 
     def __len__(self):
         return len(self._clients)
+
+
+def _client_list(count: int):
+    client_list = ClientList()
+    clients = [Client(PrinterConfig.get_new()) for _ in range(count)]
+
+    for client in clients:
+        client_list.add(client)
+
+    return client_list, clients
+
+
+def _fake_connections(monkeypatch):
+    _RecordingConnection.instances = []
+    monkeypatch.setattr(connection_manager_module, "Connection", _RecordingConnection)
+    return _RecordingConnection.instances
 
 
 @pytest.mark.asyncio
@@ -90,6 +137,171 @@ async def test_deallocate_does_not_leave_late_connection_lost_event():
 
     # Regression guard: stale async loss event must not flip us back to CONNECTING.
     assert client.state == ClientState.NOT_CONNECTED
+
+
+def test_manager_rejects_invalid_max_clients_per_connection():
+    with pytest.raises(ValueError):
+        ClientConnectionManager(
+            ConnectionMode.MULTI,
+            ClientList(),
+            max_clients_per_connection=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mode_without_capacity_reuses_one_view(monkeypatch):
+    connections = _fake_connections(monkeypatch)
+    client_list, clients = _client_list(3)
+    manager = ClientConnectionManager(ConnectionMode.MULTI, client_list)
+
+    for client in clients:
+        await manager.allocate(client)
+
+    assert len(manager.views) == 1
+    assert len(connections) == 1
+    assert len(next(iter(manager.views))) == 3
+
+
+@pytest.mark.asyncio
+async def test_multi_mode_capacity_spreads_clients_across_views(monkeypatch):
+    connections = _fake_connections(monkeypatch)
+    client_list, clients = _client_list(5)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI,
+        client_list,
+        max_clients_per_connection=2,
+    )
+
+    for client in clients:
+        await manager.allocate(client)
+
+    assert len(manager.views) == 3
+    assert len(connections) == 3
+    assert sorted(len(view) for view in manager.views) == [1, 2, 2]
+    assert all(len(view) <= 2 for view in manager.views)
+    assert all(
+        hint.mode is ConnectionMode.MULTI
+        for connection in connections
+        for hint in connection.connect_hints
+    )
+
+
+@pytest.mark.asyncio
+async def test_deallocate_removes_empty_view(monkeypatch):
+    connections = _fake_connections(monkeypatch)
+    client_list, clients = _client_list(2)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI,
+        client_list,
+        max_clients_per_connection=1,
+    )
+
+    await manager.allocate(clients[0])
+    first_connection = manager.get_connection_for_client(clients[0])
+
+    await manager.deallocate(clients[0])
+
+    assert len(manager.views) == 0
+    assert first_connection.disconnect_calls == 1
+
+    await manager.allocate(clients[1])
+
+    assert len(manager.views) == 1
+    assert len(connections) == 2
+    assert manager.get_connection_for_client(clients[1]) is not first_connection
+
+
+@pytest.mark.asyncio
+async def test_multi_mode_reuses_partially_free_view(monkeypatch):
+    connections = _fake_connections(monkeypatch)
+    client_list, clients = _client_list(3)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI,
+        client_list,
+        max_clients_per_connection=2,
+    )
+
+    await manager.allocate(clients[0])
+    await manager.allocate(clients[1])
+    first_connection = manager.get_connection_for_client(clients[0])
+
+    await manager.deallocate(clients[0])
+    await manager.allocate(clients[2])
+
+    assert len(manager.views) == 1
+    assert len(connections) == 1
+    assert manager.get_connection_for_client(clients[2]) is first_connection
+    assert sorted(len(view) for view in manager.views) == [2]
+
+
+@pytest.mark.asyncio
+async def test_multi_mode_outgoing_messages_use_assigned_connection(monkeypatch):
+    _fake_connections(monkeypatch)
+    client_list, clients = _client_list(2)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI,
+        client_list,
+        max_clients_per_connection=1,
+    )
+
+    for client in clients:
+        await manager.allocate(client)
+
+    sent_by_connection = {}
+    for connection in manager.connections:
+        sent_by_connection[connection] = []
+        connection.event_bus.on(
+            ConnectionOutgoingEvent,
+            lambda msg, _v, connection=connection: sent_by_connection[
+                connection
+            ].append(msg.for_client),
+        )
+
+    await clients[0].send(PingMsg())
+    await clients[1].send(PingMsg())
+
+    first_connection = manager.get_connection_for_client(clients[0])
+    second_connection = manager.get_connection_for_client(clients[1])
+    assert sent_by_connection[first_connection] == [clients[0].unique_id]
+    assert sent_by_connection[second_connection] == [clients[1].unique_id]
+
+
+@pytest.mark.asyncio
+async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
+    monkeypatch,
+):
+    _fake_connections(monkeypatch)
+    client_list, clients = _client_list(2)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI,
+        client_list,
+        max_clients_per_connection=1,
+    )
+
+    for client in clients:
+        await manager.allocate(client)
+
+    received = {client.unique_id: [] for client in clients}
+    for client in clients:
+        client.event_bus.on(
+            ConnectionIncomingEvent,
+            lambda msg, _v, client=client: received[client.unique_id].append(
+                msg.for_client
+            ),
+            priority=100,
+        )
+
+    first_connection = manager.get_connection_for_client(clients[0])
+    stray = PingMsg()
+    stray.for_client = clients[1].unique_id
+    await first_connection.event_bus.emit(ConnectionIncomingEvent, stray, 0)
+
+    targeted = PingMsg()
+    targeted.for_client = clients[0].unique_id
+    await first_connection.event_bus.emit(ConnectionIncomingEvent, targeted, 0)
+
+    assert received[clients[0].unique_id] == [clients[0].unique_id]
+    assert received[clients[1].unique_id] == []
 
 
 @pytest.mark.asyncio

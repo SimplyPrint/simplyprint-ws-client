@@ -57,6 +57,7 @@ class ClientSettings:
     development: bool = False
     config_manager_t: ConfigManagerType = ConfigManagerType.MEMORY
     allow_setup: bool = True
+    max_clients_per_connection: Optional[int] = None
     tick_rate = 1.0
     reconnect_timeout = 5.0
     sentry_dsn: Optional[str] = None

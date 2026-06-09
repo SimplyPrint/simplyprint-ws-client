@@ -140,6 +140,58 @@ async def test_chained_event_bus():
 
 
 @pytest.mark.asyncio
+async def test_event_bus_fast_path_preserves_priority_order():
+    event_bus = EventBus()
+    calls = []
+
+    event_bus.on(CustomEvent, lambda _event: calls.append("low"), priority=0)
+    event_bus.on(CustomEvent, lambda _event: calls.append("high"), priority=10)
+
+    await event_bus.emit(CustomEvent())
+
+    assert calls == ["high", "low"]
+
+
+@pytest.mark.asyncio
+async def test_event_bus_fast_path_preserves_return_chaining():
+    event_bus = EventBus()
+    got = []
+
+    def first(_event: CustomEvent):
+        return "next"
+
+    async def second(event: CustomEvent, value: str):
+        got.append((event.get_name(), value))
+
+    event_bus.on(CustomEvent, first, priority=10)
+    event_bus.on(CustomEvent, second, priority=0)
+
+    await event_bus.emit(CustomEvent())
+
+    assert got == [("custom", "next")]
+
+
+@pytest.mark.asyncio
+async def test_event_bus_fast_path_preserves_stop_event():
+    event_bus = EventBus()
+    calls = []
+
+    def first(event: CustomEvent):
+        calls.append("first")
+        event.stop_event()
+
+    def second(_event: CustomEvent):
+        calls.append("second")
+
+    event_bus.on(CustomEvent, first, priority=10)
+    event_bus.on(CustomEvent, second, priority=0)
+
+    await event_bus.emit(CustomEvent())
+
+    assert calls == ["first"]
+
+
+@pytest.mark.asyncio
 async def test_one_shot_listener():
     event_bus = EventBus()
     called = 0

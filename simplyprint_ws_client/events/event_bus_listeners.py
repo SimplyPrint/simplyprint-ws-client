@@ -137,14 +137,18 @@ class EventBusListener:
 
 
 class EventBusListeners(Iterable[EventBusListener]):
-    __slots__ = ("listeners", "sync_only")
+    __slots__ = ("listeners", "sync_only", "_ordered", "_fast_emit")
 
     listeners: List[Tuple[int, EventBusListener]]
     sync_only: bool
+    _ordered: Optional[List[EventBusListener]]
+    _fast_emit: Optional[bool]
 
     def __init__(self, sync_only=False) -> None:
         self.listeners = []
         self.sync_only = sync_only
+        self._ordered = None
+        self._fast_emit = None
 
     def add(
         self, listener: Callable, **kwargs: Unpack[EventBusListenerOptions]
@@ -175,11 +179,13 @@ class EventBusListeners(Iterable[EventBusListener]):
             raise ValueError("Listener marked as sync only but is async.")
 
         heapq.heappush(self.listeners, (priority, listener))
+        self._invalidate()
 
     def remove(self, listener: Callable) -> None:
         for i, (_, reg_listener) in reversed(list(enumerate(self.listeners))):
             if reg_listener == listener:
                 self.listeners.pop(i)
+                self._invalidate()
                 break
 
     def contains(self, listener: Callable) -> bool:
@@ -191,7 +197,7 @@ class EventBusListeners(Iterable[EventBusListener]):
 
     def __iter__(self) -> Iterator[EventBusListener]:
         """Iterate over listeners in priority order."""
-        for _, listener in heapq.nlargest(len(self.listeners), list(self.listeners)):
+        for listener in self.ordered():
             # Only allow once shot listener to be consumed once.
             if isinstance(listener.lifetime, ListenerLifetimeOnce):
                 self.remove(listener)
@@ -200,3 +206,30 @@ class EventBusListeners(Iterable[EventBusListener]):
 
     def __len__(self) -> int:
         return len(self.listeners)
+
+    def ordered(self) -> List[EventBusListener]:
+        """Listeners in priority order, cached until registration changes."""
+        if self._ordered is None:
+            self._ordered = [
+                listener
+                for _, listener in heapq.nlargest(
+                    len(self.listeners), list(self.listeners)
+                )
+            ]
+        return self._ordered
+
+    def fast_emit_listeners(self) -> Optional[List[EventBusListener]]:
+        """Return the cached listeners if direct dispatch can preserve semantics."""
+        if self._fast_emit is None:
+            self._fast_emit = all(
+                not isinstance(listener.lifetime, ListenerLifetimeOnce)
+                and listener.forward_emitter is None
+                for _, listener in self.listeners
+            )
+        if not self._fast_emit:
+            return None
+        return self.ordered()
+
+    def _invalidate(self) -> None:
+        self._ordered = None
+        self._fast_emit = None

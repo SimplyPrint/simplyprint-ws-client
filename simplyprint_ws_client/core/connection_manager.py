@@ -244,6 +244,7 @@ class ClientConnectionManager(
 
     mode: ConnectionMode
     client_list: ClientList
+    max_clients_per_connection: Optional[int]
     client_views: Dict[TUniqueId, ClientView]
     views: Set[ClientView]
     logger: logging.Logger
@@ -253,14 +254,19 @@ class ClientConnectionManager(
         self,
         mode: ConnectionMode,
         client_list: ClientList,
+        max_clients_per_connection: Optional[int] = None,
         logger: logging.Logger = logging.getLogger("ws_manager"),
         **kwargs,
     ):
         AsyncStoppable.__init__(self, **kwargs)
         EventLoopProvider.__init__(self, **kwargs)
 
+        if max_clients_per_connection is not None and max_clients_per_connection < 1:
+            raise ValueError("max_clients_per_connection must be a positive integer")
+
         self.mode = mode
         self.client_list = client_list
+        self.max_clients_per_connection = max_clients_per_connection
         self.client_views = {}
         self.views = set()
         self.logger = logger
@@ -300,21 +306,9 @@ class ClientConnectionManager(
         if self.is_stopped():
             raise RuntimeError("Cannot allocate connections when stopped.")
 
-        # --- The N:M load-balancing seam (B3, design-only) ---
-        # Today the policy is the two extremes: SINGLE gives every client its own
-        # connection (1:1); MULTI funnels every client onto the one shared socket
-        # (N:1, the branch below). A middle ground -- N clients spread across M
-        # shared sockets -- would slot in *here*, and nowhere else: this method is
-        # the sole connection-selection point, so a strategy ("pick the least-loaded
-        # view, or open a new one past a per-socket client cap") changes only this
-        # return. Nothing downstream assumes one-MULTI-view: ``views`` is already a
-        # set, ``connections`` already maps over all of them, and each view owns its
-        # own ``Connection`` + engine, so M sockets each reconnect independently.
-        # Deliberately not built -- one shared socket is sufficient at current scale,
-        # and a balancer with no measured need is the speculative abstraction we
-        # avoid. The seam is what we keep; the policy is what we'd add.
-        if self.mode == ConnectionMode.MULTI and len(self.views) > 0:
-            return next(iter(self.views))
+        existing = self._select_existing_view()
+        if existing is not None:
+            return existing
 
         # Creating a new connection / client view pair.
         loggerName = "ws"
@@ -356,6 +350,24 @@ class ClientConnectionManager(
         )
 
         return client_view
+
+    def _select_existing_view(self) -> Optional[ClientView]:
+        if self.mode != ConnectionMode.MULTI or not self.views:
+            return None
+
+        if self.max_clients_per_connection is None:
+            candidates = tuple(self.views)
+        else:
+            candidates = tuple(
+                view
+                for view in self.views
+                if len(view) < self.max_clients_per_connection
+            )
+
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda view: (len(view), id(view)))
 
     def _derive_connection_hint(self, client: Client) -> ConnectionHint:
         # Use up-to-date credentials to connect.
@@ -435,6 +447,7 @@ class ClientConnectionManager(
         # Disconnect the connection if no clients are left.
         if len(client_view) == 0:
             await client_view.connection.disconnect()
+            self.views.discard(client_view)
 
     def stop(self):
         super().stop()

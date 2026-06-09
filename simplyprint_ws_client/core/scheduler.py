@@ -56,7 +56,10 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         self.settings = settings
         self.client_list = client_list
         self.manager = ClientConnectionManager(
-            self.settings.mode, self.client_list, provider=self
+            self.settings.mode,
+            self.client_list,
+            max_clients_per_connection=self.settings.max_clients_per_connection,
+            provider=self,
         )
         self.logger = logger
         self._cond = asyncio.Condition()

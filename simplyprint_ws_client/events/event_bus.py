@@ -63,91 +63,11 @@ class _EmitGenerator(Generic[TEvent]):
         self.event_bus = event_bus
         self.listeners = iter(listeners)
         self.event = event
-        self.args = self._initialize_args(self.event, args)
+        self.args = _initialize_args(self.event_bus, self.event, args)
         self.kwargs = kwargs
 
     def update(self, returned_args: Union[Tuple[Any, ...], Any]):
-        self.args = self._update_args(returned_args)
-
-    def _initialize_args(
-        self, event: Union[Hashable, TEvent], args: Tuple[Any, ...]
-    ) -> Tuple[Any, ...]:
-        """If the event is an instance of the event class, pass it as the first argument."""
-        if isinstance(event, self.event_bus.event_klass):
-            return (event,) + args
-
-        return args
-
-    def _update_args(
-        self, returned_args: Union[Tuple[Any, ...], Any, None] = None
-    ) -> Tuple[Any, ...]:
-        """
-        This function transforms the arguments returned by an event listener
-        into the arguments that will be passed to the next listener.
-
-        - If `returned_args` is None, the original arguments will be used.
-        - If `returned_args` is an event of type klass, it will replace the original event.
-        - If `returned_args` is something that is not an event, the original arguments will be replaced.
-        - If `returned_args` is an empty tuple, the original arguments will be replaced.
-        - If `returned_args` is a tuple that includes an event of type klass, it will replace everything.
-
-        Given an event listener function like so:
-
-            def listener(event: Event, *args, **kwargs) -> Event:
-                # Do something with event
-                return event
-
-
-        The returned event will now take precedence over the original event.
-
-        Given an event listener function like so:
-
-            def listener(event: Event, *args, **kwargs) -> Tuple[Event, ...]:
-                # Do something with event and return more arguments
-                return event, ...
-
-
-        Then returned_args will replace the entire argument list.
-        """
-        if returned_args is None:
-            return self.args
-
-        # If the event is an instance of the event class
-        # it is always the first element of args.
-        event_is_first = (
-            isinstance(self.event, self.event_bus.event_klass)
-            and len(self.args) > 0
-            and self.args[0] == self.event
-        )
-
-        if not isinstance(returned_args, tuple):
-            # The listener may return the modified event parameter in
-            # the case the emitted event was of an event class type.
-            # this will replace the event parameter with the modified one.
-            if event_is_first:
-                return (
-                    (returned_args, *self.args[1:])
-                    if isinstance(returned_args, self.event_bus.event_klass)
-                    else (self.event, returned_args)
-                )
-
-            # Otherwise replace the entire argument list with the returned data.
-            return (returned_args,)
-
-        # If we return an empty tuple, we want to replace the entire argument list.
-        if len(returned_args) == 0:
-            return (self.event,) if event_is_first else ()
-
-        # Now we have to handle the case where the listener returns a tuple.
-        if event_is_first:
-            return (
-                returned_args
-                if isinstance(returned_args[0], self.event_bus.event_klass)
-                else (self.event, *returned_args)
-            )
-
-        # As a fallback we just return the returned arguments.
-        return returned_args
+        self.args = _update_args(self.event_bus, self.event, self.args, returned_args)
 
     def __next__(self) -> Tuple[EventBusListener, Tuple[Any, ...], Dict[Any, Any]]:
         if isinstance(self.event, Event) and self.event.is_stopped():
@@ -169,14 +89,71 @@ class _EmitGenerator(Generic[TEvent]):
         return self
 
 
+def _initialize_args(
+    event_bus: "EventBus", event: Union[Hashable, TEvent], args: Tuple[Any, ...]
+) -> Tuple[Any, ...]:
+    """If the event is an instance of the event class, pass it as the first argument."""
+    if isinstance(event, event_bus.event_klass):
+        return (event,) + args
+
+    return args
+
+
+def _update_args(
+    event_bus: "EventBus",
+    event: Union[Hashable, TEvent],
+    args: Tuple[Any, ...],
+    returned_args: Union[Tuple[Any, ...], Any, None] = None,
+) -> Tuple[Any, ...]:
+    """
+    Transform listener return values into arguments for the next listener.
+
+    - If `returned_args` is None, the original arguments will be used.
+    - If `returned_args` is an event of type klass, it will replace the original event.
+    - If `returned_args` is something that is not an event, the original arguments will be replaced.
+    - If `returned_args` is an empty tuple, the original arguments will be replaced.
+    - If `returned_args` is a tuple that includes an event of type klass, it will replace everything.
+    """
+    if returned_args is None:
+        return args
+
+    # If the event is an instance of the event class it is always first in args.
+    event_is_first = (
+        isinstance(event, event_bus.event_klass) and len(args) > 0 and args[0] == event
+    )
+
+    if not isinstance(returned_args, tuple):
+        if event_is_first:
+            return (
+                (returned_args, *args[1:])
+                if isinstance(returned_args, event_bus.event_klass)
+                else (event, returned_args)
+            )
+
+        return (returned_args,)
+
+    if len(returned_args) == 0:
+        return (event,) if event_is_first else ()
+
+    if event_is_first:
+        return (
+            returned_args
+            if isinstance(returned_args[0], event_bus.event_klass)
+            else (event, *returned_args)
+        )
+
+    return returned_args
+
+
 class EventBus(Emitter[TEvent]):
-    __slots__ = ("listeners", "event_klass", "event_loop_provider")
+    __slots__ = ("listeners", "class_listeners", "event_klass", "event_loop_provider")
 
     # Middlewares are global event listeners.
     middleware: Set["EventBusMiddleware"]
 
     # Event specific listeners.
     listeners: Dict[Hashable, EventBusListeners]
+    class_listeners: Dict[int, EventBusListeners]
 
     event_klass: Type[TEvent]
     event_loop_provider: EventLoopProvider[AbstractEventLoop]
@@ -187,6 +164,7 @@ class EventBus(Emitter[TEvent]):
         self.event_loop_provider = event_loop_provider or EventLoopProvider.default()
         self.middleware = set()
         self.listeners = {}
+        self.class_listeners = {}
 
         # Extract the generic type from the class otherwise
         # fallback to the default Event class
@@ -199,9 +177,17 @@ class EventBus(Emitter[TEvent]):
             self.event_klass = Event
 
     async def emit(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        listeners = self._listeners_for(event)
+        listeners = self.class_listeners.get(id(event.__class__))
+        if listeners is None:
+            listeners = self._listeners_for(event)
         if listeners is None and len(self.middleware) == 0:
             return
+
+        if len(self.middleware) == 0 and listeners is not None:
+            fast_listeners = listeners.fast_emit_listeners()
+            if fast_listeners is not None:
+                await self._emit_fast(event, fast_listeners, args, kwargs)
+                return
 
         generator = _EmitGenerator(
             self,
@@ -216,9 +202,17 @@ class EventBus(Emitter[TEvent]):
             generator.update(ret)
 
     def emit_sync(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        listeners = self._listeners_for(event)
+        listeners = self.class_listeners.get(id(event.__class__))
+        if listeners is None:
+            listeners = self._listeners_for(event)
         if listeners is None and len(self.middleware) == 0:
             return
+
+        if len(self.middleware) == 0 and listeners is not None:
+            fast_listeners = listeners.fast_emit_listeners()
+            if fast_listeners is not None:
+                self._emit_sync_fast(event, fast_listeners, args, kwargs)
+                return
 
         # Only invoke non-async functions.
         generator = _EmitGenerator(
@@ -272,6 +266,43 @@ class EventBus(Emitter[TEvent]):
 
         return functools.partial(emit_func, event)
 
+    async def _emit_fast(
+        self,
+        event: Union[Hashable, TEvent],
+        listeners: Iterable[EventBusListener],
+        args: Tuple[Any, ...],
+        kwargs: Dict[Any, Any],
+    ) -> None:
+        nargs = _initialize_args(self, event, args)
+        stop_check = isinstance(event, Event)
+        for listener in listeners:
+            if stop_check and event.is_stopped():
+                return
+            if listener.is_async:
+                ret = await listener.handler(*nargs, **kwargs)
+            else:
+                ret = listener.handler(*nargs, **kwargs)
+            if ret is not None:
+                nargs = _update_args(self, event, nargs, ret)
+
+    def _emit_sync_fast(
+        self,
+        event: Union[Hashable, TEvent],
+        listeners: Iterable[EventBusListener],
+        args: Tuple[Any, ...],
+        kwargs: Dict[Any, Any],
+    ) -> None:
+        nargs = _initialize_args(self, event, args)
+        stop_check = isinstance(event, Event)
+        for listener in listeners:
+            if listener.is_async:
+                continue
+            if stop_check and event.is_stopped():
+                return
+            ret = listener.handler(*nargs, **kwargs)
+            if ret is not None:
+                nargs = _update_args(self, event, nargs, ret)
+
     def on(
         self,
         event_type: Hashable,
@@ -295,11 +326,15 @@ class EventBus(Emitter[TEvent]):
 
         if len(self.listeners[event_type]) == 0:
             self.listeners.pop(event_type)
+            if isinstance(event_type, type) and issubclass(event_type, Event):
+                self.class_listeners.pop(id(event_type), None)
 
     def clear(self, *event_types: Hashable) -> None:
         """Clear all listeners for a given event type."""
         for event_type in event_types:
             self.listeners.pop(event_type, None)
+            if isinstance(event_type, type) and issubclass(event_type, Event):
+                self.class_listeners.pop(id(event_type), None)
 
     @staticmethod
     def _event_key(event: Union[Hashable, TEvent]) -> Hashable:
@@ -307,7 +342,14 @@ class EventBus(Emitter[TEvent]):
             return event.__class__
         return event
 
-    def _listeners_for(self, event: Union[Hashable, TEvent]) -> Optional[EventBusListeners]:
+    def _listeners_for(
+        self, event: Union[Hashable, TEvent]
+    ) -> Optional[EventBusListeners]:
+        if isinstance(event, Event):
+            listeners = self.class_listeners.get(id(event.__class__))
+            if listeners is not None:
+                return listeners
+
         event_key = self._event_key(event)
         listeners = self.listeners.get(event_key)
         if listeners is None and event_key is not event:
@@ -349,6 +391,8 @@ class EventBus(Emitter[TEvent]):
                 if isinstance(event_type, type) and issubclass(event_type, Event)
                 else False
             )
+            if isinstance(event_type, type) and issubclass(event_type, Event):
+                self.class_listeners[id(event_type)] = self.listeners[event_type]
 
         self.listeners[event_type].add(listener, **kwargs)
 
