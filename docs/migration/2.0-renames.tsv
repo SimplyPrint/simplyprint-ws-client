@@ -48,3 +48,9 @@ simplyprint_ws_client.contrib.discovery	simplyprint_ws_client.device.discovery	m
 simplyprint_ws_client.contrib.accounts	simplyprint_ws_client.device.accounts	module	B
 simplyprint_ws_client.contrib.camera	simplyprint_ws_client.device.camera	module	B
 simplyprint_ws_client.shared.camera	simplyprint_ws_client.device.camera	module	B
+simplyprint_ws_client.device.connection.options.ConnectionOptions.with_provider	(removed — use dataclasses.replace)	api	B
+simplyprint_ws_client.device.connection.websocket.as_message	(removed — use common.wire.messages.as_ws_message)	api	B
+simplyprint_ws_client.device.connection.websocket.frame_of	(removed — use common.wire.messages.ws_message_for_payload)	api	B
+simplyprint_ws_client.device.connection.mqtt.default_topic	(removed — unused)	api	B
+connect(retry=/provider=/keepalive=/wire_keepalive=)	connect(options=ConnectionOptions(...))	api	B
+mqtt.connect impl default "aiomqtt"	mqtt.connect impl default "paho"	behavior	B

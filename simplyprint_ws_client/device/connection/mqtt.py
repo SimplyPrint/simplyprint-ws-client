@@ -7,38 +7,41 @@ shares one socket per endpoint through a :class:`~simplyprint_ws_client.device.c
 and hands back a lease already carrying the URL's initial subscriptions.
 
 The two concrete broker wires live in their own modules and are imported here, not
-re-implemented: the async :class:`~simplyprint_ws_client.common.wire.aiomqtt.AioMqtt`
-(one ``async with`` client per attempt, on the shared reconnect loop) and the sync
-:class:`~simplyprint_ws_client.common.wire.paho.Paho` (its own network thread,
-self-healing, events couriered onto the loop). Both speak the exact
+re-implemented: the sync :class:`~simplyprint_ws_client.common.wire.paho.Paho`
+(its own network thread, self-healing, events couriered onto the loop -- the
+default, and what production runs) and the async
+:class:`~simplyprint_ws_client.common.wire.aiomqtt.AioMqtt` (one ``async with``
+client per attempt, on the shared reconnect loop). Both speak the exact
 :class:`~simplyprint_ws_client.common.wire.transport.MqttTransport` contract, so a
 consumer that only listens cannot tell which it got, and both import their wire
 library lazily so importing this module needs neither installed.
+
+Everything beyond ``url``/``impl``/``pool`` is carried by one
+:class:`~simplyprint_ws_client.device.connection.options.ConnectionOptions`.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Dict, Hashable, List, NamedTuple, Optional, Union
+from typing import List, NamedTuple, Optional, Union
 
 import yarl
 
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.wire.aiomqtt import (
     AioMqtt,
     default_aiomqtt_client,
 )
-from simplyprint_ws_client.device.connection.lease import MqttLease
-from simplyprint_ws_client.device.connection.keepalive import Keepalive
 from simplyprint_ws_client.common.wire.messages import MqttMessage
+from simplyprint_ws_client.common.wire.paho import Paho
+from simplyprint_ws_client.common.wire.policy import RetryPolicy
+from simplyprint_ws_client.common.wire.transport import MqttTransport
+from simplyprint_ws_client.device.connection.lease import MqttLease
 from simplyprint_ws_client.device.connection.options import (
     ConnectionOptions,
     WireKeepalive,
 )
-from simplyprint_ws_client.common.wire.paho import Paho
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
 from simplyprint_ws_client.device.connection.pool import Pool
-from simplyprint_ws_client.common.wire.transport import MqttTransport
-from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.device.connection.pools import DefaultPools
 
 __all__ = [
     "MqttMessage",
@@ -50,6 +53,9 @@ __all__ = [
 
 #: yarl knows default ports for ws/wss but not mqtt/mqtts; supply them.
 DEFAULT_PORTS = {"mqtt": 1883, "mqtts": 8883}
+
+#: The two shipped broker wires, by name. ``paho`` is the default.
+SUPPORTED_IMPLS = ("paho", "aiomqtt")
 
 
 class MqttBroker(NamedTuple):
@@ -84,12 +90,6 @@ def initial_topics(url: yarl.URL) -> List[str]:
     return list(url.query.getall("topic", []))
 
 
-def default_topic(url: yarl.URL) -> Optional[str]:
-    """The first ``?topic=`` of a URL -- the topic a bare ``send(bytes)`` uses."""
-    topics = initial_topics(url)
-    return topics[0] if topics else None
-
-
 def build_pool(
     impl: str,
     retry: RetryPolicy,
@@ -100,17 +100,12 @@ def build_pool(
     """The :class:`Pool` to lease from -- the caller's, or a default for ``impl``.
 
     A default pool shares one wire per :class:`MqttBroker` and hands out
-    :class:`MqttLease` leases. ``aiomqtt`` builds the async reconnecting
-    :class:`~simplyprint_ws_client.common.wire.aiomqtt.AioMqtt`; ``paho`` the sync
-    network-thread :class:`~simplyprint_ws_client.common.wire.paho.Paho`.
+    :class:`MqttLease` leases. ``paho`` builds the sync network-thread
+    :class:`~simplyprint_ws_client.common.wire.paho.Paho`; ``aiomqtt`` the async
+    reconnecting :class:`~simplyprint_ws_client.common.wire.aiomqtt.AioMqtt`.
     """
     if pool is not None:
         return pool
-
-    pool_key: Hashable = _pool_key(impl, provider, wire_keepalive)
-    existing = DEFAULT_POOLS.get(pool_key)
-    if existing is not None:
-        return existing
 
     mqtt_keepalive = _mqtt_keepalive_seconds(wire_keepalive)
 
@@ -126,35 +121,33 @@ def build_pool(
                     u, logger, keepalive=mqtt_keepalive
                 ),
             )
-        raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'aiomqtt'/'paho')")
+        raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
 
     def endpoint_key(url: yarl.URL, params: object) -> MqttBroker:
         return params if isinstance(params, MqttBroker) else MqttBroker.from_url(url)
 
-    built: Pool[MqttTransport] = Pool(
-        build=make_transport,
-        key=endpoint_key,
-        route=mqtt_message_route,
-        lease_class=MqttLease,
-        provider=provider,
-    )
-    DEFAULT_POOLS[pool_key] = built
-    return built
+    def make_pool() -> Pool[MqttTransport]:
+        return Pool(
+            build=make_transport,
+            key=endpoint_key,
+            route=mqtt_message_route,
+            lease_class=MqttLease,
+            provider=provider,
+        )
+
+    return DEFAULT_POOLS.get(impl, provider, wire_keepalive, make_pool)
 
 
-#: Process-wide default pools, one per impl, created lazily by :func:`connect`.
-DEFAULT_POOLS: Dict[Hashable, Pool[MqttTransport]] = {}
+#: One default pool per ``impl``, created on first use and torn down by
+#: :func:`shutdown`. A caller that passes its own ``pool`` never touches these.
+DEFAULT_POOLS = DefaultPools()
 
 
 def connect(
     url: Union[str, yarl.URL],
     *,
-    impl: str = "aiomqtt",
-    retry: Optional[RetryPolicy] = None,
+    impl: str = "paho",
     pool: Optional[Pool[MqttTransport]] = None,
-    provider: Optional[EventLoopProvider] = None,
-    keepalive: Optional[Keepalive] = None,
-    wire_keepalive: Optional[WireKeepalive] = None,
     options: Optional[ConnectionOptions] = None,
 ) -> MqttLease:
     """Lease a pooled, self-healing MQTT connection to ``url``.
@@ -165,12 +158,15 @@ def connect(
     subscriptions, and returns at once. Readiness/failure arrive as events on the
     lease's ``event_bus``; ``await conn.ready()`` waits for the first connect.
 
-    ``retry`` defaults to a fresh :class:`RetryPolicy` (retry forever at a constant
-    pace); pass one to cap attempts or set a give-up deadline. Raises
-    :class:`ValueError` on a URL with no host or an unknown ``impl``.
+    ``impl`` selects the broker wire (``"paho"`` default, or ``"aiomqtt"``);
+    everything else (retry policy, loop provider, wire/app keepalive) rides in
+    ``options``. Raises :class:`ValueError` on a URL with no host or an unknown
+    ``impl``.
     """
     url = yarl.URL(url) if isinstance(url, str) else url
-    options = _resolve_options(options, retry, provider, keepalive, wire_keepalive)
+    if impl not in SUPPORTED_IMPLS:
+        raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
+    options = options or ConnectionOptions()
     retry = options.retry or RetryPolicy()
     broker = MqttBroker.from_url(url)
     pool = build_pool(impl, retry, pool, options.provider, options.wire_keepalive)
@@ -178,56 +174,17 @@ def connect(
     lease = pool.connect(url, broker)
     assert isinstance(lease, MqttLease)
 
-    # Apply the URL's initial subscriptions through the lease's own seam. connect
-    # is sync, so the async subscribe runs as a task on the transport's loop; the
-    # interest is recorded on the lease synchronously first, so routing is correct
-    # the instant the link comes up (and re-asserted on every (re)connect).
-    topics = initial_topics(url)
-    if topics:
-        for topic in topics:
-            lease.topics.add(topic)
-            lease.pool.add_route(lease, topic)
-            lease.create_task(lease.transport.subscribe(topic))
+    # Apply the URL's initial subscriptions. ``subscribe_soon`` records the
+    # interest on the lease synchronously first, so routing is correct the
+    # instant the link comes up (and re-asserted on every (re)connect), then
+    # applies the wire subscribe as a task on the transport's loop.
+    for topic in initial_topics(url):
+        lease.subscribe_soon(topic)
 
     if options.app_keepalive is not None:
         lease.keepalive(options.app_keepalive)
 
     return lease
-
-
-def _resolve_options(
-    options: Optional[ConnectionOptions],
-    retry: Optional[RetryPolicy],
-    provider: Optional[EventLoopProvider],
-    keepalive: Optional[Keepalive],
-    wire_keepalive: Optional[WireKeepalive],
-) -> ConnectionOptions:
-    resolved = options or ConnectionOptions()
-    if retry is not None:
-        resolved = replace(resolved, retry=retry)
-    if provider is not None:
-        resolved = replace(resolved, provider=provider)
-    if keepalive is not None:
-        resolved = replace(resolved, app_keepalive=keepalive)
-    if wire_keepalive is not None:
-        resolved = replace(resolved, wire_keepalive=wire_keepalive)
-    return resolved
-
-
-def _pool_key(
-    impl: str,
-    provider: Optional[EventLoopProvider],
-    wire_keepalive: Optional[WireKeepalive],
-) -> Hashable:
-    if provider is None and wire_keepalive is None:
-        return impl
-    provider_key: object = None
-    if provider is not None:
-        try:
-            provider_key = id(provider.event_loop)
-        except RuntimeError:
-            provider_key = id(provider)
-    return impl, provider_key, wire_keepalive
 
 
 def _mqtt_keepalive_seconds(wire_keepalive: Optional[WireKeepalive]) -> Optional[int]:
@@ -242,11 +199,5 @@ def mqtt_message_route(message: MqttMessage) -> str:
 
 
 def shutdown() -> None:
-    """Close every default :func:`connect` pool (no-op if unused).
-
-    Stops the pools' fan-out and drops their bookkeeping; each transport's async
-    ``stop`` is the last lease's to await, so this is the coarse process-exit hook.
-    """
-    for pool in DEFAULT_POOLS.values():
-        pool.stop()
-    DEFAULT_POOLS.clear()
+    """Tear down every default pool of this front door. Idempotent."""
+    DEFAULT_POOLS.shutdown()

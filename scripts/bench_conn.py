@@ -48,6 +48,7 @@ from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopPr
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from simplyprint_ws_client.device.connection import mqtt, ws
+from simplyprint_ws_client.device.connection.options import ConnectionOptions
 from simplyprint_ws_client.device.connection.lease import Lease
 from simplyprint_ws_client.device.connection.lease import MqttLease
 from simplyprint_ws_client.common.wire.events import (
@@ -659,9 +660,8 @@ async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
         lease = ws.connect(
             server.url,
             impl=impl,
-            retry=fast_retry(),
             pool=pool,
-            provider=provider,
+            options=ConnectionOptions(retry=fast_retry(), provider=provider),
         )
         processed = 0
 
@@ -734,9 +734,8 @@ async def actual_ws_flaky_loopback_throughput(
         lease = ws.connect(
             server.url,
             impl=impl,
-            retry=fast_retry(),
             pool=pool,
-            provider=provider,
+            options=ConnectionOptions(retry=fast_retry(), provider=provider),
         )
         processed = 0
         connected = 0
@@ -839,9 +838,8 @@ async def actual_mqtt_broker_throughput(
         lease = mqtt.connect(
             parsed,
             impl=impl,
-            retry=retry,
             pool=pool,
-            provider=provider,
+            options=ConnectionOptions(retry=retry, provider=provider),
         )
         processed = 0
 

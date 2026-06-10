@@ -74,7 +74,12 @@ class Endpoint(Generic[T]):
         self.unfiltered_leases: Set["Lease[T]"] = set()
         self.route_leases: Dict[Hashable, Set["Lease[T]"]] = {}
         self.wildcard_leases: Set["Lease[T]"] = set()
-        self.refs = 0
+
+    @property
+    def refs(self) -> int:
+        """Live lease count -- the endpoint's refcount, derived from the lease set
+        (every ``Pool.connect`` adds one unique lease; ``release`` removes it)."""
+        return len(self.leases)
 
     def add_lease(self, lease: "Lease[T]") -> None:
         self.leases.add(lease)
@@ -210,7 +215,6 @@ class Pool(Generic[T]):
                 endpoint.attach()
                 self.endpoints[endpoint_key] = endpoint
                 started = transport
-            endpoint.refs += 1
             lease = self.lease_class(
                 self, endpoint.transport, parsed, endpoint_key, provider=self.provider
             )
@@ -231,8 +235,7 @@ class Pool(Generic[T]):
             if endpoint is None or lease not in endpoint.leases:
                 return None
             endpoint.remove_lease(lease)
-            endpoint.refs -= 1
-            if endpoint.refs > 0:
+            if endpoint.leases:
                 return None
             endpoint.detach()
             self.endpoints.pop(endpoint.key, None)

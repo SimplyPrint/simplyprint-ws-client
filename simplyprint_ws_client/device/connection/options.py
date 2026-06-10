@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from simplyprint_ws_client.device.connection.keepalive import Keepalive
@@ -41,6 +41,3 @@ class ConnectionOptions:
     retry: Optional["RetryPolicy"] = None
     wire_keepalive: Optional[WireKeepalive] = None
     app_keepalive: Optional[Keepalive] = None
-
-    def with_provider(self, provider: "EventLoopProvider") -> "ConnectionOptions":
-        return replace(self, provider=provider)

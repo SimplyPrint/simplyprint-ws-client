@@ -12,6 +12,7 @@ from typing import (
     Hashable,
     Optional,
     Set,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -169,32 +170,45 @@ class Lease(Generic[T]):
         if not self.closed:
             self._courier.post(event)
 
-    def create_task(
+    def _schedule(
         self, coro: Coroutine[object, object, object]
-    ) -> Optional[asyncio.Task]:
-        """Create a child task owned by this lease."""
+    ) -> Tuple[bool, Optional[asyncio.Task]]:
+        """Schedule ``coro`` on this lease's loop from any thread.
+
+        Returns ``(accepted, task)`` -- the task is only available when already
+        on the lease's loop; a cross-thread submission creates it on the loop
+        later. A rejected coroutine (lease closed, no running loop) is closed so
+        it never leaks a 'never awaited' warning.
+        """
         if self.closed:
             coro.close()
-            return None
+            return False, None
         try:
             loop = self.provider.event_loop
         except RuntimeError:
             coro.close()
-            return None
+            return False, None
         if not loop.is_running():
             coro.close()
-            return None
+            return False, None
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop is loop:
-            return self._create_task_on_loop(loop, coro)
+            return True, self._create_task_on_loop(loop, coro)
         try:
             loop.call_soon_threadsafe(self._create_task_on_loop, loop, coro)
         except RuntimeError:
             coro.close()
-        return None
+            return False, None
+        return True, None
+
+    def create_task(
+        self, coro: Coroutine[object, object, object]
+    ) -> Optional[asyncio.Task]:
+        """Create a child task owned by this lease."""
+        return self._schedule(coro)[1]
 
     async def cancel_tasks(self) -> None:
         """Cancel every child task owned by this lease."""
@@ -210,30 +224,7 @@ class Lease(Generic[T]):
 
     def submit(self, coro: Coroutine[object, object, object]) -> bool:
         """Schedule a coroutine on this lease's loop from sync code."""
-        if self.closed:
-            coro.close()
-            return False
-        try:
-            loop = self.provider.event_loop
-        except RuntimeError:
-            coro.close()
-            return False
-        if not loop.is_running():
-            coro.close()
-            return False
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is loop:
-            self._create_task_on_loop(loop, coro)
-            return True
-        try:
-            loop.call_soon_threadsafe(self._create_task_on_loop, loop, coro)
-        except RuntimeError:
-            coro.close()
-            return False
-        return True
+        return self._schedule(coro)[0]
 
     def send_soon(self, message: object) -> bool:
         """Schedule ``send(message)`` if the lease is connected."""
@@ -344,6 +335,14 @@ class MqttLease(Lease[MqttTransport]):
         self.topics.add(topic)
         self.pool.add_route(self, topic)
         await self.transport.subscribe(topic)
+
+    def subscribe_soon(self, topic: str) -> None:
+        """Subscribe from sync code: interest is recorded on the lease NOW (so
+        routing is correct the instant the link comes up, and re-asserted on every
+        (re)connect), and the wire subscribe runs as a task on the lease's loop."""
+        self.topics.add(topic)
+        self.pool.add_route(self, topic)
+        self.create_task(self.transport.subscribe(topic))
 
     async def unsubscribe(self, topic: str) -> None:
         """Stop tracking ``topic`` and drop the subscription on the shared socket."""

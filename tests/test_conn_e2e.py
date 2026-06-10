@@ -37,6 +37,7 @@ from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 from simplyprint_ws_client.device.connection import websocket as ws
 from simplyprint_ws_client.common.wire.aiohttp import Aiohttp
 from simplyprint_ws_client.device.connection.lease import WsLease
+from simplyprint_ws_client.device.connection.options import ConnectionOptions
 from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
@@ -491,9 +492,14 @@ async def front_door(
 ) -> AsyncIterator[WsLease]:
     """A ws.connect lease on its own pool, torn down cleanly after the test."""
     # Force a brand-new pool so suites do not share live sockets across tests.
-    ws.DEFAULT_POOLS.pop(impl, None)
+    ws.DEFAULT_POOLS.pools.pop(impl, None)
     pool = ws.build_pool(impl, None)
-    conn = ws.connect(url, impl=impl, retry=retry or fast_policy(), pool=pool)
+    conn = ws.connect(
+        url,
+        impl=impl,
+        options=ConnectionOptions(retry=retry or fast_policy()),
+        pool=pool,
+    )
     try:
         yield conn
     finally:
@@ -619,10 +625,14 @@ async def test_front_door_forced_drop_resume(impl, server: LoopbackServer) -> No
 @pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_pool_shares_one_socket(impl, server: LoopbackServer) -> None:
     """Two leases on one endpoint URL share a single real socket."""
-    ws.DEFAULT_POOLS.pop(impl, None)
+    ws.DEFAULT_POOLS.pools.pop(impl, None)
     pool = ws.build_pool(impl, None)
-    first = ws.connect(server.url, impl=impl, retry=fast_policy(), pool=pool)
-    second = ws.connect(server.url, impl=impl, retry=fast_policy(), pool=pool)
+    first = ws.connect(
+        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+    )
+    second = ws.connect(
+        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+    )
     try:
         assert await first.ready(timeout=3.0)
         assert await second.ready(timeout=3.0)
@@ -642,10 +652,14 @@ async def test_front_door_last_close_tears_socket_down(
     impl, server: LoopbackServer
 ) -> None:
     """The last lease to close stops the shared transport and drops the socket."""
-    ws.DEFAULT_POOLS.pop(impl, None)
+    ws.DEFAULT_POOLS.pools.pop(impl, None)
     pool = ws.build_pool(impl, None)
-    first = ws.connect(server.url, impl=impl, retry=fast_policy(), pool=pool)
-    second = ws.connect(server.url, impl=impl, retry=fast_policy(), pool=pool)
+    first = ws.connect(
+        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+    )
+    second = ws.connect(
+        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+    )
     try:
         assert await first.ready(timeout=3.0)
         assert await second.ready(timeout=3.0)
@@ -732,13 +746,23 @@ async def test_front_door_rejects_unknown_impl() -> None:
 @pytest.mark.asyncio
 async def test_both_impls_against_one_server(server: LoopbackServer) -> None:
     """The same real server serves a websockets lease and an aiohttp lease."""
-    ws.DEFAULT_POOLS.pop("websockets", None)
-    ws.DEFAULT_POOLS.pop("aiohttp", None)
+    ws.DEFAULT_POOLS.pools.pop("websockets", None)
+    ws.DEFAULT_POOLS.pools.pop("aiohttp", None)
     pool_ws = ws.build_pool("websockets", None)
     pool_aio = ws.build_pool("aiohttp", None)
 
-    a = ws.connect(server.url, impl="websockets", retry=fast_policy(), pool=pool_ws)
-    b = ws.connect(server.url, impl="aiohttp", retry=fast_policy(), pool=pool_aio)
+    a = ws.connect(
+        server.url,
+        impl="websockets",
+        options=ConnectionOptions(retry=fast_policy()),
+        pool=pool_ws,
+    )
+    b = ws.connect(
+        server.url,
+        impl="aiohttp",
+        options=ConnectionOptions(retry=fast_policy()),
+        pool=pool_aio,
+    )
 
     got_a: List[WsMessage] = []
     got_b: List[WsMessage] = []
@@ -776,10 +800,20 @@ async def test_front_door_two_leases_both_receive_broadcast(
     impl, push_server: LoopbackServer
 ) -> None:
     """A 1:1 WS broadcasts every inbound frame to EVERY lease on the endpoint."""
-    ws.DEFAULT_POOLS.pop(impl, None)
+    ws.DEFAULT_POOLS.pools.pop(impl, None)
     pool = ws.build_pool(impl, None)
-    first = ws.connect(push_server.url, impl=impl, retry=fast_policy(), pool=pool)
-    second = ws.connect(push_server.url, impl=impl, retry=fast_policy(), pool=pool)
+    first = ws.connect(
+        push_server.url,
+        impl=impl,
+        options=ConnectionOptions(retry=fast_policy()),
+        pool=pool,
+    )
+    second = ws.connect(
+        push_server.url,
+        impl=impl,
+        options=ConnectionOptions(retry=fast_policy()),
+        pool=pool,
+    )
 
     got_first: List[Any] = []
     got_second: List[Any] = []
