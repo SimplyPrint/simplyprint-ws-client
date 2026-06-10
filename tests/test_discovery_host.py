@@ -18,10 +18,10 @@ import time
 
 import pytest
 
-from simplyprint_ws_client.common.events import Event
+from simplyprint_ws_client.events import Event
 
-from simplyprint_ws_client.device.discovery.service import DiscoveryService
-from simplyprint_ws_client.device.discovery.spec import MulticastSpec
+from simplyprint_ws_client.integration.discovery.service import DiscoveryService
+from simplyprint_ws_client.integration.discovery.spec import MulticastSpec
 
 
 class _FoundEvent(Event): ...

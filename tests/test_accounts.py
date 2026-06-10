@@ -1,6 +1,6 @@
 import pytest
 
-from simplyprint_ws_client.device.accounts import (
+from simplyprint_ws_client.integration.accounts import (
     AccountResource,
     LoginChallenge,
     LoginResult,

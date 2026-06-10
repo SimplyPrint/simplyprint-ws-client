@@ -6,7 +6,7 @@ from typing import Optional, Type, List, Sequence
 from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
-from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
+from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
 from simplyprint_ws_client.integration.spec import (
     PrinterSpec,

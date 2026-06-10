@@ -7,8 +7,8 @@ import logging
 
 import pytest
 
-from simplyprint_ws_client.integration.driver import DeviceAuthError
-from simplyprint_ws_client.integration.poller import DevicePoller
+from simplyprint_ws_client.integration.drivers import DeviceAuthError
+from simplyprint_ws_client.integration.drivers import DevicePoller
 
 
 class FakeClient:

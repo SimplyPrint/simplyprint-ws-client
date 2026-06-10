@@ -18,11 +18,11 @@ import pytest
 from yarl import URL
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.device.camera.base import (
+from simplyprint_ws_client.integration.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
 )
-from simplyprint_ws_client.device.camera.pool import CameraPool
+from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.common.worker.context import ExecutionContext
 
 

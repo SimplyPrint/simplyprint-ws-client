@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from simplyprint_ws_client.core.protocol.messages import ServerMsgKind, DemandMsgKind
 from simplyprint_ws_client.core.protocol.models import ServerMsgType, DemandMsgType
-from simplyprint_ws_client.common.events.event_bus_listeners import (
+from simplyprint_ws_client.events.event_bus_listeners import (
     EventBusListenerOptions,
 )
 

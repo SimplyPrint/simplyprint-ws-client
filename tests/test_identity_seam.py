@@ -10,7 +10,7 @@ from typing import ClassVar, Optional, Tuple
 from unittest.mock import patch
 
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.device.discovery.identity import (
+from simplyprint_ws_client.integration.discovery.identity import (
     assign_unique_id,
     capture_hardware_id,
 )
@@ -72,7 +72,7 @@ def test_capture_hardware_id_resolves_mac_when_brand_has_no_serial() -> None:
     config.host = "10.0.0.7"
 
     with patch(
-        "simplyprint_ws_client.device.discovery.mac.resolve_mac",
+        "simplyprint_ws_client.integration.discovery.mac.resolve_mac",
         return_value="aa:bb:cc:dd:ee:ff",
     ):
         capture_hardware_id(config)
@@ -98,7 +98,7 @@ def test_capture_hardware_id_probes_the_config_declared_address_fields() -> None
     config.device_uri = "10.0.0.9"
 
     with patch(
-        "simplyprint_ws_client.device.discovery.mac.resolve_mac",
+        "simplyprint_ws_client.integration.discovery.mac.resolve_mac",
         return_value="11:22:33:44:55:66",
     ) as resolve:
         capture_hardware_id(config)

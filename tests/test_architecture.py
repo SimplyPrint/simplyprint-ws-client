@@ -27,7 +27,12 @@ BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centa
 
 # The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
 # re-export hub is the one sanctioned exception and lives outside these dirs).
-LAYER_DIRS = ("common", "core", "device", "integration")
+LAYER_DIRS = ("common", "core", "integration")
+
+# Top-level subsystem packages: scanned for shims/stars like the layers, but
+# their __init__ files are eager re-export hubs by design (exempt from the
+# import-free rule).
+SUBSYSTEM_DIRS = ("events", "wire")
 
 
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
@@ -110,10 +115,10 @@ _DISCOVERY_LEAK_TOKENS = (
 
 
 def test_discovery_has_no_brand_ports_or_topics():
-    """device/discovery is brand-agnostic machinery: even as plain strings, brand
+    """integration/discovery is brand-agnostic machinery: even as plain strings, brand
     ports / SSDP topic shapes must not appear (they live only in each integration's
     per-brand discovery spec)."""
-    root = LIB_PKG / "device" / "discovery"
+    root = LIB_PKG / "integration" / "discovery"
     offenders = []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -122,7 +127,9 @@ def test_discovery_has_no_brand_ports_or_topics():
         for token in _DISCOVERY_LEAK_TOKENS:
             if token in text:
                 offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
-    assert offenders == [], f"brand port/topic leak in device/discovery: {offenders}"
+    assert offenders == [], (
+        f"brand port/topic leak in integration/discovery: {offenders}"
+    )
 
 
 # Brand cloud field / login-type tokens that must never appear in the shared
@@ -132,10 +139,10 @@ _ACCOUNT_LEAK_TOKENS = ("verifycode", "tfakey", "bambulab")
 
 
 def test_accounts_has_no_brand_field_tokens():
-    """device/accounts is the neutral cloud-account surface: no brand cloud API
+    """integration/accounts is the neutral cloud-account surface: no brand cloud API
     field / login-type token may appear (they live only in each integration's
     concrete provider)."""
-    root = LIB_PKG / "device" / "accounts"
+    root = LIB_PKG / "integration" / "accounts"
     offenders = []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -144,19 +151,21 @@ def test_accounts_has_no_brand_field_tokens():
         for token in _ACCOUNT_LEAK_TOKENS:
             if token in text:
                 offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
-    assert offenders == [], f"brand field-token leak in device/accounts: {offenders}"
+    assert offenders == [], (
+        f"brand field-token leak in integration/accounts: {offenders}"
+    )
 
 
 class TestNoShims:
     """SHIM — no re-export aliases or star imports in any layer dir."""
 
-    @pytest.mark.parametrize("layer", LAYER_DIRS)
+    @pytest.mark.parametrize("layer", LAYER_DIRS + SUBSYSTEM_DIRS)
     def test_layer_has_no_shim_aliases(self, layer):
         """No module-level re-export aliases (Name = OtherName) in the layer."""
         offenders = self._find_shim_aliases(LIB_PKG / layer)
         assert not offenders, f"Shim aliases in {layer}/: {offenders}"
 
-    @pytest.mark.parametrize("layer", LAYER_DIRS)
+    @pytest.mark.parametrize("layer", LAYER_DIRS + SUBSYSTEM_DIRS)
     def test_layer_has_no_star_imports(self, layer):
         """No star re-exports (from X import *) outside __init__.py in the layer."""
         offenders = self._find_star_imports(LIB_PKG / layer)
@@ -216,7 +225,7 @@ class TestNoShims:
         import importlib
 
         # 1. The module no longer exists.
-        jl = LIB_PKG / "device" / "transfer" / "job_lock.py"
+        jl = LIB_PKG / "integration" / "transfer" / "job_lock.py"
         assert not jl.exists(), (
             "job_lock.py must be deleted; set_active_job is now "
             "FileTransfer._set_active_job_for_prepare"
@@ -224,10 +233,12 @@ class TestNoShims:
 
         # 2. Importing the dead module path raises ImportError.
         with pytest.raises(ImportError):
-            importlib.import_module("simplyprint_ws_client.device.transfer.job_lock")
+            importlib.import_module(
+                "simplyprint_ws_client.integration.transfer.job_lock"
+            )
 
         # 3. set_active_job is NOT exported from device.transfer.
-        from simplyprint_ws_client.device import transfer
+        from simplyprint_ws_client.integration import transfer
 
         assert not hasattr(transfer, "set_active_job"), (
             "device.transfer still exports a `set_active_job` free function"
@@ -321,7 +332,10 @@ class TestImportDAG:
         tree = ast.parse(init.read_text(), str(init))
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module:
-                if node.module.startswith(".") or "simplyprint_ws_client" in node.module:
+                if (
+                    node.module.startswith(".")
+                    or "simplyprint_ws_client" in node.module
+                ):
                     offenders.append(f"line {node.lineno}: {node.module}")
             elif isinstance(node, ast.Import):
                 for a in node.names:
@@ -350,7 +364,7 @@ class TestImportDAG:
         # HOST half -- post-review, cloud+runtime share the core/ dir, so the
         # tooth moved from layer names to the host module list.
         host_modules = ("app", "settings", "scheduler", "manager", "host", "registry")
-        allowed = ("common", "core", "device", "integration")
+        allowed = ("common", "core", "events", "integration", "wire")
         offenders = []
         tree = ast.parse(base.read_text(), str(base))
         for node in ast.walk(tree):

@@ -13,11 +13,11 @@ from simplyprint_ws_client.core.protocol.events import CloudConnectionEvent
 from simplyprint_ws_client.core.protocol.messages import ClientMsg, ClientMsgType
 from simplyprint_ws_client.core.protocol.protocol import CloudProtocol
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.reconnect import Reconnecting
-from simplyprint_ws_client.common.wire.transport import WsTransport
-from simplyprint_ws_client.common.wire.websockets import Websockets
-from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.transport import WsTransport
+from simplyprint_ws_client.wire.websockets import Websockets
+from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff

@@ -86,3 +86,10 @@ simplyprint_ws_client.runtime.debug	simplyprint_ws_client.common.debug	module	re
 simplyprint_ws_client.runtime.cli	simplyprint_ws_client.common.cli	module	review
 simplyprint_ws_client.runtime.manager	simplyprint_ws_client.core.manager	module	review
 simplyprint_ws_client.device.connection	simplyprint_ws_client.common.wire	module	review
+simplyprint_ws_client.common.events	simplyprint_ws_client.events	module	review
+simplyprint_ws_client.common.wire	simplyprint_ws_client.wire	module	review
+simplyprint_ws_client.device	simplyprint_ws_client.integration	module	review
+simplyprint_ws_client.integration.link.DeviceLink	simplyprint_ws_client.integration.drivers.LeaseDriver	class	review
+simplyprint_ws_client.integration.link.WsDeviceLink	simplyprint_ws_client.integration.drivers.WsDriver	class	review
+simplyprint_ws_client.integration.link.MqttDeviceLink	simplyprint_ws_client.integration.drivers.MqttDriver	class	review
+simplyprint_ws_client.integration.{driver,link,poller}	simplyprint_ws_client.integration.drivers	module	review

@@ -9,7 +9,7 @@ identity seam, and runs the fleet::
     .venv/bin/python -m example.headless_vendor
 
 The simulated device polls instead of pushing (the ``DevicePoller`` seam); a
-push device would declare a ``WsDeviceLink``/``MqttDeviceLink`` in
+push device would declare a ``WsDriver``/``MqttDriver`` in
 ``device_drivers()`` instead and override ``on_device_message``. Set
 ``SPWS_DEMO_SECONDS`` to auto-stop (the demo default is 5; ``0`` blocks forever
 like a real vendor ``main()`` would).
@@ -23,7 +23,7 @@ import random
 from typing import Optional
 
 from simplyprint_ws_client import ClientSettings, PrinterConfig, PrinterStatus
-from simplyprint_ws_client.device.discovery.spec import SubnetScanSpec
+from simplyprint_ws_client.integration.discovery.spec import SubnetScanSpec
 from simplyprint_ws_client.integration import DevicePoller, PrinterClient
 from simplyprint_ws_client.integration.flow import FlowError, FlowState, run_flow
 from simplyprint_ws_client.integration.flow.recipes import standard_add_printer_flow

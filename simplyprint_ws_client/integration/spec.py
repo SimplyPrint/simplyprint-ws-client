@@ -42,9 +42,9 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.core.client import Client
     from simplyprint_ws_client.core.config import PrinterConfig
     from simplyprint_ws_client.core.config import ConfigManagerType
-    from simplyprint_ws_client.device.accounts import AccountProvider
-    from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
-    from simplyprint_ws_client.device.discovery.spec import (
+    from simplyprint_ws_client.integration.accounts import AccountProvider
+    from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
+    from simplyprint_ws_client.integration.discovery.spec import (
         MDNSSpec,
         MulticastSpec,
         NetworkServiceSpec,
@@ -244,7 +244,7 @@ class PrinterSpec:
         The default works for every type that declares a discovery spec
         (multicast / mDNS / subnet): scan the shared service under this type's
         :attr:`KEY`, map records to neutral
-        :class:`~simplyprint_ws_client.device.discovery.device.DiscoveredDevice` s,
+        :class:`~simplyprint_ws_client.integration.discovery.device.DiscoveredDevice` s,
         and pass each through :meth:`refine_discovered`. Types with no discovery
         spec return ``None`` -- so "can this type discover?" is asked as
         ``spec.discover() is not None``.
@@ -257,10 +257,12 @@ class PrinterSpec:
             return None
 
         async def _discover(timeout: float) -> list:
-            from simplyprint_ws_client.device.discovery.active import (
+            from simplyprint_ws_client.integration.discovery.active import (
                 active_discovery_service,
             )
-            from simplyprint_ws_client.device.discovery.device import DiscoveredDevice
+            from simplyprint_ws_client.integration.discovery.device import (
+                DiscoveredDevice,
+            )
 
             records = await active_discovery_service().scan(cls.KEY, timeout)
             devices = (

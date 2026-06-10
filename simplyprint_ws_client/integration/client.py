@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
+from functools import cached_property
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import (
@@ -67,7 +68,7 @@ from simplyprint_ws_client.core.protocol.messages import (
     SystemShutdownDemandData,
     TerminalDemandData,
 )
-from simplyprint_ws_client.device.camera.mixin import ClientCameraMixin
+from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 
 if TYPE_CHECKING:
@@ -75,8 +76,8 @@ if TYPE_CHECKING:
 
     from yarl import URL
 
-    from simplyprint_ws_client.device.discovery.device import DiscoveredDevice
-    from simplyprint_ws_client.integration.driver import DeviceDriver
+    from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+    from simplyprint_ws_client.integration.drivers import DeviceDriver
 
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
 
@@ -171,7 +172,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     async def init(self) -> None:
         """Arm the device drivers."""
-        for driver in self._device_drivers():
+        for driver in self._device_drivers:
             driver.start()
 
     async def tick(self, _delta) -> None:
@@ -183,17 +184,17 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         self.printer.ambient_temperature.tick(self.printer)
         await self.update_host_telemetry()
         await self.send_ping()
-        for driver in self._device_drivers():
+        for driver in self._device_drivers:
             driver.ensure_started()
 
     async def halt(self) -> None:
         """Temporarily out of scheduling: suspend every driver."""
-        for driver in self._device_drivers():
+        for driver in self._device_drivers:
             driver.suspend()
 
     async def teardown(self) -> None:
         """Final cleanup: stop the drivers, then any extra device teardown."""
-        for driver in self._device_drivers():
+        for driver in self._device_drivers:
             driver.stop()
         await self._stop_connection()
 
@@ -201,18 +202,15 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     def device_drivers(self) -> Iterable["DeviceDriver"]:
         """Declare how this client reaches its device: zero or more drivers
-        (:class:`~simplyprint_ws_client.integration.link.WsDeviceLink` /
-        :class:`~simplyprint_ws_client.integration.link.MqttDeviceLink` /
-        :class:`~simplyprint_ws_client.integration.poller.DevicePoller`).
+        (:class:`~simplyprint_ws_client.integration.drivers.WsDriver` /
+        :class:`~simplyprint_ws_client.integration.drivers.MqttDriver` /
+        :class:`~simplyprint_ws_client.integration.drivers.DevicePoller`).
         Called once; the base owns when they start/suspend/stop."""
         return ()
 
+    @cached_property
     def _device_drivers(self) -> Tuple["DeviceDriver", ...]:
-        drivers = getattr(self, "_device_drivers_cache", None)
-        if drivers is None:
-            drivers = tuple(self.device_drivers())
-            self._device_drivers_cache = drivers
-        return drivers
+        return tuple(self.device_drivers())
 
     async def on_device_connected(self, driver: "DeviceDriver") -> None:
         """A driver reached the device: mark active and (re)resolve the camera.
@@ -235,7 +233,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     async def poll_device(self) -> None:
         """One poll cycle for request/response devices, driven by a
-        :class:`~simplyprint_ws_client.integration.poller.DevicePoller`."""
+        :class:`~simplyprint_ws_client.integration.drivers.DevicePoller`."""
         raise NotImplementedError
 
     async def refresh_device_credentials(self, driver: "DeviceDriver") -> bool:
@@ -326,7 +324,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     def _is_same_device(self, device: "DiscoveredDevice") -> bool:
         """True when ``device`` is this client's printer, by hardware identity."""
-        from simplyprint_ws_client.device.discovery.reconcile import (
+        from simplyprint_ws_client.integration.discovery.reconcile import (
             config_hardware_id,
             device_hardware_id,
         )

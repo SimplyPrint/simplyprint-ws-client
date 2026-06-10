@@ -8,10 +8,10 @@ from typing import List, Optional, Tuple
 
 import yarl
 
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.reconnect import Reconnecting
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import (
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import (
     TransientError,
     WsTransport,
 )

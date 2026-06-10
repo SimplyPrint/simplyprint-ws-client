@@ -6,7 +6,11 @@ import threading
 import pytest
 
 from simplyprint_ws_client.core.status.registry import StatusRegistry
-from simplyprint_ws_client.integration.tasks import SchedulerService, TaskRegistry, TaskSpec
+from simplyprint_ws_client.integration.tasks import (
+    SchedulerService,
+    TaskRegistry,
+    TaskSpec,
+)
 
 
 def test_fire_runs_an_on_demand_task():

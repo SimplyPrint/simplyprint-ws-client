@@ -12,12 +12,12 @@ _PUBLIC = {
     "PrinterClient": ".client",
     "JobEdge": ".client",
     "AppUpdater": ".client",
-    "DeviceDriver": ".driver",
-    "DeviceAuthError": ".driver",
-    "DeviceLink": ".link",
-    "WsDeviceLink": ".link",
-    "MqttDeviceLink": ".link",
-    "DevicePoller": ".poller",
+    "DeviceDriver": ".drivers",
+    "DeviceAuthError": ".drivers",
+    "LeaseDriver": ".drivers",
+    "WsDriver": ".drivers",
+    "MqttDriver": ".drivers",
+    "DevicePoller": ".drivers",
 }
 
 

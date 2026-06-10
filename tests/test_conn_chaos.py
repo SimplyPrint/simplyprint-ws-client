@@ -1,6 +1,6 @@
 """Chaos / failure-injection tests for the supervised reconnect engine.
 
-These hammer :class:`~simplyprint_ws_client.common.wire.reconnect.Reconnecting`
+These hammer :class:`~simplyprint_ws_client.wire.reconnect.Reconnecting`
 through a single controllable fake wire (``ChaosWire``) whose four hooks --
 ``open`` / ``recv`` / ``write`` / ``aclose`` -- a test scripts call-by-call. No
 real socket, broker, or wire library is touched; ``paho`` and ``aiomqtt`` are not
@@ -42,17 +42,17 @@ import yarl
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire.events import (
     Connected,
     Connecting,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.pool import Pool
-from simplyprint_ws_client.common.wire.reconnect import Reconnecting
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import (
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import (
     FatalError,
     NotConnected,
     TransientError,

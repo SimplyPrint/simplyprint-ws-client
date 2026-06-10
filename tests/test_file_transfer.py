@@ -8,7 +8,7 @@ from typing import Callable, Optional
 import pytest
 
 from simplyprint_ws_client import Client, FileDemandData
-from simplyprint_ws_client.device.transfer import (
+from simplyprint_ws_client.integration.transfer import (
     FileTransfer,
     FirmwareStartOutcome,
 )

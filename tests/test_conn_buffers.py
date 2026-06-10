@@ -8,16 +8,16 @@ from typing import List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.common.wire import Lease
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire import Lease
+from simplyprint_ws_client.wire.events import (
     Connected,
     WireEvent,
     MessageReceived,
 )
-from simplyprint_ws_client.common.wire.pool import Pool
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import Transport
-from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import Transport
+from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 

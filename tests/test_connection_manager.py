@@ -17,7 +17,7 @@ from simplyprint_ws_client.core.protocol.events import (
     CloudConnectionOutgoingEvent,
 )
 from simplyprint_ws_client.core.protocol.messages import PingMsg
-from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.events import EventBus
 
 
 class _DummyConnection:

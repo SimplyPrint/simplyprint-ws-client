@@ -34,25 +34,25 @@ import yarl
 
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.common.wire import websocket as ws
-from simplyprint_ws_client.common.wire.aiohttp import Aiohttp
-from simplyprint_ws_client.common.wire.lease import WsLease
-from simplyprint_ws_client.common.wire.options import ConnectionOptions
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire import websocket as ws
+from simplyprint_ws_client.wire.aiohttp import Aiohttp
+from simplyprint_ws_client.wire.lease import WsLease
+from simplyprint_ws_client.wire.options import ConnectionOptions
+from simplyprint_ws_client.wire.events import (
     Connected,
     Connecting,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.common.wire.messages import QoS
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import WsTransport
-from simplyprint_ws_client.common.wire.websocket import (
+from simplyprint_ws_client.wire.messages import QoS
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import WsTransport
+from simplyprint_ws_client.wire.websocket import (
     WsKind,
     WsMessage,
 )
-from simplyprint_ws_client.common.wire.websockets import Websockets
+from simplyprint_ws_client.wire.websockets import Websockets
 
 
 # --------------------------------------------------------------------------- #
@@ -424,7 +424,7 @@ async def test_send_after_stop_raises_not_connected(
     make, server: LoopbackServer
 ) -> None:
     """Once stopped, the transport reports NotConnected on send."""
-    from simplyprint_ws_client.common.wire.transport import NotConnected
+    from simplyprint_ws_client.wire.transport import NotConnected
 
     transport = make(server.url)
     transport.start()
@@ -845,7 +845,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
     """
     import socket
 
-    from simplyprint_ws_client.common.wire.lease import WsLease
+    from simplyprint_ws_client.wire.lease import WsLease
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
@@ -857,7 +857,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
 
     # Drive ready() through a real lease over the transport (no pool needed here:
     # ready() reads supervising()/connected/Disconnected straight off the transport).
-    from simplyprint_ws_client.common.wire.pool import Pool
+    from simplyprint_ws_client.wire.pool import Pool
 
     pool: Pool = Pool(
         build=lambda url, params: transport,
@@ -1151,7 +1151,7 @@ def test_importing_conn_package_loads_no_wire_library() -> None:
 
     code = (
         "import sys\n"
-        "import simplyprint_ws_client.common.wire as conn\n"
+        "import simplyprint_ws_client.wire as conn\n"
         "leaked = [m for m in ('websockets', 'aiohttp', 'paho', 'aiomqtt')\n"
         "          if m in sys.modules]\n"
         "assert not leaked, leaked\n"

@@ -1,13 +1,13 @@
 import pytest
 from yarl import URL
 
-from simplyprint_ws_client.device.camera import mjpeg
-from simplyprint_ws_client.device.camera.mjpeg import (
+from simplyprint_ws_client.integration.camera import mjpeg
+from simplyprint_ws_client.integration.camera.mjpeg import (
     MJPEGFrameParser,
     MJPEGSnapshotCamera,
     MJPEGStreamCamera,
 )
-from simplyprint_ws_client.device.camera.base import CameraProtocolConnectionError
+from simplyprint_ws_client.integration.camera.base import CameraProtocolConnectionError
 
 
 JPEG_ONE = b"\xff\xd8one\xff\xd9"

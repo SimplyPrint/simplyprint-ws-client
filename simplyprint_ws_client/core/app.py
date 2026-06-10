@@ -17,7 +17,7 @@ from simplyprint_ws_client.core.manager import ClientList
 from simplyprint_ws_client.core.scheduler import Scheduler
 from simplyprint_ws_client.core.settings import ClientSettings, PrinterSpec
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
-from simplyprint_ws_client.device.camera.pool import CameraPool
+from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.core.api.sentry import Sentry
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
 from simplyprint_ws_client.common.utils.stoppable import SyncStoppable

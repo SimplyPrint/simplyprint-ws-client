@@ -60,8 +60,8 @@ from simplyprint_ws_client.core.protocol.messages import (
     ConnectedMsg,
 )
 from simplyprint_ws_client.const import APP_DIRS
-from simplyprint_ws_client.common.events.emitter import Emitter, TEvent
-from simplyprint_ws_client.common.events.event_bus_listeners import ListenerUniqueness
+from simplyprint_ws_client.events.emitter import Emitter, TEvent
+from simplyprint_ws_client.events.event_bus_listeners import ListenerUniqueness
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
 from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable

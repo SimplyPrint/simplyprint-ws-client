@@ -76,8 +76,8 @@ from simplyprint_ws_client.core.protocol.models import (
     DemandMsgType,
 )
 
-from simplyprint_ws_client.common.events import EventBus, Event
-from simplyprint_ws_client.common.events.event import sync_only
+from simplyprint_ws_client.events import EventBus, Event
+from simplyprint_ws_client.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApi

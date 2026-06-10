@@ -8,7 +8,7 @@ The names below are the supported, author-facing public API. In short:
 * Declare your client type with a :class:`PrinterSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
-Deeper modules (``simplyprint_ws_client.core.*``, ``...common.*``, ``...device.*``)
+Deeper modules (``simplyprint_ws_client.core.*``, ``...wire.*``, ``...integration.*``)
 are importable but not part of the stable surface.
 
 Performance: public names are re-exported **lazily** (PEP 562 ``__getattr__``), so

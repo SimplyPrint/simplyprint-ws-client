@@ -33,7 +33,7 @@ from simplyprint_ws_client.core.settings import ClientSettings
 if TYPE_CHECKING:
     from simplyprint_ws_client.core.client import Client
     from simplyprint_ws_client.core.config import PrinterConfig
-    from simplyprint_ws_client.device.discovery import DiscoveryService
+    from simplyprint_ws_client.integration.discovery import DiscoveryService
     from simplyprint_ws_client.integration.flow import Flow
     from simplyprint_ws_client.integration.spec import BackgroundService
 
@@ -120,8 +120,8 @@ class Host:
         declared specs and publish it as the process's active service."""
         if self.discovery is not None:
             return
-        from simplyprint_ws_client.device.discovery import DiscoveryService
-        from simplyprint_ws_client.device.discovery.active import (
+        from simplyprint_ws_client.integration.discovery import DiscoveryService
+        from simplyprint_ws_client.integration.discovery.active import (
             set_active_discovery_service,
         )
 
@@ -135,7 +135,7 @@ class Host:
         self.discovery.start()
 
     def stop_discovery(self) -> None:
-        from simplyprint_ws_client.device.discovery.active import (
+        from simplyprint_ws_client.integration.discovery.active import (
             set_active_discovery_service,
         )
 
@@ -184,8 +184,12 @@ class Host:
         Raises :class:`DuplicatePrinter` when ``config`` is an already-registered
         printer (matched by hardware identity, else address).
         """
-        from simplyprint_ws_client.device.discovery.identity import assign_unique_id
-        from simplyprint_ws_client.device.discovery.reconcile import DeviceReconciler
+        from simplyprint_ws_client.integration.discovery.identity import (
+            assign_unique_id,
+        )
+        from simplyprint_ws_client.integration.discovery.reconcile import (
+            DeviceReconciler,
+        )
 
         manager = self.app.get_config_manager(client_key=key)
         assign_unique_id(config)

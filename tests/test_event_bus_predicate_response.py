@@ -3,12 +3,12 @@ import asyncio
 import pytest
 
 from simplyprint_ws_client import MultiPrinterAddedMsg
-from simplyprint_ws_client.common.events import EventBus
-from simplyprint_ws_client.common.events.event_bus_middleware import (
+from simplyprint_ws_client.events import EventBus
+from simplyprint_ws_client.events.event_bus_middleware import (
     EventBusPredicateResponseMiddleware,
 )
-from simplyprint_ws_client.common.events.predicate import IsInstance, Eq, Extract
-from simplyprint_ws_client.common.events.property_path import p
+from simplyprint_ws_client.events.predicate import IsInstance, Eq, Extract
+from simplyprint_ws_client.events.property_path import p
 
 
 @pytest.mark.asyncio

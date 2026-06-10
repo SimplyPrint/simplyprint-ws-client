@@ -23,47 +23,47 @@ from typing import Any, List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
-from simplyprint_ws_client.common.wire import (
+from simplyprint_ws_client.wire import (
     Lease,
     MqttLease,
     WsLease,
 )
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire.events import (
     Connected,
     Connecting,
     WireEvent,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.common.wire.keepalive import (
+from simplyprint_ws_client.wire.keepalive import (
     Keepalive,
     KeepaliveTimeout,
 )
-from simplyprint_ws_client.common.wire.messages import QoS
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.pool import Pool
-from simplyprint_ws_client.common.wire.reconnect import Reconnecting
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import (
+from simplyprint_ws_client.wire.messages import QoS
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import (
     MqttTransport,
     NotConnected,
     TransientError,
     Transport,
 )
 
-from simplyprint_ws_client.common.wire import mqtt
-from simplyprint_ws_client.common.wire import websocket as ws
-from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
-from simplyprint_ws_client.common.wire.mqtt import (
+from simplyprint_ws_client.wire import mqtt
+from simplyprint_ws_client.wire import websocket as ws
+from simplyprint_ws_client.wire.aiomqtt import AioMqtt
+from simplyprint_ws_client.wire.mqtt import (
     MqttBroker,
     MqttMessage,
     mqtt_message_route,
 )
-from simplyprint_ws_client.common.wire.websocket import WsMessage
-from simplyprint_ws_client.common.wire.websockets import Websockets
+from simplyprint_ws_client.wire.websocket import WsMessage
+from simplyprint_ws_client.wire.websockets import Websockets
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 

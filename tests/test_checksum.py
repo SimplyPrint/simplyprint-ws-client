@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 
-from simplyprint_ws_client.device.transfer.checksum import (
+from simplyprint_ws_client.integration.transfer.checksum import (
     file_md5,
     parse_s3_etag,
 )

@@ -26,8 +26,8 @@ from typing import (
 from simplyprint_ws_client.integration.spec import PrinterSpec
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.device.accounts import AccountProvider
-    from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
+    from simplyprint_ws_client.integration.accounts import AccountProvider
+    from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
     from simplyprint_ws_client.integration.flow import Flow
     from simplyprint_ws_client.integration.spec import ProductMetadata
     from simplyprint_ws_client.integration.tasks import TaskRegistry

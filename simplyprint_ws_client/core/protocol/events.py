@@ -2,7 +2,7 @@
 Events sent to and from a connection.
 """
 
-from simplyprint_ws_client.common.events import Event
+from simplyprint_ws_client.events import Event
 
 
 class CloudConnectionEvent(Event): ...

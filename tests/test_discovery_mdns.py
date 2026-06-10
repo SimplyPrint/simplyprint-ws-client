@@ -7,10 +7,10 @@ import dns.rdatatype
 import dns.rrset
 import pytest
 
-from simplyprint_ws_client.common.events import Event, EventBus
-from simplyprint_ws_client.common.events.event import sync_only
+from simplyprint_ws_client.events import Event, EventBus
+from simplyprint_ws_client.events.event import sync_only
 
-from simplyprint_ws_client.device.discovery.mdns import (
+from simplyprint_ws_client.integration.discovery.mdns import (
     MDNSResponse,
     MDNSResponseParser,
 )
@@ -114,8 +114,8 @@ def test_parse_normalises_cache_flush_bit():
 
 
 def test_mdns_spec_defaults():
-    from simplyprint_ws_client.device.discovery.spec import MDNSSpec
-    from simplyprint_ws_client.common.events import Event
+    from simplyprint_ws_client.integration.discovery.spec import MDNSSpec
+    from simplyprint_ws_client.events import Event
 
     spec = MDNSSpec(
         brand="acme",
@@ -145,7 +145,7 @@ def _ultimaker_response():
 
 
 def _single_stage_spec():
-    from simplyprint_ws_client.device.discovery.spec import MDNSSpec
+    from simplyprint_ws_client.integration.discovery.spec import MDNSSpec
 
     def mapper(response, addr):
         for srv in response.srv_records():
@@ -164,7 +164,7 @@ def _single_stage_spec():
 
 @pytest.mark.asyncio
 async def test_backend_caches_and_emits():
-    from simplyprint_ws_client.device.discovery.mdns import MDNSDiscoveryBackend
+    from simplyprint_ws_client.integration.discovery.mdns import MDNSDiscoveryBackend
 
     bus = EventBus()
     received = []
@@ -209,8 +209,8 @@ class _FakeTransport:
 
 @pytest.mark.asyncio
 async def test_two_stage_follow_up_issues_stage2_query_and_maps():
-    from simplyprint_ws_client.device.discovery.mdns import MDNSDiscoveryBackend
-    from simplyprint_ws_client.device.discovery.spec import MDNSSpec
+    from simplyprint_ws_client.integration.discovery.mdns import MDNSDiscoveryBackend
+    from simplyprint_ws_client.integration.discovery.spec import MDNSSpec
 
     _DNSSD = "_services._dns-sd._udp.local"
     _PREFIX = "_acme-"
@@ -263,7 +263,7 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
 
 @pytest.mark.asyncio
 async def test_discovery_service_builds_mdns_backend_and_snapshots():
-    from simplyprint_ws_client.device.discovery.service import DiscoveryService
+    from simplyprint_ws_client.integration.discovery.service import DiscoveryService
 
     service = DiscoveryService(mdns_specs=[_single_stage_spec()])
     backend = service._mdns["probe"]

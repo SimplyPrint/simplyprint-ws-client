@@ -42,33 +42,33 @@ from typing import Callable, List, Optional
 
 import yarl
 
-from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.common.wire import mqtt, ws
-from simplyprint_ws_client.common.wire.options import ConnectionOptions
-from simplyprint_ws_client.common.wire.lease import Lease
-from simplyprint_ws_client.common.wire.lease import MqttLease
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire import mqtt, ws
+from simplyprint_ws_client.wire.options import ConnectionOptions
+from simplyprint_ws_client.wire.lease import Lease
+from simplyprint_ws_client.wire.lease import MqttLease
+from simplyprint_ws_client.wire.events import (
     Connected,
     Connecting,
     WireEvent,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.common.wire.errors import TransportError
-from simplyprint_ws_client.common.wire.messages import (
+from simplyprint_ws_client.wire.errors import TransportError
+from simplyprint_ws_client.wire.messages import (
     MqttMessage,
     QoS,
     WsMessage,
 )
-from simplyprint_ws_client.common.wire.mqtt import mqtt_message_route
-from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.common.wire.pool import Pool
-from simplyprint_ws_client.common.wire.state import ConnectionState
-from simplyprint_ws_client.common.wire.transport import (
+from simplyprint_ws_client.wire.mqtt import mqtt_message_route
+from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import (
     MqttTransport,
     NotConnected,
     Transport,

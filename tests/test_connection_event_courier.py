@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from simplyprint_ws_client.common.wire.events import (
+from simplyprint_ws_client.wire.events import (
     Connected,
     Disconnected,
     MessageReceived,
