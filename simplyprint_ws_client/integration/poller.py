@@ -14,7 +14,10 @@ Rules per cycle:
                            cycle backs off like a failure).
 * raises anything else  -> log at debug, sleep ``failure_backoff``.
 * no success for ``offline_after`` seconds -> the disconnected edge fires once;
-  polling continues (the device may come back).
+  polling continues (the device may come back). Cold-start silence counts: a
+  device that was NEVER reached also gets its disconnected edge ``offline_after``
+  seconds after the poller started, so an unplugged printer reports offline
+  instead of staying forever unknown.
 """
 
 from __future__ import annotations
@@ -87,6 +90,7 @@ class DevicePoller(DeviceDriver):
             task.cancel()
 
     async def _run(self) -> None:
+        started = time.monotonic()
         while True:
             failed = False
             try:
@@ -105,10 +109,12 @@ class DevicePoller(DeviceDriver):
                     self.is_connected = True
                     await self.client.on_device_connected(self)
 
+            # Silence (since the last sign of life, or since start for a device
+            # never reached) flips the edge exactly once until contact resumes.
+            last_life = self.last_message_at if self.last_message_at is not None else started
             if (
-                self.is_connected is True
-                and self.last_message_at is not None
-                and time.monotonic() - self.last_message_at >= self.offline_after
+                self.is_connected is not False
+                and time.monotonic() - last_life >= self.offline_after
             ):
                 self.is_connected = False
                 await self.client.on_device_disconnected(self, reason=None)
