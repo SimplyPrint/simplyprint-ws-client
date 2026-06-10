@@ -57,3 +57,10 @@ mqtt.connect impl default "aiomqtt"	mqtt.connect impl default "paho"	behavior	B
 simplyprint_ws_client.cloud.client.DefaultClient	simplyprint_ws_client.cloud.client.Client (merged)	class	C
 simplyprint_ws_client.cloud.client.PhysicalClient	(deleted — populate_info_from_physical_machine stays on PrinterState; system restart/shutdown demands become authoring-base hooks)	class	C
 simplyprint_bambu.core.printer_client.BasePrinterClient	simplyprint_ws_client.integration.client.PrinterClient	promotion	C
+simplyprint_ws_client.integration.client.PrinterClient._connection_event_bus	(deleted — declare device_drivers() instead)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._connection_event_bindings	(deleted — drivers call the on_device_* hooks)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._wire_connection_events	(deleted)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._start_connection	(deleted — init() starts declared drivers)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._connection_components	(deleted — teardown() stops declared drivers)	api	C
+simplyprint_ws_client.integration.client.PrinterClient.on_connected_to_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_connected	api	C
+simplyprint_ws_client.integration.client.PrinterClient.on_disconnected_from_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_disconnected	api	C

@@ -11,7 +11,6 @@ import importlib as _importlib
 _PUBLIC = {
     "PrinterClient": ".client",
     "AppUpdater": ".client",
-    "ConnectionEventBinding": ".client",
     "DeviceDriver": ".driver",
     "DeviceAuthError": ".driver",
     "DeviceLink": ".link",

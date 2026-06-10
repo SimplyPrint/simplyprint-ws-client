@@ -2,8 +2,8 @@
 
 A printer client's job is to boil a device's model data into a
 :class:`~simplyprint_ws_client.cloud.state.PrinterState`. The *machinery* around
-that -- running the connection-component lifecycle, ticking host telemetry +
-ping, wiring the device connection's events, reducing a device-mapped status
+that -- driving the device-driver lifecycle, ticking host telemetry + ping,
+hopping device edges onto the client loop, reducing a device-mapped status
 through the shared cancel/pause/download holds and job-start/finish edges, and
 resolving the camera URI -- is identical across every brand; only the
 device-data extraction differs.
@@ -13,14 +13,15 @@ This used to be ~80 near-identical lines re-implemented in every integration's
 supplies only what is genuinely device-specific via the hooks at the bottom of
 the class:
 
+* ``device_drivers``        -- declare how the device is reached (links/poller)
+* ``on_device_connected`` / ``on_device_disconnected`` / ``on_device_message``
+                            -- the device edges, delivered on the client loop
+* ``poll_device`` / ``refresh_device_credentials``
+                            -- the polling cycle and the re-auth seam
 * ``_resolve_camera_uri``   -- the device's current camera URL (or None)
 * ``_on_job_start`` / ``_on_job_finish`` / ``_on_job_progress``
                             -- capture/classify the device's job fields
-* ``_start_connection`` / ``_stop_connection`` / ``_connection_components``
-                            -- arm and tear down the device connection component
-* ``_connection_event_bus`` / ``_connection_event_bindings``
-                            -- declare which device events drive update/connect/
-                               disconnect (skipped by HTTP-polling devices)
+* ``_stop_connection``      -- extra device teardown after drivers stop
 * ``_tick_progress``        -- drive a client-side progress shim each tick
 
 The subtle part is :meth:`apply_status`: the guard -> edge -> apply pipeline is
@@ -40,7 +41,6 @@ from datetime import timedelta
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     ClassVar,
     Coroutine,
     Generic,
@@ -66,15 +66,7 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.device.discovery.device import DiscoveredDevice
     from simplyprint_ws_client.integration.driver import DeviceDriver
 
-    from simplyprint_ws_client.common.events.event_bus import EventBus
-
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
-
-#: One device-event-class -> base/brand-handler binding for the connection
-#: component's own event bus. A flat list of these expresses both single-update
-#: devices and devices with several update events without the base assuming a
-#: shape.
-ConnectionEventBinding = Tuple[type, Callable[..., Any]]
 
 #: Host usage is read at most this often, shared across every client, so the
 #: delta-based ``psutil.cpu_percent`` isn't reset by every client every tick.
@@ -122,12 +114,11 @@ class AppUpdater(Protocol):
 class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     """Common base for device printer clients.
 
-    Subclasses still own ``__init__`` (they construct their connection
-    component, do device info population, and -- for push devices -- call
-    :meth:`_wire_connection_events` after the component exists) and the
-    device-model -> :class:`PrinterState` mapping. Everything else (lifecycle,
-    status application, camera resolution, host telemetry) is owned here and
-    parameterised through the hooks below.
+    Subclasses own ``__init__`` (device info population, device-client
+    construction) and the device-model -> :class:`PrinterState` mapping; they
+    declare how the device is reached via :meth:`device_drivers`. Everything
+    else (lifecycle, status application, camera resolution, host telemetry) is
+    owned here and parameterised through the hooks below.
     """
 
     #: Camera mixin tuning consumed by :meth:`_init_camera`. Subclasses override
@@ -143,10 +134,9 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     # slice; teardown once at final cleanup (see Client docstring).
 
     async def init(self) -> None:
-        """Arm the device drivers (and the legacy connection-component seam)."""
+        """Arm the device drivers."""
         for driver in self._device_drivers():
             driver.start()
-        await self._start_connection()
 
     async def tick(self, _delta) -> None:
         """Host housekeeping every slice: progress shim, ambient sensor, host
@@ -161,19 +151,17 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
             driver.ensure_started()
 
     async def halt(self) -> None:
-        """Temporarily out of scheduling: suspend every driver. (HTTP-polling
-        devices on the legacy seam still override to cancel their tasks.)"""
+        """Temporarily out of scheduling: suspend every driver."""
         for driver in self._device_drivers():
             driver.suspend()
 
     async def teardown(self) -> None:
-        """Final cleanup: stop the drivers and tear the legacy seam down."""
+        """Final cleanup: stop the drivers, then any extra device teardown."""
         for driver in self._device_drivers():
             driver.stop()
         await self._stop_connection()
 
-    # -- device drivers (the 2.0 seam; the connection-component trio below is
-    # -- the legacy seam, deleted once every brand declares drivers instead) --
+    # -- device drivers: how this client reaches its physical printer --
 
     def device_drivers(self) -> Iterable["DeviceDriver"]:
         """Declare how this client reaches its device: zero or more drivers
@@ -219,21 +207,9 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         ``True`` to have the driver restart with them. Default: cannot refresh."""
         return False
 
-    async def _start_connection(self) -> None:
-        """Establish/arm the device connection. Push devices start MQTT/WS here.
-        No-op default for devices that start in ``__init__``."""
-
     async def _stop_connection(self) -> None:
-        """Tear the connection down. Default stops every component returned by
-        :meth:`_connection_components`; override for devices that need extra
-        teardown commands first."""
-        for component in self._connection_components():
-            component.stop()
-
-    def _connection_components(self) -> Iterable[Any]:
-        """The connection component(s) to ``stop()`` on teardown. Override to
-        return your device client(s)."""
-        return ()
+        """Extra device teardown after the drivers stop (close an HTTP session,
+        send a goodbye). Default no-op."""
 
     def submit_to_loop(
         self, coro: Coroutine[Any, Any, Any]
@@ -250,41 +226,6 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     def _tick_progress(self) -> None:
         """Drive a client-side progress shim each tick. Default no-op; devices
         with a fake-progress shim override to tick it."""
-
-    def _connection_event_bus(self) -> Optional["EventBus"]:
-        """The connection component's own event bus, if it has one. Push devices
-        return e.g. ``self.device_client.event_bus``; HTTP-polling and
-        single-callback devices return ``None`` so wiring is skipped."""
-        return None
-
-    def _connection_event_bindings(self) -> Iterable[ConnectionEventBinding]:
-        """Declare which device events drive update/connect/disconnect. Bind
-        connect/disconnect to :meth:`on_connected_to_printer` /
-        :meth:`on_disconnected_from_printer` (or a subclass override). Only
-        consulted when :meth:`_connection_event_bus` is not ``None``."""
-        return ()
-
-    def _wire_connection_events(self) -> None:
-        """Apply :meth:`_connection_event_bindings` to the component event bus.
-        Subclasses call this from ``__init__`` once the component exists."""
-        bus = self._connection_event_bus()
-        if bus is None:
-            return
-        for event, handler in self._connection_event_bindings():
-            bus.on(event, handler)
-
-    def on_connected_to_printer(self, *_args) -> None:
-        """The device connection came up: mark active and (re)resolve the
-        camera. Subclasses override to add device startup commands."""
-        self.active = True
-        self.logger.info("Connected to printer")
-        self.update_camera_uri()
-
-    def on_disconnected_from_printer(self, *_args) -> None:
-        """The device connection went away: mark inactive and drop the camera."""
-        self.active = False
-        self.logger.info("Disconnected from printer")
-        self.clear_camera_uri()
 
     def apply_discovered(self, device: "DiscoveredDevice") -> bool:
         """A device re-announced itself on the LAN: if it is *this* printer, let the
