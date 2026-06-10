@@ -20,7 +20,7 @@ from typing import Hashable
 
 import yarl
 
-from simplyprint_ws_client.events import EventBus
+from simplyprint_ws_client.common.events import EventBus
 
 from simplyprint_ws_client.contrib.connection.events import ConnectionEvent
 from simplyprint_ws_client.contrib.connection.errors import (

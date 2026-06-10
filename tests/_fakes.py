@@ -15,8 +15,8 @@ from simplyprint_ws_client.contrib.connection.transport import (
     TransientError,
     WsTransport,
 )
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 
 class FakeTransport(WsTransport, Reconnecting):

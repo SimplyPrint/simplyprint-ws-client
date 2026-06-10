@@ -1,4 +1,4 @@
-"""Connection strategy: allocate / deallocate a client onto a backend socket.
+"""CloudConnection strategy: allocate / deallocate a client onto a backend socket.
 
 This is the SimplyPrint **protocol** multiplexing layer, and it lives in ``core``
 on purpose -- it is *not* the brand-free connection pool
@@ -9,20 +9,20 @@ logic, which is the test for whether things are the same (they are not):
 * The brand-free pool routes by one rule -- ``topic_of(payload) == lease.route`` --
   and is forbidden from knowing any message type. The backend's MULTI routing is
   protocol-aware: a global ``ConnectedMsg`` is *broadcast* to every client as
-  :class:`ConnectionEstablishedEvent`; ``MultiPrinterAdded/RemovedMsg`` route by a
+  :class:`CloudConnectionEstablishedEvent`; ``MultiPrinterAdded/RemovedMsg`` route by a
   *different* field (``msg.data.unique_id``); ordinary messages route by
-  ``for_client``; the raw transport ``ConnectionEstablishedEvent`` is *suppressed*
-  in favour of ``ConnectedMsg``; ``ConnectionLostEvent`` is broadcast. Broadcast,
+  ``for_client``; the raw transport ``CloudConnectionEstablishedEvent`` is *suppressed*
+  in favour of ``ConnectedMsg``; ``CloudConnectionLostEvent`` is broadcast. Broadcast,
   multi-field routing, and event translation have no expression in the pool's
   single-key model -- and teaching it ``ConnectedMsg``/``for_client`` would breach
   the no-brand-leak rule. So this stays here.
 
-* **Reconnection is not duplicated here.** Each backend :class:`Connection` rides
+* **Reconnection is not duplicated here.** Each backend :class:`CloudConnection` rides
   the shared :class:`~...contrib.connection.reconnect.Reconnecting` engine (connect /
   backoff / liveness / single version bump). In MULTI mode the one shared
-  ``Connection`` gets that for free; :class:`ClientView` only fans its events to the
+  ``CloudConnection`` gets that for free; :class:`ClientView` only fans its events to the
   right client(s). There is no PAUSE state: a client's "pause" is releasing its hold
-  (``deallocate``), and when the last client leaves a view its ``Connection`` is
+  (``deallocate``), and when the last client leaves a view its ``CloudConnection`` is
   disconnected (``engine.stop()``) -- the refcount/lease lifecycle, protocol-side.
 """
 
@@ -35,30 +35,36 @@ from datetime import timedelta
 from typing import Union, Dict, Mapping
 from typing import final, Optional, Set, cast, Iterable, MutableSet, Hashable
 
-from .client import Client
-from .client import ClientState
-from .config import PrinterConfig
-from .ws_protocol.connection import ConnectionHint
-from .ws_protocol.connection import ConnectionMode, Connection
-from .ws_protocol.events import ConnectionIncomingEvent, ConnectionEstablishedEvent
-from .ws_protocol.events import (
-    ConnectionOutgoingEvent,
-    ConnectionLostEvent,
-    ConnectionSuspectEvent,
+from simplyprint_ws_client.cloud.client import Client
+from simplyprint_ws_client.cloud.client import ClientState
+from simplyprint_ws_client.cloud.config import PrinterConfig
+from simplyprint_ws_client.cloud.protocol.connection import ConnectionHint
+from simplyprint_ws_client.cloud.protocol.connection import (
+    ConnectionMode,
+    CloudConnection,
 )
-from .ws_protocol.messages import ClientMsg
-from .ws_protocol.messages import (
+from simplyprint_ws_client.cloud.protocol.events import (
+    CloudConnectionIncomingEvent,
+    CloudConnectionEstablishedEvent,
+)
+from simplyprint_ws_client.cloud.protocol.events import (
+    CloudConnectionOutgoingEvent,
+    CloudConnectionLostEvent,
+    CloudConnectionSuspectEvent,
+)
+from simplyprint_ws_client.cloud.protocol.messages import ClientMsg
+from simplyprint_ws_client.cloud.protocol.messages import (
     MultiPrinterAddedMsg,
     MultiPrinterRemovedMsg,
     Msg,
     ConnectedMsg,
 )
-from ..const import APP_DIRS
-from ..events.emitter import Emitter, TEvent
-from ..events.event_bus_listeners import ListenerUniqueness
-from ..shared.asyncio.event_loop_provider import EventLoopProvider
-from ..shared.debug.connectivity import ConnectivityReport
-from ..shared.utils.stoppable import AsyncStoppable
+from simplyprint_ws_client.const import APP_DIRS
+from simplyprint_ws_client.common.events.emitter import Emitter, TEvent
+from simplyprint_ws_client.common.events.event_bus_listeners import ListenerUniqueness
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.shared.debug.connectivity import ConnectivityReport
+from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
 
 TUniqueId = Union[str, int]
 
@@ -96,16 +102,16 @@ class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
 
 class ClientView(Emitter, MutableSet[Client], Hashable):
     """The protocol-aware fan-out over the clients sharing one backend
-    :class:`Connection` -- the multiplexing the brand-free pool deliberately does
+    :class:`CloudConnection` -- the multiplexing the brand-free pool deliberately does
     not do (see the module docstring). :meth:`emit` is the routing brain: it
     broadcasts the global handshake, routes per-printer messages by ``for_client``
     (or ``data.unique_id`` for add/remove), suppresses the raw transport
     ``established``, and broadcasts ``lost`` -- delivering each onto the target
-    client's own event bus. Reconnection is the ``Connection``'s engine's job, not
+    client's own event bus. Reconnection is the ``CloudConnection``'s engine's job, not
     this object's; a view only decides *who hears what*."""
 
     mode: ConnectionMode
-    connection: Connection
+    connection: CloudConnection
     client_list: ClientList
     clients: Set[TUniqueId]
     logger: logging.Logger
@@ -113,7 +119,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
     def __init__(
         self,
         mode: ConnectionMode,
-        connection: Connection,
+        connection: CloudConnection,
         client_list: ClientList,
         logger=logging.getLogger(__name__),
     ):
@@ -153,7 +159,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
         # Custom handling for incoming messages
         # when we have multiple clients.
-        if is_multi_mode and event == ConnectionIncomingEvent:
+        if is_multi_mode and event == CloudConnectionIncomingEvent:
             if len(args) != 2:
                 return
 
@@ -165,10 +171,10 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
             # For multi-printer connections the `connected` message is the `established` message.
             if isinstance(msg, ConnectedMsg) and msg.for_client is None:
                 self.logger.debug(
-                    "Converted base ConnectedMsg to ConnectionEstablishedEvent with v: %d.",
+                    "Converted base ConnectedMsg to CloudConnectionEstablishedEvent with v: %d.",
                     v,
                 )
-                await self._emit_all(ConnectionEstablishedEvent(v))
+                await self._emit_all(CloudConnectionEstablishedEvent(v))
                 return
 
             # We can get a routing hint from the message directly.
@@ -196,9 +202,9 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
             return
 
-        if is_multi_mode and isinstance(event, ConnectionEstablishedEvent):
+        if is_multi_mode and isinstance(event, CloudConnectionEstablishedEvent):
             self.logger.debug(
-                "Dropped ConnectionEstablishedEvent for multi-mode connection with v: %d in favor of ConnectedMsg",
+                "Dropped CloudConnectionEstablishedEvent for multi-mode connection with v: %d in favor of ConnectedMsg",
                 event.v,
             )
             return
@@ -272,10 +278,10 @@ class ClientConnectionManager(
         self.logger = logger
         self._next_connection_id = 0
 
-    def _suspect_connection(self, connection: Connection, _):
+    def _suspect_connection(self, connection: CloudConnection, _):
         """Called when a connection suspects its ability to connect is compromised."""
         self.logger.info(
-            "Connection %s suspects it is unable to connect. Running connectivity test suite and generating log file",
+            "CloudConnection %s suspects it is unable to connect. Running connectivity test suite and generating log file",
             connection.url,
         )
 
@@ -320,31 +326,33 @@ class ClientConnectionManager(
         if self.mode != ConnectionMode.MULTI:
             loggerName = f"{loggerName}[{connection_id}]"
 
-        connection = Connection(provider=self, logger=logging.getLogger(loggerName))
+        connection = CloudConnection(
+            provider=self, logger=logging.getLogger(loggerName)
+        )
         client_view = ClientView(self.mode, connection, self.client_list)
         self.views.add(client_view)
 
         # Registering the connection with the client view.
         connection.event_bus.on(
-            ConnectionIncomingEvent,
-            functools.partial(client_view.emit, ConnectionIncomingEvent),
+            CloudConnectionIncomingEvent,
+            functools.partial(client_view.emit, CloudConnectionIncomingEvent),
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            ConnectionEstablishedEvent,
+            CloudConnectionEstablishedEvent,
             client_view.emit,
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            ConnectionLostEvent,
+            CloudConnectionLostEvent,
             client_view.emit,
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            ConnectionSuspectEvent,
+            CloudConnectionSuspectEvent,
             functools.partial(self._suspect_connection, connection),
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
@@ -380,10 +388,10 @@ class ClientConnectionManager(
         )
 
     @property
-    def connections(self) -> Iterable[Connection]:
+    def connections(self) -> Iterable[CloudConnection]:
         return map(lambda x: cast(ClientView, x).connection, list(self.views))
 
-    def get_connection_for_client(self, client: Client) -> Optional[Connection]:
+    def get_connection_for_client(self, client: Client) -> Optional[CloudConnection]:
         view = self.client_views.get(client.unique_id)
 
         if not view:
@@ -418,12 +426,14 @@ class ClientConnectionManager(
                 return (message,) + args
 
             client.event_bus.on(
-                ConnectionOutgoingEvent, transform_message_with_unique_id, priority=10
+                CloudConnectionOutgoingEvent,
+                transform_message_with_unique_id,
+                priority=10,
             )
 
         client.event_bus.on(
-            ConnectionOutgoingEvent,
-            functools.partial(connection.event_bus.emit, ConnectionOutgoingEvent),
+            CloudConnectionOutgoingEvent,
+            functools.partial(connection.event_bus.emit, CloudConnectionOutgoingEvent),
         )
 
         await connection.connect(hint=self._derive_connection_hint(client))
@@ -435,14 +445,14 @@ class ClientConnectionManager(
 
         client_view = self.client_views.pop(client.unique_id)
         client_view.discard(client)
-        client.event_bus.clear(ConnectionOutgoingEvent)
+        client.event_bus.clear(CloudConnectionOutgoingEvent)
 
         # Tell removed the client it has lost its connection, since it no longer receives messages.
         # This must be awaited (not emit_task) to prevent a race condition where the client
-        # is re-allocated before the ConnectionLostEvent handler runs, causing the handler
+        # is re-allocated before the CloudConnectionLostEvent handler runs, causing the handler
         # to overwrite the state set by allocate() and permanently sticking the client in
         # CONNECTING state.
-        await client.event_bus.emit(ConnectionLostEvent(client.v))
+        await client.event_bus.emit(CloudConnectionLostEvent(client.v))
 
         # Disconnect the connection if no clients are left.
         if len(client_view) == 0:

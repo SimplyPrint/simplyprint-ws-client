@@ -3,21 +3,21 @@ import asyncio
 import pytest
 
 import simplyprint_ws_client.core.connection_manager as connection_manager_module
-from simplyprint_ws_client.core.client import Client, ClientState
-from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.cloud.client import Client, ClientState
+from simplyprint_ws_client.cloud.config import PrinterConfig
 from simplyprint_ws_client.core.connection_manager import (
     ClientConnectionManager,
     ClientList,
     ClientView,
 )
-from simplyprint_ws_client.core.ws_protocol.connection import ConnectionMode
-from simplyprint_ws_client.core.ws_protocol.events import (
-    ConnectionIncomingEvent,
-    ConnectionLostEvent,
-    ConnectionOutgoingEvent,
+from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode
+from simplyprint_ws_client.cloud.protocol.events import (
+    CloudConnectionIncomingEvent,
+    CloudConnectionLostEvent,
+    CloudConnectionOutgoingEvent,
 )
-from simplyprint_ws_client.core.ws_protocol.messages import PingMsg
-from simplyprint_ws_client.events import EventBus
+from simplyprint_ws_client.cloud.protocol.messages import PingMsg
+from simplyprint_ws_client.common.events import EventBus
 
 
 class _DummyConnection:
@@ -76,7 +76,9 @@ def _client_list(count: int):
 
 def _fake_connections(monkeypatch):
     _RecordingConnection.instances = []
-    monkeypatch.setattr(connection_manager_module, "Connection", _RecordingConnection)
+    monkeypatch.setattr(
+        connection_manager_module, "CloudConnection", _RecordingConnection
+    )
     return _RecordingConnection.instances
 
 
@@ -93,12 +95,12 @@ async def test_deallocate_waits_for_connection_lost_handlers():
     gate = asyncio.Event()
     handler_started = asyncio.Event()
 
-    async def blocking_listener(_event: ConnectionLostEvent):
+    async def blocking_listener(_event: CloudConnectionLostEvent):
         handler_started.set()
         await gate.wait()
 
     # Run before built-in listeners to maximize race surface.
-    client.event_bus.on(ConnectionLostEvent, blocking_listener, priority=100)
+    client.event_bus.on(CloudConnectionLostEvent, blocking_listener, priority=100)
 
     task = asyncio.create_task(manager.deallocate(client))
 
@@ -123,11 +125,11 @@ async def test_deallocate_does_not_leave_late_connection_lost_event():
     manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList())
     manager.client_views[client.unique_id] = _DummyView(client, _DummyConnection())
 
-    async def slow_listener(_event: ConnectionLostEvent):
+    async def slow_listener(_event: CloudConnectionLostEvent):
         await asyncio.sleep(0.03)
 
     # Delay execution of built-in _on_connection_lost in the listener chain.
-    client.event_bus.on(ConnectionLostEvent, slow_listener, priority=100)
+    client.event_bus.on(CloudConnectionLostEvent, slow_listener, priority=100)
 
     await manager.deallocate(client)
 
@@ -251,7 +253,7 @@ async def test_multi_mode_outgoing_messages_use_assigned_connection(monkeypatch)
     for connection in manager.connections:
         sent_by_connection[connection] = []
         connection.event_bus.on(
-            ConnectionOutgoingEvent,
+            CloudConnectionOutgoingEvent,
             lambda msg, _v, connection=connection: sent_by_connection[
                 connection
             ].append(msg.for_client),
@@ -284,7 +286,7 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     received = {client.unique_id: [] for client in clients}
     for client in clients:
         client.event_bus.on(
-            ConnectionIncomingEvent,
+            CloudConnectionIncomingEvent,
             lambda msg, _v, client=client: received[client.unique_id].append(
                 msg.for_client
             ),
@@ -294,11 +296,11 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     first_connection = manager.get_connection_for_client(clients[0])
     stray = PingMsg()
     stray.for_client = clients[1].unique_id
-    await first_connection.event_bus.emit(ConnectionIncomingEvent, stray, 0)
+    await first_connection.event_bus.emit(CloudConnectionIncomingEvent, stray, 0)
 
     targeted = PingMsg()
     targeted.for_client = clients[0].unique_id
-    await first_connection.event_bus.emit(ConnectionIncomingEvent, targeted, 0)
+    await first_connection.event_bus.emit(CloudConnectionIncomingEvent, targeted, 0)
 
     assert received[clients[0].unique_id] == [clients[0].unique_id]
     assert received[clients[1].unique_id] == []

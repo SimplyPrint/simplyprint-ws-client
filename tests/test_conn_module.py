@@ -23,8 +23,8 @@ from typing import Any, List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection import (
     Connection,
@@ -64,7 +64,7 @@ from simplyprint_ws_client.contrib.connection.mqtt import (
 )
 from simplyprint_ws_client.contrib.connection.websocket import WsMessage
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
-from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 
 # --------------------------------------------------------------------------- #

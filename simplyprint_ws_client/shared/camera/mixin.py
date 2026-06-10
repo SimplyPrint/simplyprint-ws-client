@@ -7,14 +7,14 @@ from typing import Optional, Literal, TypeVar
 
 from yarl import URL
 
-from .handle import CameraHandle
-from .pool import CameraPool
-from ..asyncio.cancelable_lock import CancelableLock
-from ..sp.simplyprint_api import SimplyPrintApi
-from ... import DemandMsgType
-from ...core.client import Client, configure
-from ...core.config import PrinterConfig
-from ...core.ws_protocol.messages import (
+from simplyprint_ws_client.shared.camera.handle import CameraHandle
+from simplyprint_ws_client.shared.camera.pool import CameraPool
+from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
+from simplyprint_ws_client.cloud.api.simplyprint_api import SimplyPrintApi
+from simplyprint_ws_client import DemandMsgType
+from simplyprint_ws_client.cloud.client import Client, configure
+from simplyprint_ws_client.cloud.config import PrinterConfig
+from simplyprint_ws_client.cloud.protocol.messages import (
     WebcamSnapshotDemandData,
     StreamMsg,
 )

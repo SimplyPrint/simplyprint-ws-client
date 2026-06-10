@@ -17,8 +17,8 @@ from simplyprint_ws_client.contrib.connection.events import (
 from simplyprint_ws_client.contrib.connection.pool import Pool
 from simplyprint_ws_client.contrib.connection.state import ConnectionState
 from simplyprint_ws_client.contrib.connection.transport import Transport
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 
 class FakeTransport(Transport):

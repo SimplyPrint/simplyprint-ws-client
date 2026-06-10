@@ -14,7 +14,7 @@ from collections import defaultdict
 
 import pytest
 
-from simplyprint_ws_client.shared.asyncio.courier import Courier, OverflowPolicy
+from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 
 
 @pytest.mark.asyncio

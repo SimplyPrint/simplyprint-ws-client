@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Mapping
 
-from simplyprint_ws_client.events import EventBus
+from simplyprint_ws_client.common.events import EventBus
 
 from simplyprint_ws_client.contrib.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.contrib.discovery.mdns import MDNSDiscoveryBackend

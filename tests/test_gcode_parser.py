@@ -1,4 +1,4 @@
-from simplyprint_ws_client.shared.utils.gcode_parser import GcodeParser, GcodeCommand
+from simplyprint_ws_client.common.utils.gcode_parser import GcodeParser, GcodeCommand
 
 
 def test_simple():

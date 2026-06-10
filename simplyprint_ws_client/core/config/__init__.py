@@ -4,18 +4,15 @@ __all__ = [
     "MemoryConfigManager",
     "SQLiteConfigManager",
     "JsonConfigManager",
-    "Config",
-    "PrinterConfig",
 ]
 
 from enum import Enum
 from typing import Type
 
-from .config import PrinterConfig, Config
-from .json import JsonConfigManager
-from .manager import ConfigManager
-from .memory import MemoryConfigManager
-from .sqlite import SQLiteConfigManager
+from simplyprint_ws_client.core.config.json import JsonConfigManager
+from simplyprint_ws_client.core.config.manager import ConfigManager
+from simplyprint_ws_client.core.config.memory import MemoryConfigManager
+from simplyprint_ws_client.core.config.sqlite import SQLiteConfigManager
 
 
 class ConfigManagerType(Enum):

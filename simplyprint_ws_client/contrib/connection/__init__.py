@@ -2,31 +2,31 @@
 
 from __future__ import annotations
 
-from . import events, mqtt, websocket
-from .aiohttp import Aiohttp
-from .aiomqtt import AioMqtt
-from .connection import Connection, MqttConnection, WsConnection
-from .events import (
+from simplyprint_ws_client.contrib.connection import events, mqtt, websocket
+from simplyprint_ws_client.contrib.connection.aiohttp import Aiohttp
+from simplyprint_ws_client.contrib.connection.aiomqtt import AioMqtt
+from simplyprint_ws_client.contrib.connection.connection import Connection, MqttConnection, WsConnection
+from simplyprint_ws_client.contrib.connection.events import (
     Connected,
     Connecting,
     ConnectionEvent,
     Disconnected,
     MessageReceived,
 )
-from .keepalive import ConnectionKeepalive, Keepalive, KeepaliveTimeout
-from .messages import (
+from simplyprint_ws_client.contrib.connection.keepalive import ConnectionKeepalive, Keepalive, KeepaliveTimeout
+from simplyprint_ws_client.contrib.connection.messages import (
     MqttMessage,
     QoS,
     WsKind,
     WsMessage,
 )
-from .options import ConnectionOptions, WireKeepalive
-from .paho import Paho
-from .policy import RetryPolicy
-from .pool import Endpoint, Pool
-from .reconnect import Reconnecting
-from .state import ConnectionState
-from .transport import (
+from simplyprint_ws_client.contrib.connection.options import ConnectionOptions, WireKeepalive
+from simplyprint_ws_client.contrib.connection.paho import Paho
+from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
+from simplyprint_ws_client.contrib.connection.pool import Endpoint, Pool
+from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
+from simplyprint_ws_client.contrib.connection.state import ConnectionState
+from simplyprint_ws_client.contrib.connection.transport import (
     FatalError,
     MqttTransport,
     NotConnected,
@@ -35,8 +35,8 @@ from .transport import (
     WsTransport,
     topic_matches,
 )
-from .errors import ErrorCode, TransportError
-from .websockets import Websockets
+from simplyprint_ws_client.contrib.connection.errors import ErrorCode, TransportError
+from simplyprint_ws_client.contrib.connection.websockets import Websockets
 
 ws = websocket
 

@@ -3,9 +3,9 @@ from typing import Optional
 
 import pytest
 
-from simplyprint_ws_client.events.event import Event
-from simplyprint_ws_client.events.event_bus import EventBus, EventBusListeners
-from simplyprint_ws_client.events.event_bus_listeners import (
+from simplyprint_ws_client.common.events.event import Event
+from simplyprint_ws_client.common.events.event_bus import EventBus, EventBusListeners
+from simplyprint_ws_client.common.events.event_bus_listeners import (
     ListenerUniqueness,
     ListenerLifetimeForever,
     ListenerLifetimeOnce,

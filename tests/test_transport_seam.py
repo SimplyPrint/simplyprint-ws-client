@@ -1,18 +1,18 @@
-"""Tests that :class:`Connection` composes protocol over a transport."""
+"""Tests that :class:`CloudConnection` composes protocol over a transport."""
 
 import asyncio
 from unittest.mock import patch
 
 import pytest
 
-from simplyprint_ws_client.core.ws_protocol import connection as conn_mod
-from simplyprint_ws_client.core.ws_protocol.connection import (
-    Connection,
+from simplyprint_ws_client.cloud.protocol import connection as conn_mod
+from simplyprint_ws_client.cloud.protocol.connection import (
+    CloudConnection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.core.ws_protocol.events import ConnectionEstablishedEvent
-from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
+from simplyprint_ws_client.cloud.protocol.events import CloudConnectionEstablishedEvent
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from tests._fakes import FakeTransport
 
@@ -30,7 +30,7 @@ def _connection_with_recording_factory():
         built.append(transport)
         return transport
 
-    conn = Connection(
+    conn = CloudConnection(
         transport_factory=factory,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
@@ -42,10 +42,12 @@ def _connection_with_recording_factory():
 async def test_connect_builds_transport_via_factory_once():
     conn, built = _connection_with_recording_factory()
     established = []
-    conn.event_bus.on(ConnectionEstablishedEvent, lambda e: established.append(e.v))
+    conn.event_bus.on(
+        CloudConnectionEstablishedEvent, lambda e: established.append(e.v)
+    )
 
     with patch(
-        "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout", 10.0
+        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout", 10.0
     ):
         await conn.connect()
         await asyncio.sleep(0.05)
@@ -66,7 +68,7 @@ async def test_transport_reconnect_advances_protocol_version():
 
     with (
         patch(
-            "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout",
+            "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
             10.0,
         ),
         patch.object(ConstantBackoff, "delay", return_value=0.01),

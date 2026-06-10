@@ -1,5 +1,5 @@
-from simplyprint_ws_client.core.autowire import AutowireClientMeta, configure, autowire
-from simplyprint_ws_client.core.ws_protocol.models import ServerMsgType, DemandMsgType
+from simplyprint_ws_client.cloud.autowire import AutowireClientMeta, configure, autowire
+from simplyprint_ws_client.cloud.protocol.models import ServerMsgType, DemandMsgType
 
 
 class AutowireClient1(metaclass=AutowireClientMeta):

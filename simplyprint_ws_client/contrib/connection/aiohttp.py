@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Tuple, Union
 
 import yarl
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.messages import (
     WsMessage,
@@ -83,7 +83,7 @@ class Aiohttp(WsTransport, Reconnecting):
 
     Construct it with the endpoint URL and (optionally) a
     :class:`~simplyprint_ws_client.contrib.connection.policy.RetryPolicy`, an
-    :class:`~simplyprint_ws_client.shared.asyncio.event_loop_provider.EventLoopProvider`
+    :class:`~simplyprint_ws_client.common.asyncio.event_loop_provider.EventLoopProvider`
     for the supervision task, and a :data:`AiohttpConnectFactory` to open the link with
     (the default uses aiohttp; tests pass a fake). Everything else -- the connect /
     consume / reconnect cycle, state, generation, lifecycle events -- comes from

@@ -8,7 +8,7 @@ not part of the printer-connection pool.
 
 import time
 
-from simplyprint_ws_client.contrib.watchdog import Watchdog
+from simplyprint_ws_client.common.utils.watchdog import Watchdog
 
 
 def test_watchdog_expires_after_timeout():

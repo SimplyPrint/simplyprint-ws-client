@@ -34,7 +34,7 @@ from typing import (
 
 import yarl
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.messages import (
     MqttInboundMessage,

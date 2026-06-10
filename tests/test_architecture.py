@@ -1,12 +1,15 @@
-"""Architecture invariants for library contrib/ and shared/ — brand-free, DAG-clean, no shims.
+"""Architecture invariants for the library package — brand-free, DAG-clean, no shims.
 
 These tests enforce the rules from CLAUDE.md and decisions.md:
-  LEAK  — no brand identifiers (NAME tokens) in contrib/ + shared/
-  SHIM  — no re-export aliases or star imports (both @ module-level)
+  LEAK  — no brand identifiers (NAME tokens) anywhere in the library package
+  SHIM  — no re-export aliases or star imports (both @ module-level) in the layer dirs
   DAG   — contrib/__init__ import-free; library never ships/imports contrib.printer_client
 
 The production code is brand-free by hand; these tests turn that into a machine-checked invariant
 so future edits (especially migrations from integrations) cannot regress the abstraction.
+
+2.0 restructure: the scans cover the new layer dirs (common/, cloud/) alongside the
+legacy ones (contrib/, shared/, core/) so no file escapes a guard mid-migration.
 """
 
 import pathlib
@@ -19,22 +22,49 @@ import pytest
 # The library package root
 LIB_PKG = pathlib.Path(__file__).parent.parent / "simplyprint_ws_client"
 
-# Brand names that must NEVER appear as NAME tokens in contrib/ + shared/ (case-insensitive substring)
+# Brand names that must NEVER appear as NAME tokens in the library (case-insensitive substring)
 BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centauri")
+
+# The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
+# re-export hub is the one sanctioned exception and lives outside these dirs).
+LAYER_DIRS = ("cloud", "common", "contrib", "core", "shared")
+
+
+# The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
+# member ids, bed-plate types). These modules MIRROR that cloud-defined vocabulary —
+# they are protocol constants, not machinery branching on a brand. Everything else
+# in the package must stay brand-free.
+PROTOCOL_VOCABULARY = ("cloud/state/models.py",)
 
 
 class TestBrandFree:
-    """LEAK — no brand identifiers in contrib/ + shared/."""
+    """LEAK — no brand identifiers anywhere in the library package.
 
-    def test_contrib_is_brand_free(self):
-        """Contrib package contains zero brand NAME tokens (ignoring comments/strings)."""
-        offenders = self._find_brand_leaks(LIB_PKG / "contrib")
-        assert not offenders, f"Brand leak in contrib/: {offenders}"
+    2.0 restructure: widened from contrib/ + shared/ to the whole package (the
+    assertion itself is unchanged: zero brand NAME tokens), with the cloud
+    protocol-vocabulary mirror as the one explicit, listed exception.
+    """
 
-    def test_shared_is_brand_free(self):
-        """Shared package contains zero brand NAME tokens (ignoring comments/strings)."""
-        offenders = self._find_brand_leaks(LIB_PKG / "shared")
-        assert not offenders, f"Brand leak in shared/: {offenders}"
+    def test_library_is_brand_free(self):
+        """The whole package contains zero brand NAME tokens (ignoring comments/strings)."""
+        offenders = [
+            o
+            for o in self._find_brand_leaks(LIB_PKG)
+            if not o.startswith(PROTOCOL_VOCABULARY)
+        ]
+        assert not offenders, f"Brand leak in library: {offenders}"
+
+    def test_protocol_vocabulary_allowlist_is_not_stale(self):
+        """Every allowlisted protocol-vocabulary module still exists and still
+        carries protocol-defined brand identifiers (else the entry must be removed
+        so the allowlist cannot silently grow stale)."""
+        for entry in PROTOCOL_VOCABULARY:
+            path = LIB_PKG / entry
+            assert path.exists(), f"stale allowlist entry: {entry}"
+            hits = self._find_brand_leaks(path.parent)
+            assert any(h.startswith(entry) for h in hits), (
+                f"{entry} no longer carries protocol vocabulary; remove it from the allowlist"
+            )
 
     @staticmethod
     def _find_brand_leaks(root: pathlib.Path) -> List[str]:
@@ -118,27 +148,19 @@ def test_accounts_has_no_brand_field_tokens():
 
 
 class TestNoShims:
-    """SHIM — no re-export aliases or star imports in contrib/ + shared/."""
+    """SHIM — no re-export aliases or star imports in any layer dir."""
 
-    def test_contrib_has_no_shim_aliases(self):
-        """Contrib: no module-level re-export aliases (Name = OtherName)."""
-        offenders = self._find_shim_aliases(LIB_PKG / "contrib")
-        assert not offenders, f"Shim aliases in contrib/: {offenders}"
+    @pytest.mark.parametrize("layer", LAYER_DIRS)
+    def test_layer_has_no_shim_aliases(self, layer):
+        """No module-level re-export aliases (Name = OtherName) in the layer."""
+        offenders = self._find_shim_aliases(LIB_PKG / layer)
+        assert not offenders, f"Shim aliases in {layer}/: {offenders}"
 
-    def test_shared_has_no_shim_aliases(self):
-        """Shared: no module-level re-export aliases (Name = OtherName)."""
-        offenders = self._find_shim_aliases(LIB_PKG / "shared")
-        assert not offenders, f"Shim aliases in shared/: {offenders}"
-
-    def test_contrib_has_no_star_imports(self):
-        """Contrib: no star re-exports (from X import *) outside __init__.py."""
-        offenders = self._find_star_imports(LIB_PKG / "contrib")
-        assert not offenders, f"Star re-exports in contrib/: {offenders}"
-
-    def test_shared_has_no_star_imports(self):
-        """Shared: no star re-exports (from X import *) outside __init__.py."""
-        offenders = self._find_star_imports(LIB_PKG / "shared")
-        assert not offenders, f"Star re-exports in shared/: {offenders}"
+    @pytest.mark.parametrize("layer", LAYER_DIRS)
+    def test_layer_has_no_star_imports(self, layer):
+        """No star re-exports (from X import *) outside __init__.py in the layer."""
+        offenders = self._find_star_imports(LIB_PKG / layer)
+        assert not offenders, f"Star re-exports in {layer}/: {offenders}"
 
     def test_state_model_alias_removed(self):
         """SHIM (S-state): the StateModel re-export shim is gone for good.
@@ -150,17 +172,17 @@ class TestNoShims:
         """
         import importlib
 
-        # 1. The shim file no longer exists.
-        shim = LIB_PKG / "core" / "state" / "state_model.py"
+        # 1. The shim file no longer exists (state/ lives under cloud/ since 2.0).
+        shim = LIB_PKG / "cloud" / "state" / "state_model.py"
         assert not shim.exists(), f"state_model.py was resurrected: {shim}"
 
         # 2. Importing the dead module path raises ImportError.
         with pytest.raises(ImportError):
-            importlib.import_module("simplyprint_ws_client.core.state.state_model")
+            importlib.import_module("simplyprint_ws_client.cloud.state.state_model")
 
         # 3. Every state class inherits from the real ReactiveModel, not a local alias.
-        from simplyprint_ws_client.contrib.model.reactive import ReactiveModel
-        import simplyprint_ws_client.core.state as state_pkg
+        from simplyprint_ws_client.common.model.reactive import ReactiveModel
+        import simplyprint_ws_client.cloud.state as state_pkg
 
         state_classes = [
             "TemperatureState",
@@ -178,7 +200,7 @@ class TestNoShims:
 
         # 4. No `StateModel` name re-exported from the state package.
         assert not hasattr(state_pkg, "StateModel"), (
-            "core.state still re-exports a `StateModel` alias"
+            "cloud.state still re-exports a `StateModel` alias"
         )
 
     def test_job_lock_module_removed(self):

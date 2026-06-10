@@ -6,7 +6,7 @@ Tests ensure that:
 - Messages are dropped when targeting a stale version
 - Multiple disconnect/reconnect cycles maintain version consistency
 
-These drive :class:`Connection` through a :class:`FakeTransport`, so they pin the
+These drive :class:`CloudConnection` through a :class:`FakeTransport`, so they pin the
 version/state contract independently of the concrete socket library.
 """
 
@@ -16,18 +16,18 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from simplyprint_ws_client.core.ws_protocol import connection as conn_mod
-from simplyprint_ws_client.core.ws_protocol.connection import (
-    Connection,
+from simplyprint_ws_client.cloud.protocol import connection as conn_mod
+from simplyprint_ws_client.cloud.protocol.connection import (
+    CloudConnection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.core.ws_protocol.events import (
-    ConnectionEstablishedEvent,
-    ConnectionLostEvent,
-    ConnectionIncomingEvent,
+from simplyprint_ws_client.cloud.protocol.events import (
+    CloudConnectionEstablishedEvent,
+    CloudConnectionLostEvent,
+    CloudConnectionIncomingEvent,
 )
-from simplyprint_ws_client.core.ws_protocol.messages import (
+from simplyprint_ws_client.cloud.protocol.messages import (
     PingMsg,
 )
 
@@ -42,7 +42,7 @@ async def fake_transport():
 
 @pytest_asyncio.fixture
 async def connection(fake_transport):
-    """Create a Connection whose transport factory yields the fake transport."""
+    """Create a CloudConnection whose transport factory yields the fake transport."""
 
     def factory(url, provider, logger):
         fake_transport.url = url
@@ -51,7 +51,7 @@ async def connection(fake_transport):
         fake_transport.first_message_timeout = conn_mod.WsFirstMessageTimeout
         return fake_transport
 
-    conn = Connection(
+    conn = CloudConnection(
         transport_factory=factory,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
@@ -142,14 +142,14 @@ async def test_incoming_message_tagged_with_correct_version(connection):
         received_messages.append((msg, v))
 
     # Subscribe to incoming events
-    connection.event_bus.on(ConnectionIncomingEvent, on_message)
+    connection.event_bus.on(CloudConnectionIncomingEvent, on_message)
 
     # Simulate connection at version 0
     connection.v = 0
 
     # Emit a message event as would happen in poll()
     test_msg = {"msg_type": "test"}
-    await connection.event_bus.emit(ConnectionIncomingEvent, test_msg, 0)
+    await connection.event_bus.emit(CloudConnectionIncomingEvent, test_msg, 0)
 
     await asyncio.sleep(0.05)
     assert len(received_messages) == 1
@@ -160,21 +160,21 @@ async def test_incoming_message_tagged_with_correct_version(connection):
 @pytest.mark.asyncio
 async def test_version_consistency_across_events():
     """Test that version is consistent when events are emitted."""
-    conn = Connection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+    conn = CloudConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
     events_captured = []
 
-    async def capture_established(event: ConnectionEstablishedEvent):
+    async def capture_established(event: CloudConnectionEstablishedEvent):
         events_captured.append(("established", event.v, conn.v))
 
-    async def capture_lost(event: ConnectionLostEvent):
+    async def capture_lost(event: CloudConnectionLostEvent):
         events_captured.append(("lost", event.v, conn.v))
 
-    conn.event_bus.on(ConnectionEstablishedEvent, capture_established)
-    conn.event_bus.on(ConnectionLostEvent, capture_lost)
+    conn.event_bus.on(CloudConnectionEstablishedEvent, capture_established)
+    conn.event_bus.on(CloudConnectionLostEvent, capture_lost)
 
     # Emit events with specific versions
-    await conn.event_bus.emit(ConnectionEstablishedEvent(42))
-    await conn.event_bus.emit(ConnectionLostEvent(42))
+    await conn.event_bus.emit(CloudConnectionEstablishedEvent(42))
+    await conn.event_bus.emit(CloudConnectionLostEvent(42))
 
     await asyncio.sleep(0.05)
 
@@ -188,8 +188,8 @@ async def test_version_consistency_across_events():
 @pytest.mark.asyncio
 async def test_version_isolation_between_connections():
     """Test that versions are independent between different connection instances."""
-    conn1 = Connection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
-    conn2 = Connection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+    conn1 = CloudConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+    conn2 = CloudConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
 
     assert conn1.v == 0
     assert conn2.v == 0
@@ -234,19 +234,19 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
     first-message timeout. It verifies that the first dropped transport attempt
     increments the protocol version exactly once.
     """
-    # Capture ConnectionLostEvent to know when timeout was handled
+    # Capture CloudConnectionLostEvent to know when timeout was handled
     lost_events = []
     first_lost = asyncio.Event()
 
-    async def on_connection_lost(event: ConnectionLostEvent):
+    async def on_connection_lost(event: CloudConnectionLostEvent):
         lost_events.append(event)
         first_lost.set()
 
-    connection.event_bus.on(ConnectionLostEvent, on_connection_lost)
+    connection.event_bus.on(CloudConnectionLostEvent, on_connection_lost)
 
     # Patch WsFirstMessageTimeout to be very short so test completes quickly
     with patch(
-        "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout",
+        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
         0.01,  # 10ms timeout
     ):
         # Start the connection loop (which will eventually hit the first message timeout)
@@ -283,14 +283,14 @@ async def test_poll_failure_increments_version_via_exception_handler(
     # Capture connection lost events to verify exception was handled
     lost_events = []
 
-    async def on_connection_lost(event: ConnectionLostEvent):
+    async def on_connection_lost(event: CloudConnectionLostEvent):
         lost_events.append(event)
 
-    connection.event_bus.on(ConnectionLostEvent, on_connection_lost)
+    connection.event_bus.on(CloudConnectionLostEvent, on_connection_lost)
 
     # Use a long first message timeout to avoid interference with this test
     with patch(
-        "simplyprint_ws_client.core.ws_protocol.connection.WsFirstMessageTimeout",
+        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
         10.0,  # 10 seconds - long enough for test to complete
     ):
         # Start the connection loop
@@ -319,7 +319,7 @@ async def test_poll_failure_increments_version_via_exception_handler(
             f"This indicates a double-increment bug in the exception handler path."
         )
         assert len(lost_events) == 1, (
-            "Should have emitted exactly one ConnectionLostEvent"
+            "Should have emitted exactly one CloudConnectionLostEvent"
         )
 
         # Clean up

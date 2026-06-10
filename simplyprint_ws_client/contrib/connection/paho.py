@@ -10,7 +10,7 @@ to the connection event vocabulary, and lets paho keep the socket alive on its o
 Those callbacks fire on paho's network thread, but every
 :class:`~simplyprint_ws_client.contrib.connection.transport.Transport` consumer (the pool
 fan-out, every lease) lives on one asyncio loop. So :class:`Paho` owns a single
-:class:`~simplyprint_ws_client.shared.asyncio.courier.Courier`: a callback posts a
+:class:`~simplyprint_ws_client.common.asyncio.courier.Courier`: a callback posts a
 ready-to-emit event from the paho thread, the courier coalesces the wakeup, and the
 event is emitted on the loop. The pool and the leases never see a foreign thread.
 
@@ -29,9 +29,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
 
 import yarl
 
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.courier import Courier, OverflowPolicy
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.events import (
     Connected,

@@ -25,17 +25,17 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
-from .base import (
+from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
     CameraProtocolConnectionError,
     CameraProtocolInvalidState,
     CameraProtocolPollingMode,
 )
-from ..asyncio.courier import Courier, OverflowPolicy
-from ..asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 if TYPE_CHECKING:
-    from .handle import CameraHandle
+    from simplyprint_ws_client.shared.camera.handle import CameraHandle
 
 
 async def _resolve_aiter(protocol: BaseCameraProtocol):

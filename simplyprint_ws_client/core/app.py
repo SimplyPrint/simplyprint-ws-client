@@ -6,16 +6,21 @@ import logging
 import threading
 from typing import Dict, Optional, cast
 
-from .client import Client, ClientConfigChangedEvent, ClientStateChangeEvent
-from .config import ConfigManager, PrinterConfig
-from .connection_manager import ClientList
-from .scheduler import Scheduler
-from .settings import ClientSettings, ClientSpec
-from ..shared.asyncio.event_loop_runner import Runner
-from ..shared.camera.pool import CameraPool
-from ..shared.sp.sentry import Sentry
-from ..shared.sp.url_builder import SimplyPrintURL
-from ..shared.utils.stoppable import SyncStoppable
+from simplyprint_ws_client.cloud.client import (
+    Client,
+    ClientConfigChangedEvent,
+    ClientStateChangeEvent,
+)
+from simplyprint_ws_client.cloud.config import PrinterConfig
+from simplyprint_ws_client.core.config import ConfigManager
+from simplyprint_ws_client.core.connection_manager import ClientList
+from simplyprint_ws_client.core.scheduler import Scheduler
+from simplyprint_ws_client.core.settings import ClientSettings, ClientSpec
+from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
+from simplyprint_ws_client.shared.camera.pool import CameraPool
+from simplyprint_ws_client.cloud.api.sentry import Sentry
+from simplyprint_ws_client.cloud.api.url_builder import SimplyPrintURL
+from simplyprint_ws_client.common.utils.stoppable import SyncStoppable
 
 
 class ClientApp(SyncStoppable):

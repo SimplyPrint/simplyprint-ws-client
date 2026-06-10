@@ -9,7 +9,7 @@ The names below are the supported, author-facing public API. In short:
 * Declare your client type with a :class:`ClientSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
-Deeper modules (``simplyprint_ws_client.core.*``, ``...shared.*``, ``...contrib.*``)
+Deeper modules (``simplyprint_ws_client.cloud.*``, ``...common.*``, ``...contrib.*``)
 are importable but not part of the stable surface.
 
 Performance: public names are re-exported **lazily** (PEP 562 ``__getattr__``), so
@@ -26,19 +26,20 @@ from __future__ import annotations
 import importlib as _importlib
 from typing import TYPE_CHECKING
 
-from . import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
+from simplyprint_ws_client import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
 
 # Modules whose public names are re-exported, tried light-first so resolving a
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
+    ".cloud.config",
     ".core.config",
     ".core.settings",
-    ".core.state",
-    ".core.autowire",
-    ".core.ws_protocol.connection",
-    ".core.ws_protocol.models",
-    ".core.ws_protocol.messages",
-    ".core.client",
+    ".cloud.state",
+    ".cloud.autowire",
+    ".cloud.protocol.connection",
+    ".cloud.protocol.models",
+    ".cloud.protocol.messages",
+    ".cloud.client",
     ".core.app",
 )
 
@@ -99,14 +100,15 @@ def __dir__():
 
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
-    from .core.app import *  # noqa: F401,F403
-    from .core.client import *  # noqa: F401,F403
-    from .core.config import *  # noqa: F401,F403
-    from .core.settings import *  # noqa: F401,F403
-    from .core.state import *  # noqa: F401,F403
-    from .core.ws_protocol.connection import ConnectionMode  # noqa: F401
-    from .core.ws_protocol.messages import *  # noqa: F401,F403
-    from .core.ws_protocol.models import (  # noqa: F401
+    from simplyprint_ws_client.core.app import *  # noqa: F401,F403
+    from simplyprint_ws_client.cloud.client import *  # noqa: F401,F403
+    from simplyprint_ws_client.cloud.config import *  # noqa: F401,F403
+    from simplyprint_ws_client.core.config import *  # noqa: F401,F403
+    from simplyprint_ws_client.core.settings import *  # noqa: F401,F403
+    from simplyprint_ws_client.cloud.state import *  # noqa: F401,F403
+    from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode  # noqa: F401
+    from simplyprint_ws_client.cloud.protocol.messages import *  # noqa: F401,F403
+    from simplyprint_ws_client.cloud.protocol.models import (  # noqa: F401
         ClientMsgType,
         DemandMsgType,
         DispatchMode,

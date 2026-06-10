@@ -21,8 +21,8 @@ import queue
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Optional
 
-from .config import LoggingConfig, RoutingRule
-from .naming import (
+from simplyprint_ws_client.contrib.logging.config import LoggingConfig, RoutingRule
+from simplyprint_ws_client.contrib.logging.naming import (
     PRINTER_ROOT,
     ROOT,
     printer_log_dir,
@@ -30,7 +30,7 @@ from .naming import (
     printer_logger_name,
     scope_of,
 )
-from .policy import (
+from simplyprint_ws_client.contrib.logging.policy import (
     LOG_TARGET_FILE,
     LOG_TARGET_LIVE,
     LOG_TARGET_QUEUE,
@@ -38,11 +38,20 @@ from .policy import (
     LoggingPolicy,
     LoggingPolicyFilter,
 )
-from .routing import JsonLogFormatter, PassthroughQueueHandler, RoutingHandler
-from .store import LogFileInfo, LogNotFound, LogScopeInfo, LogStore
+from simplyprint_ws_client.contrib.logging.routing import (
+    JsonLogFormatter,
+    PassthroughQueueHandler,
+    RoutingHandler,
+)
+from simplyprint_ws_client.contrib.logging.store import (
+    LogFileInfo,
+    LogNotFound,
+    LogScopeInfo,
+    LogStore,
+)
 
 if TYPE_CHECKING:
-    from ...core.app import ClientSettings
+    from simplyprint_ws_client.core.app import ClientSettings
 
 __all__ = [
     "LoggingConfig",
@@ -94,7 +103,7 @@ def _resolve_config(settings: "ClientSettings", config: LoggingConfig) -> Loggin
     if config.system_log_stem is not None:
         return replace(config, policy=policy)
 
-    from ...shared.utils.slugify import slugify
+    from simplyprint_ws_client.common.utils.slugify import slugify
 
     stem = slugify(settings.name or "") or config.system_scope
     return replace(config, system_log_stem=stem, policy=policy)

@@ -2,15 +2,15 @@ import logging
 import threading
 from typing import final, Optional, Callable
 
-from .base import (
+from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
     FrameT,
     CameraProtocolInvalidState,
     CameraProtocolConnectionError,
 )
-from ..utils.stoppable import SyncStoppable
-from ..utils.synchronized import Synchronized
+from simplyprint_ws_client.common.utils.stoppable import SyncStoppable
+from simplyprint_ws_client.common.utils.synchronized import Synchronized
 
 
 @final

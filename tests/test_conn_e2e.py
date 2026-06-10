@@ -32,7 +32,7 @@ import pytest
 import pytest_asyncio
 import yarl
 
-from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from simplyprint_ws_client.contrib.connection import websocket as ws
 from simplyprint_ws_client.contrib.connection.aiohttp import Aiohttp

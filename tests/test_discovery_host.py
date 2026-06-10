@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from simplyprint_ws_client.events import Event
+from simplyprint_ws_client.common.events import Event
 
 from simplyprint_ws_client.contrib.discovery.service import DiscoveryService
 from simplyprint_ws_client.contrib.discovery.spec import MulticastSpec

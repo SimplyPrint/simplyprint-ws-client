@@ -17,13 +17,13 @@ import time
 import pytest
 from yarl import URL
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
 )
 from simplyprint_ws_client.shared.camera.pool import CameraPool
-from simplyprint_ws_client.shared.worker.context import ExecutionContext
+from simplyprint_ws_client.common.worker.context import ExecutionContext
 
 
 def _shm_count():

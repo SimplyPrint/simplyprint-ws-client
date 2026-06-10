@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, List, Optional, Tuple
 
-from .config import LoggingConfig
+from simplyprint_ws_client.contrib.logging.config import LoggingConfig
 
 #: gzip magic number -- rotated backups are compressed in place but keep their
 #: ``.log.N`` name, so content has to be sniffed.
@@ -332,7 +332,7 @@ class LogStore:
 
     def strip_system_raw_logs(self, max_size: int = 50 * 1024 * 1024) -> None:
         """Tail-truncate the unbounded macOS raw capture logs to ``max_size``."""
-        from ...shared.files.file_backup import FileBackup
+        from simplyprint_ws_client.cloud.files.file_backup import FileBackup
 
         for name in ("stderr.log", "stdout.log"):
             FileBackup.strip_log_file(self._root / name, max_size=max_size)

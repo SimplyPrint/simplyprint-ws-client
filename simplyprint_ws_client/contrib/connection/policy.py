@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from simplyprint_ws_client.shared.utils.backoff import Backoff, ConstantBackoff
+from simplyprint_ws_client.common.utils.backoff import Backoff, ConstantBackoff
 
 
 @dataclass

@@ -3,7 +3,7 @@ from typing import List
 
 import pytest
 
-from simplyprint_ws_client.shared.files.file_manager import File, FileManager
+from simplyprint_ws_client.cloud.files.file_manager import File, FileManager
 
 
 @pytest.fixture

@@ -50,7 +50,7 @@ from simplyprint_ws_client.contrib.connection.options import (
 )
 from simplyprint_ws_client.contrib.connection.transport import WsTransport
 from simplyprint_ws_client.contrib.connection.websockets import Websockets
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 __all__ = [
     "WsKind",

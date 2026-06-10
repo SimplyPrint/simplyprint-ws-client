@@ -15,7 +15,7 @@ from typing import (
 from yarl import URL
 
 if TYPE_CHECKING:
-    from ..worker.context import ExecutionContext
+    from simplyprint_ws_client.common.worker.context import ExecutionContext
 
 # Typically JPEG bytes.
 FrameT = Union[bytes, bytearray, memoryview]

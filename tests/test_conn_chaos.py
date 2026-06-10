@@ -39,8 +39,8 @@ from typing import Any, Callable, List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.shared.utils.backoff import ConstantBackoff
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from simplyprint_ws_client.contrib.connection.events import (
     Connected,

@@ -26,10 +26,10 @@ import dns.name
 import dns.rdataclass
 import dns.rdatatype
 
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.shared.utils.expiring_dict import ExpiringDict
-from simplyprint_ws_client.shared.utils.stoppable import AsyncStoppable
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
+from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
 
 from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
 

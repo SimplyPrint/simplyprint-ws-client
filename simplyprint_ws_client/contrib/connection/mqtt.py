@@ -38,7 +38,7 @@ from simplyprint_ws_client.contrib.connection.paho import Paho
 from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
 from simplyprint_ws_client.contrib.connection.pool import Pool
 from simplyprint_ws_client.contrib.connection.transport import MqttTransport
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 __all__ = [
     "MqttMessage",

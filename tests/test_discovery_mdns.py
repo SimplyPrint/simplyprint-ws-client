@@ -1,8 +1,14 @@
+import asyncio
+
 import dns.message
 import dns.name
 import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
+import pytest
+
+from simplyprint_ws_client.common.events import Event, EventBus
+from simplyprint_ws_client.common.events.event import sync_only
 
 from simplyprint_ws_client.contrib.discovery.mdns import (
     MDNSResponse,
@@ -30,12 +36,18 @@ def test_build_query_is_a_ptr_question():
 
 
 def test_parse_ptr_srv_a_txt():
-    wire = _response_wire([
-        ("_ultimaker._tcp.local.", "PTR", "ultimaker._ultimaker._tcp.local."),
-        ("ultimaker._ultimaker._tcp.local.", "SRV", "0 0 80 um3.local."),
-        ("um3.local.", "A", "192.0.2.7"),
-        ("ultimaker._ultimaker._tcp.local.", "TXT", '"name=My UM3" "type=ultimaker3"'),
-    ])
+    wire = _response_wire(
+        [
+            ("_ultimaker._tcp.local.", "PTR", "ultimaker._ultimaker._tcp.local."),
+            ("ultimaker._ultimaker._tcp.local.", "SRV", "0 0 80 um3.local."),
+            ("um3.local.", "A", "192.0.2.7"),
+            (
+                "ultimaker._ultimaker._tcp.local.",
+                "TXT",
+                '"name=My UM3" "type=ultimaker3"',
+            ),
+        ]
+    )
     response = MDNSResponseParser.parse(wire)
     assert isinstance(response, MDNSResponse)
     assert response.ptr_targets("_ultimaker._tcp.local") == [
@@ -88,10 +100,12 @@ def test_parse_normalises_cache_flush_bit():
     # Real responders set the cache-flush bit; the parser must still return typed
     # records (regression for the GenericRdata AttributeError crash on live LANs).
     wire = _set_cache_flush(
-        _response_wire([
-            ("svc._x._tcp.local.", "SRV", "0 0 80 host.local."),
-            ("host.local.", "A", "192.0.2.5"),
-        ])
+        _response_wire(
+            [
+                ("svc._x._tcp.local.", "SRV", "0 0 80 host.local."),
+                ("host.local.", "A", "192.0.2.5"),
+            ]
+        )
     )
     response = MDNSResponseParser.parse(wire)
     assert response is not None
@@ -101,7 +115,7 @@ def test_parse_normalises_cache_flush_bit():
 
 def test_mdns_spec_defaults():
     from simplyprint_ws_client.contrib.discovery.spec import MDNSSpec
-    from simplyprint_ws_client.events import Event
+    from simplyprint_ws_client.common.events import Event
 
     spec = MDNSSpec(
         brand="acme",
@@ -116,23 +130,18 @@ def test_mdns_spec_defaults():
     assert spec.follow_up(object()) == ()  # default: no DNS-SD chaining
 
 
-import asyncio
-import pytest
-from simplyprint_ws_client.events import Event, EventBus
-from simplyprint_ws_client.events.event import sync_only
-
-
 @sync_only
-class _ProbeEvent(Event):
-    ...
+class _ProbeEvent(Event): ...
 
 
 def _ultimaker_response():
-    return _response_wire([
-        ("_ultimaker._tcp.local.", "PTR", "um._ultimaker._tcp.local."),
-        ("um._ultimaker._tcp.local.", "SRV", "0 0 80 um.local."),
-        ("um.local.", "A", "192.0.2.7"),
-    ])
+    return _response_wire(
+        [
+            ("_ultimaker._tcp.local.", "PTR", "um._ultimaker._tcp.local."),
+            ("um._ultimaker._tcp.local.", "SRV", "0 0 80 um.local."),
+            ("um.local.", "A", "192.0.2.7"),
+        ]
+    )
 
 
 def _single_stage_spec():
@@ -173,17 +182,21 @@ async def test_backend_caches_and_emits():
 
 
 def _dnssd_stage1():
-    return _response_wire([
-        ("_services._dns-sd._udp.local.", "PTR", "_acme-AA11._udp.local."),
-    ])
+    return _response_wire(
+        [
+            ("_services._dns-sd._udp.local.", "PTR", "_acme-AA11._udp.local."),
+        ]
+    )
 
 
 def _dnssd_stage2():
-    return _response_wire([
-        ("_acme-AA11._udp.local.", "PTR", "p._acme-AA11._udp.local."),
-        ("p._acme-AA11._udp.local.", "SRV", "0 0 80 p.local."),
-        ("p.local.", "A", "192.0.2.9"),
-    ])
+    return _response_wire(
+        [
+            ("_acme-AA11._udp.local.", "PTR", "p._acme-AA11._udp.local."),
+            ("p._acme-AA11._udp.local.", "SRV", "0 0 80 p.local."),
+            ("p.local.", "A", "192.0.2.9"),
+        ]
+    )
 
 
 class _FakeTransport:
@@ -203,9 +216,7 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
     _PREFIX = "_acme-"
 
     def follow_up(response):
-        return tuple(
-            t for t in response.ptr_targets(_DNSSD) if t.startswith(_PREFIX)
-        )
+        return tuple(t for t in response.ptr_targets(_DNSSD) if t.startswith(_PREFIX))
 
     def mapper(response, addr):
         for srv in response.srv_records():
@@ -232,7 +243,10 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
     await asyncio.sleep(0)
     assert len(transport.sent) == 1
     sent_query = dns.message.from_wire(transport.sent[0][0])
-    assert sent_query.question[0].name.to_text(omit_final_dot=True) == "_acme-AA11._udp.local"
+    assert (
+        sent_query.question[0].name.to_text(omit_final_dot=True)
+        == "_acme-AA11._udp.local"
+    )
 
     # Stage 2 -> device is resolved and cached.
     protocol.datagram_received(_dnssd_stage2(), ("192.0.2.9", 5353))

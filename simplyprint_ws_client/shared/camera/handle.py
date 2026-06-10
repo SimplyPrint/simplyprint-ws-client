@@ -3,17 +3,17 @@ import datetime
 import threading
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from .base import FrameT
-from .commands import (
+from simplyprint_ws_client.shared.camera.base import FrameT
+from simplyprint_ws_client.shared.camera.commands import (
     PollCamera,
     StartCamera,
     StopCamera,
     DeleteCamera,
 )
-from ..utils.stoppable import StoppableInterface
+from simplyprint_ws_client.common.utils.stoppable import StoppableInterface
 
 if TYPE_CHECKING:
-    from .pool import CameraPool
+    from simplyprint_ws_client.shared.camera.pool import CameraPool
 
 
 class CameraHandle(StoppableInterface):

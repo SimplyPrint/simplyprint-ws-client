@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from simplyprint_ws_client.contrib.discovery.device import DiscoveredDevice
-from simplyprint_ws_client.shared.utils.expiring_dict import ExpiringDict
+from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 
 JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
 DiscoveryExtra = Dict[str, JsonValue]

@@ -10,19 +10,25 @@ from typing import Callable, Dict, List, Optional, Type, final
 
 from yarl import URL
 
-from .base import (
+from simplyprint_ws_client.shared.camera.base import (
     BaseCameraProtocol,
     CameraProtocolConnectionError,
     CameraProtocolInvalidState,
     CameraProtocolPollingMode,
 )
-from .commands import DeleteCamera, PollCamera, Request, StartCamera, StopCamera
-from .handle import CameraHandle
-from ..asyncio.event_loop_provider import EventLoopProvider
-from ..utils.stoppable import ProcessStoppable
-from ..utils.synchronized import Synchronized
-from ..worker.context import ExecutionContext
-from ..worker.pool import WorkerHandle, WorkerPool
+from simplyprint_ws_client.shared.camera.commands import (
+    DeleteCamera,
+    PollCamera,
+    Request,
+    StartCamera,
+    StopCamera,
+)
+from simplyprint_ws_client.shared.camera.handle import CameraHandle
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.utils.stoppable import ProcessStoppable
+from simplyprint_ws_client.common.utils.synchronized import Synchronized
+from simplyprint_ws_client.common.worker.context import ExecutionContext
+from simplyprint_ws_client.common.worker.pool import WorkerHandle, WorkerPool
 
 
 async def _resolve_aiter(protocol: BaseCameraProtocol):

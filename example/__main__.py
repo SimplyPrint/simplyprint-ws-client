@@ -4,7 +4,7 @@ from simplyprint_ws_client import (
     ConfigManagerType,
     ConnectionMode,
 )
-from simplyprint_ws_client.shared.asyncio.event_loop_runner import EventLoopBackend
+from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.shared.cli.cli import ClientCli
 from simplyprint_ws_client.contrib.logging import setup_logging
 

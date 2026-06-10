@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-from simplyprint_ws_client.contrib.model import ReactiveModel, SimpleUpdateModel
+from simplyprint_ws_client.common.model import ReactiveModel, SimpleUpdateModel
 
 
 class _Ctx:

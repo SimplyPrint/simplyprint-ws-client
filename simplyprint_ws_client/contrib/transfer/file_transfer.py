@@ -39,8 +39,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
-from simplyprint_ws_client.shared.files.file_download import FileDownload
-from simplyprint_ws_client.shared.utils.slugify import slugify
+from simplyprint_ws_client.cloud.files.file_download import FileDownload
+from simplyprint_ws_client.common.utils.slugify import slugify
 
 from simplyprint_ws_client.contrib.transfer.checksum import file_md5
 

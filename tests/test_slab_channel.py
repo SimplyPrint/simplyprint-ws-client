@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from simplyprint_ws_client.shared.worker.channel import SharedSlabChannel
+from simplyprint_ws_client.common.worker.channel import SharedSlabChannel
 
 _SHM_DIR = "/dev/shm"
 

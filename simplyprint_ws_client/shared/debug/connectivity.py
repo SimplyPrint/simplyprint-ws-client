@@ -15,7 +15,7 @@ import psutil
 from aiohttp import ClientWSTimeout
 from pydantic import BaseModel, Field
 
-from ..sp.url_builder import SimplyPrintBackend
+from simplyprint_ws_client.cloud.api.url_builder import SimplyPrintBackend
 
 
 class WebSocketTestResult(BaseModel):

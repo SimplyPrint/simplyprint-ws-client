@@ -9,7 +9,7 @@ from simplyprint_ws_client.contrib.connection.keepalive import Keepalive
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
-    from simplyprint_ws_client.shared.asyncio.event_loop_provider import (
+    from simplyprint_ws_client.common.asyncio.event_loop_provider import (
         EventLoopProvider,
     )
 

@@ -2,7 +2,7 @@ import pytest
 from dataclasses import dataclass, field
 from typing import List
 
-from simplyprint_ws_client.shared.events.property_path import PropertyPath, as_path, p
+from simplyprint_ws_client.common.events.property_path import PropertyPath, as_path, p
 
 
 def test_simple():

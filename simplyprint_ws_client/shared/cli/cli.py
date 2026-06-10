@@ -4,10 +4,10 @@ from typing import Any, Dict, Optional, Union, get_args, get_origin, Callable
 
 import click
 
-from ..debug.connectivity import ConnectivityReport
-from ...const import APP_DIRS
-from ...core.app import ClientApp
-from ...core.config import PrinterConfig
+from simplyprint_ws_client.shared.debug.connectivity import ConnectivityReport
+from simplyprint_ws_client.const import APP_DIRS
+from simplyprint_ws_client.core.app import ClientApp
+from simplyprint_ws_client.cloud.config import PrinterConfig
 
 
 class CommandBag:

@@ -64,7 +64,7 @@ def scope_of(
 
 def printer_resolver(logger_name: str) -> Tuple[str, str]:
     """``'simplyprint.printer.<enc>.mqtt' -> ('<uid>', 'mqtt')``; base -> ('<uid>', 'main')."""
-    from ...shared.utils.slugify import slugify
+    from simplyprint_ws_client.common.utils.slugify import slugify
 
     rest = logger_name[len(PRINTER_ROOT) + 1 :]
     segment, _, sub = rest.partition(".")
@@ -86,7 +86,7 @@ def printer_log_dir(unique_id: str, log_dir: Optional[Path] = None) -> Path:
     if log_dir is not None:
         root = Path(log_dir)
     else:
-        from ...const import APP_DIRS
+        from simplyprint_ws_client.const import APP_DIRS
 
         root = APP_DIRS.user_log_path
     folder = root / str(unique_id)

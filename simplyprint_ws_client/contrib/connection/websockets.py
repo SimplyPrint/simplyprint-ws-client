@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Union
 
 import yarl
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.messages import (
     WsMessage,
@@ -72,7 +72,7 @@ class Websockets(WsTransport, Reconnecting):
 
     Construct it with the endpoint URL and, optionally, a
     :class:`~simplyprint_ws_client.contrib.connection.policy.RetryPolicy`, the
-    :class:`~simplyprint_ws_client.shared.asyncio.event_loop_provider.EventLoopProvider`
+    :class:`~simplyprint_ws_client.common.asyncio.event_loop_provider.EventLoopProvider`
     whose loop the supervision task runs on, a ``connect`` factory (defaulting to
     the library's, resolved lazily), and connect keyword arguments passed to that
     factory on every attempt. :meth:`start` it and drive it by events;

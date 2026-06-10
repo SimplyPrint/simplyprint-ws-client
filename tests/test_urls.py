@@ -1,4 +1,4 @@
-from simplyprint_ws_client.shared.sp.url_builder import (
+from simplyprint_ws_client.cloud.api.url_builder import (
     SimplyPrintURL,
     SimplyPrintBackend,
 )

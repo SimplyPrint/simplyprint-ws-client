@@ -24,8 +24,8 @@ from typing import Optional
 
 import yarl
 
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.events import (
     Connected,

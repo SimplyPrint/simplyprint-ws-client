@@ -1,6 +1,6 @@
 from typing import Union, NamedTuple, Optional
 
-from .base import BaseCameraProtocol
+from simplyprint_ws_client.shared.camera.base import BaseCameraProtocol
 
 
 class CreateCamera(NamedTuple):

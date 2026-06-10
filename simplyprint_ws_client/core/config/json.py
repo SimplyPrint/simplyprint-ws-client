@@ -6,9 +6,9 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from .manager import ConfigManager
-from .config import Config
-from ...shared.files.file_backup import FileBackup
+from simplyprint_ws_client.core.config.manager import ConfigManager
+from simplyprint_ws_client.cloud.config import Config
+from simplyprint_ws_client.cloud.files.file_backup import FileBackup
 
 
 class JsonConfigManager(ConfigManager):

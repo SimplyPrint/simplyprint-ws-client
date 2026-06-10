@@ -1,5 +1,5 @@
-from simplyprint_ws_client.events import Event
-from simplyprint_ws_client.shared.events.predicate import (
+from simplyprint_ws_client.common.events import Event
+from simplyprint_ws_client.common.events.predicate import (
     Constant,
     Reduce,
     Eq,
@@ -8,7 +8,7 @@ from simplyprint_ws_client.shared.events.predicate import (
     And,
     EmptyPipe,
 )
-from simplyprint_ws_client.shared.events.property_path import p
+from simplyprint_ws_client.common.events.property_path import p
 
 
 def test_simple():

@@ -18,9 +18,9 @@ from typing import (
 
 import yarl
 
-from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.shared.asyncio.courier import Courier, OverflowPolicy
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.events import EventBus
+from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.events import (
     Connected,

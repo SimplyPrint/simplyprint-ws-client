@@ -1,6 +1,6 @@
 """The connection event vocabulary -- the single language every wire speaks.
 
-A transport publishes these on an :class:`~simplyprint_ws_client.events.EventBus`,
+A transport publishes these on an :class:`~simplyprint_ws_client.common.events.EventBus`,
 keyed by type, so a consumer subscribes with ``bus.on(Connected, handler)`` and
 the handler receives the typed instance. The same four events flow whether the
 wire underneath is MQTT or WebSocket, sync or async -- a consumer that only
@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from simplyprint_ws_client.events import Event
+from simplyprint_ws_client.common.events import Event
 
 from simplyprint_ws_client.contrib.connection.errors import TransportError
 from simplyprint_ws_client.contrib.connection.messages import QoS

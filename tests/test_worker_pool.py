@@ -12,9 +12,9 @@ import time
 
 import pytest
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.shared.worker import ExecutionContext, OverflowPolicy
-from simplyprint_ws_client.shared.worker.pool import WorkerPool
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.worker import ExecutionContext, OverflowPolicy
+from simplyprint_ws_client.common.worker.pool import WorkerPool
 
 
 def _frame(i, size):

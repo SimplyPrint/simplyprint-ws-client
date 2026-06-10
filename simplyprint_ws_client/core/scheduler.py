@@ -6,14 +6,17 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict, Set
 
-from .client import Client, ClientState
-from .connection_manager import ClientConnectionManager, ClientList
-from .settings import ClientSettings
-from ..shared.asyncio.async_task_scope import AsyncTaskScope
-from ..shared.asyncio.continuous_task import ContinuousTask
-from ..shared.asyncio.event_loop_provider import EventLoopProvider
-from ..shared.asyncio.utils import cond_notify_all, cond_wait
-from ..shared.utils.stoppable import AsyncStoppable
+from simplyprint_ws_client.cloud.client import Client, ClientState
+from simplyprint_ws_client.core.connection_manager import (
+    ClientConnectionManager,
+    ClientList,
+)
+from simplyprint_ws_client.core.settings import ClientSettings
+from simplyprint_ws_client.common.asyncio.async_task_scope import AsyncTaskScope
+from simplyprint_ws_client.common.asyncio.continuous_task import ContinuousTask
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.utils import cond_notify_all, cond_wait
+from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
 
 
 class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):

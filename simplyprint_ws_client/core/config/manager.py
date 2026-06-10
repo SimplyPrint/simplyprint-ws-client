@@ -4,8 +4,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generic, List, Optional, Type, TypeVar, Set
 
-from .config import Config, PrinterConfig
-from ...const import APP_DIRS
+from simplyprint_ws_client.cloud.config import Config, PrinterConfig
+from simplyprint_ws_client.const import APP_DIRS
 
 TConfig = TypeVar("TConfig", bound=Config)
 

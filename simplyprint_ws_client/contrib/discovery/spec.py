@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Generic, Optional, Tuple, TYPE_CHECKING, TypeVar
 
-from simplyprint_ws_client.events import Event
+from simplyprint_ws_client.common.events import Event
 
 from simplyprint_ws_client.contrib.discovery.ssdp import SSDPRequest
 

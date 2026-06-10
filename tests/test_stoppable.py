@@ -1,6 +1,6 @@
 from typing import List
 
-from simplyprint_ws_client.shared.utils.stoppable import StoppableThread
+from simplyprint_ws_client.common.utils.stoppable import StoppableThread
 
 
 class StoppableTaskExample(StoppableThread):

@@ -27,7 +27,7 @@ from typing import Callable, Dict, Generic, Hashable, List, Optional, Set, TypeV
 
 import yarl
 
-from simplyprint_ws_client.shared.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
 from simplyprint_ws_client.contrib.connection.connection import Connection
 from simplyprint_ws_client.contrib.connection.events import (
