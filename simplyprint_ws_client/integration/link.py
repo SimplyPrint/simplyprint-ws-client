@@ -27,10 +27,10 @@ from simplyprint_ws_client.common.wire.events import (
     MessageReceived,
 )
 from simplyprint_ws_client.common.wire.messages import MqttMessage, WsMessage
-from simplyprint_ws_client.device.connection import mqtt as mqtt_front_door
-from simplyprint_ws_client.device.connection import websocket as ws_front_door
-from simplyprint_ws_client.device.connection.lease import Lease, MqttLease, WsLease
-from simplyprint_ws_client.device.connection.options import ConnectionOptions
+from simplyprint_ws_client.common.wire import mqtt as mqtt_front_door
+from simplyprint_ws_client.common.wire import websocket as ws_front_door
+from simplyprint_ws_client.common.wire.lease import Lease, MqttLease, WsLease
+from simplyprint_ws_client.common.wire.options import ConnectionOptions
 from simplyprint_ws_client.integration.driver import DeviceDriver
 
 if TYPE_CHECKING:
@@ -59,15 +59,11 @@ class DeviceLink(DeviceDriver):
         self._options = options
         self.lease: Optional[Lease] = None
 
-    # -- the front-door seam concrete links fill ---------------------------
-
     def _connect(self, url: Union[str, yarl.URL], options: ConnectionOptions) -> Lease:
         raise NotImplementedError
 
     def _on_lease_acquired(self, lease: Lease) -> None:
         """Post-connect per-protocol setup (e.g. topic subscriptions)."""
-
-    # -- lifecycle ----------------------------------------------------------
 
     @property
     def connected(self) -> bool:
@@ -120,8 +116,6 @@ class DeviceLink(DeviceDriver):
             return
         lease.close_soon()
 
-    # -- guarded outbound ----------------------------------------------------
-
     def send_soon(self, message: object) -> bool:
         """Schedule a send if the wire is up; ``False`` (and no raise) if not."""
         lease = self.lease
@@ -135,8 +129,6 @@ class DeviceLink(DeviceDriver):
         if lease is None:
             raise ConnectionError(f"{self.name} link is not started")
         await lease.send(message)
-
-    # -- wire events -> client hooks (already on the client's loop) ----------
 
     async def _on_wire_connected(self, _event: object) -> None:
         self.is_connected = True

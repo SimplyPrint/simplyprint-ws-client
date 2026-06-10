@@ -87,8 +87,6 @@ class DeviceDriver(ABC):
         self.stop()
         self.start()
 
-    # -- credential refresh ------------------------------------------------
-
     def request_credential_refresh(self) -> None:
         """Run the client's credential refresh exactly once, then restart.
 

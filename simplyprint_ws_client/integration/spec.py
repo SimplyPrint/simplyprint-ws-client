@@ -39,9 +39,9 @@ from typing import (
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.cloud.client import Client
-    from simplyprint_ws_client.cloud.config import PrinterConfig
-    from simplyprint_ws_client.runtime.config import ConfigManagerType
+    from simplyprint_ws_client.core.client import Client
+    from simplyprint_ws_client.core.config import PrinterConfig
+    from simplyprint_ws_client.core.config import ConfigManagerType
     from simplyprint_ws_client.device.accounts import AccountProvider
     from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
     from simplyprint_ws_client.device.discovery.spec import (
@@ -134,8 +134,6 @@ class PrinterSpec:
     back it via :meth:`provides` and builds none it doesn't need.
     """
 
-    # -- the runtime fields the app consumes (the old PrinterSpec) -------------
-
     key: str
     client_factory: TClientFactory
     config_factory: TConfigFactory
@@ -156,8 +154,6 @@ class PrinterSpec:
 
         return f"{app_name}-{self.key}" if app_name else self.key
 
-    # -- catalogue identity, read off the class without building --------------
-
     #: ``key`` is the per-instance runtime field; :meth:`build` sets it from this.
     KEY: ClassVar[str]
     #: Declarative product facts, read off the class without building the heavy
@@ -165,8 +161,6 @@ class PrinterSpec:
     metadata: ClassVar[ProductMetadata]
     #: Optional storage name the default ``build`` passes through.
     NAME: ClassVar[Optional[str]] = None
-
-    # -- declarative construction (the default ``build`` consumes these) ------
 
     #: ``lazy("pkg.module:PrinterClass")`` -- the client factory.
     client: ClassVar[Optional[LazyRef]] = None
@@ -196,8 +190,6 @@ class PrinterSpec:
             config_factory=cls.config.resolve(),
             camera_protocols=tuple(ref.resolve() for ref in cls.cameras),
         )
-
-    # -- capability hooks: default "this type does not back the surface" --------
 
     @classmethod
     def background_service(cls, event_loop_provider=None) -> "BackgroundService | None":

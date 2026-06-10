@@ -111,7 +111,9 @@ class DevicePoller(DeviceDriver):
 
             # Silence (since the last sign of life, or since start for a device
             # never reached) flips the edge exactly once until contact resumes.
-            last_life = self.last_message_at if self.last_message_at is not None else started
+            last_life = (
+                self.last_message_at if self.last_message_at is not None else started
+            )
             if (
                 self.is_connected is not False
                 and time.monotonic() - last_life >= self.offline_after

@@ -26,7 +26,7 @@ import yarl
 from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
-from simplyprint_ws_client.device.connection import (
+from simplyprint_ws_client.common.wire import (
     Lease,
     MqttLease,
     WsLease,
@@ -38,13 +38,13 @@ from simplyprint_ws_client.common.wire.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.device.connection.keepalive import (
+from simplyprint_ws_client.common.wire.keepalive import (
     Keepalive,
     KeepaliveTimeout,
 )
 from simplyprint_ws_client.common.wire.messages import QoS
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.pool import Pool
 from simplyprint_ws_client.common.wire.reconnect import Reconnecting
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import (
@@ -54,15 +54,15 @@ from simplyprint_ws_client.common.wire.transport import (
     Transport,
 )
 
-from simplyprint_ws_client.device.connection import mqtt
-from simplyprint_ws_client.device.connection import websocket as ws
+from simplyprint_ws_client.common.wire import mqtt
+from simplyprint_ws_client.common.wire import websocket as ws
 from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
-from simplyprint_ws_client.device.connection.mqtt import (
+from simplyprint_ws_client.common.wire.mqtt import (
     MqttBroker,
     MqttMessage,
     mqtt_message_route,
 )
-from simplyprint_ws_client.device.connection.websocket import WsMessage
+from simplyprint_ws_client.common.wire.websocket import WsMessage
 from simplyprint_ws_client.common.wire.websockets import Websockets
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 

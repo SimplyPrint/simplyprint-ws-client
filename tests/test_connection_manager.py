@@ -2,21 +2,21 @@ import asyncio
 
 import pytest
 
-import simplyprint_ws_client.runtime.manager as connection_manager_module
-from simplyprint_ws_client.cloud.client import Client, ClientState
-from simplyprint_ws_client.cloud.config import PrinterConfig
-from simplyprint_ws_client.runtime.manager import (
+import simplyprint_ws_client.core.manager as connection_manager_module
+from simplyprint_ws_client.core.client import Client, ClientState
+from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.core.manager import (
     ClientConnectionManager,
     ClientList,
     ClientView,
 )
-from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode
-from simplyprint_ws_client.cloud.protocol.events import (
+from simplyprint_ws_client.core.protocol.connection import ConnectionMode
+from simplyprint_ws_client.core.protocol.events import (
     CloudConnectionIncomingEvent,
     CloudConnectionLostEvent,
     CloudConnectionOutgoingEvent,
 )
-from simplyprint_ws_client.cloud.protocol.messages import PingMsg
+from simplyprint_ws_client.core.protocol.messages import PingMsg
 from simplyprint_ws_client.common.events import EventBus
 
 

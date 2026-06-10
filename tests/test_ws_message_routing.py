@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from simplyprint_ws_client import PrinterConfig
 from simplyprint_ws_client.common.logging.naming import printer_logger_name
-from simplyprint_ws_client.cloud.protocol.connection import (
+from simplyprint_ws_client.core.protocol.connection import (
     CloudConnection,
     ConnectionHint,
     ConnectionMode,

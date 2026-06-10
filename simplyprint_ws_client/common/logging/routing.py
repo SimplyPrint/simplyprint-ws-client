@@ -16,7 +16,10 @@ import threading
 from typing import TYPE_CHECKING, Dict
 
 from simplyprint_ws_client.common.logging.naming import scope_of
-from simplyprint_ws_client.common.logging.policy import LOG_TARGET_FILE, LoggingPolicyFilter
+from simplyprint_ws_client.common.logging.policy import (
+    LOG_TARGET_FILE,
+    LoggingPolicyFilter,
+)
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.common.logging.config import LoggingConfig

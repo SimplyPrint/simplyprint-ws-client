@@ -1,4 +1,4 @@
-from simplyprint_ws_client.runtime.debug.connectivity import ConnectivityReport
+from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
 
 
 def test_generate_default_report():

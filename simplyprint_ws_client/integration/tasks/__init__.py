@@ -3,8 +3,8 @@
 Declare a task with the :data:`REGISTRY` decorator next to its coroutine; let the
 app's single :class:`SchedulerService` read the registry at startup and own all
 firing. A task reports by publishing to a
-:class:`~simplyprint_ws_client.runtime.status.registry.StatusRegistry` (see
-:mod:`simplyprint_ws_client.runtime.status`), so periodic work and the status
+:class:`~simplyprint_ws_client.core.status.registry.StatusRegistry` (see
+:mod:`simplyprint_ws_client.core.status`), so periodic work and the status
 endpoint are decoupled: tasks compute on a schedule, the endpoint serves the
 cached snapshot.
 
@@ -19,7 +19,7 @@ Example -- a producer codes against this contract::
     from datetime import timedelta
 
     from simplyprint_ws_client.integration.tasks import REGISTRY, TaskContext
-    from simplyprint_ws_client.runtime.status import StatusEntry, StatusState
+    from simplyprint_ws_client.core.status import StatusEntry, StatusState
 
     @REGISTRY.periodic(interval=timedelta(hours=1), name="ota.check")
     async def check_for_update(ctx: TaskContext) -> None:

@@ -332,7 +332,7 @@ class LogStore:
 
     def strip_system_raw_logs(self, max_size: int = 50 * 1024 * 1024) -> None:
         """Tail-truncate the unbounded macOS raw capture logs to ``max_size``."""
-        from simplyprint_ws_client.cloud.files.file_backup import FileBackup
+        from simplyprint_ws_client.core.files.file_backup import FileBackup
 
         for name in ("stderr.log", "stdout.log"):
             FileBackup.strip_log_file(self._root / name, max_size=max_size)

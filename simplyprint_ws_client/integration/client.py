@@ -1,7 +1,7 @@
 """The headline base for authoring a printer integration, as one business object.
 
 A printer client's job is to boil a device's model data into a
-:class:`~simplyprint_ws_client.cloud.state.PrinterState`. The *machinery* around
+:class:`~simplyprint_ws_client.core.state.PrinterState`. The *machinery* around
 that -- driving the device-driver lifecycle, ticking host telemetry + ping,
 hopping device edges onto the client loop, reducing a device-mapped status
 through the shared cancel/pause/download holds and job-start/finish edges, and
@@ -53,10 +53,10 @@ from typing import (
     TypeVar,
 )
 
-from simplyprint_ws_client.cloud.client import ClientConfigChangedEvent
-from simplyprint_ws_client.cloud.config import PrinterConfig
-from simplyprint_ws_client.cloud.state import PrinterStatus
-from simplyprint_ws_client.cloud.protocol.messages import (
+from simplyprint_ws_client.core.client import ClientConfigChangedEvent
+from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.core.state import PrinterStatus
+from simplyprint_ws_client.core.protocol.messages import (
     CancelDemandData,
     GcodeDemandData,
     PauseDemandData,
@@ -243,7 +243,6 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         ``True`` to have the driver restart with them. Default: cannot refresh."""
         return False
 
-    # -- the demand surface (typed, discoverable; autowired by name) ---------
     # Override what your device supports; each default is a no-op (logged at
     # debug). An override registers exactly once -- autowire resolves one
     # attribute per name through the MRO -- and may use any tolerated arity.

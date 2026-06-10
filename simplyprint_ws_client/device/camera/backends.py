@@ -71,8 +71,6 @@ class InlineCameraBackend:
     def _continuous(self) -> bool:
         return self._protocol.polling_mode == CameraProtocolPollingMode.CONTINUOUS
 
-    # -- handle-facing surface (callable from any thread) --------------- #
-
     def poll(self) -> None:
         self._provider.event_loop.call_soon_threadsafe(self._poll_on_loop)
 
@@ -84,8 +82,6 @@ class InlineCameraBackend:
 
     def stop(self) -> None:
         self.pause()
-
-    # -- loop-thread implementation ------------------------------------- #
 
     def _poll_on_loop(self) -> None:
         if self._continuous:
@@ -172,8 +168,6 @@ class ThreadCameraBackend:
         frame, timestamp = item
         self._handle._set_frame(frame, timestamp)
 
-    # -- handle-facing surface ------------------------------------------ #
-
     def poll(self) -> None:
         if self._continuous:
             self.start()
@@ -198,8 +192,6 @@ class ThreadCameraBackend:
     def stop(self) -> None:
         self.pause()
         self._courier.close()
-
-    # -- internals ------------------------------------------------------ #
 
     def _refresh_timer(self) -> None:
         if not self._pause_timeout or not self._continuous:

@@ -5,8 +5,8 @@ from itertools import chain
 import pytest
 
 from simplyprint_ws_client import Client, MaterialDataMsg
-from simplyprint_ws_client.cloud.state import MaterialLayoutEntry
-from simplyprint_ws_client.cloud.state.models import VolumeType, NozzleType, BedType
+from simplyprint_ws_client.core.state import MaterialLayoutEntry
+from simplyprint_ws_client.core.state.models import VolumeType, NozzleType, BedType
 
 
 @pytest.mark.parametrize(

@@ -27,14 +27,14 @@ BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centa
 
 # The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
 # re-export hub is the one sanctioned exception and lives outside these dirs).
-LAYER_DIRS = ("cloud", "common", "device", "integration", "runtime")
+LAYER_DIRS = ("common", "core", "device", "integration")
 
 
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
 # member ids, bed-plate types). These modules MIRROR that cloud-defined vocabulary —
 # they are protocol constants, not machinery branching on a brand. Everything else
 # in the package must stay brand-free.
-PROTOCOL_VOCABULARY = ("cloud/state/models.py",)
+PROTOCOL_VOCABULARY = ("core/state/models.py",)
 
 
 class TestBrandFree:
@@ -173,16 +173,16 @@ class TestNoShims:
         import importlib
 
         # 1. The shim file no longer exists (state/ lives under cloud/ since 2.0).
-        shim = LIB_PKG / "cloud" / "state" / "state_model.py"
+        shim = LIB_PKG / "core" / "state" / "state_model.py"
         assert not shim.exists(), f"state_model.py was resurrected: {shim}"
 
         # 2. Importing the dead module path raises ImportError.
         with pytest.raises(ImportError):
-            importlib.import_module("simplyprint_ws_client.cloud.state.state_model")
+            importlib.import_module("simplyprint_ws_client.core.state.state_model")
 
         # 3. Every state class inherits from the real ReactiveModel, not a local alias.
         from simplyprint_ws_client.common.model.reactive import ReactiveModel
-        import simplyprint_ws_client.cloud.state as state_pkg
+        import simplyprint_ws_client.core.state as state_pkg
 
         state_classes = [
             "TemperatureState",
@@ -346,7 +346,11 @@ class TestImportDAG:
         base = LIB_PKG / "integration" / "client.py"
         assert base.exists(), "integration/client.py (the authoring base) is missing"
 
-        allowed = ("cloud", "common", "device", "integration")
+        # The authoring base may use the protocol half of core/ but never the
+        # HOST half -- post-review, cloud+runtime share the core/ dir, so the
+        # tooth moved from layer names to the host module list.
+        host_modules = ("app", "settings", "scheduler", "manager", "host", "registry")
+        allowed = ("common", "core", "device", "integration")
         offenders = []
         tree = ast.parse(base.read_text(), str(base))
         for node in ast.walk(tree):
@@ -358,9 +362,11 @@ class TestImportDAG:
             for module in modules:
                 if not module.startswith("simplyprint_ws_client."):
                     continue
-                layer = module.split(".")[1]
-                if layer not in allowed:
+                parts = module.split(".")
+                if parts[1] not in allowed:
                     offenders.append(f"line {node.lineno}: {module}")
+                elif parts[1] == "core" and len(parts) > 2 and parts[2] in host_modules:
+                    offenders.append(f"line {node.lineno}: {module} (host half)")
         assert not offenders, (
             f"integration/client.py imports non-leftward layers: {offenders}"
         )

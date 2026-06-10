@@ -13,7 +13,7 @@ de-duplication, hiding already-added devices from the discovery list, and a
 running client's re-discovery host update.
 
 Which config fields may carry an address comes from the config class
-(:attr:`~simplyprint_ws_client.cloud.config.PrinterConfig.network_address_fields`),
+(:attr:`~simplyprint_ws_client.core.config.PrinterConfig.network_address_fields`),
 so a brand with an unusually-named address field extends its own config rather
 than this module.
 """

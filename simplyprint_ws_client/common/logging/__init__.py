@@ -51,7 +51,7 @@ from simplyprint_ws_client.common.logging.store import (
 )
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.runtime.app import ClientSettings
+    from simplyprint_ws_client.core.app import ClientSettings
 
 __all__ = [
     "LoggingConfig",

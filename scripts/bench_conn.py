@@ -47,10 +47,10 @@ from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.device.connection import mqtt, ws
-from simplyprint_ws_client.device.connection.options import ConnectionOptions
-from simplyprint_ws_client.device.connection.lease import Lease
-from simplyprint_ws_client.device.connection.lease import MqttLease
+from simplyprint_ws_client.common.wire import mqtt, ws
+from simplyprint_ws_client.common.wire.options import ConnectionOptions
+from simplyprint_ws_client.common.wire.lease import Lease
+from simplyprint_ws_client.common.wire.lease import MqttLease
 from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
@@ -64,9 +64,9 @@ from simplyprint_ws_client.common.wire.messages import (
     QoS,
     WsMessage,
 )
-from simplyprint_ws_client.device.connection.mqtt import mqtt_message_route
+from simplyprint_ws_client.common.wire.mqtt import mqtt_message_route
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.pool import Pool
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import (
     MqttTransport,

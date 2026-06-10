@@ -1,14 +1,18 @@
-"""The neutral self-healing wire engine both sides ride.
+"""The connection subsystem: self-healing wires, shared pools, per-caller leases.
 
-A :class:`Transport` is a supervised link to one endpoint; :class:`Reconnecting`
-is the one supervision loop concrete wires fill four hooks on. The cloud protocol
-composes a wire for the SimplyPrint socket exactly like the device front doors do
-for printers -- nothing in here knows which side it is carrying, which is why this
-lives in ``common`` and not on either side.
+One semantic home for everything connection: the supervised :class:`Transport`
+engine (:class:`Reconnecting` + the concrete backends), the wire events both
+sides ride, the :class:`Pool` that shares one socket per endpoint, the
+per-caller :class:`Lease` (with app-level keepalive), and the ``mqtt`` /
+``websocket`` connect front doors. The SimplyPrint socket and a printer link
+compose the same machinery -- nothing in here knows which side it carries.
 """
 
 from __future__ import annotations
 
+from simplyprint_ws_client.common.wire import mqtt, websocket
+from simplyprint_ws_client.common.wire.aiohttp import Aiohttp
+from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
 from simplyprint_ws_client.common.wire.errors import ErrorCode, TransportError
 from simplyprint_ws_client.common.wire.events import (
     Connected,
@@ -17,13 +21,17 @@ from simplyprint_ws_client.common.wire.events import (
     MessageReceived,
     WireEvent,
 )
-from simplyprint_ws_client.common.wire.messages import (
-    MqttMessage,
-    QoS,
-    WsKind,
-    WsMessage,
+from simplyprint_ws_client.common.wire.keepalive import (
+    ConnectionKeepalive,
+    Keepalive,
+    KeepaliveTimeout,
 )
+from simplyprint_ws_client.common.wire.lease import Lease, MqttLease, WsLease
+from simplyprint_ws_client.common.wire.messages import MqttMessage, QoS, WsKind, WsMessage
+from simplyprint_ws_client.common.wire.options import ConnectionOptions, WireKeepalive
+from simplyprint_ws_client.common.wire.paho import Paho
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
+from simplyprint_ws_client.common.wire.pool import Endpoint, Pool
 from simplyprint_ws_client.common.wire.reconnect import Reconnecting
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import (
@@ -35,26 +43,46 @@ from simplyprint_ws_client.common.wire.transport import (
     WsTransport,
     topic_matches,
 )
+from simplyprint_ws_client.common.wire.websockets import Websockets
+
+ws = websocket
 
 __all__ = [
+    "mqtt",
+    "websocket",
+    "ws",
+    "AioMqtt",
+    "Aiohttp",
     "Connected",
     "Connecting",
+    "ConnectionKeepalive",
+    "ConnectionOptions",
     "ConnectionState",
     "Disconnected",
+    "Endpoint",
     "ErrorCode",
     "FatalError",
+    "Keepalive",
+    "KeepaliveTimeout",
+    "Lease",
     "MessageReceived",
+    "MqttLease",
     "MqttMessage",
     "MqttTransport",
     "NotConnected",
+    "Paho",
+    "Pool",
     "QoS",
     "Reconnecting",
     "RetryPolicy",
     "TransientError",
     "Transport",
     "TransportError",
+    "Websockets",
     "WireEvent",
+    "WireKeepalive",
     "WsKind",
+    "WsLease",
     "WsMessage",
     "WsTransport",
     "topic_matches",

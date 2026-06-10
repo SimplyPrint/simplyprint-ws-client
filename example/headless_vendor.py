@@ -28,12 +28,10 @@ from simplyprint_ws_client.integration import DevicePoller, PrinterClient
 from simplyprint_ws_client.integration.flow import FlowError, FlowState, run_flow
 from simplyprint_ws_client.integration.flow.recipes import standard_add_printer_flow
 from simplyprint_ws_client.integration.spec import PrinterSpec, ProductMetadata, lazy
-from simplyprint_ws_client.runtime.host import Host
-from simplyprint_ws_client.runtime.registry import SpecRegistry
+from simplyprint_ws_client.core.host import Host
+from simplyprint_ws_client.core.registry import SpecRegistry
 
-# --------------------------------------------------------------------------- #
 # 1. The config: the persisted record of one printer.
-# --------------------------------------------------------------------------- #
 
 
 class VendorConfig(PrinterConfig):
@@ -45,9 +43,7 @@ class VendorConfig(PrinterConfig):
         return self.serial
 
 
-# --------------------------------------------------------------------------- #
 # 2. The printer client: device facts -> PrinterState, via the polling seam.
-# --------------------------------------------------------------------------- #
 
 
 class VendorPrinter(PrinterClient[VendorConfig]):
@@ -65,9 +61,7 @@ class VendorPrinter(PrinterClient[VendorConfig]):
         self.apply_status(PrinterStatus.OPERATIONAL)
 
 
-# --------------------------------------------------------------------------- #
 # 3. The flow: the guided add-printer skeleton, composed.
-# --------------------------------------------------------------------------- #
 
 
 async def _verify(state: FlowState, _answer) -> dict:
@@ -95,9 +89,7 @@ def build_add_printer_flow():
     )
 
 
-# --------------------------------------------------------------------------- #
 # 4. The spec: the one declarative descriptor.
-# --------------------------------------------------------------------------- #
 
 
 async def _probe(host: str):
@@ -126,9 +118,7 @@ class VendorSpec(PrinterSpec):
         return build_add_printer_flow()
 
 
-# --------------------------------------------------------------------------- #
 # 5. The headless main(): registry -> host -> discover -> flow -> add -> run.
-# --------------------------------------------------------------------------- #
 
 
 async def onboard(host: Host) -> None:

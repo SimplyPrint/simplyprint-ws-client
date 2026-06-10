@@ -13,7 +13,7 @@ in a web handler:
   ``unique_id``.
 
 Which config fields may carry the device's address is the config class's
-business: :attr:`~simplyprint_ws_client.cloud.config.PrinterConfig.network_address_fields`.
+business: :attr:`~simplyprint_ws_client.core.config.PrinterConfig.network_address_fields`.
 """
 
 from __future__ import annotations

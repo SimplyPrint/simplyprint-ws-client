@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 import pytest
 
-from simplyprint_ws_client.cloud.protocol import connection as conn_mod
-from simplyprint_ws_client.cloud.protocol.connection import (
+from simplyprint_ws_client.core.protocol import connection as conn_mod
+from simplyprint_ws_client.core.protocol.connection import (
     CloudConnection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.cloud.protocol.events import CloudConnectionEstablishedEvent
+from simplyprint_ws_client.core.protocol.events import CloudConnectionEstablishedEvent
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from tests._fakes import FakeTransport
@@ -47,7 +47,7 @@ async def test_connect_builds_transport_via_factory_once():
     )
 
     with patch(
-        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout", 10.0
+        "simplyprint_ws_client.core.protocol.connection.WsFirstMessageTimeout", 10.0
     ):
         await conn.connect()
         await asyncio.sleep(0.05)
@@ -68,7 +68,7 @@ async def test_transport_reconnect_advances_protocol_version():
 
     with (
         patch(
-            "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
+            "simplyprint_ws_client.core.protocol.connection.WsFirstMessageTimeout",
             10.0,
         ),
         patch.object(ConstantBackoff, "delay", return_value=0.01),

@@ -34,10 +34,10 @@ import yarl
 
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.device.connection import websocket as ws
+from simplyprint_ws_client.common.wire import websocket as ws
 from simplyprint_ws_client.common.wire.aiohttp import Aiohttp
-from simplyprint_ws_client.device.connection.lease import WsLease
-from simplyprint_ws_client.device.connection.options import ConnectionOptions
+from simplyprint_ws_client.common.wire.lease import WsLease
+from simplyprint_ws_client.common.wire.options import ConnectionOptions
 from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
@@ -48,7 +48,7 @@ from simplyprint_ws_client.common.wire.messages import QoS
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import WsTransport
-from simplyprint_ws_client.device.connection.websocket import (
+from simplyprint_ws_client.common.wire.websocket import (
     WsKind,
     WsMessage,
 )
@@ -845,7 +845,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
     """
     import socket
 
-    from simplyprint_ws_client.device.connection.lease import WsLease
+    from simplyprint_ws_client.common.wire.lease import WsLease
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
@@ -857,7 +857,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
 
     # Drive ready() through a real lease over the transport (no pool needed here:
     # ready() reads supervising()/connected/Disconnected straight off the transport).
-    from simplyprint_ws_client.device.connection.pool import Pool
+    from simplyprint_ws_client.common.wire.pool import Pool
 
     pool: Pool = Pool(
         build=lambda url, params: transport,
@@ -1151,7 +1151,7 @@ def test_importing_conn_package_loads_no_wire_library() -> None:
 
     code = (
         "import sys\n"
-        "import simplyprint_ws_client.device.connection as conn\n"
+        "import simplyprint_ws_client.common.wire as conn\n"
         "leaked = [m for m in ('websockets', 'aiohttp', 'paho', 'aiomqtt')\n"
         "          if m in sys.modules]\n"
         "assert not leaked, leaked\n"

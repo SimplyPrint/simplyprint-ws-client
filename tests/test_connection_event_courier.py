@@ -9,8 +9,8 @@ from simplyprint_ws_client.common.wire.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.cloud.protocol.connection import CloudConnection
-from simplyprint_ws_client.cloud.protocol.events import (
+from simplyprint_ws_client.core.protocol.connection import CloudConnection
+from simplyprint_ws_client.core.protocol.events import (
     CloudConnectionEstablishedEvent,
     CloudConnectionIncomingEvent,
     CloudConnectionLostEvent,

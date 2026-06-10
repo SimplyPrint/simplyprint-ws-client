@@ -1,7 +1,7 @@
 """The wire contract the pool drives.
 
 A :class:`Transport` is a supervised link to ONE endpoint that the
-:class:`~simplyprint_ws_client.device.connection.pool.Pool` shares across leases. It
+:class:`~simplyprint_ws_client.common.wire.pool.Pool` shares across leases. It
 owns the whole reliability story -- connect, reconnect, state, generation -- and
 publishes :class:`~simplyprint_ws_client.common.wire.events.WireEvent` s on
 its :attr:`~Transport.events` bus so a consumer drives it by events, never by a

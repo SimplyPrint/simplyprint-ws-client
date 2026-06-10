@@ -8,13 +8,13 @@ from typing import List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.device.connection import Lease
+from simplyprint_ws_client.common.wire import Lease
 from simplyprint_ws_client.common.wire.events import (
     Connected,
     WireEvent,
     MessageReceived,
 )
-from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.pool import Pool
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import Transport
 from simplyprint_ws_client.common.events import EventBus

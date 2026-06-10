@@ -9,7 +9,7 @@ import uuid
 from typing import ClassVar, Optional, Tuple
 from unittest.mock import patch
 
-from simplyprint_ws_client.cloud.config import PrinterConfig
+from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.device.discovery.identity import (
     assign_unique_id,
     capture_hardware_id,

@@ -49,7 +49,7 @@ from simplyprint_ws_client.common.wire.events import (
     MessageReceived,
 )
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.pool import Pool
 from simplyprint_ws_client.common.wire.reconnect import Reconnecting
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import (

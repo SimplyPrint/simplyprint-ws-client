@@ -90,7 +90,10 @@ class LoggingConfig:
 
     def compiled_rules(self) -> List[RoutingRule]:
         """The routing rules, always ending in a catch-all system rule."""
-        from simplyprint_ws_client.common.logging.naming import PRINTER_ROOT, printer_resolver
+        from simplyprint_ws_client.common.logging.naming import (
+            PRINTER_ROOT,
+            printer_resolver,
+        )
 
         kind = "json" if self.json_output else "text"
         if self.routes is not None:

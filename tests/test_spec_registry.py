@@ -5,12 +5,12 @@ from typing import Optional
 
 import pytest
 
-from simplyprint_ws_client.cloud.client import Client
-from simplyprint_ws_client.cloud.config import PrinterConfig
+from simplyprint_ws_client.core.client import Client
+from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.integration.spec import PrinterSpec, ProductMetadata
-from simplyprint_ws_client.runtime.host import DuplicatePrinter, Host
-from simplyprint_ws_client.runtime.registry import SpecRegistry
-from simplyprint_ws_client.runtime.settings import ClientSettings
+from simplyprint_ws_client.core.host import DuplicatePrinter, Host
+from simplyprint_ws_client.core.registry import SpecRegistry
+from simplyprint_ws_client.core.settings import ClientSettings
 
 
 class AlphaConfig(PrinterConfig):

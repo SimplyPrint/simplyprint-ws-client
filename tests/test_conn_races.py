@@ -36,9 +36,9 @@ from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.device.connection import mqtt as mqtt_door
+from simplyprint_ws_client.common.wire import mqtt as mqtt_door
 from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
-from simplyprint_ws_client.device.connection.lease import MqttLease
+from simplyprint_ws_client.common.wire.lease import MqttLease
 from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
@@ -46,13 +46,13 @@ from simplyprint_ws_client.common.wire.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.device.connection.mqtt import (
+from simplyprint_ws_client.common.wire.mqtt import (
     MqttBroker,
     mqtt_message_route,
 )
 from simplyprint_ws_client.common.wire.paho import Paho
 from simplyprint_ws_client.common.wire.policy import RetryPolicy
-from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.pool import Pool
 from simplyprint_ws_client.common.wire.reconnect import Reconnecting
 from simplyprint_ws_client.common.wire.state import ConnectionState
 from simplyprint_ws_client.common.wire.transport import (
@@ -1090,7 +1090,7 @@ def ws_pool(sockets: List[FakeWsSocket]) -> Pool:
             logger=silent_logger(),
         )
 
-    from simplyprint_ws_client.device.connection.websocket import WsLease
+    from simplyprint_ws_client.common.wire.websocket import WsLease
 
     return Pool(
         build=build,

@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from simplyprint_ws_client.runtime.status.registry import StatusRegistry
+from simplyprint_ws_client.core.status.registry import StatusRegistry
 from simplyprint_ws_client.integration.tasks import SchedulerService, TaskRegistry, TaskSpec
 
 

@@ -16,18 +16,18 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from simplyprint_ws_client.cloud.protocol import connection as conn_mod
-from simplyprint_ws_client.cloud.protocol.connection import (
+from simplyprint_ws_client.core.protocol import connection as conn_mod
+from simplyprint_ws_client.core.protocol.connection import (
     CloudConnection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.cloud.protocol.events import (
+from simplyprint_ws_client.core.protocol.events import (
     CloudConnectionEstablishedEvent,
     CloudConnectionLostEvent,
     CloudConnectionIncomingEvent,
 )
-from simplyprint_ws_client.cloud.protocol.messages import (
+from simplyprint_ws_client.core.protocol.messages import (
     PingMsg,
 )
 
@@ -246,7 +246,7 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
 
     # Patch WsFirstMessageTimeout to be very short so test completes quickly
     with patch(
-        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
+        "simplyprint_ws_client.core.protocol.connection.WsFirstMessageTimeout",
         0.01,  # 10ms timeout
     ):
         # Start the connection loop (which will eventually hit the first message timeout)
@@ -290,7 +290,7 @@ async def test_poll_failure_increments_version_via_exception_handler(
 
     # Use a long first message timeout to avoid interference with this test
     with patch(
-        "simplyprint_ws_client.cloud.protocol.connection.WsFirstMessageTimeout",
+        "simplyprint_ws_client.core.protocol.connection.WsFirstMessageTimeout",
         10.0,  # 10 seconds - long enough for test to complete
     ):
         # Start the connection loop

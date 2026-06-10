@@ -10,11 +10,11 @@ from yarl import URL
 from simplyprint_ws_client.device.camera.handle import CameraHandle
 from simplyprint_ws_client.device.camera.pool import CameraPool
 from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
-from simplyprint_ws_client.cloud.api.simplyprint_api import SimplyPrintApi
+from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApi
 from simplyprint_ws_client import DemandMsgType
-from simplyprint_ws_client.cloud.client import Client, configure
-from simplyprint_ws_client.cloud.config import PrinterConfig
-from simplyprint_ws_client.cloud.protocol.messages import (
+from simplyprint_ws_client.core.client import Client, configure
+from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.core.protocol.messages import (
     WebcamSnapshotDemandData,
     StreamMsg,
 )
