@@ -5,7 +5,7 @@ your [client](concepts/client.md) class.
 from simplyprint_ws_client import *
 
 
-class MyPrinterClient(DefaultClient[PrinterConfig]):
+class MyPrinterClient(Client[PrinterConfig]):
     ...
 ```
 
@@ -97,7 +97,7 @@ But most likely we also want to be able to both send and receive some messages t
 from simplyprint_ws_client import *
 
 
-class MyPrinterClient(DefaultClient[PrinterConfig]):
+class MyPrinterClient(Client[PrinterConfig]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Set basic information
@@ -152,7 +152,7 @@ class MyPrinterConfig(PrinterConfig):
 
 # Extend client class to hold instance of custom printer connection
 # and use the custom config.
-class MyPrinterClient(DefaultClient[MyPrinterConfig]): # Specify custom config
+class MyPrinterClient(Client[MyPrinterConfig]): # Specify custom config
     printer_connection: CustomPrinterConnection
     
     def __init__(self, *args, **kwargs):

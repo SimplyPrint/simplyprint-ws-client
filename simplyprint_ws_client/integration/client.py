@@ -100,7 +100,12 @@ async def _host_usage() -> dict:
         not _host_usage_snapshot
         or now - _host_usage_read_at >= _HOST_USAGE_MIN_INTERVAL
     ):
-        _host_usage_snapshot = await asyncio.to_thread(PhysicalMachine.get_usage)
+        try:
+            _host_usage_snapshot = await asyncio.to_thread(PhysicalMachine.get_usage)
+        except RuntimeError:
+            # Shutdown race: a final tick can land after the loop's executor
+            # closed; the stale (possibly empty) snapshot is the right answer.
+            return _host_usage_snapshot
         _host_usage_read_at = now
     return _host_usage_snapshot
 
