@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from simplyprint_ws_client.core.config.manager import ConfigManager
+from simplyprint_ws_client.runtime.config.manager import ConfigManager
 from simplyprint_ws_client.cloud.config import Config
 from simplyprint_ws_client.cloud.files.file_backup import FileBackup
 

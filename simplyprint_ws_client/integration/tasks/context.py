@@ -4,7 +4,7 @@ A :class:`~simplyprint_ws_client.integration.tasks.spec.TaskSpec` is pure
 declaration; when the scheduler (or an on-demand trigger) runs the task it calls
 ``spec.fn(ctx)`` with a ``TaskContext``. The context is how a task reaches the
 wired runtime -- chiefly the
-:class:`~simplyprint_ws_client.contrib.status.registry.StatusRegistry` it
+:class:`~simplyprint_ws_client.runtime.status.registry.StatusRegistry` it
 publishes results into -- without reaching for a global. This is what keeps
 producers (health, OTA, discovery, ...) decoupled: they are handed what they
 need rather than importing a service locator.
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from simplyprint_ws_client.contrib.status.registry import StatusRegistry
+from simplyprint_ws_client.runtime.status.registry import StatusRegistry
 
 
 @dataclass(frozen=True)

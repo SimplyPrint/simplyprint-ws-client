@@ -27,7 +27,7 @@ from simplyprint_ws_client.common.wire.events import (
 )
 from simplyprint_ws_client.common.wire.messages import WsMessage
 from simplyprint_ws_client.common.wire.transport import WsTransport
-from simplyprint_ws_client.contrib.logging import printer_logger
+from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.utils.bounded_variable import BoundedInterval
 

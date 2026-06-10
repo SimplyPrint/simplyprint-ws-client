@@ -8,7 +8,7 @@ section by name -- a new producer (health, OTA, discovery, ...) is just another
 producers (tasks) that feed it.
 """
 
-from simplyprint_ws_client.contrib.status.registry import (
+from simplyprint_ws_client.runtime.status.registry import (
     StatusEntry,
     StatusRegistry,
     StatusState,

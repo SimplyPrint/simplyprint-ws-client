@@ -27,7 +27,7 @@ BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centa
 
 # The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
 # re-export hub is the one sanctioned exception and lives outside these dirs).
-LAYER_DIRS = ("cloud", "common", "contrib", "core", "device", "integration", "shared")
+LAYER_DIRS = ("cloud", "common", "device", "integration", "runtime")
 
 
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
@@ -310,25 +310,24 @@ class TestImportDAG:
     base lives in integration/ (promoted back in 2.0 slice C) and imports only
     leftward layers; the old ``contrib.printer_client`` stays a tombstone."""
 
-    def test_contrib_init_is_import_free(self):
-        """contrib/__init__.py must not import anything (internal or relative)."""
-        init = LIB_PKG / "contrib" / "__init__.py"
-        if not init.exists():
-            pytest.skip("contrib/__init__.py does not exist")
+    @pytest.mark.parametrize("layer", LAYER_DIRS)
+    def test_layer_init_imports_no_library_modules_eagerly(self, layer):
+        """Layer ``__init__`` discipline (generalizes the old contrib rule): a
+        layer root imports no library module eagerly -- docstring-only or PEP 562
+        lazy (stdlib imports are fine)."""
+        init = LIB_PKG / layer / "__init__.py"
+        assert init.exists(), f"{layer}/__init__.py missing"
         offenders = []
-        try:
-            tree = ast.parse(init.read_text(), str(init))
-        except SyntaxError:
-            pytest.fail("contrib/__init__.py has syntax errors")
+        tree = ast.parse(init.read_text(), str(init))
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module:
-                if node.module.startswith(".") or "contrib" in node.module:
+                if node.module.startswith(".") or "simplyprint_ws_client" in node.module:
                     offenders.append(f"line {node.lineno}: {node.module}")
             elif isinstance(node, ast.Import):
                 for a in node.names:
-                    if a.name.startswith(".") or "contrib" in a.name:
+                    if "simplyprint_ws_client" in a.name:
                         offenders.append(f"line {node.lineno}: {a.name}")
-        assert not offenders, f"contrib/__init__.py is not import-free: {offenders}"
+        assert not offenders, f"{layer}/__init__.py imports eagerly: {offenders}"
 
     def test_printer_client_promoted_out_of_library(self):
         """2.0 slice C inverts this contract: the authoring base now SHIPS in the

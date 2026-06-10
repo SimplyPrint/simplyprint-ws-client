@@ -41,7 +41,7 @@ from pydantic import BaseModel, ConfigDict
 if TYPE_CHECKING:
     from simplyprint_ws_client.cloud.client import Client
     from simplyprint_ws_client.cloud.config import PrinterConfig
-    from simplyprint_ws_client.core.config import ConfigManagerType
+    from simplyprint_ws_client.runtime.config import ConfigManagerType
     from simplyprint_ws_client.device.accounts import AccountProvider
     from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
     from simplyprint_ws_client.device.discovery.spec import (

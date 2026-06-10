@@ -9,10 +9,10 @@ __all__ = [
 from enum import Enum
 from typing import Type
 
-from simplyprint_ws_client.core.config.json import JsonConfigManager
-from simplyprint_ws_client.core.config.manager import ConfigManager
-from simplyprint_ws_client.core.config.memory import MemoryConfigManager
-from simplyprint_ws_client.core.config.sqlite import SQLiteConfigManager
+from simplyprint_ws_client.runtime.config.json import JsonConfigManager
+from simplyprint_ws_client.runtime.config.manager import ConfigManager
+from simplyprint_ws_client.runtime.config.memory import MemoryConfigManager
+from simplyprint_ws_client.runtime.config.sqlite import SQLiteConfigManager
 
 
 class ConfigManagerType(Enum):

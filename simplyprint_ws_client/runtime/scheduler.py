@@ -7,11 +7,11 @@ from datetime import datetime, timedelta
 from typing import Dict, Set
 
 from simplyprint_ws_client.cloud.client import Client, ClientState
-from simplyprint_ws_client.core.connection_manager import (
+from simplyprint_ws_client.runtime.manager import (
     ClientConnectionManager,
     ClientList,
 )
-from simplyprint_ws_client.core.settings import ClientSettings
+from simplyprint_ws_client.runtime.settings import ClientSettings
 from simplyprint_ws_client.common.asyncio.async_task_scope import AsyncTaskScope
 from simplyprint_ws_client.common.asyncio.continuous_task import ContinuousTask
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider

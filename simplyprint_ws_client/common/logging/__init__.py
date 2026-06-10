@@ -21,8 +21,8 @@ import queue
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Optional
 
-from simplyprint_ws_client.contrib.logging.config import LoggingConfig, RoutingRule
-from simplyprint_ws_client.contrib.logging.naming import (
+from simplyprint_ws_client.common.logging.config import LoggingConfig, RoutingRule
+from simplyprint_ws_client.common.logging.naming import (
     PRINTER_ROOT,
     ROOT,
     printer_log_dir,
@@ -30,7 +30,7 @@ from simplyprint_ws_client.contrib.logging.naming import (
     printer_logger_name,
     scope_of,
 )
-from simplyprint_ws_client.contrib.logging.policy import (
+from simplyprint_ws_client.common.logging.policy import (
     LOG_TARGET_FILE,
     LOG_TARGET_LIVE,
     LOG_TARGET_QUEUE,
@@ -38,12 +38,12 @@ from simplyprint_ws_client.contrib.logging.policy import (
     LoggingPolicy,
     LoggingPolicyFilter,
 )
-from simplyprint_ws_client.contrib.logging.routing import (
+from simplyprint_ws_client.common.logging.routing import (
     JsonLogFormatter,
     PassthroughQueueHandler,
     RoutingHandler,
 )
-from simplyprint_ws_client.contrib.logging.store import (
+from simplyprint_ws_client.common.logging.store import (
     LogFileInfo,
     LogNotFound,
     LogScopeInfo,
@@ -51,7 +51,7 @@ from simplyprint_ws_client.contrib.logging.store import (
 )
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.core.app import ClientSettings
+    from simplyprint_ws_client.runtime.app import ClientSettings
 
 __all__ = [
     "LoggingConfig",

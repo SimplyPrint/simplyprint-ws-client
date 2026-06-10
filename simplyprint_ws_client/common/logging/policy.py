@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Tuple
 
-from simplyprint_ws_client.contrib.logging.naming import PRINTER_ROOT, is_printer_logger
+from simplyprint_ws_client.common.logging.naming import PRINTER_ROOT, is_printer_logger
 
 DEFAULT_NOISY_LOGGERS: Tuple[str, ...] = (
     "aiohttp",

@@ -8,7 +8,7 @@ The names below are the supported, author-facing public API. In short:
 * Declare your client type with a :class:`PrinterSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
-Deeper modules (``simplyprint_ws_client.cloud.*``, ``...common.*``, ``...contrib.*``)
+Deeper modules (``simplyprint_ws_client.cloud.*``, ``...common.*``, ``...device.*``)
 are importable but not part of the stable surface.
 
 Performance: public names are re-exported **lazily** (PEP 562 ``__getattr__``), so
@@ -31,15 +31,15 @@ from simplyprint_ws_client import _polyfill  # noqa: F401  (cheap; installs runt
 # config/settings/transport-base name never drags in core.app/aiohttp/sentry.
 _REEXPORT_MODULES = (
     ".cloud.config",
-    ".core.config",
-    ".core.settings",
+    ".runtime.config",
+    ".runtime.settings",
     ".cloud.state",
     ".cloud.autowire",
     ".cloud.protocol.connection",
     ".cloud.protocol.models",
     ".cloud.protocol.messages",
     ".cloud.client",
-    ".core.app",
+    ".runtime.app",
 )
 
 # The curated, documented public surface. Other public names remain importable
@@ -97,11 +97,11 @@ def __dir__():
 
 if TYPE_CHECKING:
     # Eager re-exports for static analysis / IDEs only (no runtime cost).
-    from simplyprint_ws_client.core.app import *  # noqa: F401,F403
+    from simplyprint_ws_client.runtime.app import *  # noqa: F401,F403
     from simplyprint_ws_client.cloud.client import *  # noqa: F401,F403
     from simplyprint_ws_client.cloud.config import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.config import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.settings import *  # noqa: F401,F403
+    from simplyprint_ws_client.runtime.config import *  # noqa: F401,F403
+    from simplyprint_ws_client.runtime.settings import *  # noqa: F401,F403
     from simplyprint_ws_client.cloud.state import *  # noqa: F401,F403
     from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode  # noqa: F401
     from simplyprint_ws_client.cloud.protocol.messages import *  # noqa: F401,F403

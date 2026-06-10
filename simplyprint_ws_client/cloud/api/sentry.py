@@ -11,7 +11,7 @@ from sentry_sdk.integrations.threading import ThreadingIntegration
 from simplyprint_ws_client.const import VERSION
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.core.settings import ClientSettings
+    from simplyprint_ws_client.runtime.settings import ClientSettings
 
 # This cannot be 0.
 MAX_UNIQUE_EXCEPTIONS = 100

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.logging.policy import LoggingPolicy
+from simplyprint_ws_client.common.logging.policy import LoggingPolicy
 
 DEFAULT_TEXT_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s | %(message)s"
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -82,7 +82,7 @@ class LoggingConfig:
         )
 
     def formatter_for(self, kind: str) -> logging.Formatter:
-        from simplyprint_ws_client.contrib.logging.routing import JsonLogFormatter
+        from simplyprint_ws_client.common.logging.routing import JsonLogFormatter
 
         if kind == "json":
             return JsonLogFormatter(self.system_scope)
@@ -90,7 +90,7 @@ class LoggingConfig:
 
     def compiled_rules(self) -> List[RoutingRule]:
         """The routing rules, always ending in a catch-all system rule."""
-        from simplyprint_ws_client.contrib.logging.naming import PRINTER_ROOT, printer_resolver
+        from simplyprint_ws_client.common.logging.naming import PRINTER_ROOT, printer_resolver
 
         kind = "json" if self.json_output else "text"
         if self.routes is not None:

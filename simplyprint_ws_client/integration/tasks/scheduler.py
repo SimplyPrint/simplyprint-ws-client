@@ -36,7 +36,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
-from simplyprint_ws_client.contrib.status.registry import (
+from simplyprint_ws_client.runtime.status.registry import (
     StatusEntry,
     StatusRegistry,
     StatusState,

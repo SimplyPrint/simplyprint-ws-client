@@ -2,10 +2,10 @@ import asyncio
 
 import pytest
 
-import simplyprint_ws_client.core.connection_manager as connection_manager_module
+import simplyprint_ws_client.runtime.manager as connection_manager_module
 from simplyprint_ws_client.cloud.client import Client, ClientState
 from simplyprint_ws_client.cloud.config import PrinterConfig
-from simplyprint_ws_client.core.connection_manager import (
+from simplyprint_ws_client.runtime.manager import (
     ClientConnectionManager,
     ClientList,
     ClientView,

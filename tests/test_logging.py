@@ -13,7 +13,7 @@ import zipfile
 import pytest
 
 from simplyprint_ws_client import ClientSettings
-from simplyprint_ws_client.contrib.logging import (
+from simplyprint_ws_client.common.logging import (
     configure_logging,
     LoggingConfig,
     LogNotFound,
@@ -24,7 +24,7 @@ from simplyprint_ws_client.contrib.logging import (
     PRINTER_ROOT,
     scope_of,
 )
-from simplyprint_ws_client.contrib.logging.naming import decode_uid, encode_uid
+from simplyprint_ws_client.common.logging.naming import decode_uid, encode_uid
 
 
 def _record(name, message="msg", level=logging.INFO):
@@ -49,7 +49,7 @@ def test_scope_of_printer_and_system():
 
 
 def test_json_formatter_tags_scope():
-    from simplyprint_ws_client.contrib.logging import JsonLogFormatter
+    from simplyprint_ws_client.common.logging import JsonLogFormatter
 
     formatter = JsonLogFormatter()
     printer = json.loads(

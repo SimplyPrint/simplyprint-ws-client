@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, List, Optional, Tuple
 
-from simplyprint_ws_client.contrib.logging.config import LoggingConfig
+from simplyprint_ws_client.common.logging.config import LoggingConfig
 
 #: gzip magic number -- rotated backups are compressed in place but keep their
 #: ``.log.N`` name, so content has to be sniffed.

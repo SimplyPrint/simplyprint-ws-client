@@ -3,7 +3,7 @@ __all__ = ["ClientSettings"]
 from dataclasses import dataclass
 from typing import Optional, Type, List, Sequence
 
-from simplyprint_ws_client.core.config import ConfigManagerType
+from simplyprint_ws_client.runtime.config import ConfigManagerType
 from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode
 from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.device.camera.base import BaseCameraProtocol

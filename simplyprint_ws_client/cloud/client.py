@@ -79,7 +79,7 @@ from simplyprint_ws_client.cloud.protocol.models import (
 from simplyprint_ws_client.common.events import EventBus, Event
 from simplyprint_ws_client.common.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.contrib.logging import printer_logger
+from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.cloud.api.simplyprint_api import SimplyPrintApi
 from simplyprint_ws_client.common.utils.backoff import Backoff, ExponentialBackoff
 

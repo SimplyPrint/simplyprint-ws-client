@@ -12,10 +12,10 @@ from simplyprint_ws_client.cloud.client import (
     ClientStateChangeEvent,
 )
 from simplyprint_ws_client.cloud.config import PrinterConfig
-from simplyprint_ws_client.core.config import ConfigManager
-from simplyprint_ws_client.core.connection_manager import ClientList
-from simplyprint_ws_client.core.scheduler import Scheduler
-from simplyprint_ws_client.core.settings import ClientSettings, PrinterSpec
+from simplyprint_ws_client.runtime.config import ConfigManager
+from simplyprint_ws_client.runtime.manager import ClientList
+from simplyprint_ws_client.runtime.scheduler import Scheduler
+from simplyprint_ws_client.runtime.settings import ClientSettings, PrinterSpec
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
 from simplyprint_ws_client.device.camera.pool import CameraPool
 from simplyprint_ws_client.cloud.api.sentry import Sentry
