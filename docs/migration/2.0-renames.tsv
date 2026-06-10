@@ -54,3 +54,6 @@ simplyprint_ws_client.device.connection.websocket.frame_of	(removed — use comm
 simplyprint_ws_client.device.connection.mqtt.default_topic	(removed — unused)	api	B
 connect(retry=/provider=/keepalive=/wire_keepalive=)	connect(options=ConnectionOptions(...))	api	B
 mqtt.connect impl default "aiomqtt"	mqtt.connect impl default "paho"	behavior	B
+simplyprint_ws_client.cloud.client.DefaultClient	simplyprint_ws_client.cloud.client.Client (merged)	class	C
+simplyprint_ws_client.cloud.client.PhysicalClient	(deleted — populate_info_from_physical_machine stays on PrinterState; system restart/shutdown demands become authoring-base hooks)	class	C
+simplyprint_bambu.core.printer_client.BasePrinterClient	simplyprint_ws_client.integration.client.PrinterClient	promotion	C

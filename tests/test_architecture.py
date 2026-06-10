@@ -27,7 +27,7 @@ BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centa
 
 # The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
 # re-export hub is the one sanctioned exception and lives outside these dirs).
-LAYER_DIRS = ("cloud", "common", "contrib", "core", "device", "shared")
+LAYER_DIRS = ("cloud", "common", "contrib", "core", "device", "integration", "shared")
 
 
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
@@ -306,9 +306,9 @@ class TestNoShims:
 
 
 class TestImportDAG:
-    """DAG — import-graph acyclicity: contrib/__init__ import-free; the high-level
-    printer-client base was promoted out to the integration, so the library must
-    neither ship nor import ``contrib.printer_client``."""
+    """DAG — import-graph acyclicity: contrib/__init__ import-free; the authoring
+    base lives in integration/ (promoted back in 2.0 slice C) and imports only
+    leftward layers; the old ``contrib.printer_client`` stays a tombstone."""
 
     def test_contrib_init_is_import_free(self):
         """contrib/__init__.py must not import anything (internal or relative)."""
@@ -331,19 +331,40 @@ class TestImportDAG:
         assert not offenders, f"contrib/__init__.py is not import-free: {offenders}"
 
     def test_printer_client_promoted_out_of_library(self):
-        """The high-level printer-client base was promoted to the integration.
+        """2.0 slice C inverts this contract: the authoring base now SHIPS in the
+        library as ``integration/client.py`` (the cycle that forced its demotion
+        died with the layer restructure — its imports are all leftward layers).
 
-        It must stay deleted in the library (re-shipping it would re-introduce the
-        core<->contrib cycle it imports back into), and nothing in the library may
-        import ``contrib.printer_client`` either.
+        The old ``contrib/printer_client.py`` stays a tombstone, and the base must
+        import only from {cloud, common, device} + stdlib — never core/runtime.
         """
-        module = LIB_PKG / "contrib" / "printer_client.py"
-        assert not module.exists(), (
-            "contrib/printer_client.py was relocated to the integration; it must "
-            "stay deleted in the library (no re-export shim)."
+        tombstone = LIB_PKG / "contrib" / "printer_client.py"
+        assert not tombstone.exists(), (
+            "contrib/printer_client.py must stay deleted (the base lives in "
+            "integration/client.py now; no re-export shim)."
         )
-        offenders = self._find_printer_client_imports(LIB_PKG)
-        assert not offenders, f"library still imports printer_client: {offenders}"
+
+        base = LIB_PKG / "integration" / "client.py"
+        assert base.exists(), "integration/client.py (the authoring base) is missing"
+
+        allowed = ("cloud", "common", "device", "integration")
+        offenders = []
+        tree = ast.parse(base.read_text(), str(base))
+        for node in ast.walk(tree):
+            modules = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module]
+            elif isinstance(node, ast.Import):
+                modules = [a.name for a in node.names]
+            for module in modules:
+                if not module.startswith("simplyprint_ws_client."):
+                    continue
+                layer = module.split(".")[1]
+                if layer not in allowed:
+                    offenders.append(f"line {node.lineno}: {module}")
+        assert not offenders, (
+            f"integration/client.py imports non-leftward layers: {offenders}"
+        )
 
     @staticmethod
     def _find_printer_client_imports(root: pathlib.Path) -> List[str]:
