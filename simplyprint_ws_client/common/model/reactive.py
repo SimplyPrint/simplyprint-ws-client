@@ -1,5 +1,6 @@
 __all__ = ["ReactiveModel"]
 
+import collections.abc
 import datetime
 import decimal
 import enum
@@ -7,18 +8,17 @@ import functools
 import weakref
 from itertools import repeat
 from typing import (
+    Callable,
     Optional,
     Dict,
     Any,
+    Protocol,
     TypeVar,
     TYPE_CHECKING,
     ClassVar,
     Type,
     get_origin,
-    List,
     Set,
-    Tuple,
-    Mapping,
     get_args,
     Union,
     no_type_check,
@@ -32,6 +32,23 @@ from simplyprint_ws_client.common.utils.synchronized import Synchronized
 from simplyprint_ws_client.common.model.annotations import _is_exclusive, _is_untracked
 
 TReactiveModel = TypeVar("TReactiveModel", bound="ReactiveModel")
+
+
+class ReactiveContext(Protocol):
+    """The contract a model's ``ctx`` callable must resolve to (or ``None``).
+
+    The tree root's context (in practice the SimplyPrint client) stamps each
+    change with a message id and signals the consumer that a changeset is ready.
+    """
+
+    def next_msg_id(self) -> int: ...
+
+    def signal(self) -> None: ...
+
+
+#: A model's context accessor: a ``weakref.ref`` (or plain callable) yielding
+#: the live :class:`ReactiveContext`, or ``None`` when unbound.
+ContextRef = Callable[[], Optional[ReactiveContext]]
 
 
 class ReactiveModel(BaseModel, Synchronized):
@@ -64,7 +81,9 @@ class ReactiveModel(BaseModel, Synchronized):
     @classmethod
     @functools.lru_cache
     def is_pydantic_change_detect_annotation(
-        cls, annotation: Type[Any] = None, field_info: Optional[FieldInfo] = None
+        cls,
+        annotation: Optional[Type[Any]] = None,
+        field_info: Optional[FieldInfo] = None,
     ) -> bool:
         """
         Return True if the given annotation is a ChangeDetectionMixin annotation.
@@ -84,18 +103,15 @@ class ReactiveModel(BaseModel, Synchronized):
         ):
             return True
 
-        # Otherwise we may need to handle typing arguments
+        # Otherwise we may need to handle typing arguments. get_origin()
+        # normalizes typing aliases (List, Mapping, ...) to their runtime
+        # classes, so we compare against those.
         origin = get_origin(annotation)
-        if (
-            origin is List
-            or origin is list
-            or origin is Set
-            or origin is set
-            or origin is Tuple
-            or origin is tuple
-        ):
+        if origin in (list, set, frozenset, tuple):
             return cls.is_pydantic_change_detect_annotation(get_args(annotation)[0])
-        elif origin is Dict or origin is dict or origin is Mapping:
+        elif origin is dict or (
+            isinstance(origin, type) and issubclass(origin, collections.abc.Mapping)
+        ):
             return cls.is_pydantic_change_detect_annotation(get_args(annotation)[1])
         elif origin is Union:
             # Note: This includes Optional, as Optional[...] is just Union[..., None]
@@ -109,18 +125,20 @@ class ReactiveModel(BaseModel, Synchronized):
 
     if TYPE_CHECKING:
         model_self_changed_fields: Dict[str, int] = PrivateAttr(...)
-        ctx: weakref.ref = PrivateAttr(...)
+        ctx: ContextRef = PrivateAttr(...)
 
     __slots__ = ("model_self_changed_fields", "ctx")
 
-    def __init__(self, ctx=lambda: None, **kwargs: Any) -> None:
+    def __init__(self, ctx: ContextRef = lambda: None, **kwargs: Any) -> None:
         BaseModel.__init__(self, **kwargs)
         Synchronized.__init__(self)
         # Default to static no-context to prevent unnecessary errors
         object.__setattr__(self, "ctx", ctx)
         self.model_reset_changed()
 
-    def provide_context(self, ctx: Union["ReactiveModel", weakref.ref]) -> None:
+    def provide_context(
+        self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
+    ) -> None:
         """Give tree a reference"""
         if isinstance(ctx, ReactiveModel):
             object.__setattr__(self, "ctx", ctx.ctx)
@@ -165,7 +183,7 @@ class ReactiveModel(BaseModel, Synchronized):
             self.model_self_changed_fields.pop(key, None)
 
     @property
-    def model_changed_fields(self) -> set:
+    def model_changed_fields(self) -> Set[str]:
         """
         Return a dictionary of all changed fields.
         """

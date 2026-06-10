@@ -22,26 +22,6 @@ class ConstantBackoff(Backoff):
         pass
 
 
-class LinearBackoff(Backoff):
-    d: int  # Delay
-    min: int  # Minimum
-    max: int  # Maximum
-    inc: int  # Increment
-
-    def __init__(self, mi: int = 0, ma: int = 0, fa: int = 1):
-        self.d = mi
-        self.min = mi
-        self.max = ma
-        self.inc = fa
-
-    def delay(self) -> float:
-        self.d = min(self.d + self.inc, self.max)
-        return self.d
-
-    def reset(self) -> None:
-        self.d = self.min
-
-
 class ExponentialBackoff(Backoff):
     """Derived from https://github.com/Rapptz/discord.py/blob/master/discord/backoff.py"""
 

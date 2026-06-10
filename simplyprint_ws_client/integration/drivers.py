@@ -46,8 +46,12 @@ from simplyprint_ws_client.wire.options import ConnectionOptions
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.integration.client import PrinterClient
+    from simplyprint_ws_client.wire.mqtt import MqttImpl
 
 TLease = TypeVar("TLease", bound=Lease)
+#: The inbound payload shape a lease driver hands to ``on_device_message``:
+#: ``str``/``bytes`` for a WebSocket frame, :class:`MqttMessage` for a broker.
+TPayload = TypeVar("TPayload")
 
 __all__ = [
     "DeviceAuthError",
@@ -154,12 +158,13 @@ class DeviceDriver(ABC):
 UrlFactory = Callable[[], Union[str, yarl.URL]]
 
 
-class LeaseDriver(DeviceDriver, Generic[TLease]):
+class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
     """A driver over a pooled lease; concrete drivers pick the front door.
 
     Generic over its lease type, so a concrete driver's ``lease`` carries the
     full protocol API (``MqttDriver(...).lease.subscribe_soon`` resolves in an
-    IDE without casts).
+    IDE without casts), and over its inbound payload type, so ``_payload`` and
+    the wire-message handler agree on what ``on_device_message`` receives.
     """
 
     def __init__(
@@ -201,6 +206,12 @@ class LeaseDriver(DeviceDriver, Generic[TLease]):
             return
         try:
             url = yarl.URL(str(self._url()))
+        except DeviceAuthError as error:
+            # The factory is pure; it signals "credentials must be minted"
+            # and the client's refresh hook does the (off-loop) work.
+            self.client.logger.debug("%s link needs credentials: %s", self.name, error)
+            self.request_credential_refresh()
+            return
         except Exception as error:  # noqa: BLE001 -- config not ready yet; tick retries
             self.client.logger.debug("cannot start %s link yet: %s", self.name, error)
             return
@@ -261,11 +272,11 @@ class LeaseDriver(DeviceDriver, Generic[TLease]):
         await self.client.on_device_message(self._payload(event.message), self)
 
     @staticmethod
-    def _payload(message: object) -> object:
+    def _payload(message: object) -> TPayload:
         return message
 
 
-class WsDriver(LeaseDriver[WsLease]):
+class WsDriver(LeaseDriver[WsLease, Union[str, bytes]]):
     """A 1:1 WebSocket attachment: every frame is this client's.
 
     Inbound frames reach ``on_device_message`` as their raw payload
@@ -278,11 +289,11 @@ class WsDriver(LeaseDriver[WsLease]):
         return ws_front_door.connect(url, options=options)
 
     @staticmethod
-    def _payload(message: object) -> object:
+    def _payload(message: object) -> Union[str, bytes]:
         return message.payload if isinstance(message, WsMessage) else message
 
 
-class MqttDriver(LeaseDriver[MqttLease]):
+class MqttDriver(LeaseDriver[MqttLease, MqttMessage]):
     """A broker attachment: topics multiplexed over one shared socket.
 
     ``topics`` resolves at (re)start so a restart re-subscribes against the
@@ -297,7 +308,7 @@ class MqttDriver(LeaseDriver[MqttLease]):
         url: UrlFactory,
         *,
         topics: Callable[[], Iterable[str]] = tuple,
-        impl: str = "paho",
+        impl: "MqttImpl" = "paho",
         name: str = "device",
         options: Optional[ConnectionOptions] = None,
     ) -> None:
@@ -310,7 +321,7 @@ class MqttDriver(LeaseDriver[MqttLease]):
     ) -> MqttLease:
         return mqtt_front_door.connect(url, impl=self._impl, options=options)
 
-    def _on_lease_acquired(self, lease: TLease) -> None:
+    def _on_lease_acquired(self, lease: MqttLease) -> None:
         for topic in self._topics():
             lease.subscribe_soon(topic)
 

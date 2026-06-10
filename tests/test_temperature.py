@@ -13,7 +13,7 @@ def test_tool0_temperature(client: Client):
     tool0.temperature.actual = 200
     tool0.temperature.target = 250
 
-    messages, _ = client.consume()
+    messages = client.consume()
 
     assert len(messages) == 1
 
@@ -31,7 +31,7 @@ def test_tool0_temperature(client: Client):
     tool0.temperature.actual = 250
     client.printer.bed.temperature.target = 60
 
-    messages, _ = client.consume()
+    messages = client.consume()
 
     assert len(messages) == 1
 
@@ -60,7 +60,7 @@ def test_multiple_tools_temperatures(client: Client):
     tool1.temperature.actual = 180
     tool1.temperature.target = 220
 
-    messages, _ = client.consume()
+    messages = client.consume()
 
     assert len(messages) == 1
     message = messages[0]

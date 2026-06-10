@@ -11,6 +11,14 @@ from simplyprint_ws_client.core.state import FileProgressState, FileProgressStat
 from simplyprint_ws_client.core.protocol.messages import FileDemandData
 
 
+class FileDownloadError(Exception):
+    """A download failed after part of the file was already delivered.
+
+    Falling back to another URL would restart from byte zero and corrupt
+    whatever the consumer already received, so this is raised instead.
+    """
+
+
 class FileDownload:
     state: FileProgressState
     client: Client
@@ -52,6 +60,8 @@ class FileDownload:
                 if url is None:
                     continue
 
+                downloaded = 0
+
                 try:
                     async with session.get(url) as resp:
                         if resp.status != 200:
@@ -63,7 +73,6 @@ class FileDownload:
                         self.state.state = FileProgressStateEnum.STARTED
 
                         size = int(resp.headers.get("content-length", 0))
-                        downloaded = 0
 
                         self.state.state = FileProgressStateEnum.DOWNLOADING
 
@@ -73,17 +82,27 @@ class FileDownload:
 
                             downloaded += len(chunk)
 
-                            total_percentage = int((downloaded / size) * 100)
+                            if size > 0:
+                                total_percentage = min(
+                                    int((downloaded / size) * 100), 100
+                                )
 
-                            self.state.percent = (
-                                clamp_progress(total_percentage)
-                                if clamp_progress
-                                else total_percentage
-                            )
+                                self.state.percent = (
+                                    clamp_progress(total_percentage)
+                                    if clamp_progress
+                                    else total_percentage
+                                )
 
                         break
                 except (OSError, SSLError, ClientError, asyncio.TimeoutError) as e:
                     self.state.message = f"Failed to download file from {url}: {e}"
+
+                    if downloaded > 0:
+                        # The consumer already received part of this file -
+                        # retrying another URL would corrupt their stream.
+                        self.state.state = FileProgressStateEnum.ERROR
+                        raise FileDownloadError(self.state.message) from e
+
                     continue
             else:
                 # If we exhausted all URLs and none worked, set the state to error.
@@ -92,14 +111,12 @@ class FileDownload:
     async def download_as_bytes(
         self, data: FileDemandData, clamp_progress: Optional[Callable] = None
     ) -> bytes:
-        # Bytes object to store the downloaded data
-        content = b""
+        content = bytearray()
 
         async for chunk in self.download(data, clamp_progress):
             content += chunk
 
-        # Return the data as a BytesIO object
-        return content
+        return bytes(content)
 
     async def download_as_file(
         self,

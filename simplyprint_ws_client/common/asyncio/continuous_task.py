@@ -72,7 +72,7 @@ class ContinuousTask(Generic[T], EventLoopProvider[AbstractEventLoop]):
         """Special case of pop, consume result if it exists."""
         task = self.pop()
 
-        if task is None or not task.done():
+        if task is None or not task.done() or task.cancelled():
             return
 
         if not task.exception():

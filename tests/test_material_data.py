@@ -30,7 +30,7 @@ def test_producer_triggers(client: Client, field, value, expected_data_key):
     elif field == "tools.*.type":
         client.printer.tool0.type = value
 
-    messages, _ = client.consume()
+    messages = client.consume()
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert expected_data_key in messages[0].data
@@ -59,7 +59,7 @@ def test_materials_chain_iterator_bug(client: Client):
     tool0.materials[0].type = "PLA"
     tool1.materials[0].type = "ABS"
 
-    messages, _ = client.consume()
+    messages = client.consume()
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert "materials" in messages[0].data
@@ -81,7 +81,7 @@ def test_mms_layout_changes(client: Client):
     """Test mms_layout changes trigger MaterialDataMsg."""
     client.printer.update_mms_layout([MaterialLayoutEntry(nozzle=0, size=4)])
 
-    messages, _ = client.consume()
+    messages = client.consume()
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert "layout" in messages[0].data
@@ -93,10 +93,10 @@ def test_mms_layout_changes(client: Client):
 
 
 def test_refresh_mode_includes_all_sections(client: Client):
-    """Test is_refresh=True includes all message sections."""
-    msg = MaterialDataMsg(
-        data=dict(MaterialDataMsg.build(client.printer, is_refresh=True))
-    )
+    """Test build_refresh() includes all message sections."""
+    # Deliberate API change: the refresh snapshot is its own classmethod now
+    # (build() previously took an is_refresh flag violating its base signature).
+    msg = MaterialDataMsg(data=dict(MaterialDataMsg.build_refresh(client.printer)))
 
     assert "refresh" in msg.data
     assert msg.data["refresh"] is True
@@ -128,8 +128,8 @@ def test_reset_changes_mirrors_producer_fields(client: Client):
         assert {"size", "type", "volume_type"}.issubset(tool.model_changed_fields)
 
     # Build and reset message
-    msgs, _ = client.consume()
+    msgs = client.consume()
     assert len(msgs) == 1
     assert msgs[0].__class__ == MaterialDataMsg
-    msgs, _ = client.consume()
+    msgs = client.consume()
     assert len(msgs) == 0

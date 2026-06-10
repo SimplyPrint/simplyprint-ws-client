@@ -237,6 +237,46 @@ async def test_one_shot_listener_ret():
     assert result == 1337
 
 
+@pytest.mark.asyncio
+async def test_distinct_classes_with_same_name_do_not_share_listeners():
+    """Two different Event classes with the same class NAME are distinct keys."""
+    klass_a = type("DuplicateNamedEvent", (Event,), {})
+    klass_b = type("DuplicateNamedEvent", (Event,), {})
+    assert klass_a is not klass_b
+
+    event_bus = EventBus()
+    calls = []
+
+    event_bus.on(klass_a, lambda _event: calls.append("a"))
+    event_bus.on(klass_b, lambda _event: calls.append("b"))
+
+    # Each class keeps its own listener list (no silent merge).
+    assert len(event_bus.listeners[klass_a]) == 1
+    assert len(event_bus.listeners[klass_b]) == 1
+
+    await event_bus.emit(klass_a())
+    assert calls == ["a"]
+
+    await event_bus.emit(klass_b())
+    assert calls == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_event_string_comparability_preserved():
+    """An event (class or instance) still compares equal to its get_name()
+    string, and explicitly string-keyed listeners still fire on string emits."""
+    assert CustomEvent == "custom"
+    assert CustomEvent() == "custom"
+    assert ClientEvent == "ClientEvent"
+
+    event_bus = EventBus()
+    calls = []
+    event_bus.on("custom", lambda *args: calls.append(args))
+
+    await event_bus.emit("custom", 42)
+    assert calls == [(42,)]
+
+
 def test_event_listener_adding():
     event_listeners = EventBusListeners()
 
@@ -267,3 +307,13 @@ def test_event_listener_adding():
     event_bus.on(CustomEvent, func2, generic=True)
 
     assert len(event_bus.listeners[CustomEvent]) == 2
+
+
+def test_listener_lifetime_variants_are_distinct():
+    """The lifetime tagged-union variants must not compare equal across types
+    (they used to, as empty NamedTuples)."""
+    assert ListenerLifetimeOnce() != ListenerLifetimeForever()
+    assert ListenerLifetimeForever() != ListenerLifetimeOnce()
+    # Same-variant instances stay interchangeable.
+    assert ListenerLifetimeOnce() == ListenerLifetimeOnce()
+    assert ListenerLifetimeForever() == ListenerLifetimeForever()

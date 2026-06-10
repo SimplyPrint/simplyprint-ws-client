@@ -8,9 +8,9 @@ from typing import (
     List,
     Union,
     Tuple,
-    NamedTuple,
     Optional,
     get_args,
+    get_type_hints,
     Iterable,
     Iterator,
 )
@@ -35,24 +35,33 @@ class ListenerUniqueness(Enum):
     EXCLUSIVE_WITH_ERROR = 3
 
 
-class ListenerLifetime(NamedTuple):
-    """Implement listener lifetime options as a tagged-union
-    to support value based lifetimes such as max-calls in the future.
+class ListenerLifetime:
+    """Listener lifetime options as a tagged-union (room for value-based
+    lifetimes such as max-calls in the future).
+
+    Variants are distinguished by type (consumers ``isinstance`` on them);
+    instances of *different* variants never compare equal.
     """
 
-    ...
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return type(self) is type(other)
+
+    def __hash__(self) -> int:
+        return hash(type(self))
 
 
 class ListenerLifetimeOnce(ListenerLifetime):
     """An event listener that is removed after being called once."""
 
-    ...
+    __slots__ = ()
 
 
 class ListenerLifetimeForever(ListenerLifetime):
     """A normal event listener that is never removed."""
 
-    ...
+    __slots__ = ()
 
 
 class EventBusListenerOptions(TypedDict):
@@ -96,11 +105,22 @@ class EventBusListener:
         self.is_async = _is_async(handler)
         self.forward_emitter = None
 
-        # If function takes a named argument with the type Emitter, store that kwarg name.
-        signature = inspect.signature(handler)
+        # If the function takes a named argument with the type Emitter, store
+        # that kwarg name. Not every callable has an inspectable signature.
+        try:
+            signature = inspect.signature(handler)
+        except (TypeError, ValueError):
+            return
 
-        for parameter in signature.parameters.values():
-            annotation = parameter.annotation
+        # Under PEP 563 (`from __future__ import annotations`) the raw
+        # annotations are strings; resolve them so the type check still works.
+        try:
+            hints = get_type_hints(handler)
+        except Exception:
+            hints = {}
+
+        for name, parameter in signature.parameters.items():
+            annotation = hints.get(name, parameter.annotation)
 
             # Check if the annotation is a type or a type hint. And whether it is a subclass of Emitter.
             if not any(
@@ -110,7 +130,7 @@ class EventBusListener:
             ):
                 continue
 
-            self.forward_emitter = parameter.name
+            self.forward_emitter = name
             break
 
     def __lt__(self, other: "EventBusListener") -> bool:

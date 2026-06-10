@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import functools
 from asyncio import AbstractEventLoop
 from itertools import chain
@@ -8,8 +9,10 @@ from typing import (
     Generator,
     Hashable,
     Optional,
+    TypeVar,
     Union,
     get_args,
+    overload,
     Type,
     Any,
     Tuple,
@@ -40,12 +43,25 @@ if TYPE_CHECKING:
         EventBusMiddleware,
     )
 
+#: The concrete event class a class-keyed ``on(...)`` registration listens for.
+#: It cannot be bound to the bus's ``TEvent`` (a TypeVar cannot bound another),
+#: so it is inferred per call from the class the caller passes.
+E = TypeVar("E")
+
 
 @final
 class _EmitGenerator(Generic[TEvent]):
-    """Stateful generator that updates arguments according to input and output."""
+    """The one per-listener dispatch core every emit path drives.
 
-    __slots__ = ("event_bus", "listeners", "event", "args", "kwargs")
+    Owns the shared loop mechanics -- the stop-event check, the per-listener
+    argument snapshot (with emitter forwarding) and the listener return-value
+    protocol (:func:`_update_args`) -- so the async, sync and fast emit paths
+    cannot drift apart. A path iterates it, invokes each listener however it
+    must (awaited or direct), and feeds the return value back via
+    :meth:`update`.
+    """
+
+    __slots__ = ("event_bus", "listeners", "event", "args", "kwargs", "_stop_check")
 
     event_bus: "EventBus"
     listeners: Iterator[EventBusListener]
@@ -67,12 +83,15 @@ class _EmitGenerator(Generic[TEvent]):
         self.event = event
         self.args = _initialize_args(self.event_bus, self.event, args)
         self.kwargs = kwargs
+        self._stop_check = isinstance(event, Event)
 
-    def update(self, returned_args: Union[Tuple[Any, ...], Any]):
+    def update(self, returned_args: Union[Tuple[Any, ...], Any, None]):
+        if returned_args is None:
+            return
         self.args = _update_args(self.event_bus, self.event, self.args, returned_args)
 
     def __next__(self) -> Tuple[EventBusListener, Tuple[Any, ...], Dict[Any, Any]]:
-        if isinstance(self.event, Event) and self.event.is_stopped():
+        if self._stop_check and self.event.is_stopped():
             raise StopIteration()
 
         event_listener = next(self.listeners)
@@ -179,63 +198,60 @@ class EventBus(Emitter[TEvent]):
             self.event_klass = Event
 
     async def emit(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        listeners = self.class_listeners.get(id(event.__class__))
-        if listeners is None:
-            listeners = self._listeners_for(event)
-        if listeners is None and len(self.middleware) == 0:
+        generator = self._emit_generator(event, args, kwargs)
+        if generator is None:
             return
 
-        if len(self.middleware) == 0 and listeners is not None:
-            fast_listeners = listeners.fast_emit_listeners()
-            if fast_listeners is not None:
-                await self._emit_fast(event, fast_listeners, args, kwargs)
-                return
-
-        generator = _EmitGenerator(
-            self,
-            chain(self.middleware, listeners or []),
-            event,
-            args,
-            kwargs,
-        )
-
         for listener, nargs, nkwargs in generator:
-            ret = await listener(*nargs, **nkwargs)
+            if listener.is_async:
+                ret = await listener.handler(*nargs, **nkwargs)
+            else:
+                ret = listener.handler(*nargs, **nkwargs)
             generator.update(ret)
 
     def emit_sync(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
+        generator = self._emit_generator(event, args, kwargs)
+        if generator is None:
+            return
+
+        for listener, nargs, nkwargs in generator:
+            # Only invoke non-async listeners.
+            if listener.is_async:
+                continue
+            ret = listener.handler(*nargs, **nkwargs)
+            generator.update(ret)
+
+    def _emit_generator(
+        self, event: Union[Hashable, TEvent], args: Tuple[Any, ...], kwargs: Dict
+    ) -> Optional[_EmitGenerator]:
+        """Build the shared dispatch core for one emit, or ``None`` for no-op.
+
+        Picks the cached fast listener list when direct dispatch preserves
+        semantics (no middleware, no one-shot listeners, no emitter
+        forwarding); otherwise the full middleware + registration iteration.
+        """
         listeners = self.class_listeners.get(id(event.__class__))
         if listeners is None:
             listeners = self._listeners_for(event)
         if listeners is None and len(self.middleware) == 0:
-            return
+            return None
 
+        iterable: Iterable[EventBusListener]
         if len(self.middleware) == 0 and listeners is not None:
-            fast_listeners = listeners.fast_emit_listeners()
-            if fast_listeners is not None:
-                self._emit_sync_fast(event, fast_listeners, args, kwargs)
-                return
+            iterable = listeners.fast_emit_listeners() or listeners
+        else:
+            iterable = chain(self.middleware, listeners or [])
 
-        # Only invoke non-async functions.
-        generator = _EmitGenerator(
-            self,
-            chain(
-                self.middleware,
-                filter(lambda lst: not lst.is_async, listeners or []),
-            ),
-            event,
-            args,
-            kwargs,
-        )
-
-        for listener, nargs, nkwargs in generator:
-            ret = listener.handler(*nargs, **nkwargs)
-            generator.update(ret)
+        return _EmitGenerator(self, iterable, event, args, kwargs)
 
     def emit_task(
         self, event: Union[Hashable, TEvent], *args, **kwargs
-    ) -> asyncio.Future:
-        """Allows for synchronous emitting of events. Useful cross-thread communication."""
+    ) -> "concurrent.futures.Future":
+        """Allows for synchronous emitting of events. Useful cross-thread communication.
+
+        Returns the ``concurrent.futures.Future`` from
+        :func:`asyncio.run_coroutine_threadsafe` - block on it with
+        ``.result()``; it is not awaitable."""
         return asyncio.run_coroutine_threadsafe(
             self.emit(event, *args, **kwargs), self.event_loop_provider.event_loop
         )
@@ -268,42 +284,41 @@ class EventBus(Emitter[TEvent]):
 
         return functools.partial(emit_func, event)
 
-    async def _emit_fast(
+    @overload
+    def on(
         self,
-        event: Union[Hashable, TEvent],
-        listeners: Iterable[EventBusListener],
-        args: Tuple[Any, ...],
-        kwargs: Dict[Any, Any],
-    ) -> None:
-        nargs = _initialize_args(self, event, args)
-        stop_check = isinstance(event, Event)
-        for listener in listeners:
-            if stop_check and event.is_stopped():
-                return
-            if listener.is_async:
-                ret = await listener.handler(*nargs, **kwargs)
-            else:
-                ret = listener.handler(*nargs, **kwargs)
-            if ret is not None:
-                nargs = _update_args(self, event, nargs, ret)
+        event_type: Type[E],
+        listener: Callable[[E], object],
+        generic: bool = ...,
+        **kwargs: Unpack[EventBusListenerOptions],
+    ) -> Callable[[E], object]: ...
 
-    def _emit_sync_fast(
+    @overload
+    def on(
         self,
-        event: Union[Hashable, TEvent],
-        listeners: Iterable[EventBusListener],
-        args: Tuple[Any, ...],
-        kwargs: Dict[Any, Any],
-    ) -> None:
-        nargs = _initialize_args(self, event, args)
-        stop_check = isinstance(event, Event)
-        for listener in listeners:
-            if listener.is_async:
-                continue
-            if stop_check and event.is_stopped():
-                return
-            ret = listener.handler(*nargs, **kwargs)
-            if ret is not None:
-                nargs = _update_args(self, event, nargs, ret)
+        event_type: Type[E],
+        listener: None = ...,
+        generic: bool = ...,
+        **kwargs: Unpack[EventBusListenerOptions],
+    ) -> Callable[[Callable[[E], object]], Callable[[E], object]]: ...
+
+    @overload
+    def on(
+        self,
+        event_type: Hashable,
+        listener: Callable,
+        generic: bool = ...,
+        **kwargs: Unpack[EventBusListenerOptions],
+    ) -> Callable: ...
+
+    @overload
+    def on(
+        self,
+        event_type: Hashable,
+        listener: None = ...,
+        generic: bool = ...,
+        **kwargs: Unpack[EventBusListenerOptions],
+    ) -> Callable[[Callable], Callable]: ...
 
     def on(
         self,
@@ -337,6 +352,11 @@ class EventBus(Emitter[TEvent]):
             self.listeners.pop(event_type, None)
             if isinstance(event_type, type) and issubclass(event_type, Event):
                 self.class_listeners.pop(id(event_type), None)
+
+    def clear_all(self) -> None:
+        """Drop every listener for every event type."""
+        self.listeners.clear()
+        self.class_listeners.clear()
 
     @staticmethod
     def _event_key(event: Union[Hashable, TEvent]) -> Hashable:

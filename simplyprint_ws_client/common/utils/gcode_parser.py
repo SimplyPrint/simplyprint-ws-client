@@ -1,16 +1,23 @@
-from typing import List, Iterable, Tuple, Any, NamedTuple, Optional
+from typing import Generator, List, Iterable, Tuple, NamedTuple, Optional, Union
+
+#: A parsed argument value: ``F0``/``F1`` become booleans, numerics become
+#: ``int``/``float``, anything else stays the raw string.
+GcodeArgValue = Union[str, int, float, bool]
 
 
 class GcodeCommand(NamedTuple):
     cmd: str
-    args: Optional[List[Tuple[str, Any]]] = None
+    args: Optional[List[Tuple[str, GcodeArgValue]]] = None
 
-    def __getattr__(self, item):
-        for arg in self.args:
-            if arg[0] == item:
-                return arg[1]
+    def arg(
+        self, name: str, default: Optional[GcodeArgValue] = None
+    ) -> Optional[GcodeArgValue]:
+        """The value of argument ``name`` (e.g. ``"S"``), or ``default``."""
+        for key, value in self.args or ():
+            if key == name:
+                return value
 
-        return None
+        return default
 
     def __str__(self):
         s = f"{self.cmd}"
@@ -24,7 +31,7 @@ class GcodeCommand(NamedTuple):
         return s
 
     @staticmethod
-    def arg_cast(c: str, s: str) -> Any:
+    def arg_cast(c: str, s: str) -> GcodeArgValue:
         try:
             if c == "F":
                 if s == "0":
@@ -40,7 +47,7 @@ class GcodeCommand(NamedTuple):
             return s
 
     @classmethod
-    def from_line(cls, s: str):
+    def from_line(cls, s: str) -> "GcodeCommand":
         wc = 0
         p = ""
         command = ""
@@ -84,6 +91,6 @@ class GcodeParser:
             if line := self._cleanup_gcode_line(line):
                 yield line
 
-    def parse_gcode(self, lines: List[str]):
+    def parse_gcode(self, lines: List[str]) -> Generator[GcodeCommand, None, None]:
         for line in self._clean_gcode_lines(lines):
             yield GcodeCommand.from_line(line)

@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import multiprocessing
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Type, final
 
 from yarl import URL
 
+from simplyprint_ws_client.integration.camera.backends import _PauseTimer
 from simplyprint_ws_client.integration.camera.base import (
     BaseCameraProtocol,
     CameraProtocolConnectionError,
@@ -92,7 +92,9 @@ class CameraWorkerBackend:
         self._release = release
         self._pause_timeout = pause_timeout
         self._worker: Optional[WorkerHandle] = None
-        self._pause_timer: Optional[threading.Timer] = None
+        self._pause_timer: Optional[_PauseTimer] = (
+            _PauseTimer(pause_timeout, self.pause) if pause_timeout else None
+        )
         self._lock = threading.Lock()
 
     @property
@@ -148,17 +150,12 @@ class CameraWorkerBackend:
             self._worker = worker
 
     def _refresh_timer(self) -> None:
-        if not self._pause_timeout or not self._continuous:
-            return
-        self._cancel_timer()
-        self._pause_timer = threading.Timer(self._pause_timeout, self.pause)
-        self._pause_timer.daemon = True
-        self._pause_timer.start()
+        if self._pause_timer is not None and self._continuous:
+            self._pause_timer.touch()
 
     def _cancel_timer(self) -> None:
         if self._pause_timer is not None:
             self._pause_timer.cancel()
-            self._pause_timer = None
 
 
 @final
@@ -166,24 +163,15 @@ class CameraPool(ProcessStoppable, Synchronized):
     protocols: List[Type[BaseCameraProtocol]]
     allocations: Dict[int, CameraHandle]
 
-    def __init__(self, pool_size=0, *, event_loop_provider=None, **kwargs):
+    def __init__(self, *, event_loop_provider=None, **kwargs):
         ProcessStoppable.__init__(self, **kwargs)
         Synchronized.__init__(self)
 
-        self._pool_size = pool_size or multiprocessing.cpu_count()
         self.protocols = []
         self.allocations = {}
         self._provider = event_loop_provider or EventLoopProvider.default()
         self._workers = WorkerPool(event_loop_provider=self._provider)
         self._id_counter = 0
-
-    @property
-    def pool_size(self):
-        return self._pool_size
-
-    @pool_size.setter
-    def pool_size(self, value):
-        self._pool_size = value
 
     def submit_request(self, req: Request):
         handle = self.allocations.get(req.id)

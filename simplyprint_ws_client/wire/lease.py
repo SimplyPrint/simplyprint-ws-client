@@ -22,6 +22,7 @@ import yarl
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.utils import submit_coro_threadsafe
 
 from simplyprint_ws_client.wire.events import (
     Connected,
@@ -91,6 +92,9 @@ class Lease(Generic[T]):
         self.topics: Set[str] = set()
         self._close_callbacks: Set[Callable[[], None]] = set()
         self._tasks: Set[asyncio.Task] = set()
+        #: Unresolved ``ready()`` futures; settled ``False`` when the lease
+        #: closes so no waiter outlives its event source.
+        self._ready_waiters: Set[asyncio.Future] = set()
         self.closed = False
 
     @property
@@ -141,8 +145,11 @@ class Lease(Generic[T]):
 
         self.event_bus.on(Connected, on_connected)
         self.event_bus.on(Disconnected, on_disconnected)
+        self._ready_waiters.add(result)
         try:
-            if self.connected and not result.done():
+            if self.closed and not result.done():
+                result.set_result(False)
+            elif self.connected and not result.done():
                 result.set_result(True)
             elif not self.transport.supervising() and not result.done():
                 result.set_result(False)
@@ -152,6 +159,7 @@ class Lease(Generic[T]):
         except asyncio.TimeoutError:
             return False
         finally:
+            self._ready_waiters.discard(result)
             self.event_bus.off(Connected, on_connected)
             self.event_bus.off(Disconnected, on_disconnected)
 
@@ -188,21 +196,8 @@ class Lease(Generic[T]):
         except RuntimeError:
             coro.close()
             return False, None
-        if not loop.is_running():
-            coro.close()
-            return False, None
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is loop:
-            return True, self._create_task_on_loop(loop, coro)
-        try:
-            loop.call_soon_threadsafe(self._create_task_on_loop, loop, coro)
-        except RuntimeError:
-            coro.close()
-            return False, None
-        return True, None
+        # The lease retains its child tasks via the create_task seam.
+        return submit_coro_threadsafe(loop, coro, create_task=self._create_task_on_loop)
 
     def create_task(
         self, coro: Coroutine[object, object, object]
@@ -267,7 +262,12 @@ class Lease(Generic[T]):
             except Exception:  # noqa: BLE001 -- close must continue cleanup
                 self.logger.warning("connection close callback failed", exc_info=True)
         self._close_callbacks.clear()
-        self.event_bus.clear(*tuple(self.event_bus.listeners.keys()))
+        # Settle pending ready() waiters before their event source disappears.
+        for waiter in tuple(self._ready_waiters):
+            if not waiter.done():
+                waiter.set_result(False)
+        self._ready_waiters.clear()
+        self.event_bus.clear_all()
         self._courier.close(drain=False)
         await self.cancel_tasks()
         transport = self.pool.release(self)
@@ -354,7 +354,15 @@ class MqttLease(Lease[MqttTransport]):
         if self.closed:
             return
         for topic in tuple(self.topics):
-            await self.unsubscribe(topic)
+            try:
+                await self.unsubscribe(topic)
+            except Exception:  # noqa: BLE001 -- a broken link must not abort close
+                # Local route bookkeeping is already dropped (unsubscribe does
+                # it before the broker call); transport teardown handles the
+                # broker side.
+                self.logger.debug(
+                    "unsubscribe(%s) failed during close", topic, exc_info=True
+                )
         await super().close()
 
 

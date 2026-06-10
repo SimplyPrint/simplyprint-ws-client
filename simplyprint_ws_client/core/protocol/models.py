@@ -5,7 +5,9 @@ __all__ = [
     "DispatchMode",
 ]
 
-from enum import IntEnum, StrEnum
+from enum import IntEnum
+
+from simplyprint_ws_client._compat import StrEnum
 
 
 class ServerMsgType(StrEnum):

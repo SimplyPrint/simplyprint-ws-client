@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
+
+#: A JSON-shaped value carried in discovery payloads and diagnostic details.
+#: Spelled with typing.Union (not the ``X | Y`` operator) because this is a
+#: runtime expression and the library floor is Python 3.9.
+JsonValue = Union[
+    str, int, float, bool, None, Dict[str, "JsonValue"], List["JsonValue"]
+]
 
 
 @dataclass(frozen=True)

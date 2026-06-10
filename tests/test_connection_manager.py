@@ -12,9 +12,9 @@ from simplyprint_ws_client.core.manager import (
 )
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionIncomingEvent,
-    CloudConnectionLostEvent,
-    CloudConnectionOutgoingEvent,
+    SimplyPrintConnectionIncomingEvent,
+    SimplyPrintConnectionLostEvent,
+    SimplyPrintConnectionOutgoingEvent,
 )
 from simplyprint_ws_client.core.protocol.messages import PingMsg
 from simplyprint_ws_client.events import EventBus
@@ -95,12 +95,12 @@ async def test_deallocate_waits_for_connection_lost_handlers():
     gate = asyncio.Event()
     handler_started = asyncio.Event()
 
-    async def blocking_listener(_event: CloudConnectionLostEvent):
+    async def blocking_listener(_event: SimplyPrintConnectionLostEvent):
         handler_started.set()
         await gate.wait()
 
     # Run before built-in listeners to maximize race surface.
-    client.event_bus.on(CloudConnectionLostEvent, blocking_listener, priority=100)
+    client.event_bus.on(SimplyPrintConnectionLostEvent, blocking_listener, priority=100)
 
     task = asyncio.create_task(manager.deallocate(client))
 
@@ -125,11 +125,11 @@ async def test_deallocate_does_not_leave_late_connection_lost_event():
     manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList())
     manager.client_views[client.unique_id] = _DummyView(client, _DummyConnection())
 
-    async def slow_listener(_event: CloudConnectionLostEvent):
+    async def slow_listener(_event: SimplyPrintConnectionLostEvent):
         await asyncio.sleep(0.03)
 
     # Delay execution of built-in _on_connection_lost in the listener chain.
-    client.event_bus.on(CloudConnectionLostEvent, slow_listener, priority=100)
+    client.event_bus.on(SimplyPrintConnectionLostEvent, slow_listener, priority=100)
 
     await manager.deallocate(client)
 
@@ -253,7 +253,7 @@ async def test_multi_mode_outgoing_messages_use_assigned_connection(monkeypatch)
     for connection in manager.connections:
         sent_by_connection[connection] = []
         connection.event_bus.on(
-            CloudConnectionOutgoingEvent,
+            SimplyPrintConnectionOutgoingEvent,
             lambda msg, _v, connection=connection: sent_by_connection[
                 connection
             ].append(msg.for_client),
@@ -286,7 +286,7 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     received = {client.unique_id: [] for client in clients}
     for client in clients:
         client.event_bus.on(
-            CloudConnectionIncomingEvent,
+            SimplyPrintConnectionIncomingEvent,
             lambda msg, _v, client=client: received[client.unique_id].append(
                 msg.for_client
             ),
@@ -296,11 +296,13 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     first_connection = manager.get_connection_for_client(clients[0])
     stray = PingMsg()
     stray.for_client = clients[1].unique_id
-    await first_connection.event_bus.emit(CloudConnectionIncomingEvent, stray, 0)
+    await first_connection.event_bus.emit(SimplyPrintConnectionIncomingEvent, stray, 0)
 
     targeted = PingMsg()
     targeted.for_client = clients[0].unique_id
-    await first_connection.event_bus.emit(CloudConnectionIncomingEvent, targeted, 0)
+    await first_connection.event_bus.emit(
+        SimplyPrintConnectionIncomingEvent, targeted, 0
+    )
 
     assert received[clients[0].unique_id] == [clients[0].unique_id]
     assert received[clients[1].unique_id] == []

@@ -24,7 +24,6 @@ from typing import (
     List,
     Callable,
     Optional,
-    TYPE_CHECKING,
 )
 
 try:
@@ -87,37 +86,39 @@ class Runner:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        return True
+        # Never suppress exceptions: a crash inside the `with` block must
+        # propagate to the caller (and set a non-zero exit status).
+        return False
 
-    if TYPE_CHECKING:
+    def run(
+        self,
+        main: Coroutine[Any, Any, _T],
+        *,
+        loop_factory: Optional[Callable[[], Loop]] = None,
+        debug: Optional[bool] = None,
+    ) -> Optional[_T]:
+        """The preferred way of running a coroutine with uvloop.
 
-        def run(
-            self,
-            main: Coroutine[Any, Any, _T],
-            *,
-            loop_factory: Optional[Callable[[], Loop]] = asyncio.new_event_loop,
-            debug: Optional[bool] = None,
-        ) -> _T:
-            """The preferred way of running a coroutine with uvloop."""
-    else:
+        Returns the coroutine's result, or None when the run itself is
+        cancelled. ``loop_factory`` defaults to the configured backend's
+        loop factory.
+        """
+        with contextlib.ExitStack() as stack:
+            for context_func in self.context_stack:
+                stack.enter_context(context_func())
 
-        def run(self, *args, **kwargs) -> None:
+            if debug is None:
+                debug = self.debug or _loop_debug_enabled.get()
+
+            if loop_factory is None:
+                loop_factory = (self.backend or _loop_backend.get()).new_event_loop
+
             try:
-                with contextlib.ExitStack() as stack:
-                    for context_func in self.context_stack:
-                        stack.enter_context(context_func())
-
-                    kwargs["debug"] = kwargs.get("debug") or (
-                        self.debug or _loop_debug_enabled.get()
-                    )
-                    kwargs["loop_factory"] = (
-                        kwargs.get("loop_factory")
-                        or (self.backend or _loop_backend.get()).new_event_loop
-                    )
-
-                    return run(*args, **kwargs)
+                return run(main, loop_factory=loop_factory, debug=debug)
             except asyncio.CancelledError:
-                pass
+                # Cancellation of the main coroutine is a graceful shutdown,
+                # not an error; everything else propagates.
+                return None
 
 
 def run(main, *, loop_factory=asyncio.new_event_loop, debug=None, **run_kwargs):

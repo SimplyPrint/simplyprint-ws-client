@@ -34,17 +34,20 @@ from simplyprint_ws_client.integration.flow.base import (
     Ask,
     Choice,
     FlowError,
-    InputModel,
-    InputValidationError,
+    PromptKind,
     Reject,
     Step,
     StepAction,
     StepField,
     StepOutcome,
     StepPrompt,
+    resolve,
+)
+from simplyprint_ws_client.integration.flow.schema import (
+    InputModel,
+    InputValidationError,
     fields_from_schema,
     model_input_schema,
-    resolve,
     validate_input,
 )
 
@@ -96,7 +99,7 @@ class FieldsStep(Step):
         content: Optional[Content] = None,
         footer: Optional[Content] = None,
         actions: Optional[Sequence[StepAction]] = None,
-        kind: str = "form",
+        kind: PromptKind = "form",
         input_model: Optional[InputModel] = None,
         input_values: Optional[
             Union[
@@ -294,7 +297,7 @@ class SelectStep(Step):
         label: str,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
-        kind: str = "discovery",
+        kind: PromptKind = "discovery",
         manual_field: Optional[StepField] = None,
         manual: Optional[
             Callable[

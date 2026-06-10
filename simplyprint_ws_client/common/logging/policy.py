@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Tuple
+from typing import Callable, Final, Literal, Tuple
 
 from simplyprint_ws_client.common.logging.naming import PRINTER_ROOT, is_printer_logger
 
@@ -22,10 +22,13 @@ DEFAULT_NOISY_LOGGERS: Tuple[str, ...] = (
     "apscheduler",
 )
 
-LOG_TARGET_FILE = "file"
-LOG_TARGET_QUEUE = "queue"
-LOG_TARGET_STREAM = "stream"
-LOG_TARGET_LIVE = "live"
+LOG_TARGET_FILE: Final = "file"
+LOG_TARGET_QUEUE: Final = "queue"
+LOG_TARGET_STREAM: Final = "stream"
+LOG_TARGET_LIVE: Final = "live"
+
+#: The sinks a record can be policy-checked against (the LOG_TARGET_* values).
+LogTarget = Literal["file", "queue", "stream", "live"]
 
 
 @dataclass(frozen=True)
@@ -46,7 +49,7 @@ class LoggingPolicy:
     noisy_level: int = logging.WARNING
     noisy_loggers: Tuple[str, ...] = DEFAULT_NOISY_LOGGERS
 
-    def allows(self, record: logging.LogRecord, target: str) -> bool:
+    def allows(self, record: logging.LogRecord, target: LogTarget) -> bool:
         """Whether ``record`` should reach ``target``.
 
         ``target`` is one of ``queue``, ``file``, ``stream`` or ``live``. Unknown
@@ -138,7 +141,7 @@ class LoggingPolicy:
 class LoggingPolicyFilter(logging.Filter):
     """A ``logging.Filter`` adapter for :class:`LoggingPolicy`."""
 
-    def __init__(self, policy: LoggingPolicy, target: str) -> None:
+    def __init__(self, policy: LoggingPolicy, target: LogTarget) -> None:
         super().__init__()
         self._policy = policy
         self._target = target

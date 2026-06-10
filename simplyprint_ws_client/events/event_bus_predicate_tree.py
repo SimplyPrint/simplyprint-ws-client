@@ -62,33 +62,35 @@ class EventBusPredicateTree(Generic[_TResource]):
             if value == resource:
                 self.remove_resource_id(resource_id)
 
-    def remove_resource_id(self, resource_id: int, entry: PredicateTreeNode = None):
-        # Only perform early exit if the resource does not exist at the initial call.
-        # For nested calls the resource has already been removed.
-        if resource_id not in self.resources and entry is None:
+    def remove_resource_id(self, resource_id: int) -> None:
+        if self.resources.pop(resource_id, None) is None:
             return
-        else:
-            # We actually do not know if it exists, so we pass a default anyhow.
-            self.resources.pop(resource_id, None)
 
-        if entry is None:
-            entry = self.root
+        self._prune(self.root, resource_id)
 
-        for i, child in enumerate(entry.predicates):
+    def _prune(self, node: PredicateTreeNode, resource_id: int) -> bool:
+        """Drop ``resource_id`` from the subtree, removing now-empty branches.
+
+        Returns True once the resource was found; an id lives on exactly one
+        path, so siblings are skipped after a hit.
+        """
+        found = False
+
+        for child in node.predicates:
             if resource_id in child.resources:
                 child.resources.discard(resource_id)
+                found = True
+            else:
+                found = self._prune(child, resource_id)
 
-                if len(child.resources) == 0 and len(child.predicates) == 0:
-                    entry.predicates.pop(i)
+            if found:
+                break
 
-                return
+        node.predicates[:] = [
+            child for child in node.predicates if child.resources or child.predicates
+        ]
 
-            self.remove_resource_id(resource_id, child)
-
-        # Clean up empty entries.
-        for i, child in enumerate(list(entry.predicates)):
-            if len(child.resources) == 0 and len(child.predicates) == 0:
-                entry.predicates.pop(i)
+        return found
 
     def get_resources(self, *resources) -> Iterable[_TResource]:
         return [
@@ -98,13 +100,13 @@ class EventBusPredicateTree(Generic[_TResource]):
         ]
 
     def evaluate(self, *args, **kwargs) -> Iterator[int]:
-        b = self.root
+        """Yield the resources on every root-to-leaf path whose predicates all
+        match. All matching children are descended, not just the first."""
+        stack = list(self.root.predicates)
 
-        while len(b.predicates) > 0:
-            for entry in b.predicates:
-                if entry.predicate(*args, **kwargs):
-                    yield from entry.resources
-                    b = entry
-                    break
-            else:
-                break
+        while stack:
+            entry = stack.pop()
+
+            if entry.predicate(*args, **kwargs):
+                yield from entry.resources
+                stack.extend(entry.predicates)

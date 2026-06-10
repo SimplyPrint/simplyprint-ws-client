@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-__all__ = ["CloudConnection", "ConnectionHint", "ConnectionMode", "TransportFactory"]
+__all__ = [
+    "SimplyPrintConnection",
+    "ConnectionHint",
+    "ConnectionMode",
+    "TransportFactory",
+]
 
 import asyncio
 import logging
@@ -9,9 +14,9 @@ from typing import Callable, Hashable, Optional, final
 
 from yarl import URL
 
-from simplyprint_ws_client.core.protocol.events import CloudConnectionEvent
+from simplyprint_ws_client.core.protocol.events import SimplyPrintConnectionEvent
 from simplyprint_ws_client.core.protocol.messages import ClientMsg, ClientMsgType
-from simplyprint_ws_client.core.protocol.protocol import CloudProtocol
+from simplyprint_ws_client.core.protocol.protocol import SimplyPrintProtocol
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.reconnect import Reconnecting
@@ -82,13 +87,13 @@ def default_transport_factory(
 
 
 @final
-class CloudConnection(
+class SimplyPrintConnection(
     AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop], Hashable
 ):
     """Stateful SimplyPrint server session.
 
-    The transport owns link lifecycle and frames. :class:`CloudProtocol` sits on top
-    and owns message parsing, protocol events, and version state. ``CloudConnection`` is
+    The transport owns link lifecycle and frames. :class:`SimplyPrintConnection` sits on top
+    and owns message parsing, protocol events, and version state. ``SimplyPrintConnection`` is
     the public stateful handle that composes the two.
     """
 
@@ -108,8 +113,8 @@ class CloudConnection(
         self.hint = hint or ConnectionHint()
         self.logger = logger
         self.transport: Optional[WsTransport] = None
-        self.protocol = CloudProtocol(self, logger)
-        self.event_bus: EventBus[CloudConnectionEvent] = self.protocol.event_bus
+        self.protocol = SimplyPrintProtocol(self, logger)
+        self.event_bus: EventBus[SimplyPrintConnectionEvent] = self.protocol.event_bus
 
     @property
     def v(self) -> int:

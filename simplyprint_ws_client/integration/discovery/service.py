@@ -24,6 +24,7 @@ from simplyprint_ws_client.integration.discovery.multicast import (
     MulticastDiscoveryBackend,
 )
 from simplyprint_ws_client.integration.discovery.network import (
+    DiagnosticReason,
     HostDiagnostic,
     NetworkScanContext,
     diagnostic_status,
@@ -141,7 +142,7 @@ class DiscoveryService:
                 services=service_results,
                 checks=checks,
                 matched=None,
-                reason="required_services_open",
+                reason=DiagnosticReason.REQUIRED_SERVICES_OPEN,
                 message=f"{host} is answering on the expected {brand} port(s)",
             )
 
@@ -158,7 +159,7 @@ class DiscoveryService:
             services=service_results,
             checks=checks,
             matched=False,
-            reason="required_service_closed",
+            reason=DiagnosticReason.REQUIRED_SERVICE_CLOSED,
             message=(
                 f"{host} is not answering on the expected {brand} "
                 f"service port(s): {', '.join(labels)}"

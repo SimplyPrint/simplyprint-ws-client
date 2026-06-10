@@ -10,6 +10,10 @@ from typing import NamedTuple, Optional
 
 import psutil
 
+#: Any public address works here: the socket is never written to, it only makes
+#: the kernel pick the outbound interface so we can read this host's local ip.
+_OUTBOUND_PROBE_ADDR = ("168.119.98.102", 80)
+
 
 class NetworkInfo(NamedTuple):
     """Network information tuple."""
@@ -19,30 +23,38 @@ class NetworkInfo(NamedTuple):
 
 
 def get_local_ip_and_mac() -> NetworkInfo:
-    """Get the local IP and MAC address of the machine."""
+    """Get the local IP and MAC address of the machine.
+
+    The MAC is only reported when an interface actually carries ``ip``;
+    callers correlate hardware identity on it, so a guess is worse than None.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(0)
     try:
-        # doesn't even have to be reachable -- we just need the kernel to pick
-        # the outbound interface so we learn this host's local ip.
-        s.connect(("168.119.98.102", 80))
+        s.connect(_OUTBOUND_PROBE_ADDR)
         local_ip = s.getsockname()[0]
     except socket.error:
         local_ip = "127.0.0.1"
     finally:
         s.close()
 
-    nics = psutil.net_if_addrs()
-    for iface in nics:
+    mac: Optional[str] = None
+
+    for iface, addrs in psutil.net_if_addrs().items():
         if iface == "lo":
             continue
-        mac = None
+
+        iface_mac = None
         found = False
-        for addr in nics[iface]:
+
+        for addr in addrs:
             if addr.family == socket.AF_INET and addr.address == local_ip:
                 found = True
             if addr.family == psutil.AF_LINK:
-                mac = addr.address
+                iface_mac = addr.address
+
         if found:
+            mac = iface_mac
             break
+
     return NetworkInfo(ip=local_ip, mac=mac)

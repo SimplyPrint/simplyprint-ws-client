@@ -46,6 +46,7 @@ from typing import (
     Any,
     ClassVar,
     Coroutine,
+    Dict,
     Generic,
     Iterable,
     Optional,
@@ -53,6 +54,8 @@ from typing import (
     Tuple,
     TypeVar,
 )
+
+from typing_extensions import TypeVar as TypeVarWithDefault
 
 from simplyprint_ws_client.core.client import ClientConfigChangedEvent
 from simplyprint_ws_client.core.config import PrinterConfig
@@ -80,15 +83,18 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.integration.drivers import DeviceDriver
 
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
+#: The brand payload a :class:`JobEdge` carries; defaults to ``object`` so an
+#: unparameterized ``JobEdge`` keeps working for existing subscribers.
+TRaw = TypeVarWithDefault("TRaw", default=object)
 
 #: Host usage is read at most this often, shared across every client, so the
 #: delta-based ``psutil.cpu_percent`` isn't reset by every client every tick.
 _HOST_USAGE_MIN_INTERVAL = 5.0
-_host_usage_snapshot: dict = {}
+_host_usage_snapshot: Dict[str, int] = {}
 _host_usage_read_at: float = 0.0
 
 
-async def _host_usage() -> dict:
+async def _host_usage() -> Dict[str, int]:
     """Return a process-wide, throttled snapshot of host CPU/memory usage.
 
     The refresh reads sysfs/proc via ``psutil`` and is offloaded to a worker
@@ -112,17 +118,18 @@ async def _host_usage() -> dict:
 
 
 @dataclass(frozen=True)
-class JobEdge:
+class JobEdge(Generic[TRaw]):
     """One status transition handed to the job-edge hooks.
 
     ``raw`` is whatever brand payload the ``apply_status`` caller passed along --
     the device's print dict, raw state enum, ... -- so a hook never has to read
-    smuggled instance attributes to see what produced the edge.
+    smuggled instance attributes to see what produced the edge. A brand that
+    always passes one payload shape may annotate its hooks ``JobEdge[ThatShape]``.
     """
 
     new_status: PrinterStatus
     previous_status: Optional[PrinterStatus]
-    raw: object = None
+    raw: TRaw = None  # type: ignore[assignment]
 
 
 class AppUpdater(Protocol):
@@ -196,6 +203,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         """Final cleanup: stop the drivers, then any extra device teardown."""
         for driver in self._device_drivers:
             driver.stop()
+        self.teardown_camera_mixin()
         await self._stop_connection()
 
     # -- device drivers: how this client reaches its physical printer --

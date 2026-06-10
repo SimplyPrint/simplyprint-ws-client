@@ -9,7 +9,8 @@ touches these.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Generic, Hashable, Optional, TypeVar
+import asyncio
+from typing import Callable, Dict, Generic, Hashable, Optional, Set, TypeVar
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.wire.options import WireKeepalive
@@ -17,6 +18,10 @@ from simplyprint_ws_client.wire.pool import Pool
 from simplyprint_ws_client.wire.transport import Transport
 
 T = TypeVar("T", bound=Transport)
+
+#: Keeps scheduled transport-stop tasks alive until they finish (asyncio holds
+#: tasks weakly; an unreferenced stop task could be collected mid-teardown).
+_STOP_TASKS: Set["asyncio.Task"] = set()
 
 
 def pool_identity(
@@ -59,13 +64,41 @@ class DefaultPools(Generic[T]):
         return built
 
     def shutdown(self) -> None:
-        """Tear down every cached pool. Idempotent.
+        """Tear down every cached pool and stop its live transports. Idempotent.
 
-        Stops each pool's fan-out and drops its bookkeeping; the live sockets'
-        async ``stop`` is the owning loop's to drive (a lease ``close`` already
-        does this on the last release).
+        A lease released after this finds no endpoint to stop the socket
+        through, so each transport's async ``stop`` is scheduled here, on the
+        transport's own loop (awaitable from that loop, threadsafe from any
+        other).
         """
         pools = list(self.pools.values())
         self.pools.clear()
         for pool in pools:
-            pool.stop()
+            for transport in pool.stop():
+                _schedule_transport_stop(transport)
+
+
+def _schedule_transport_stop(transport: Transport) -> None:
+    """Run ``transport.stop()`` on the transport's loop from any thread."""
+    coro = transport.stop()
+
+    try:
+        loop = transport.provider.event_loop
+    except (AttributeError, RuntimeError):
+        loop = None
+
+    if loop is None or loop.is_closed():
+        coro.close()
+        return
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is loop:
+        task = loop.create_task(coro)
+        _STOP_TASKS.add(task)
+        task.add_done_callback(_STOP_TASKS.discard)
+    else:
+        asyncio.run_coroutine_threadsafe(coro, loop)

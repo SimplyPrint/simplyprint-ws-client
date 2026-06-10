@@ -39,6 +39,8 @@ __all__ = [
     "StreamOffDemandData",
     "SetPrinterProfileDemandData",
     "SetMaterialDataDemandData",
+    "RefreshMaterialDataDemandData",
+    "MMSMapEntry",
     "SkipObjectsDemandData",
     "ResolveNotificationDemandData",
     "GetGcodeScriptBackupsDemandData",
@@ -86,6 +88,7 @@ __all__ = [
     "LogsSentMsg",
     "MaterialDataMsg",
     "NotificationMsg",
+    "ObjectsData",
     "ObjectsMsg",
 ]
 
@@ -448,11 +451,15 @@ class GotoWsTestDemandData(BaseModel):
     demand: Literal[DemandMsgType.GOTO_WS_TEST] = DemandMsgType.GOTO_WS_TEST
 
 
+#: Default cap (bytes) on a log upload's body when the server sends none.
+DEFAULT_SEND_LOGS_MAX_BODY = 100000000
+
+
 class SendLogsDemandData(BaseModel):
     demand: Literal[DemandMsgType.SEND_LOGS] = DemandMsgType.SEND_LOGS
     token: str
     logs: List[str]
-    max_body: int = 100000000
+    max_body: int = DEFAULT_SEND_LOGS_MAX_BODY
 
     @property
     def send_main(self):
@@ -601,7 +608,8 @@ class GcodeScriptsMsg(ClientMsg[Literal[ClientMsgType.GCODE_SCRIPTS]]): ...
 class MachineDataMsg(ClientMsg[Literal[ClientMsgType.INFO]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        return state.info.model_dump(mode="json", exclude_none=True)
+        # Honour the generator contract every other build() follows.
+        yield from state.info.model_dump(mode="json", exclude_none=True).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.info.model_reset_changed()
@@ -888,7 +896,19 @@ class MaterialDataMsg(ClientMsg[Literal[ClientMsgType.MATERIAL_DATA]]):
     _TOOL_FIELDS: ClassVar[Set[str]] = {"nozzle", "type", "volume_type", "size"}
 
     @classmethod
-    def build(cls, state: PrinterState, is_refresh=False) -> TClientMsgDataGenerator:
+    def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
+        """The changed material fields only (the regular diff dispatch)."""
+        yield from cls._build(state, is_refresh=False)
+
+    @classmethod
+    def build_refresh(cls, state: PrinterState) -> TClientMsgDataGenerator:
+        """A full material snapshot, marked ``refresh`` for the server."""
+        yield from cls._build(state, is_refresh=True)
+
+    @classmethod
+    def _build(
+        cls, state: PrinterState, *, is_refresh: bool
+    ) -> TClientMsgDataGenerator:
         if is_refresh:
             yield "refresh", True
 
@@ -1008,4 +1028,8 @@ class ObjectsMsg(ClientMsg[Literal[ClientMsgType.OBJECTS]]):
     """Raw objects data support"""
 
     def __init__(self, data: Union[dict, ObjectsData]):
+        # The wire field is a plain dict; accept the typed model and dump it
+        # (previously a model instance raised ValidationError).
+        if isinstance(data, ObjectsData):
+            data = data.model_dump(mode="json", exclude_none=True)
         super().__init__(data=data)

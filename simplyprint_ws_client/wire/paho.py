@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     from paho.mqtt.client import MQTTMessage
     from paho.mqtt.reasoncodes import ReasonCode
 
+    from simplyprint_ws_client.wire.policy import RetryPolicy
+
 PahoReasonCode = Optional[Union[int, "ReasonCode"]]
 
 
@@ -67,7 +69,9 @@ class PahoPublishInfo(Protocol):
 
     rc: int
 
-    def wait_for_publish(self) -> None: ...
+    def wait_for_publish(self, timeout: Optional[float] = None) -> None: ...
+
+    def is_published(self) -> bool: ...
 
 
 class PahoClient(Protocol):
@@ -112,12 +116,29 @@ class PahoClient(Protocol):
 PahoClientFactory = Callable[[yarl.URL, logging.Logger], PahoClient]
 
 
-def default_paho_client(url: yarl.URL, logger: logging.Logger) -> PahoClient:
+#: How long a QoS>0 publish waits for the broker ack before it is reported lost.
+PUBLISH_ACK_TIMEOUT = 30.0
+
+#: paho's reconnect pacing when no retry policy is supplied.
+DEFAULT_RECONNECT_DELAYS = (1, 5)
+
+
+def default_paho_client(
+    url: yarl.URL,
+    logger: logging.Logger,
+    *,
+    verify_tls: bool = False,
+    retry: Optional["RetryPolicy"] = None,
+) -> PahoClient:
     """Build a real ``paho.mqtt.client.Client``, TLS-enabled for ``mqtts://``.
 
     Imported lazily so merely importing this module never requires paho. paho
     keeps the socket alive itself (``reconnect_on_failure``), which is why
-    :class:`Paho` adapts it instead of supervising it.
+    :class:`Paho` adapts it instead of supervising it. ``verify_tls`` is off by
+    default - printer fleets routinely present self-signed broker certificates -
+    but is an explicit choice via ``ConnectionOptions``. A ``retry`` policy's
+    backoff is mapped onto paho's ``reconnect_delay_set`` bounds (paho cannot
+    express give-up limits, so those are ignored here).
     """
     import ssl
 
@@ -128,10 +149,29 @@ def default_paho_client(url: yarl.URL, logger: logging.Logger) -> PahoClient:
         reconnect_on_failure=True,
     )
     if url.scheme == "mqtts":
-        client.tls_set(tls_version=ssl.PROTOCOL_TLS, cert_reqs=ssl.CERT_NONE)
-        client.tls_insecure_set(True)
-    client.reconnect_delay_set(min_delay=1, max_delay=5)
+        if verify_tls:
+            client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+        else:
+            client.tls_set(tls_version=ssl.PROTOCOL_TLS, cert_reqs=ssl.CERT_NONE)
+            client.tls_insecure_set(True)
+    min_delay, max_delay = (
+        DEFAULT_RECONNECT_DELAYS if retry is None else retry_delay_bounds(retry)
+    )
+    client.reconnect_delay_set(min_delay=min_delay, max_delay=max_delay)
     return client
+
+
+def retry_delay_bounds(retry: "RetryPolicy") -> "tuple[int, int]":
+    """Approximate a retry policy's backoff as paho ``(min_delay, max_delay)``.
+
+    The backoff is sampled (then reset) because the schedule is behavior, not
+    data - this captures its envelope without knowing its concrete type.
+    """
+    samples = [retry.backoff.delay() for _ in range(8)]
+    retry.backoff.reset()
+    min_delay = max(1, int(min(samples)))
+    max_delay = max(min_delay, int(max(samples)))
+    return min_delay, max_delay
 
 
 class Paho(MqttTransport):
@@ -191,11 +231,15 @@ class Paho(MqttTransport):
         if self.started:
             return
         self.started = True
+        # Bounded like the lease courier: lifecycle and QoS>0 messages are
+        # lossless, QoS0 telemetry sheds oldest-first if the loop stalls.
         self.courier = Courier(
             sink=self.emit,
             is_async_sink=True,
             provider=self.provider,
-            policy=OverflowPolicy.UNBOUNDED,
+            policy=OverflowPolicy.DROP_OLDEST,
+            maxsize=1024,
+            lossless=self._lossless_event,
         )
 
         client = self.client_factory(self.url, self.logger)
@@ -232,13 +276,20 @@ class Paho(MqttTransport):
             except Exception:  # noqa: BLE001 -- stop must never raise
                 self.logger.debug("paho %s disconnect failed", self.url, exc_info=True)
             try:
-                client.loop_stop()
+                # loop_stop joins paho's network thread - keep it off the loop.
+                await self.provider.event_loop.run_in_executor(None, client.loop_stop)
             except Exception:  # noqa: BLE001
                 self.logger.debug("paho %s loop_stop failed", self.url, exc_info=True)
         if self.courier is not None:
             self.courier.close(drain=False)
             self.courier = None
+        # An intentional stop is silent (no Disconnected) - matching the
+        # supervised wires; Lease.close() settles its own ready() waiters.
         self.state = ConnectionState.DISCONNECTED
+
+    @staticmethod
+    def _lossless_event(event: WireEvent) -> bool:
+        return not isinstance(event, MessageReceived) or event.lossless
 
     async def send(self, message: MqttMessage) -> None:
         """Publish ``message`` on the live socket (raises if the link is down).
@@ -260,7 +311,15 @@ class Paho(MqttTransport):
         if info.rc != 0:
             raise NotConnected(f"paho publish rejected (rc={info.rc})", code=info.rc)
         if message.qos.value > 0:
-            await self.provider.event_loop.run_in_executor(None, info.wait_for_publish)
+            # Bound the ack wait: an unacked QoS>0 publish on a dropped link
+            # must not park an executor thread forever.
+            await self.provider.event_loop.run_in_executor(
+                None, lambda: info.wait_for_publish(PUBLISH_ACK_TIMEOUT)
+            )
+            if not info.is_published():
+                raise TransientError(
+                    f"paho publish unacked after {PUBLISH_ACK_TIMEOUT:g}s"
+                )
 
     async def subscribe(self, topic: str) -> None:
         """Assert a subscription for ``topic``, refcounted across leases.

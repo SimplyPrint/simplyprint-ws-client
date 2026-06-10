@@ -12,12 +12,24 @@ import weakref
 from abc import ABC
 from datetime import timedelta, datetime
 from enum import IntEnum
-from typing import NamedTuple, Optional, Union, Generic, TypeVar, cast
+from typing import (
+    Any,
+    Generic,
+    NamedTuple,
+    Optional,
+    TypeVar,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+)
+
+from pydantic import BaseModel
 
 try:
-    from typing import Unpack, Never
+    from typing import Unpack
 except ImportError:
-    from typing_extensions import Unpack, Never
+    from typing_extensions import Unpack
 
 from simplyprint_ws_client.core.autowire import (
     configure,
@@ -25,13 +37,17 @@ from simplyprint_ws_client.core.autowire import (
     AutowireClientMeta,
 )
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.core.state import PrinterState, NotificationEvent
+from simplyprint_ws_client.core.state import (
+    PrinterState,
+    NotificationEvent,
+    NotificationEventKwargs,
+)
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionOutgoingEvent,
-    CloudConnectionEstablishedEvent,
-    CloudConnectionLostEvent,
-    CloudConnectionIncomingEvent,
+    SimplyPrintConnectionOutgoingEvent,
+    SimplyPrintConnectionEstablishedEvent,
+    SimplyPrintConnectionLostEvent,
+    SimplyPrintConnectionIncomingEvent,
 )
 from simplyprint_ws_client.core.protocol.messages import (
     SetMaterialDataDemandData,
@@ -148,6 +164,49 @@ _CLIENT_MSG_PRODUCERS = {
 }
 
 _CLIENT_MSG_MAP = {k: v for v, keys in _CLIENT_MSG_PRODUCERS.items() for k in keys}
+
+
+def _producer_path_is_valid(path: str) -> bool:
+    """Whether a producer's dotted path still matches the PrinterState models."""
+    annotation: Any = PrinterState
+
+    for part in path.split("."):
+        # Unwrap Optional[...] around models/containers.
+        if get_origin(annotation) is Union:
+            args = [a for a in get_args(annotation) if a is not type(None)]
+            if len(args) == 1:
+                annotation = args[0]
+
+        if part == "*":
+            if get_origin(annotation) not in (list, tuple):
+                return False
+            annotation = get_args(annotation)[0]
+            continue
+
+        if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
+            return False
+
+        field = annotation.model_fields.get(part)
+        if field is None:
+            return False
+        annotation = field.annotation
+
+    return True
+
+
+_invalid_producer_paths = [
+    path
+    for paths in _CLIENT_MSG_PRODUCERS.values()
+    for path in paths
+    if not _producer_path_is_valid(path)
+]
+if _invalid_producer_paths:
+    # Fail at import: a renamed state field would otherwise silently stop its
+    # message from ever being sent.
+    raise RuntimeError(
+        f"_CLIENT_MSG_PRODUCERS paths no longer match PrinterState: "
+        f"{_invalid_producer_paths}"
+    )
 
 
 class Client(
@@ -318,8 +377,8 @@ class Client(
     def signal(self):
         self.event_bus.emit_sync(ClientStateChangeEvent)
 
-    def consume(self):
-        """Consume the list of pending messages."""
+    def consume(self) -> list:
+        """Consume and return the list of pending messages."""
         self.last_msg_id = self.msg_id
 
         changes = self.printer.model_recursive_changeset
@@ -366,11 +425,11 @@ class Client(
             msgs.append(msg)
             msg.reset_changes(self.printer, v=highest)
 
-        return msgs, -1  # max(v for _, v in msg_kinds)
+        return msgs
 
     # internal methods
 
-    @configure(CloudConnectionIncomingEvent)
+    @configure(SimplyPrintConnectionIncomingEvent)
     async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
         if self.v > v:
             self.logger.warning("Dropped incoming message %s with v: %d.", msg, v)
@@ -389,15 +448,15 @@ class Client(
         else:
             await self.event_bus.emit(msg.type, msg)
 
-    @configure(CloudConnectionEstablishedEvent)
-    def _on_connection_established(self, event: CloudConnectionEstablishedEvent):
+    @configure(SimplyPrintConnectionEstablishedEvent)
+    def _on_connection_established(self, event: SimplyPrintConnectionEstablishedEvent):
         self.v = event.v
 
         if self.state == ClientState.CONNECTING:
             self.state = ClientState.NOT_CONNECTED
 
-    @configure(CloudConnectionLostEvent)
-    def _on_connection_lost(self, event: CloudConnectionLostEvent):
+    @configure(SimplyPrintConnectionLostEvent)
+    def _on_connection_lost(self, event: SimplyPrintConnectionLostEvent):
         if self.v > event.v:
             return
 
@@ -449,7 +508,7 @@ class Client(
             )
             return
 
-        await self.event_bus.emit(CloudConnectionOutgoingEvent, msg, self.v)
+        await self.event_bus.emit(SimplyPrintConnectionOutgoingEvent, msg, self.v)
 
     # lifetime methods
 
@@ -506,19 +565,23 @@ class Client(
         except Exception as e:
             self.logger.warning("Failed to start next print: %s", e)
 
-    async def push_notification(
-        self, event_id: Never = ..., **kwargs: Unpack[NotificationEvent]
-    ):
+    async def push_notification(self, **kwargs: Unpack[NotificationEventKwargs]):
         """
         Push unmanaged notification, no response available, no event_id available.
         Alternatively use the notification state to manage persistent notifications.
         """
+        if "event_id" in kwargs:
+            raise TypeError(
+                "push_notification() does not accept 'event_id'; "
+                "use the notification state for persistent notifications"
+            )
         await self.send(NotificationMsg(data={"events": [NotificationEvent(**kwargs)]}))
 
     # Default event handling.
 
     @configure(ServerMsgType.ERROR, priority=1)
-    def _on_error(self, msg: ErrorMsg): ...
+    def _on_error(self, msg: ErrorMsg):
+        self.logger.warning("Server reported an error: %s", msg.data)
 
     @configure(ServerMsgType.NEW_TOKEN, priority=1)
     async def _on_new_token(self, msg: NewTokenMsg):
@@ -530,6 +593,11 @@ class Client(
 
     @configure(ServerMsgType.CONNECTED, priority=1)
     async def _on_connected_data(self, msg: ConnectedMsg):
+        if msg.data is None:
+            # A bare `connected` frame carries nothing to apply; the
+            # established-state handler still runs at its own priority.
+            return
+
         self.config.name = msg.data.name
         self.config.in_setup = msg.data.in_setup
         self.config.short_id = msg.data.short_id
@@ -581,28 +649,28 @@ class Client(
     @configure(DemandMsgType.SET_MATERIAL_DATA, priority=1)
     def _on_set_material_data(self, data: SetMaterialDataDemandData):
         for material in data.materials:
-            tool = self.printer.tool(material.nozzle)
+            entry = self.printer.material(material.nozzle, material.ext)
 
-            if tool is None:
+            if entry is None:
                 continue
 
-            if material.ext not in tool.materials:
-                continue
-
-            tool.materials[material.ext].model_update(material)
-            tool.materials[material.ext].model_reset_changed()
+            entry.model_update(material)
+            entry.model_reset_changed()
 
     @configure(DemandMsgType.REFRESH_MATERIAL_DATA, priority=1)
     async def _on_refresh_material_data(self):
         await self.send(
-            MaterialDataMsg(
-                data=dict(MaterialDataMsg.build(self.printer, is_refresh=True))
-            )
+            MaterialDataMsg(data=dict(MaterialDataMsg.build_refresh(self.printer)))
         )
 
     @configure(DemandMsgType.RESOLVE_NOTIFICATION, priority=1)
     async def _on_resolve_notification(self, data: ResolveNotificationDemandData):
         event = self.printer.notifications.notifications.get(data.event_id)
+
+        if event is None:
+            # Already removed client-side (or never known) - nothing to resolve.
+            self.logger.debug("Ignoring resolve for unknown event %s", data.event_id)
+            return
 
         # The default action is to resolve the event client side.
         if data.action is None:

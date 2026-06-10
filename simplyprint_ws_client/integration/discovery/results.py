@@ -16,14 +16,17 @@ That is the same bar the ``_DISCOVERY_MODULES`` guard in
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+from simplyprint_ws_client.integration.discovery.device import (
+    DiscoveredDevice,
+    JsonValue,
+)
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 
-JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
 DiscoveryExtra = Dict[str, JsonValue]
 
 #: How long a discovered device lingers in the store after it was last seen. A
@@ -101,8 +104,6 @@ class DiscoveryResultsStore:
 
         self._scanning = True
         try:
-            import asyncio
-
             brands = [client_type] if client_type else list(self._brands_fn())
             await asyncio.gather(
                 *(self._scan_one(brand, timeout) for brand in brands),

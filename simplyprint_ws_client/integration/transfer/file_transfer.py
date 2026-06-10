@@ -45,7 +45,7 @@ from simplyprint_ws_client.common.utils.slugify import slugify
 from simplyprint_ws_client.integration.transfer.checksum import file_md5
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client import Client
+    from simplyprint_ws_client.integration.client import PrinterClient
 
 #: Seconds to wait, after the file reached the printer and the start command was
 #: sent, for the firmware to broadcast a started print state.
@@ -88,7 +88,7 @@ class FileTransfer(ABC):
     #: Grace window for the firmware to confirm a started print.
     grace_seconds: float = DEFAULT_GRACE_SECONDS
 
-    def __init__(self, client: "Client") -> None:
+    def __init__(self, client: "PrinterClient") -> None:
         self.client = client
         self.next_to_print: Optional[PreparedPrint] = None
 
@@ -180,7 +180,9 @@ class FileTransfer(ABC):
         if running_loop is not None and (
             client_loop is None or running_loop is client_loop
         ):
-            self._download_dispatch = running_loop.create_task(coro)
+            task = running_loop.create_task(coro)
+            self._download_dispatch = task
+            task.add_done_callback(self._on_dispatch_done)
             return
 
         submit_to_loop = getattr(self.client, "submit_to_loop", None)
@@ -193,6 +195,20 @@ class FileTransfer(ABC):
         else:
             coro.close()
             raise RuntimeError("No running client event loop for file transfer")
+
+    def _on_dispatch_done(self, task: "asyncio.Task") -> None:
+        """Surface a dispatch that died before it could register itself as the
+        active download task, and drop the strong reference."""
+        if self._download_dispatch is task:
+            self._download_dispatch = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.client.logger.warning(
+                "file transfer dispatch failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def ensure_file_and_start(self, data: FileDemandData) -> None:
         """Ensure the SP file is on the printer and, if auto-start is set,

@@ -8,11 +8,11 @@ from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionEstablishedEvent,
-    CloudConnectionIncomingEvent,
-    CloudConnectionLostEvent,
-    CloudConnectionOutgoingEvent,
-    CloudConnectionSuspectEvent,
+    SimplyPrintConnectionEstablishedEvent,
+    SimplyPrintConnectionIncomingEvent,
+    SimplyPrintConnectionLostEvent,
+    SimplyPrintConnectionOutgoingEvent,
+    SimplyPrintConnectionSuspectEvent,
 )
 from simplyprint_ws_client.core.protocol.messages import (
     ClientMsg,
@@ -20,6 +20,7 @@ from simplyprint_ws_client.core.protocol.messages import (
     Msg,
     ServerMsg,
 )
+from simplyprint_ws_client.wire import TransportError
 from simplyprint_ws_client.wire.events import (
     Connected,
     Disconnected,
@@ -31,24 +32,26 @@ from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.utils.bounded_variable import BoundedInterval
 
+#: Connection-shaped failures a send may swallow. CancelledError is
+#: deliberately NOT here: swallowing it would break task cancellation.
 WsConnectionErrors = (
     OSError,
     ConnectionError,
     asyncio.TimeoutError,
-    asyncio.CancelledError,
+    TransportError,
 )
 
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
 
 
-class CloudProtocol:
+class SimplyPrintProtocol:
     """Client-side SimplyPrint WS protocol over a reconnecting transport."""
 
     def __init__(self, connection, logger: logging.Logger) -> None:
         self.connection = connection
         self.logger = logger
         self.event_bus = EventBus()
-        self.event_bus.on(CloudConnectionOutgoingEvent, self.send)
+        self.event_bus.on(SimplyPrintConnectionOutgoingEvent, self.send)
         self.v = 0
         self._suspect = WsSuspectConnectionBoundedInterval.create_variable(0)
         self.transport: Optional[WsTransport] = None
@@ -71,16 +74,16 @@ class CloudProtocol:
 
     async def _on_connected(self, _event: Connected) -> None:
         self._suspect.reset()
-        await self.event_bus.emit(CloudConnectionEstablishedEvent(self.v))
+        await self.event_bus.emit(SimplyPrintConnectionEstablishedEvent(self.v))
         self.logger.info("Connected to %s", self.connection.url)
 
     async def _on_disconnected(self, event: Disconnected) -> None:
-        self.logger.debug("Emitting CloudConnectionLostEvent.")
-        await self.event_bus.emit(CloudConnectionLostEvent(self.v))
+        self.logger.debug("Emitting SimplyPrintConnectionLostEvent.")
+        await self.event_bus.emit(SimplyPrintConnectionLostEvent(self.v))
         self.v += 1
 
         if event.code is not None and self._suspect.guard_until_bound():
-            await self.event_bus.emit(CloudConnectionSuspectEvent, event.code)
+            await self.event_bus.emit(SimplyPrintConnectionSuspectEvent, event.code)
 
     async def _on_message(self, event: MessageReceived) -> None:
         data = self._payload(event.message)
@@ -92,7 +95,7 @@ class CloudProtocol:
             self.logger.error("Invalid message: %s", data, exc_info=e)
             return
         self._message_logger(msg).debug("received %s", msg)
-        await self.event_bus.emit(CloudConnectionIncomingEvent, msg, self.v)
+        await self.event_bus.emit(SimplyPrintConnectionIncomingEvent, msg, self.v)
 
     @staticmethod
     def _payload(message: object) -> Optional[str]:
@@ -137,5 +140,6 @@ class CloudProtocol:
             )
         except (PydanticSerializationError, UnicodeError) as e:
             self.logger.error("Serialization error.", exc_info=e)
-        except WsConnectionErrors:
-            pass
+        except WsConnectionErrors as e:
+            # The reconnect loop owns recovery; the dropped send is only logged.
+            self.logger.debug("send of %s dropped: %s", msg.msg_type(), e)

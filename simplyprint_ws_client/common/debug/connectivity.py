@@ -3,17 +3,34 @@ __all__ = ["ConnectivityReport"]
 import asyncio
 import datetime
 import logging
-import queue
 import socket
-import threading
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Awaitable, Callable, List, Optional, Dict, TypeVar
 
 import aiohttp
 import netifaces
 import psutil
 from aiohttp import ClientWSTimeout
 from pydantic import BaseModel, Field
+
+_TProbeResult = TypeVar("_TProbeResult")
+
+
+def _run_probe(
+    probe: "Awaitable[_TProbeResult]",
+    on_error: "Callable[[Exception], _TProbeResult]",
+    logger: logging.Logger,
+) -> "_TProbeResult":
+    """Run one probe coroutine from a sync CLI entry point.
+
+    A failure outside the probe's own error handling (loop setup, session
+    construction) yields an explicit error result instead of ``None``.
+    """
+    try:
+        return asyncio.run(probe)
+    except Exception as e:  # noqa: BLE001 -- a probe must yield a result, not raise
+        logger.error(f"Connectivity probe failed: {e}")
+        return on_error(e)
 
 
 class WebSocketTestResult(BaseModel):
@@ -105,83 +122,64 @@ class ConnectivityReport(BaseModel):
     def websocket_test(
         url: str, websocket_timeout: int, logger: logging.Logger
     ) -> WebSocketTestResult:
-        result_queue = queue.Queue()
+        ws_timeout = ClientWSTimeout(ws_close=websocket_timeout)
 
-        if ClientWSTimeout is not None:
-            websocket_timeout = ClientWSTimeout(ws_close=websocket_timeout)
-
-        def test_ws():
-            async def inner():
-                async with aiohttp.ClientSession() as session:
-                    start_time = ConnectivityReport.utc_now()
-                    try:
-                        async with session.ws_connect(
-                            url, timeout=websocket_timeout
-                        ) as ws:
-                            latency = (
-                                ConnectivityReport.utc_now() - start_time
-                            ).total_seconds() * 1000
-                            logger.info(
-                                f"Websocket connection successful to {url} (latency: {latency:.2f}ms)"
-                            )
-                            return WebSocketTestResult(
-                                url=url,
-                                success=True,
-                                response_headers=dict(ws._response.headers),
-                                latency_ms=latency,
-                            )
-                    except Exception as e:
-                        logger.error(f"Websocket connection failed to {url}: {e}")
-
-                        return WebSocketTestResult(
-                            url=url, success=False, error_message=str(e)
+        async def probe():
+            async with aiohttp.ClientSession() as session:
+                start_time = ConnectivityReport.utc_now()
+                try:
+                    async with session.ws_connect(url, timeout=ws_timeout) as ws:
+                        latency = (
+                            ConnectivityReport.utc_now() - start_time
+                        ).total_seconds() * 1000
+                        logger.info(
+                            f"Websocket connection successful to {url} (latency: {latency:.2f}ms)"
                         )
+                        return WebSocketTestResult(
+                            url=url,
+                            success=True,
+                            response_headers=dict(ws._response.headers),
+                            latency_ms=latency,
+                        )
+                except Exception as e:
+                    logger.error(f"Websocket connection failed to {url}: {e}")
 
-            try:
-                result_queue.put(asyncio.run(inner()))
-            finally:
-                result_queue.put(None)
+                    return WebSocketTestResult(
+                        url=url, success=False, error_message=str(e)
+                    )
 
-        thread = threading.Thread(target=test_ws)
-        thread.start()
-        thread.join()
-        return result_queue.get()
+        return _run_probe(
+            probe(),
+            lambda e: WebSocketTestResult(url=url, success=False, error_message=str(e)),
+            logger,
+        )
 
     @staticmethod
     def http_test(url: str, timeout: int, logger: logging.Logger) -> HTTPTestResult:
-        result_queue = queue.Queue()
-
-        def test_http():
-            async def inner():
-                async with aiohttp.ClientSession() as session:
-                    try:
-                        async with session.get(url, timeout=timeout) as response:
-                            text = await response.text()
-                            snippet = text[:100]
-                            logger.info(
-                                f"HTTP request successful to {url} with status {response.status}"
-                            )
-                            return HTTPTestResult(
-                                url=url,
-                                success=True,
-                                status_code=response.status,
-                                response_snippet=snippet,
-                            )
-                    except Exception as e:
-                        logger.error(f"HTTP request failed to {url}: {e}")
-                        return HTTPTestResult(
-                            url=url, success=False, error_message=str(e)
+        async def probe():
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(url, timeout=timeout) as response:
+                        text = await response.text()
+                        snippet = text[:100]
+                        logger.info(
+                            f"HTTP request successful to {url} with status {response.status}"
                         )
+                        return HTTPTestResult(
+                            url=url,
+                            success=True,
+                            status_code=response.status,
+                            response_snippet=snippet,
+                        )
+                except Exception as e:
+                    logger.error(f"HTTP request failed to {url}: {e}")
+                    return HTTPTestResult(url=url, success=False, error_message=str(e))
 
-            try:
-                result_queue.put(asyncio.run(inner()))
-            finally:
-                result_queue.put(None)
-
-        thread = threading.Thread(target=test_http)
-        thread.start()
-        thread.join()
-        return result_queue.get()
+        return _run_probe(
+            probe(),
+            lambda e: HTTPTestResult(url=url, success=False, error_message=str(e)),
+            logger,
+        )
 
     @staticmethod
     def generate(
@@ -221,25 +219,6 @@ class ConnectivityReport(BaseModel):
         return report
 
     @staticmethod
-    def generate_default(**kwargs) -> "ConnectivityReport":
-        return ConnectivityReport.generate(
-            [
-                # Lazy: common/ stays import-clean; this diagnostic is the one
-                # place the leaf layer looks up the SimplyPrint endpoints.
-                str(_sp_backend().PRODUCTION.urls().ws),
-                str(_sp_backend().STAGING.urls().ws),
-                str(_sp_backend().TESTING.urls().ws),
-            ],
-            [
-                str(_sp_backend().PRODUCTION.urls().api),
-                str(_sp_backend().STAGING.urls().api),
-                str(_sp_backend().TESTING.urls().api),
-            ],
-            ["1.1.1.1", "google.com"],
-            **kwargs,
-        )
-
-    @staticmethod
     def read_previous_reports(path: Path) -> List["ConnectivityReport"]:
         report_files = sorted(path.glob("connectivity_report_*.json"), reverse=True)
         return [
@@ -275,9 +254,3 @@ class ConnectivityReport(BaseModel):
             f.write(self.model_dump_json(indent=4))
 
         return full_path
-
-
-def _sp_backend():
-    from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
-
-    return SimplyPrintBackend

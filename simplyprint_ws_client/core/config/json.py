@@ -2,6 +2,7 @@ __all__ = ["JsonConfigManager"]
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Optional
@@ -22,30 +23,46 @@ class JsonConfigManager(ConfigManager):
         self._ensure_json_file()
 
         with self._file_lock:
-            with open(self._json_file, "w") as file:
-                data = [
-                    json.loads(config.as_json())
-                    for config in self.get_all()
-                    if not config.is_empty()
-                ]
+            data = [
+                json.loads(config.as_json())
+                for config in self.get_all()
+                if not config.is_empty()
+            ]
+            # Atomic: write to a temp file and replace, so a crash mid-write
+            # can never destroy the printer registry.
+            tmp = self._json_file.with_suffix(".json.tmp")
+            with open(tmp, "w") as file:
                 json.dump(data, file, indent=4)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp, self._json_file)
 
     def load(self):
         self._ensure_json_file()
 
         with self._file_lock:
-            with open(self._json_file, "r") as file:
-                try:
+            try:
+                with open(self._json_file, "r") as file:
                     data = json.load(file)
-                except json.JSONDecodeError:
+            except json.JSONDecodeError:
+                # Never discard registration data: preserve the unreadable
+                # file (the next flush writes a fresh one) and start empty.
+                corrupt = self._json_file.with_suffix(".json.corrupt")
+                logging.error(
+                    "%s is not valid JSON; preserving it as %s and starting empty",
+                    self._json_file,
+                    corrupt,
+                )
+                try:
+                    os.replace(self._json_file, corrupt)
+                except OSError:
                     logging.warning(
-                        f"Failed to load {self._json_file} configuration file, it's invalid - resetting it!!!"
+                        "could not preserve the corrupt config file", exc_info=True
                     )
+                data = []
 
-                    data = []
-
-                for config in data:
-                    self.persist(self.config_t.from_dict(config))
+            for config in data:
+                self.persist(self.config_t.from_dict(config))
 
     def delete_storage(self):
         with self._file_lock:

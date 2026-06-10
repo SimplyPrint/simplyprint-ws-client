@@ -119,20 +119,25 @@ class ClientCameraMixin(Client[_T]):
             f"Set new camera URI to {uri} with handle ID {self._camera_handle.id if self._camera_handle else 'N/A'}, status is now {self._camera_status}."
         )
 
-    def __del__(self):
+    def teardown_camera_mixin(self) -> None:
+        """Release the camera handle. Called from the client's ``teardown`` -
+        explicit ownership, never ``__del__`` (a finalizer would re-enter the
+        event loop during GC)."""
         self.camera_uri = None
 
     async def on_stream_on(self):
         if not self._camera_handle:
             await self._stream_setup.wait()
 
-        self._camera_handle.start()
+        if self._camera_handle is not None:
+            self._camera_handle.start()
 
     async def on_stream_off(self):
         if not self._camera_handle:
             await self._stream_setup.wait()
 
-        self._camera_handle.pause()
+        if self._camera_handle is not None:
+            self._camera_handle.pause()
         self._stream_lock.cancel()
         self._request_count = 0
 
@@ -145,51 +150,84 @@ class ClientCameraMixin(Client[_T]):
         if data.id is None:
             self._request_count += 1
 
+    #: Frame-read attempts per snapshot request before giving up.
+    _SNAPSHOT_MAX_ATTEMPTS = 5
+
     async def on_webcam_snapshot(
         self,
-        data: WebcamSnapshotDemandData = WebcamSnapshotDemandData(),
+        data: Optional[WebcamSnapshotDemandData] = None,
         attempt=0,
         retry_timeout=5,
     ):
+        data = data or WebcamSnapshotDemandData()
+
+        # Both the retry path and the keep-streaming path are loops (recursion
+        # here used to grow the stack under sustained streaming).
+        while True:
+            frame = await self._receive_frame_with_retries(data, attempt, retry_timeout)
+            if frame is None:
+                return
+
+            if not await self._publish_frame(data, frame):
+                return
+
+            # Keep sending frames until the request count is 0.
+            data = WebcamSnapshotDemandData()
+            attempt = 0
+
+    async def _receive_frame_with_retries(
+        self, data: WebcamSnapshotDemandData, attempt: int, retry_timeout: float
+    ) -> Optional[bytes]:
         if not self._camera_handle:
             await self._stream_setup.wait()
 
         is_snapshot_event = data.id is not None
 
-        st = datetime.datetime.now()
+        while True:
+            handle = self._camera_handle
+            if handle is None:
+                return None
 
-        # Block until the camera is ready, but we will sometimes allow snapshot events
-        # to use existing images if they are new enough but only once.
-        frame = await self._camera_handle.receive_frame(
-            allow_cache_age=self._camera_max_cache_age if is_snapshot_event else None
-        )
+            st = datetime.datetime.now()
 
-        # Empty frame or none.
-        if not frame:
-            if attempt <= 3:
+            # Block until the camera is ready, but we will sometimes allow
+            # snapshot events to use existing images if they are new enough,
+            # but only once.
+            frame = await handle.receive_frame(
+                allow_cache_age=self._camera_max_cache_age
+                if is_snapshot_event
+                else None
+            )
+
+            if frame:
                 self._camera_logger.debug(
-                    f"Failed to get frame, retrying in {retry_timeout} seconds"
+                    f"Received frame from camera with size {len(frame)} bytes "
+                    f"with an fps of {handle.fps or 'N/A'} in "
+                    f"{datetime.datetime.now() - st} from camera handle id {handle.id}."
                 )
-                await asyncio.sleep(retry_timeout)
-                await self.on_webcam_snapshot(data, attempt + 1, retry_timeout)
-            else:
+                return frame
+
+            attempt += 1
+            if attempt >= self._SNAPSHOT_MAX_ATTEMPTS:
                 self._camera_logger.debug(
-                    f"Failed to get frame, giving up. Used camera handle id {self._camera_handle and self._camera_handle.id}."
+                    f"Failed to get frame, giving up. Used camera handle id {handle.id}."
                 )
+                return None
 
-            return
+            self._camera_logger.debug(
+                f"Failed to get frame, retrying in {retry_timeout} seconds"
+            )
+            await asyncio.sleep(retry_timeout)
 
-        self._camera_logger.debug(
-            f"Received frame from camera with size {len(frame) if frame else 0} bytes "
-            f"with an fps of {self._camera_handle and self._camera_handle.fps or 'N/A'} in "
-            f"{datetime.datetime.now() - st} from camera handle id {self._camera_handle and self._camera_handle.id}."
-        )
-
+    async def _publish_frame(
+        self, data: WebcamSnapshotDemandData, frame: bytes
+    ) -> bool:
+        """Deliver one frame; True when the stream should keep going."""
         # Capture snapshot events and send them to the API
-        if is_snapshot_event:
+        if data.id is not None:
             await SimplyPrintApi.post_snapshot(data.id, frame, endpoint=data.endpoint)
             self._camera_logger.debug(f"Posted snapshot to API with id {data.id}")
-            return
+            return False
 
         # Mark the webcam as connected if it's not already.
         if not self.printer.webcam_info.connected:
@@ -204,6 +242,4 @@ class ClientCameraMixin(Client[_T]):
             if self._request_count > 0:
                 self._request_count -= 1
 
-        # Keep sending frames until the request count is 0.
-        if len(self._stream_lock) == 0 and self._request_count > 0:
-            await self.on_webcam_snapshot()
+        return len(self._stream_lock) == 0 and self._request_count > 0

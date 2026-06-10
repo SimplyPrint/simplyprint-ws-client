@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import os
 import threading
 from typing import TYPE_CHECKING, Dict
 
@@ -106,6 +107,31 @@ class RoutingHandler(logging.Handler):
                 self._handlers[key] = handler
             return handler
 
+    def close_scope(self, scope: str) -> None:
+        """Close and drop every file handler under ``scope``'s directory.
+
+        Called when a printer's logs are pruned: the open handles must go
+        first, both to release the files (Windows cannot delete open files)
+        and to keep this handler table from growing with printer churn.
+        """
+        scope_dir = self._config.resolve_log_dir() / scope
+        prefix = str(scope_dir) + os.sep
+
+        with self._lock:
+            stale = [key for key in self._handlers if key.startswith(prefix)]
+            handlers = [self._handlers.pop(key) for key in stale]
+
+        for handler in handlers:
+            handler.close()
+
+    def close(self) -> None:
+        with self._lock:
+            handlers = list(self._handlers.values())
+            self._handlers.clear()
+        for handler in handlers:
+            handler.close()
+        super().close()
+
     def _route(self, logger_name: str):
         for rule in self._rules:
             if rule.matches(logger_name):
@@ -123,10 +149,3 @@ class RoutingHandler(logging.Handler):
             self._config.system_log_stem or self._config.system_scope,
             "text",
         )
-
-    def close(self) -> None:
-        with self._lock:
-            for handler in self._handlers.values():
-                handler.close()
-            self._handlers.clear()
-        super().close()

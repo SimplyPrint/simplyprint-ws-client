@@ -7,11 +7,13 @@ import pytest
 
 from simplyprint_ws_client.core.protocol import connection as conn_mod
 from simplyprint_ws_client.core.protocol.connection import (
-    CloudConnection,
+    SimplyPrintConnection,
     ConnectionHint,
     ConnectionMode,
 )
-from simplyprint_ws_client.core.protocol.events import CloudConnectionEstablishedEvent
+from simplyprint_ws_client.core.protocol.events import (
+    SimplyPrintConnectionEstablishedEvent,
+)
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from tests._fakes import FakeTransport
@@ -30,7 +32,7 @@ def _connection_with_recording_factory():
         built.append(transport)
         return transport
 
-    conn = CloudConnection(
+    conn = SimplyPrintConnection(
         transport_factory=factory,
         hint=ConnectionHint(mode=ConnectionMode.SINGLE),
     )
@@ -43,7 +45,7 @@ async def test_connect_builds_transport_via_factory_once():
     conn, built = _connection_with_recording_factory()
     established = []
     conn.event_bus.on(
-        CloudConnectionEstablishedEvent, lambda e: established.append(e.v)
+        SimplyPrintConnectionEstablishedEvent, lambda e: established.append(e.v)
     )
 
     with patch(

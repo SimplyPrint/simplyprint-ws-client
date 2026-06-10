@@ -28,6 +28,8 @@ from typing import (
     Awaitable,
     Callable,
     ClassVar,
+    Generic,
+    List,
     Optional,
     Protocol,
     Tuple,
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.core.config import ConfigManagerType
     from simplyprint_ws_client.integration.accounts import AccountProvider
     from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
+    from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
     from simplyprint_ws_client.integration.discovery.spec import (
         MDNSSpec,
         MulticastSpec,
@@ -56,6 +59,8 @@ if TYPE_CHECKING:
 
 TAnyClient = TypeVar("TAnyClient", bound="Client")
 TAnyPrinterConfig = TypeVar("TAnyPrinterConfig", bound="PrinterConfig")
+#: What a :class:`LazyRef` resolves to.
+TResolved = TypeVar("TResolved")
 
 
 class ClientFactory(Protocol):
@@ -66,7 +71,7 @@ TClientFactory = Union[Type[TAnyClient], ClientFactory]
 TConfigFactory = Union[Type[TAnyPrinterConfig], Callable[..., TAnyPrinterConfig]]
 
 
-class LazyRef:
+class LazyRef(Generic[TResolved]):
     """A ``"package.module:attr"`` reference resolved on first use, then cached.
 
     The declarative side of :class:`PrinterSpec`: a spec points its
@@ -81,9 +86,9 @@ class LazyRef:
         if ":" not in target:
             raise ValueError(f"lazy ref needs 'package.module:attr', got {target!r}")
         self.target = target
-        self._resolved: Any = None
+        self._resolved: Optional[TResolved] = None
 
-    def resolve(self) -> Any:
+    def resolve(self) -> TResolved:
         if self._resolved is None:
             module_path, attr = self.target.split(":", 1)
             value: Any = importlib.import_module(module_path)
@@ -96,7 +101,7 @@ class LazyRef:
         return f"lazy({self.target!r})"
 
 
-def lazy(target: str) -> LazyRef:
+def lazy(target: str) -> LazyRef[Any]:
     """Declare a lazily-resolved ``"package.module:attr"`` reference."""
     return LazyRef(target)
 
@@ -237,7 +242,9 @@ class PrinterSpec:
         return ()
 
     @classmethod
-    def discover(cls) -> "Optional[Callable[[float], Awaitable[list]]]":
+    def discover(
+        cls,
+    ) -> "Optional[Callable[[float], Awaitable[List[DiscoveredDevice]]]]":
         """An ``async discover(timeout)`` listing devices via the shared discovery
         service, or ``None`` if this type does not discover over the LAN.
 
@@ -256,7 +263,7 @@ class PrinterSpec:
         ):
             return None
 
-        async def _discover(timeout: float) -> list:
+        async def _discover(timeout: float) -> List[DiscoveredDevice]:
             from simplyprint_ws_client.integration.discovery.active import (
                 active_discovery_service,
             )
@@ -280,7 +287,9 @@ class PrinterSpec:
         return _discover
 
     @classmethod
-    def refine_discovered(cls, device):
+    def refine_discovered(
+        cls, device: "DiscoveredDevice"
+    ) -> "Optional[DiscoveredDevice]":
         """Polish (or drop, by returning ``None``) one discovered device before it
         reaches the candidate surface -- probe it, enrich the model name, ... The
         default keeps it as-is."""

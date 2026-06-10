@@ -35,7 +35,12 @@ import multiprocessing as mp
 import struct
 import threading
 from multiprocessing import shared_memory
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ctypes import c_byte
+    from multiprocessing.connection import Connection
+    from multiprocessing.sharedctypes import SynchronizedArray
 
 __all__ = ["SlabLease", "SharedSlabChannel"]
 
@@ -112,7 +117,7 @@ class SlabLease:
         timestamp: float,
         *,
         view: Optional[memoryview] = None,
-        release_cb: Optional[Any] = None,
+        release_cb: Optional[Callable[[], None]] = None,
         data_bytes: Optional[bytes] = None,
     ) -> None:
         self.producer_id = producer_id
@@ -168,9 +173,9 @@ class SharedSlabChannel:
         *,
         owner: bool,
         data_shm: "shared_memory.SharedMemory",
-        states: Any,  # multiprocessing.Array('b', n_slabs), has .get_lock()
-        parent_conn: Any,
-        child_conn: Any,
+        states: "SynchronizedArray[c_byte]",  # mp.Array('b', n_slabs), has .get_lock()
+        parent_conn: Optional["Connection"],
+        child_conn: "Connection",
         n_slabs: int,
         slab_size: int,
     ) -> None:
@@ -211,7 +216,9 @@ class SharedSlabChannel:
             slab_size=slab_size,
         )
 
-    def child_args(self) -> tuple:
+    def child_args(
+        self,
+    ) -> Tuple[str, "SynchronizedArray[c_byte]", "Connection", int, int]:
         """A picklable bundle to rebuild this channel in the worker process."""
         return (
             self._data.name,
@@ -222,7 +229,9 @@ class SharedSlabChannel:
         )
 
     @classmethod
-    def attach(cls, args: tuple) -> "SharedSlabChannel":
+    def attach(
+        cls, args: Tuple[str, "SynchronizedArray[c_byte]", "Connection", int, int]
+    ) -> "SharedSlabChannel":
         """Rebuild the channel inside the worker process (the child side)."""
         data_name, states, child_conn, n_slabs, slab_size = args
         data_shm = _attach_shm(data_name)  # the parent owns this segment, not us

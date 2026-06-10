@@ -22,7 +22,9 @@ __all__ = [
 
 import asyncio
 import time
-from enum import IntEnum, StrEnum, Enum
+from enum import IntEnum, Enum
+
+from simplyprint_ws_client._compat import StrEnum
 from typing import Optional, Dict, Any, Literal, Generic, TypeVar, Union, Annotated
 
 from pydantic import BaseModel, PrivateAttr, Field

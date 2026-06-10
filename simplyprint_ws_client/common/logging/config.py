@@ -14,7 +14,7 @@ import logging
 import logging.handlers
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
 from simplyprint_ws_client.common.logging.policy import LoggingPolicy
 
@@ -22,6 +22,9 @@ DEFAULT_TEXT_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s | %(me
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_MAX_BYTES = 30 * 1024 * 1024
 DEFAULT_BACKUP_COUNT = 3
+
+#: How a destination renders records: plain text lines or JSON objects.
+FormatterKind = Literal["text", "json"]
 
 #: Resolves a matched logger name to ``(scope, file_stem)``.
 NameResolver = Callable[[str], Tuple[str, str]]
@@ -39,7 +42,7 @@ class RoutingRule:
 
     name: str
     prefix: Optional[str]
-    formatter: str = "text"
+    formatter: FormatterKind = "text"
     resolver: Optional[NameResolver] = None
 
     def matches(self, logger_name: str) -> bool:
@@ -81,7 +84,7 @@ class LoggingConfig:
             delay=True,
         )
 
-    def formatter_for(self, kind: str) -> logging.Formatter:
+    def formatter_for(self, kind: FormatterKind) -> logging.Formatter:
         from simplyprint_ws_client.common.logging.routing import JsonLogFormatter
 
         if kind == "json":
@@ -95,7 +98,7 @@ class LoggingConfig:
             printer_resolver,
         )
 
-        kind = "json" if self.json_output else "text"
+        kind: FormatterKind = "json" if self.json_output else "text"
         if self.routes is not None:
             rules = list(self.routes)
         else:

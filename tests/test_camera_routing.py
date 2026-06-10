@@ -121,7 +121,7 @@ class _PlainSync(BaseCameraProtocol):
 
 
 def _pool(loop):
-    return CameraPool(pool_size=1, event_loop_provider=EventLoopProvider(loop=loop))
+    return CameraPool(event_loop_provider=EventLoopProvider(loop=loop))
 
 
 # -- routing (pure) ---------------------------------------------------------- #

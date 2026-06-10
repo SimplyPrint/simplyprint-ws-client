@@ -41,16 +41,16 @@ from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.protocol.connection import ConnectionHint
 from simplyprint_ws_client.core.protocol.connection import (
     ConnectionMode,
-    CloudConnection,
+    SimplyPrintConnection,
 )
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionIncomingEvent,
-    CloudConnectionEstablishedEvent,
+    SimplyPrintConnectionIncomingEvent,
+    SimplyPrintConnectionEstablishedEvent,
 )
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionOutgoingEvent,
-    CloudConnectionLostEvent,
-    CloudConnectionSuspectEvent,
+    SimplyPrintConnectionOutgoingEvent,
+    SimplyPrintConnectionLostEvent,
+    SimplyPrintConnectionSuspectEvent,
 )
 from simplyprint_ws_client.core.protocol.messages import ClientMsg
 from simplyprint_ws_client.core.protocol.messages import (
@@ -65,8 +65,13 @@ from simplyprint_ws_client.events.event_bus_listeners import ListenerUniqueness
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
 from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
+from simplyprint_ws_client.core.api.url_builder import default_connectivity_report
 
 TUniqueId = Union[str, int]
+
+#: Minimum age of the newest stored connectivity report before another
+#: connectivity test suite is run.
+CONNECTIVITY_REPORT_MIN_INTERVAL = timedelta(minutes=20)
 
 
 class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
@@ -111,7 +116,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
     this object's; a view only decides *who hears what*."""
 
     mode: ConnectionMode
-    connection: CloudConnection
+    connection: SimplyPrintConnection
     client_list: ClientList
     clients: Set[TUniqueId]
     logger: logging.Logger
@@ -119,7 +124,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
     def __init__(
         self,
         mode: ConnectionMode,
-        connection: CloudConnection,
+        connection: SimplyPrintConnection,
         client_list: ClientList,
         logger=logging.getLogger(__name__),
     ):
@@ -159,7 +164,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
         # Custom handling for incoming messages
         # when we have multiple clients.
-        if is_multi_mode and event == CloudConnectionIncomingEvent:
+        if is_multi_mode and event == SimplyPrintConnectionIncomingEvent:
             if len(args) != 2:
                 return
 
@@ -174,7 +179,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                     "Converted base ConnectedMsg to CloudConnectionEstablishedEvent with v: %d.",
                     v,
                 )
-                await self._emit_all(CloudConnectionEstablishedEvent(v))
+                await self._emit_all(SimplyPrintConnectionEstablishedEvent(v))
                 return
 
             # We can get a routing hint from the message directly.
@@ -202,7 +207,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
             return
 
-        if is_multi_mode and isinstance(event, CloudConnectionEstablishedEvent):
+        if is_multi_mode and isinstance(event, SimplyPrintConnectionEstablishedEvent):
             self.logger.debug(
                 "Dropped CloudConnectionEstablishedEvent for multi-mode connection with v: %d in favor of ConnectedMsg",
                 event.v,
@@ -277,36 +282,64 @@ class ClientConnectionManager(
         self.views = set()
         self.logger = logger
         self._next_connection_id = 0
+        self._connectivity_report_inflight = False
 
-    def _suspect_connection(self, connection: CloudConnection, _):
-        """Called when a connection suspects its ability to connect is compromised."""
+    def _suspect_connection(self, connection: SimplyPrintConnection, _):
+        """Called when a connection suspects its ability to connect is compromised.
+
+        The report itself (synchronous socket probes plus file I/O) runs in the
+        default executor: this listener fires on the shared connection loop at
+        exactly the moment the network is already degraded, and blocking that
+        loop would stall every other printer on it.
+        """
         self.logger.info(
             "CloudConnection %s suspects it is unable to connect. Running connectivity test suite and generating log file",
             connection.url,
         )
 
-        path = APP_DIRS.user_log_path / "connectivity_reports"
+        if self._connectivity_report_inflight:
+            return
+        self._connectivity_report_inflight = True
 
-        if not path.exists():
-            path.mkdir(parents=True, exist_ok=True)
-
-        previous_reports = ConnectivityReport.read_previous_reports(path)
-
-        # TODO Make this configurable, and be able to hook into real-time data (network events etc.)
-        if previous_reports and previous_reports[
-            0
-        ].timestamp - ConnectivityReport.utc_now() < timedelta(minutes=20):
-            self.logger.info(
-                "Last connectivity test was run less than 20 minute ago, skipping."
-            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop to protect - run inline (e.g. called from sync tests).
+            self._generate_connectivity_report()
             return
 
-        # Perform various checks, do we have internet, is the server down, etc.
-        report = ConnectivityReport.generate_default()
+        loop.run_in_executor(None, self._generate_connectivity_report)
 
-        path = report.store_in_path(path)
+    def _generate_connectivity_report(self) -> None:
+        try:
+            path = APP_DIRS.user_log_path / "connectivity_reports"
+            path.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("Connectivity test suite complete. Report saved to %s", path)
+            previous_reports = ConnectivityReport.read_previous_reports(path)
+
+            # TODO Make this configurable, and be able to hook into real-time data (network events etc.)
+            if (
+                previous_reports
+                and previous_reports[0].timestamp - ConnectivityReport.utc_now()
+                < CONNECTIVITY_REPORT_MIN_INTERVAL
+            ):
+                self.logger.info(
+                    "Last connectivity test was run less than 20 minute ago, skipping."
+                )
+                return
+
+            # Perform various checks, do we have internet, is the server down, etc.
+            report = default_connectivity_report()
+
+            stored = report.store_in_path(path)
+
+            self.logger.info(
+                "Connectivity test suite complete. Report saved to %s", stored
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never crash the executor
+            self.logger.warning("Connectivity report generation failed", exc_info=True)
+        finally:
+            self._connectivity_report_inflight = False
 
     def _allocate_new_connection(self) -> ClientView:
         if self.is_stopped():
@@ -326,7 +359,7 @@ class ClientConnectionManager(
         if self.mode != ConnectionMode.MULTI:
             loggerName = f"{loggerName}[{connection_id}]"
 
-        connection = CloudConnection(
+        connection = SimplyPrintConnection(
             provider=self, logger=logging.getLogger(loggerName)
         )
         client_view = ClientView(self.mode, connection, self.client_list)
@@ -334,25 +367,25 @@ class ClientConnectionManager(
 
         # Registering the connection with the client view.
         connection.event_bus.on(
-            CloudConnectionIncomingEvent,
-            functools.partial(client_view.emit, CloudConnectionIncomingEvent),
+            SimplyPrintConnectionIncomingEvent,
+            functools.partial(client_view.emit, SimplyPrintConnectionIncomingEvent),
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            CloudConnectionEstablishedEvent,
+            SimplyPrintConnectionEstablishedEvent,
             client_view.emit,
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            CloudConnectionLostEvent,
+            SimplyPrintConnectionLostEvent,
             client_view.emit,
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
 
         connection.event_bus.on(
-            CloudConnectionSuspectEvent,
+            SimplyPrintConnectionSuspectEvent,
             functools.partial(self._suspect_connection, connection),
             unique=ListenerUniqueness.EXCLUSIVE_WITH_ERROR,
         )
@@ -388,10 +421,12 @@ class ClientConnectionManager(
         )
 
     @property
-    def connections(self) -> Iterable[CloudConnection]:
+    def connections(self) -> Iterable[SimplyPrintConnection]:
         return map(lambda x: cast(ClientView, x).connection, list(self.views))
 
-    def get_connection_for_client(self, client: Client) -> Optional[CloudConnection]:
+    def get_connection_for_client(
+        self, client: Client
+    ) -> Optional[SimplyPrintConnection]:
         view = self.client_views.get(client.unique_id)
 
         if not view:
@@ -426,14 +461,16 @@ class ClientConnectionManager(
                 return (message,) + args
 
             client.event_bus.on(
-                CloudConnectionOutgoingEvent,
+                SimplyPrintConnectionOutgoingEvent,
                 transform_message_with_unique_id,
                 priority=10,
             )
 
         client.event_bus.on(
-            CloudConnectionOutgoingEvent,
-            functools.partial(connection.event_bus.emit, CloudConnectionOutgoingEvent),
+            SimplyPrintConnectionOutgoingEvent,
+            functools.partial(
+                connection.event_bus.emit, SimplyPrintConnectionOutgoingEvent
+            ),
         )
 
         await connection.connect(hint=self._derive_connection_hint(client))
@@ -445,14 +482,14 @@ class ClientConnectionManager(
 
         client_view = self.client_views.pop(client.unique_id)
         client_view.discard(client)
-        client.event_bus.clear(CloudConnectionOutgoingEvent)
+        client.event_bus.clear(SimplyPrintConnectionOutgoingEvent)
 
         # Tell removed the client it has lost its connection, since it no longer receives messages.
         # This must be awaited (not emit_task) to prevent a race condition where the client
         # is re-allocated before the CloudConnectionLostEvent handler runs, causing the handler
         # to overwrite the state set by allocate() and permanently sticking the client in
         # CONNECTING state.
-        await client.event_bus.emit(CloudConnectionLostEvent(client.v))
+        await client.event_bus.emit(SimplyPrintConnectionLostEvent(client.v))
 
         # Disconnect the connection if no clients are left.
         if len(client_view) == 0:

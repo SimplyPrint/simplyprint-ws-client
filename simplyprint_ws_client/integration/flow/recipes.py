@@ -51,11 +51,14 @@ def standard_add_printer_flow(
     phases: List[Phase] = []
 
     if models is not None:
+        # Only forward a caller-supplied label; None must not clobber the
+        # identify step's own default.
+        identify_kwargs = {} if identify_label is None else {"label": identify_label}
         phases.append(
             Phase(
                 "identify",
                 "Model",
-                steps=[models.identify_step(label=identify_label)],
+                steps=[models.identify_step(**identify_kwargs)],
             )
         )
 

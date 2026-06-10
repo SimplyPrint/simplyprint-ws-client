@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import gzip
 import io
+import logging
 import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterable, List, Optional, Tuple
+from typing import BinaryIO, Callable, Iterable, List, Optional, Tuple
 
 from simplyprint_ws_client.common.logging.config import LoggingConfig
+from simplyprint_ws_client.common.utils.file_tail import strip_log_file
+
+logger = logging.getLogger(__name__)
 
 #: gzip magic number -- rotated backups are compressed in place but keep their
 #: ``.log.N`` name, so content has to be sniffed.
@@ -86,10 +90,14 @@ class LogStore:
         config: Optional[LoggingConfig] = None,
         *,
         root: Optional[Path] = None,
+        on_scope_pruned: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._config = config or LoggingConfig()
         self._root = Path(root) if root is not None else self._config.resolve_log_dir()
         self._system_scope = self._config.system_scope
+        #: Invoked with each scope about to be pruned, so the live routing
+        #: handler can close its open file handles first.
+        self._on_scope_pruned = on_scope_pruned
 
     @property
     def root(self) -> Path:
@@ -205,14 +213,26 @@ class LogStore:
         backup. Returns at most the last ``tail_lines`` lines (when given) and
         never more than ``max_bytes`` of decoded text (truncated from the front)."""
         path = self.resolve_file(scope, name)
-        opener = gzip.open if _is_compressed(path) else open
 
-        with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        if _is_compressed(path):
+            # gzip cannot be seeked from the end; only rotated backups are
+            # compressed, so the whole-file read stays off the hot path.
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+                if tail_lines is not None:
+                    text = "".join(handle.readlines()[-tail_lines:])
+                else:
+                    text = handle.read()
+        else:
+            # Bounded: read at most max_bytes from the end, so a large live
+            # log is never materialized in full just to return its tail.
+            with open(path, "rb") as handle:
+                handle.seek(0, io.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - max_bytes))
+                raw = handle.read(max_bytes)
+            text = raw.decode("utf-8", errors="replace")
             if tail_lines is not None:
-                lines = handle.readlines()[-tail_lines:]
-                text = "".join(lines)
-            else:
-                text = handle.read()
+                text = "".join(text.splitlines(keepends=True)[-tail_lines:])
 
         if len(text) > max_bytes:
             text = text[-max_bytes:]
@@ -332,10 +352,8 @@ class LogStore:
 
     def strip_system_raw_logs(self, max_size: int = 50 * 1024 * 1024) -> None:
         """Tail-truncate the unbounded macOS raw capture logs to ``max_size``."""
-        from simplyprint_ws_client.core.files.file_backup import FileBackup
-
         for name in ("stderr.log", "stdout.log"):
-            FileBackup.strip_log_file(self._root / name, max_size=max_size)
+            strip_log_file(self._root / name, max_size=max_size)
 
     def prune_unused_scopes(self, active_unique_ids: Iterable[str]) -> None:
         """Remove per-printer directories for printers that no longer exist.
@@ -350,6 +368,11 @@ class LogStore:
         for child in self._root.iterdir():
             if not child.is_dir() or child.name in keep:
                 continue
+            if self._on_scope_pruned is not None:
+                try:
+                    self._on_scope_pruned(child.name)
+                except Exception:  # noqa: BLE001 -- pruning must not stop on a handler
+                    logger.debug("close_scope(%s) failed", child.name, exc_info=True)
             shutil.rmtree(child, ignore_errors=True)
 
     def compress_rotated_files(self) -> None:

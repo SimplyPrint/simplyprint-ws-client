@@ -19,6 +19,15 @@ import socket
 import subprocess
 from typing import Optional
 
+from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
+
+#: host -> resolved MAC, cached briefly so passive re-announcements (which can
+#: arrive every few seconds per printer) do not repeat subprocess/socket work
+#: on the caller's loop. Negative results are not cached - a cold neighbour
+#: table can warm up between announcements.
+_MAC_CACHE_TTL = 60
+_mac_cache: ExpiringDict = ExpiringDict(ttl=_MAC_CACHE_TTL)
+
 # A normalised, fully-specified unicast MAC (six octets, not the all-zero /
 # broadcast placeholders the neighbour table parks against unresolved entries).
 _MAC_RE = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}")
@@ -116,6 +125,9 @@ def resolve_mac(host: str, *, warm: bool = True, timeout: float = 0.3) -> Option
     the OS has resolved, else ``None`` (off-segment, unreachable, or unknown OS).
     Never raises and never needs elevated privileges.
     """
+    cached = _mac_cache.get(host)
+    if cached is not None:
+        return cached
     ip = _resolve_host_ip(host)
     if ip is None:
         return None
@@ -125,4 +137,6 @@ def resolve_mac(host: str, *, warm: bool = True, timeout: float = 0.3) -> Option
     if mac is None and warm:
         _warm_neighbour_table(ip, timeout)
         mac = _mac_from_proc(ip) or _mac_from_command(ip, timeout)
+    if mac is not None:
+        _mac_cache[host] = mac
     return mac

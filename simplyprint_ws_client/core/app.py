@@ -79,10 +79,7 @@ class ClientApp(SyncStoppable):
         if self.settings.camera_workers is not None:
             # The scheduler is the app's EventLoopProvider; INLINE/THREAD cameras
             # deliver frames onto its loop.
-            self.camera_pool = CameraPool(
-                pool_size=self.settings.camera_workers,
-                event_loop_provider=self.scheduler,
-            )
+            self.camera_pool = CameraPool(event_loop_provider=self.scheduler)
             self.camera_pool.protocols.extend(self.settings.camera_protocols or [])
 
     async def run(self):
@@ -103,6 +100,15 @@ class ClientApp(SyncStoppable):
         with Runner(debug, contexts, self.settings.event_loop_backend) as runner:
             runner.run(self.run(), loop_factory=lambda: self._app_event_loop)
 
+    def is_running(self) -> bool:
+        """Whether the detached runner thread is alive.
+
+        The liveness seam supervisors poll to decide on a restart.
+        """
+        with self._app_lock:
+            thread = self._app_instance
+        return thread is not None and thread.is_alive()
+
     def run_detached(self, *args, **kwargs):
         with self._app_lock:
             if self._app_instance is not None:
@@ -116,6 +122,18 @@ class ClientApp(SyncStoppable):
 
             # Register atexit handler to prevent spamming of "Cannot schedule new futures after shutdown" errors.
             atexit.register(self.stop)
+
+    def generate_connectivity_report(self, **kwargs):
+        """Generate a connectivity report for the SimplyPrint backends.
+
+        The app-level hook the generic CLI calls, so the leaf debug module
+        never has to look up the SimplyPrint endpoints itself.
+        """
+        from simplyprint_ws_client.core.api.url_builder import (
+            default_connectivity_report,
+        )
+
+        return default_connectivity_report(**kwargs)
 
     def _get_client_spec(
         self, config: Optional[PrinterConfig] = None, client_key: Optional[str] = None

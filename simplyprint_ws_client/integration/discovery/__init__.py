@@ -26,6 +26,7 @@ from simplyprint_ws_client.integration.discovery.spec import (
 )
 from simplyprint_ws_client.integration.discovery.network import (
     DiagnosticCheckResult,
+    DiagnosticReason,
     HostDiagnostic,
     HostProbeContext,
     NetworkScanContext,
@@ -68,6 +69,7 @@ __all__ = [
     "NetworkServiceSpec",
     "SubnetScanSpec",
     "DiagnosticCheckResult",
+    "DiagnosticReason",
     "HostDiagnostic",
     "HostProbeContext",
     "NetworkScanContext",

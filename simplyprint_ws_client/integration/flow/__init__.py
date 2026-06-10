@@ -25,8 +25,6 @@ from simplyprint_ws_client.integration.flow.base import (
     FlowError,
     FlowResult,
     FlowState,
-    InputModel,
-    InputValidationError,
     Phase,
     Poll,
     Prompt,
@@ -40,11 +38,15 @@ from simplyprint_ws_client.integration.flow.base import (
     StepPrompt,
     active_position,
     advance_flow,
-    fields_from_schema,
-    model_input_schema,
     outline,
     resolve,
     run_flow,
+)
+from simplyprint_ws_client.integration.flow.schema import (
+    InputModel,
+    InputValidationError,
+    fields_from_schema,
+    model_input_schema,
     validate_input,
 )
 from simplyprint_ws_client.integration.flow.steps import (

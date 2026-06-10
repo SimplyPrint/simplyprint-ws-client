@@ -1,12 +1,4 @@
-from typing import Union, NamedTuple, Optional
-
-from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
-
-
-class CreateCamera(NamedTuple):
-    id: int
-    protocol: BaseCameraProtocol
-    pause_timeout: Optional[int] = None
+from typing import Union, NamedTuple
 
 
 class PollCamera(NamedTuple):
@@ -26,7 +18,6 @@ class DeleteCamera(NamedTuple):
 
 
 Request = Union[
-    CreateCamera,
     PollCamera,
     StartCamera,
     StopCamera,

@@ -23,7 +23,18 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Dict, Generic, Hashable, List, Optional, Set, TypeVar
+from typing import (
+    Callable,
+    Dict,
+    Generic,
+    Hashable,
+    List,
+    Optional,
+    Set,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import yarl
 
@@ -37,14 +48,16 @@ from simplyprint_ws_client.wire.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.wire.transport import Transport
+from simplyprint_ws_client.wire.transport import Transport, is_wildcard_filter
 
 __all__ = ["Pool", "Endpoint"]
 
 T = TypeVar("T", bound=Transport)
 
 #: Builds (but does not start) a transport for a URL and the caller's params.
-TransportBuilder = Callable[[yarl.URL, object], "Transport"]
+#: Generic over the pool's transport type; params stay ``object`` because each
+#: front door defines its own params shape and narrows with ``isinstance``.
+TransportBuilder = Callable[[yarl.URL, object], T]
 #: Maps a URL and params to the hashable endpoint key the pool shares by.
 EndpointKey = Callable[[yarl.URL, object], Hashable]
 #: Maps an inbound message to the route leases match against. ``None`` broadcasts.
@@ -97,13 +110,13 @@ class Endpoint(Generic[T]):
 
     def add_route(self, lease: "Lease[T]", route: Hashable) -> None:
         self.unfiltered_leases.discard(lease)
-        if isinstance(route, str) and route.endswith("/#"):
+        if is_wildcard_filter(route):
             self.wildcard_leases.add(lease)
             return
         self.route_leases.setdefault(route, set()).add(lease)
 
     def remove_route(self, lease: "Lease[T]", route: Hashable) -> None:
-        if isinstance(route, str) and route.endswith("/#"):
+        if is_wildcard_filter(route):
             self.wildcard_leases.discard(lease)
         else:
             leases = self.route_leases.get(route)
@@ -173,10 +186,10 @@ class Pool(Generic[T]):
     def __init__(
         self,
         *,
-        build: TransportBuilder,
+        build: TransportBuilder[T],
         key: EndpointKey,
         route: Optional[MessageRoute] = None,
-        lease_class: Optional[type] = None,
+        lease_class: Optional[Type[Lease[T]]] = None,
         provider: Optional[EventLoopProvider] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -186,14 +199,14 @@ class Pool(Generic[T]):
         #: The lease flavour to hand out -- :class:`Lease` by default, or a
         #: protocol-specific subclass (``MqttLease`` / ``WsLease``) a
         #: front door passes so callers get ``subscribe`` / framed ``send``.
-        self.lease_class = lease_class or Lease
+        self.lease_class: Type[Lease[T]] = lease_class or Lease
         self.provider = provider or EventLoopProvider.default()
         self.logger = logger or logging.getLogger("conn.pool")
         self.endpoints: Dict[Hashable, Endpoint[T]] = {}
         #: Held only for refcount/dict bookkeeping -- never across I/O.
         self.lock = threading.Lock()
 
-    def connect(self, url: object, params: object = None) -> "Lease[T]":
+    def connect(self, url: Union[str, yarl.URL], params: object = None) -> "Lease[T]":
         """Lease the shared transport for ``url`` + ``params``.
 
         Synchronous and fire-and-forget: it refcounts and returns at once. Building
@@ -241,22 +254,19 @@ class Pool(Generic[T]):
             self.endpoints.pop(endpoint.key, None)
             return endpoint.transport
 
-    def transports(self) -> List[T]:
-        """Snapshot of the live transports -- for shutdown."""
-        with self.lock:
-            return [endpoint.transport for endpoint in self.endpoints.values()]
+    def stop(self) -> List[T]:
+        """Detach every endpoint, clear the pool, and return the live transports.
 
-    def stop(self) -> None:
-        """Detach every endpoint and clear the pool.
-
-        Each transport's async ``stop`` is the lease/caller's to await; this drops
-        the pool's bookkeeping and stops the fan-out so no further events are
-        delivered.
+        Releasing a lease after this finds no endpoint, so nobody is left to
+        stop the sockets - the caller must await (or schedule) each returned
+        transport's async ``stop``.
         """
         with self.lock:
-            for endpoint in self.endpoints.values():
+            endpoints = list(self.endpoints.values())
+            for endpoint in endpoints:
                 endpoint.detach()
             self.endpoints.clear()
+        return [endpoint.transport for endpoint in endpoints]
 
     def add_route(self, lease: "Lease[T]", route: Hashable) -> None:
         with self.lock:

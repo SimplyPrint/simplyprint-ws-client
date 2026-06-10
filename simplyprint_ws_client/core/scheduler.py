@@ -18,6 +18,10 @@ from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopPr
 from simplyprint_ws_client.common.asyncio.utils import cond_notify_all, cond_wait
 from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
 
+#: Per-client budget for one ``tick``; a slow client is cut off so it cannot
+#: stall the shared scheduling loop.
+TICK_TIMEOUT_SECONDS = 5
+
 
 class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
     """Client scheduler.
@@ -73,6 +77,12 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         self._schedule_task = ContinuousTask(self._schedule_loop, provider=self)
         self._pending_signals = set()
         self._signal_lock = threading.Lock()
+        #: How many loop tasks currently sit in ``cond_wait`` - our own counter
+        #: instead of peeking at asyncio.Condition's private ``_waiters``.
+        self._cond_waiters = 0
+        #: Keeps in-flight client teardown tasks alive (asyncio holds tasks
+        #: weakly) and reports their failures.
+        self._teardown_tasks = set()
 
     def submit(self, client: Client):
         if client.unique_id in self.client_list:
@@ -100,13 +110,14 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
     def _delete(self, client: Client):
         self.client_list.remove(client)
         self._tasks.pop(client.unique_id, None)
+        self._last_ticked.pop(client.unique_id, None)
         self._to_delete.discard(client.unique_id)
         self.signal()
 
     def signal(self):
         with self._signal_lock:
             # Optimization: No one to wake.
-            if len(self._cond._waiters) == 0:
+            if self._cond_waiters == 0:
                 return
 
             # Optimization: No need to signal if there are pending signals.
@@ -119,8 +130,23 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             fut = asyncio.run_coroutine_threadsafe(
                 cond_notify_all(self._cond), self.event_loop
             )
-            fut.add_done_callback(self._pending_signals.discard)
+            fut.add_done_callback(self._discard_pending_signal)
             self._pending_signals.add(fut)
+
+    def _discard_pending_signal(self, fut) -> None:
+        # Runs on the loop thread; take the same lock signal() holds.
+        with self._signal_lock:
+            self._pending_signals.discard(fut)
+
+    async def _cond_wait(self):
+        """``cond_wait`` with the waiter accounted for ``signal()``'s fast path."""
+        with self._signal_lock:
+            self._cond_waiters += 1
+        try:
+            await cond_wait(self._cond)
+        finally:
+            with self._signal_lock:
+                self._cond_waiters -= 1
 
     def _should_schedule_client(self, client: Client, when: datetime):
         # Always schedule clients that have changes.
@@ -178,13 +204,13 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 self._last_ticked[client.unique_id] = now
 
                 # TODO: Manage timeouts.
-                async with asyncio.timeout(5):
+                async with asyncio.timeout(TICK_TIMEOUT_SECONDS):
                     await client.tick(delta_tick)
 
             if not client.has_changes:
                 return
 
-            msgs, v = client.consume()
+            msgs = client.consume()
 
             for msg in msgs:
                 await client.send(msg, skip_dispatch=True)
@@ -234,7 +260,20 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             self._delete(client)
             # SAFETY: The client will never be considered for this again
             # so this spawns a single task per added client.
-            self.event_loop.create_task(client.teardown())
+            task = self.event_loop.create_task(client.teardown())
+            self._teardown_tasks.add(task)
+            task.add_done_callback(self._on_teardown_task_done)
+
+    def _on_teardown_task_done(self, task) -> None:
+        self._teardown_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.logger.warning(
+                "client teardown failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def _teardown(self):
         """Teardown all clients, then await all connections to stop."""
@@ -283,7 +322,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                     # Wait until either a change is made to the state or a timeout occurs.
                     conditions = [
                         task_scope.create_task(self.wait(self.settings.tick_rate)),
-                        task_scope.create_task(cond_wait(self._cond)),
+                        task_scope.create_task(self._cond_wait()),
                     ]
 
                     await asyncio.wait(conditions, return_when=asyncio.FIRST_COMPLETED)

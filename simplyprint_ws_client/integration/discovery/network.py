@@ -9,12 +9,27 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from simplyprint_ws_client._compat import StrEnum
 from typing import Awaitable, Callable, Mapping, Optional
 
+from simplyprint_ws_client.integration.discovery.device import JsonValue
 from simplyprint_ws_client.integration.discovery.spec import NetworkServiceSpec
 
-JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
 DiagnosticDetail = Mapping[str, JsonValue]
+
+
+class DiagnosticReason(StrEnum):
+    """Why a host diagnostic landed where it did (stable, machine-readable).
+
+    A ``str`` subclass, so members compare and serialize byte-identically to the
+    plain reason strings they replace.
+    """
+
+    REQUIRED_SERVICE_CLOSED = "required_service_closed"
+    REQUIRED_SERVICES_OPEN = "required_services_open"
+    PROBE_ERROR = "probe_error"
+    FINGERPRINT_MISMATCH = "fingerprint_mismatch"
+    MATCHED = "matched"
 
 
 @dataclass(frozen=True)
@@ -94,7 +109,7 @@ def service_diagnostic_check(result: PortCheckResult) -> DiagnosticCheckResult:
         message = f"{label} is reachable"
     elif result.required:
         status = "error"
-        code = "required_service_closed"
+        code = DiagnosticReason.REQUIRED_SERVICE_CLOSED
         message = f"{label} is not reachable"
     else:
         status = "warning"

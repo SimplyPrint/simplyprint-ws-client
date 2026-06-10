@@ -129,8 +129,11 @@ class Courier(Generic[T]):
         self._scheduled = False
         self._closed = False
         self._dropped = 0
-        # Touched only on the loop thread (async sink path).
+        # Guarded by _lock (created on the loop, cancelled from any thread).
         self._drain_task: Optional[asyncio.Task] = None
+        # The close(drain=True) flush task; retained so it cannot be GC'd
+        # mid-drain (asyncio holds tasks weakly).
+        self._final_drain_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _resolve_provider(
@@ -350,10 +353,20 @@ class Courier(Generic[T]):
 
     def _final_drain(self, pending: "list[T]") -> None:
         if self._is_async_sink:
-            self._provider.event_loop.create_task(self._final_drain_async(pending))
+            task = self._provider.event_loop.create_task(
+                self._final_drain_async(pending)
+            )
+            with self._lock:
+                self._final_drain_task = task
+            task.add_done_callback(self._clear_final_drain_task)
             return
         for item in pending:
             self._safe_invoke_sync(item)
+
+    def _clear_final_drain_task(self, task: "asyncio.Task") -> None:
+        with self._lock:
+            if self._final_drain_task is task:
+                self._final_drain_task = None
 
     async def _final_drain_async(self, pending: "list[T]") -> None:
         for item in pending:
@@ -378,8 +391,9 @@ class Courier(Generic[T]):
         return _NOTHING
 
     def _cancel_drain_task(self) -> None:
-        task = self._drain_task
-        self._drain_task = None
+        with self._lock:
+            task = self._drain_task
+            self._drain_task = None
         if task is None or task.done():
             return
         try:

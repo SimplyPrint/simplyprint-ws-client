@@ -44,17 +44,27 @@ class FileManager:
         files.sort(key=lambda f: f.last_modified)
         time_now = time.time()
 
+        # Both sweeps yield newest-first and must stay safe when the list
+        # holds duplicate entries, so they rebuild instead of remove().
+        remaining: List[File] = []
         for file in reversed(files):
             if 0 < self.max_age < time_now - file.last_modified:
-                files.remove(file)
                 total_disk_usage -= file.size
                 yield file
+            else:
+                remaining.append(file)
+        remaining.reverse()
+        files[:] = remaining
 
+        remaining = []
         for file in reversed(files):
             if 0 < self.max_size < file.size:
-                files.remove(file)
                 total_disk_usage -= file.size
                 yield file
+            else:
+                remaining.append(file)
+        remaining.reverse()
+        files[:] = remaining
 
         if self.least_remaining_space_percentage > 0:
             space_left = total_disk_space - total_disk_usage

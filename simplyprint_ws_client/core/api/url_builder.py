@@ -113,6 +113,29 @@ class SimplyPrintURL:
         return self.backend_urls().ws / SimplyPrintWsVersion.VERSION_0_2.value
 
 
+def default_connectivity_report(**kwargs):
+    """Generate a :class:`ConnectivityReport` probing every SimplyPrint backend.
+
+    Lives here (not on the report) so the leaf ``common.debug`` module never
+    looks up the SimplyPrint endpoints itself -- core, the layer that owns
+    them, injects the URL lists. Lazy import: the debug module pulls in heavy
+    optional networking deps that url_builder consumers never need.
+    """
+    from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
+
+    backends = (
+        SimplyPrintBackend.PRODUCTION,
+        SimplyPrintBackend.STAGING,
+        SimplyPrintBackend.TESTING,
+    )
+    return ConnectivityReport.generate(
+        [str(backend.urls().ws) for backend in backends],
+        [str(backend.urls().api) for backend in backends],
+        ["1.1.1.1", "google.com"],
+        **kwargs,
+    )
+
+
 if value := environ.get("SIMPLYPRINT_BACKEND"):
     SimplyPrintURL.set_backend(SimplyPrintBackend(value))
 elif {

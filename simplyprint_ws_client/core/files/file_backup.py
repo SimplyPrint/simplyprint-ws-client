@@ -3,6 +3,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from simplyprint_ws_client.common.utils.file_tail import strip_log_file
+
 
 class FileBackup:
     """Small wrapper for count based file backups, used for configs"""
@@ -35,6 +37,7 @@ class FileBackup:
         backups = sorted(file.parent.glob(f"{file.name}.bak.*"), reverse=True)
 
         latest_backup: Optional[datetime.datetime] = None
+        remaining = []
 
         for backup in backups:
             date_changed = datetime.datetime.fromtimestamp(backup.stat().st_mtime)
@@ -45,7 +48,10 @@ class FileBackup:
 
             if max_age and datetime.datetime.now() - date_changed > max_age:
                 backup.unlink()
-                backups.remove(backup)
+            else:
+                remaining.append(backup)
+
+        backups = remaining
 
         # If the last backup is too recent, don't create a new one and stop this function
         if (
@@ -68,20 +74,6 @@ class FileBackup:
 
     @staticmethod
     def strip_log_file(file: Path, max_size: int = 100 * 1024 * 1024):
-        """Strip a log file to a maximum size"""
-
-        if not file.exists():
-            return
-
-        if file.stat().st_size <= max_size:
-            return
-
-        # Use the size to start seeking from the end of the file
-        # and then read the file in chunks of 1024 bytes until we have read the last size
-        # then overwrite the file with the new content
-        with open(file, "rb+") as f:
-            f.seek(-max_size, 2)
-            data = f.read()
-            f.seek(0)
-            f.write(data)
-            f.truncate()
+        """Strip a log file to a maximum size (the generic primitive lives in
+        ``common.utils.file_tail``; this stays the config-backup entry point)."""
+        strip_log_file(file, max_size=max_size)

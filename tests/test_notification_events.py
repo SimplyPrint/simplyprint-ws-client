@@ -50,7 +50,7 @@ def test_keyed_notifications(client: Client):
     assert event1.resolved_at is not None
 
     intervals.set_time(0)
-    msg, _ = client.consume()
+    msg = client.consume()
     assert len(msg) == 1 and msg[0].__class__ == NotificationMsg
 
     # After consuming, resolved notifications may be cleaned up
@@ -74,7 +74,7 @@ def test_keyed_notifications(client: Client):
     assert event5.resolved_at is not None
 
     intervals.set_time(1000)
-    msg, _ = client.consume()
+    msg = client.consume()
     assert len(msg) == 1 and msg[0].__class__ == NotificationMsg
 
     # Allow for cleanup behavior after consuming

@@ -16,11 +16,16 @@ front door because it is a fan-out concern, not a wire lifecycle concern.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Hashable
+from typing import TYPE_CHECKING, Hashable
 
 import yarl
 
 from simplyprint_ws_client.events import EventBus
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.common.asyncio.event_loop_provider import (
+        EventLoopProvider,
+    )
 
 from simplyprint_ws_client.wire.events import WireEvent
 from simplyprint_ws_client.wire.errors import (
@@ -40,6 +45,7 @@ __all__ = [
     "MqttTransport",
     "WsTransport",
     "topic_matches",
+    "is_wildcard_filter",
 ]
 
 
@@ -60,6 +66,9 @@ class Transport(ABC):
     generation: int
     #: Where consumers subscribe -- keyed by event type.
     events: EventBus[WireEvent]
+    #: The loop this transport delivers its events on (every concrete family
+    #: sets one; shutdown helpers schedule ``stop`` through it).
+    provider: "EventLoopProvider"
 
     @property
     @abstractmethod
@@ -125,9 +134,9 @@ class WsTransport(Transport):
 def topic_matches(subscription: str, topic: Hashable) -> bool:
     """Whether an incoming ``topic`` is covered by an MQTT ``subscription``.
 
-    Supports the trailing multi-level ``#`` wildcard: ``foo/#`` matches ``foo``
-    itself and anything beneath it (``foo/bar``, ``foo/bar/baz``). An exact
-    string match always wins.
+    Implements MQTT filter matching: ``+`` matches exactly one level and a
+    trailing ``#`` matches every remaining level (including none, so ``foo/#``
+    covers ``foo`` itself). An exact string match always wins.
     """
     if not isinstance(topic, str):
         return False
@@ -135,8 +144,22 @@ def topic_matches(subscription: str, topic: Hashable) -> bool:
     if subscription == topic:
         return True
 
-    if not subscription.endswith("/#"):
-        return False
+    levels = subscription.split("/")
+    topic_levels = topic.split("/")
 
-    prefix = subscription[:-2]
-    return topic == prefix or topic.startswith(f"{prefix}/")
+    for i, pattern in enumerate(levels):
+        if pattern == "#":
+            return i == len(levels) - 1
+        if i >= len(topic_levels):
+            return False
+        if pattern != "+" and pattern != topic_levels[i]:
+            return False
+
+    return len(topic_levels) == len(levels)
+
+
+def is_wildcard_filter(subscription: Hashable) -> bool:
+    """Whether an MQTT subscription filter contains a ``+`` or ``#`` wildcard."""
+    if not isinstance(subscription, str):
+        return False
+    return any(level in ("+", "#") for level in subscription.split("/"))

@@ -1186,3 +1186,93 @@ async def test_fully_seeded_device_insta_adds_in_one_advance():
     step = await advance_flow(flow, {"host": "10.0.0.5", "device_type": "x1"})
     assert isinstance(step, Done)
     assert step.value == {"host": "10.0.0.5", "device_type": "x1"}
+
+
+@pytest.mark.asyncio
+async def test_async_phase_include_is_rejected_loudly():
+    """An async phase ``include`` would evaluate truthy-always (a coroutine
+    object); the engine must reject it instead of silently including."""
+
+    async def bad_include(_state):
+        return False
+
+    flow = Flow(
+        id="bad-include",
+        title="Bad include",
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[ActionStep("noop", lambda _s, _a: {})],
+                include=bad_include,
+            )
+        ],
+        finish=lambda s: dict(s),
+    )
+
+    with pytest.raises(FlowError, match="include must be sync"):
+        await advance_flow(flow)
+
+    with pytest.raises(FlowError, match="include must be sync"):
+        outline(flow)
+
+
+@pytest.mark.asyncio
+async def test_run_flow_surfaces_promptless_failed_message():
+    """A Failed without a prompt has nothing to re-offer: run_flow raises a
+    FlowError carrying its message instead of crashing on the missing prompt."""
+
+    from simplyprint_ws_client.integration.flow import Step
+
+    class PromptlessRejectStep(Step):
+        key = "reject"
+        label = "Reject"
+
+        async def run(self, state, answer, action=None):
+            return Reject("the device said no")
+
+    flow = Flow(
+        id="promptless-failed",
+        title="Promptless failed",
+        phases=[Phase("main", "Main", steps=[PromptlessRejectStep()])],
+        finish=lambda s: dict(s),
+    )
+
+    driver = Driver()
+
+    with pytest.raises(FlowError, match="the device said no"):
+        await run_flow(flow, on_prompt=driver)
+
+    # The driver was never asked to answer a nonexistent prompt.
+    assert driver.asked == []
+
+
+def test_recipe_identify_label_none_keeps_step_default():
+    """standard_add_printer_flow must not clobber identify_step's default label
+    by forwarding label=None."""
+    from simplyprint_ws_client.integration.flow import ModelChoice, ModelChoiceCatalog
+    from simplyprint_ws_client.integration.flow.recipes import (
+        standard_add_printer_flow,
+    )
+
+    catalog = ModelChoiceCatalog((ModelChoice(value="x1", label="X1"),))
+
+    default_label = catalog.identify_step().label
+    assert default_label  # the step ships a non-empty default
+
+    flow = standard_add_printer_flow(
+        title="Add printer",
+        make_config=lambda state: dict(state),
+        models=catalog,
+    )
+    identify_phase = flow.phases[0]
+    assert identify_phase.id == "identify"
+    assert identify_phase.steps[0].label == default_label
+
+    labelled = standard_add_printer_flow(
+        title="Add printer",
+        make_config=lambda state: dict(state),
+        models=catalog,
+        identify_label="Which one?",
+    )
+    assert labelled.phases[0].steps[0].label == "Which one?"

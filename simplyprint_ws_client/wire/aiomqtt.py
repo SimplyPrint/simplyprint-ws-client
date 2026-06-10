@@ -82,18 +82,30 @@ MqttClientFactory = Callable[
 
 
 def default_aiomqtt_client(
-    url: yarl.URL, logger: logging.Logger, keepalive: Optional[int] = None
+    url: yarl.URL,
+    logger: logging.Logger,
+    keepalive: Optional[int] = None,
+    *,
+    verify_tls: bool = False,
 ) -> AsyncContextManager[AioMqttClient]:
     """Build a real ``aiomqtt.Client`` from ``url`` (aiomqtt imported lazily).
 
-    A ``mqtts://`` scheme enables TLS (matching the broker the printer fleet uses);
-    credentials and port come from the URL. Importing this module never triggers
-    this code, so aiomqtt stays an optional dependency.
+    A ``mqtts://`` scheme enables TLS (matching the broker the printer fleet
+    uses); credentials and port come from the URL. ``verify_tls`` is off by
+    default - printer brokers routinely present self-signed certificates - but
+    is an explicit choice via ``ConnectionOptions``. Importing this module never
+    triggers this code, so aiomqtt stays an optional dependency.
     """
     import aiomqtt  # lazy: importing this module must not require aiomqtt
 
     tls = url.scheme == "mqtts"
-    tls_params = aiomqtt.TLSParameters(cert_reqs=ssl.CERT_NONE) if tls else None
+    tls_params = None
+    if tls:
+        tls_params = (
+            aiomqtt.TLSParameters()
+            if verify_tls
+            else aiomqtt.TLSParameters(cert_reqs=ssl.CERT_NONE)
+        )
     kwargs = {}
     if keepalive is not None:
         kwargs["keepalive"] = keepalive
@@ -103,7 +115,7 @@ def default_aiomqtt_client(
         username=url.user or None,
         password=url.password or None,
         tls_params=tls_params,
-        tls_insecure=tls or None,
+        tls_insecure=(tls and not verify_tls) or None,
         **kwargs,
     )
 
@@ -226,15 +238,27 @@ class AioMqtt(MqttTransport, Reconnecting):
         if self.client is not None:
             await self.client.unsubscribe(topic)
 
-    @staticmethod
-    def classify(error: Exception) -> TransportError:
+    #: CONNACK codes meaning "the broker said no" (MQTT 3.1.1: bad credentials=4,
+    #: not authorized=5; MQTT 5: 134/135).
+    _AUTH_REJECT_CODES = frozenset({4, 5, 134, 135})
+
+    @classmethod
+    def classify(cls, error: Exception) -> TransportError:
         """Tag a connect failure as fatal (auth) or transient (everything else).
 
         The reconnect loop retries regardless; the tag only rides through to
-        ``Disconnected.code`` so a consumer can tell "the broker said no" from "the
-        broker is unreachable".
+        ``Disconnected.code`` so a consumer can tell "the broker said no" from
+        "the broker is unreachable". Classification uses aiomqtt's typed reason
+        codes (imported lazily), never error-message text.
         """
-        text = str(error).lower()
-        if "auth" in text or "not authorized" in text or "password" in text:
-            return FatalError.wrap(error)
+        try:
+            import aiomqtt  # lazy: optional dependency
+        except ImportError:
+            return TransientError.wrap(error)
+
+        if isinstance(error, aiomqtt.MqttCodeError):
+            code = error.rc if isinstance(error.rc, int) else error.rc.value
+            if code in cls._AUTH_REJECT_CODES:
+                return FatalError.wrap(error)
+
         return TransientError.wrap(error)

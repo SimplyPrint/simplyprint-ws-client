@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import logging
 import socket
 import struct
 from dataclasses import dataclass, field
@@ -27,13 +26,12 @@ import dns.rdataclass
 import dns.rdatatype
 
 from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
-from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
-
+from simplyprint_ws_client.integration.discovery.multicast_base import (
+    DEVICE_TTL,
+    MulticastListenerBase,
+)
 from simplyprint_ws_client.integration.discovery.spec import MDNSSpec
-
-_DEVICE_TTL = 300
 
 
 def _clear_cache_flush(data: bytes) -> bytes:
@@ -223,8 +221,11 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         self._devices = devices
         self._emit = emit  # async callable(record) | None
         self._logger = logger
-        self._queried = queried  # set of already-issued follow-up query names
+        self._queried = queried  # TTL'd set of already-issued follow-up names
         self._transport = None
+        #: In-flight datagram handlers; retained because asyncio holds tasks
+        #: weakly and an unreferenced one can be collected mid-flight.
+        self._handle_tasks: "set[asyncio.Task]" = set()
 
     def connection_made(self, transport) -> None:
         self._transport = transport
@@ -233,7 +234,9 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         response = MDNSResponseParser.parse(data)
         if response is None:
             return
-        asyncio.create_task(self._handle(response, addr))
+        task = asyncio.create_task(self._handle(response, addr))
+        self._handle_tasks.add(task)
+        task.add_done_callback(self._handle_tasks.discard)
 
     async def _handle(self, response, addr) -> None:
         self._chain_follow_ups(response)
@@ -264,7 +267,7 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         for name in names:
             if name in self._queried or self._transport is None:
                 continue
-            self._queried.add(name)
+            self._queried[name] = True
             self._transport.sendto(
                 MDNSResponseParser.build_query(name),
                 (self._spec.group, self._spec.port),
@@ -276,105 +279,42 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         self._logger.error("mdns error for %s", self._spec.brand, exc_info=exc)
 
 
-class MDNSDiscoveryBackend(
-    AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]
-):
+class MDNSDiscoveryBackend(MulticastListenerBase):
     """One always-on mDNS listener (periodic query + response parsing) per brand."""
 
+    spec: MDNSSpec
+
+    _listen_label = "mdns discovery"
+    _port_label = "mdns"
+
     def __init__(self, spec: MDNSSpec, event_bus: EventBus) -> None:
-        AsyncStoppable.__init__(self)
-        EventLoopProvider.__init__(self)
-
-        self.spec = spec
-        self.event_bus = event_bus
-        self.logger = logging.getLogger("discovery")
-        self.devices = ExpiringDict(ttl=_DEVICE_TTL)
-        self._emit = event_bus.emit_wrap(spec.event_type, blocking=True)
-        self._queried: set = set()
-
-    def get_devices(self) -> list:
-        return self.devices.values()
+        super().__init__(spec, event_bus)
+        # TTL'd like the device cache: a name can be re-queried once its
+        # entry expires, and the set cannot grow for process lifetime.
+        self._queried = ExpiringDict(ttl=DEVICE_TTL)
 
     def _protocol_factory(self) -> _MDNSProtocol:
         return _MDNSProtocol(
             self.spec, self.devices, self._emit, self.logger, self._queried
         )
 
-    def _make_socket(self) -> socket.socket:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        if hasattr(socket, "SO_REUSEADDR"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        if self.spec.multicast_ttl is not None:
-            sock.setsockopt(
-                socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.spec.multicast_ttl
-            )
-        sock.setblocking(False)
-        return sock
-
     async def _bind(self, sock: socket.socket) -> None:
         # Bind the fixed mDNS port (shared with the system responder via
         # SO_REUSEPORT) so multicast responses and announcements are received;
         # retry briefly while a previous instance tears down.
-        while not self.is_stopped():
-            try:
-                sock.bind(("", self.spec.port))
-                return
-            except OSError as exc:
-                if exc.errno == errno.EADDRINUSE:
-                    self.logger.warning(
-                        "mdns port %s in use - retrying in 5s", self.spec.port
-                    )
-                    await self.wait(5)
-                else:
-                    raise
+        await self._bind_fixed_port(sock)
 
     def _join_group(self, sock: socket.socket) -> None:
-        group = socket.inet_aton(self.spec.group)
-        mreq = struct.pack("4sL", group, socket.INADDR_ANY)
         try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self._join_group_mreq(sock)
         except OSError:
             self.logger.warning("could not join mdns group for %s", self.spec.brand)
 
-    async def run(self) -> None:
-        self.use_running_loop()
-
-        sock = self._make_socket()
-        await self._bind(sock)
-        if self.is_stopped():
-            sock.close()
-            return
-
-        self._join_group(sock)
-        transport, _ = await self.event_loop.create_datagram_endpoint(
-            self._protocol_factory, sock=sock
-        )
-        self.logger.info(
-            "mdns discovery listening for %s on %s:%s",
-            self.spec.brand,
-            self.spec.group,
-            self.spec.port,
-        )
-
-        try:
-            while not self.is_stopped():
-                for name in self.spec.queries:
-                    transport.sendto(
-                        MDNSResponseParser.build_query(name),
-                        (self.spec.group, self.spec.port),
-                    )
-                await self.wait(self.spec.query_interval)
-        finally:
-            transport.close()
-
-        self.logger.info("mdns discovery for %s stopping", self.spec.brand)
-
-    def stop(self) -> None:
-        if self.is_stopped():
-            return
-        if self.event_loop_is_running():
-            self.event_loop.call_soon_threadsafe(super().stop)
-        else:
-            super().stop()
+    async def _run_loop(self, transport: asyncio.DatagramTransport) -> None:
+        while not self.is_stopped():
+            for name in self.spec.queries:
+                transport.sendto(
+                    MDNSResponseParser.build_query(name),
+                    (self.spec.group, self.spec.port),
+                )
+            await self.wait(self.spec.query_interval)

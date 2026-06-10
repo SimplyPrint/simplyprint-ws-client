@@ -9,30 +9,32 @@ from simplyprint_ws_client.wire.events import (
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.core.protocol.connection import CloudConnection
+from simplyprint_ws_client.core.protocol.connection import SimplyPrintConnection
 from simplyprint_ws_client.core.protocol.events import (
-    CloudConnectionEstablishedEvent,
-    CloudConnectionIncomingEvent,
-    CloudConnectionLostEvent,
+    SimplyPrintConnectionEstablishedEvent,
+    SimplyPrintConnectionIncomingEvent,
+    SimplyPrintConnectionLostEvent,
 )
 
 
 @pytest.mark.asyncio
 async def test_transport_events_emit_protocol_events_in_order():
-    conn = CloudConnection()
+    conn = SimplyPrintConnection()
     payload = '{"type":"pong"}'
     order = []
 
     conn.event_bus.on(
-        CloudConnectionEstablishedEvent, lambda e: order.append(("est", e.v))
+        SimplyPrintConnectionEstablishedEvent, lambda e: order.append(("est", e.v))
     )
 
     async def on_incoming(msg, v):
         await asyncio.sleep(0)
         order.append(("inc", msg.type, v))
 
-    conn.event_bus.on(CloudConnectionIncomingEvent, on_incoming)
-    conn.event_bus.on(CloudConnectionLostEvent, lambda e: order.append(("lost", e.v)))
+    conn.event_bus.on(SimplyPrintConnectionIncomingEvent, on_incoming)
+    conn.event_bus.on(
+        SimplyPrintConnectionLostEvent, lambda e: order.append(("lost", e.v))
+    )
 
     await conn.protocol._on_connected(Connected(1))
     await conn.protocol._on_message(MessageReceived(1, payload))
@@ -44,14 +46,14 @@ async def test_transport_events_emit_protocol_events_in_order():
 
 @pytest.mark.asyncio
 async def test_protocol_event_emission_does_not_drop_bursts():
-    conn = CloudConnection()
+    conn = SimplyPrintConnection()
     payload = '{"type":"pong"}'
     got = []
 
     async def on_incoming(_msg, v):
         got.append(v)
 
-    conn.event_bus.on(CloudConnectionIncomingEvent, on_incoming)
+    conn.event_bus.on(SimplyPrintConnectionIncomingEvent, on_incoming)
 
     for _ in range(500):
         await conn.protocol._on_message(MessageReceived(1, payload))

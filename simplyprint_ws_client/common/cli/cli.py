@@ -188,14 +188,14 @@ class ClientCliDebugConnectivity(CommandBag, click.Group):
         self.add_command(click.Command("status", callback=self.list_previous_reports))
         self.add_command(click.Command("clean", callback=self.delete_all_reports))
 
-    @staticmethod
-    def test():
+    def test(self):
         path = APP_DIRS.user_log_path / "connectivity_reports"
 
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
 
-        r = ConnectivityReport.generate_default()
+        # The app injects the endpoints to probe (common never imports core).
+        r = self.app.generate_connectivity_report()
         p = r.store_in_path(path)
         print("Connectivity test suite complete. Report saved to:", p)
 
@@ -228,12 +228,12 @@ class ClientCliDebugConnectivity(CommandBag, click.Group):
             file.unlink()
 
 
-class ClientCli(CommandBag, click.MultiCommand):
+class ClientCli(CommandBag, click.Group):
     app: "ClientApp"
     commands: Dict[str, click.Command]
     _client_runner: Optional[Callable[[], None]] = None
 
-    def __init__(self, app: Optional[ClientApp] = None) -> None:
+    def __init__(self, app: Optional["ClientApp"] = None) -> None:
         super().__init__(name="simplyprint", help="SimplyPrint client CLI")
         self.app = app
         self.commands = {}

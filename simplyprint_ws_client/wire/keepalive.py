@@ -60,6 +60,9 @@ class ConnectionKeepalive:
         self.task: Optional[asyncio.Task] = None
 
     def start(self) -> "ConnectionKeepalive":
+        if self.task is not None and not self.task.done():
+            return self
+
         loop = self.connection.provider.event_loop
         self.last_activity = loop.time()
         self.connection.event_bus.on(Connected, self._on_activity)

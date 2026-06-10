@@ -12,12 +12,16 @@ accumulate-changeset engine and shares the annotation vocabulary in
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, NamedTuple, TypeVar, Union
+from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
 
 try:
     from typing import Self
 except ImportError:  # Python < 3.11
     from typing_extensions import Self
+
+# Generic NamedTuple classes need Python 3.11+; typing_extensions backports them
+# to the library's 3.9 floor.
+from typing_extensions import NamedTuple
 
 from pydantic import BaseModel
 
@@ -35,7 +39,7 @@ __all__ = [
 UpdatedT = TypeVar("UpdatedT")
 
 
-class UpdatedField(Generic[UpdatedT], NamedTuple):
+class UpdatedField(NamedTuple, Generic[UpdatedT]):
     old: UpdatedT | None
     new: UpdatedT | None
 
@@ -46,8 +50,13 @@ class UpdatedField(Generic[UpdatedT], NamedTuple):
         return self.old != self.new
 
 
+#: List diffs are index-aligned with the merged list: ``None`` marks an element
+#: that did not change, a dict is a nested-model diff, an ``UpdatedField`` a
+#: scalar element change.
+UpdatedListType = List[Union["UpdatedFieldsType", UpdatedField, None]]
+
 UpdatedFieldsType = Dict[
-    str, Union[UpdatedField, "UpdatedFieldsType", List["UpdatedFieldsType"], None]
+    str, Union[UpdatedField, "UpdatedFieldsType", UpdatedListType, None]
 ]
 
 
@@ -125,16 +134,24 @@ class SimpleUpdateModel(UpdateModel):
                     if not isinstance(value2, list):
                         continue
 
-                    changes = []
+                    # Like the scalar path below, this reports *touched*
+                    # elements (consumers filter with ``has_changed()``); a
+                    # list whose element diffs are all empty is not reported.
+                    changes: List[Optional[Any]] = []
+                    any_touched = False
                     min_length = min(len(value1), len(value2))
 
                     for i in range(min_length):
                         if isinstance(value1[i], UpdateModel):
-                            changes.append(value1[i].update_model(value2[i]))
+                            element_diff = value1[i].update_model(value2[i])
+                            changes.append(element_diff or None)
+                            any_touched = any_touched or bool(element_diff)
                         else:
+                            changes.append(UpdatedField(value1[i], value2[i]))
                             value1[i] = value2[i]
+                            any_touched = True
 
-                    if changes:
+                    if any_touched:
                         updated_fields[name] = changes
 
                     continue

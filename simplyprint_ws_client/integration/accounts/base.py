@@ -127,7 +127,8 @@ class LoginChallenge:
 
 @dataclass(frozen=True)
 class LoginResult:
-    """Outcome of one :meth:`PrinterAccountProvider.login` / :meth:`verify` step.
+    """Outcome of one :meth:`PasswordChallengeAccountProvider.login` /
+    :meth:`~PasswordChallengeAccountProvider.verify` step.
 
     Exactly one of ``account`` (when ``status`` is ``COMPLETED``) or ``challenge``
     (when ``status`` is ``CHALLENGE``) is set; both are ``None`` on ``FAILED``.
@@ -180,7 +181,7 @@ class InvalidRegion(AccountError):
 
 
 class DeviceNotFound(AccountError):
-    """Raised by :meth:`PrinterAccountProvider.adopt_device` when the account has
+    """Raised by :meth:`AccountProvider.adopt_device` when the account has
     no device with the given serial. A distinct subclass so the caller can map it
     to a not-found rather than a generic upstream failure."""
 

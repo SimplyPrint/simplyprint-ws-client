@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import json
 from typing import Optional, Union
 
@@ -8,6 +9,22 @@ from yarl import URL
 
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
 from simplyprint_ws_client.const import VERSION
+
+
+class SimplyPrintApiError(Exception):
+    """A SimplyPrint HTTP API call failed (non-200 response)."""
+
+
+def _company_id_from_token(action_token: str) -> int:
+    """Extract the company id from an action token (a JWT) without verifying it.
+
+    Hacky but deliberate: the token is opaque to the client except for this one
+    routing value the API path needs.
+    """
+    payload = json.loads(
+        base64.b64decode(action_token.split(".")[1] + "===").decode("utf-8")
+    )
+    return payload["company"]
 
 
 class SimplyPrintApi:
@@ -33,7 +50,9 @@ class SimplyPrintApi:
                 timeout=ClientTimeout(total=45),
             ) as response:
                 if response.status != 200:
-                    raise Exception(f"Failed to post snapshot: {await response.text()}")
+                    raise SimplyPrintApiError(
+                        f"Failed to post snapshot: {await response.text()}"
+                    )
 
     @staticmethod
     async def post_logs(
@@ -56,26 +75,31 @@ class SimplyPrintApi:
 
         headers = {"User-Agent": f"simplyprint-ws-client/{VERSION}"}
 
-        if main_log_file:
-            data["main"] = open(main_log_file, "r")
+        # The handles must stay open until aiohttp has streamed the upload, and
+        # must always be closed afterwards.
+        with contextlib.ExitStack() as stack:
+            if main_log_file:
+                data["main"] = stack.enter_context(open(main_log_file, "r"))
 
-        if plugin_log_file:
-            data["plugin_log"] = open(plugin_log_file, "r")
+            if plugin_log_file:
+                data["plugin_log"] = stack.enter_context(open(plugin_log_file, "r"))
 
-        if serial_log_file:
-            data["serial_log"] = open(serial_log_file, "r")
+            if serial_log_file:
+                data["serial_log"] = stack.enter_context(open(serial_log_file, "r"))
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                str(endpoint),
-                data=data,
-                headers=headers,
-                timeout=ClientTimeout(total=45),
-            ) as response:
-                if response.status != 200:
-                    raise Exception(f"Failed to post logs: {await response.text()}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    str(endpoint),
+                    data=data,
+                    headers=headers,
+                    timeout=ClientTimeout(total=45),
+                ) as response:
+                    if response.status != 200:
+                        raise SimplyPrintApiError(
+                            f"Failed to post logs: {await response.text()}"
+                        )
 
-                return await response.json()
+                    return await response.json()
 
     @staticmethod
     async def clear_bed(
@@ -88,14 +112,9 @@ class SimplyPrintApi:
             "X-Action-Token": action_token,
         }
 
-        # Hacky: extract company_id from action_token itself (jwt)
-        company_id = json.loads(
-            base64.b64decode(action_token.split(".")[1] + "===").decode("utf-8")
-        )["company"]
-
         endpoint = (
             SimplyPrintURL().api_url
-            / str(company_id)
+            / str(_company_id_from_token(action_token))
             / "printers"
             / "actions"
             / "ClearBed"
@@ -115,7 +134,9 @@ class SimplyPrintApi:
                 timeout=ClientTimeout(total=45),
             ) as response:
                 if response.status != 200:
-                    raise Exception(f"Failed to clear bed: {await response.text()}")
+                    raise SimplyPrintApiError(
+                        f"Failed to clear bed: {await response.text()}"
+                    )
 
                 return await response.json()
 
@@ -125,11 +146,6 @@ class SimplyPrintApi:
             "X-Action-Token": action_token,
         }
 
-        # Hacky: extract company_id from action_token itself (jwt)
-        company_id = json.loads(
-            base64.b64decode(action_token.split(".")[1] + "===").decode("utf-8")
-        )["company"]
-
         data = {
             "pid": printer_id,
             "next_queue_item": True,
@@ -137,7 +153,7 @@ class SimplyPrintApi:
 
         endpoint = (
             SimplyPrintURL().api_url
-            / str(company_id)
+            / str(_company_id_from_token(action_token))
             / "printers"
             / "actions"
             / "CreateJob"
@@ -151,7 +167,7 @@ class SimplyPrintApi:
                 timeout=ClientTimeout(total=45),
             ) as response:
                 if response.status != 200:
-                    raise Exception(
+                    raise SimplyPrintApiError(
                         f"Failed to start next print: {await response.text()}"
                     )
 

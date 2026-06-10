@@ -8,7 +8,7 @@ serialization, and the wire untouched.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from simplyprint_ws_client._compat import StrEnum
 
 
 class ConnectionState(StrEnum):

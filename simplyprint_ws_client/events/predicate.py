@@ -15,6 +15,47 @@ except ImportError:
     from typing_extensions import Self
 
 
+def _code_fingerprint(code) -> tuple:
+    """The behavior-relevant parts of a code object (source position excluded,
+    constants included - ``lambda x: x > 5`` must differ from ``x > 99``)."""
+    return (
+        code.co_code,
+        code.co_consts,
+        code.co_names,
+        code.co_varnames,
+        code.co_argcount,
+        code.co_kwonlyargcount,
+        code.co_flags,
+        code.co_freevars,
+        code.co_cellvars,
+    )
+
+
+def _callables_equivalent(a: Any, b: Any) -> bool:
+    """Whether two callables are interchangeable as predicates.
+
+    Distinct-but-identical lambdas compare equal only when their code
+    fingerprints match and neither captures free variables - a closure's
+    behavior lives in its cells, which the code object misses. Defaults are
+    compared separately for the same reason.
+    """
+    if a == b:
+        return True
+
+    code_a = getattr(a, "__code__", None)
+    code_b = getattr(b, "__code__", None)
+
+    if code_a is None or code_b is None:
+        return False
+
+    return (
+        not code_a.co_freevars
+        and _code_fingerprint(code_a) == _code_fingerprint(code_b)
+        and getattr(a, "__defaults__", None) == getattr(b, "__defaults__", None)
+        and getattr(a, "__kwdefaults__", None) == getattr(b, "__kwdefaults__", None)
+    )
+
+
 @dataclass
 class Predicate(ABC):
     """Evaluates an input and returns a boolean."""
@@ -165,14 +206,22 @@ class Pipe(Generic[_TValue], Predicate, ABC):
         if not isinstance(other, Predicate) and callable(other):
             other = Reduce(other)
 
-        original = output = self.__class__(self.value, self.output)
+        # Copy every Pipe node down to the open tail: a head-only copy would
+        # share its tail with ``self``, and assigning into that shared node
+        # silently extended the original chain.
+        head = node = self.__class__(self.value, self.output)
 
-        while isinstance(output, Pipe):
-            if output.output is None:
-                output.output = other
-                return original
+        while isinstance(node, Pipe):
+            if node.output is None:
+                node.output = other
+                return head
 
-            output = output.output
+            if isinstance(node.output, Pipe):
+                node.output = node.output.__class__(
+                    node.output.value, node.output.output
+                )
+
+            node = node.output
 
         raise TypeError(f"Cannot reduce {self} with {other}")
 
@@ -191,24 +240,10 @@ class Reduce(Pipe[Callable]):
         if not isinstance(other, self.__class__):
             return False
 
-        # If the callable objects are not strictly equal, we compare their code objects.
-        if (
-            self.value != other.value
-            and (
-                hasattr(self.value, "__code__")
-                and hasattr(self.value.__code__, "co_code")
-            )
-            and (
-                hasattr(other.value, "__code__")
-                and hasattr(other.value.__code__, "co_code")
-            )
-        ):
-            return (
-                self.output == other.output
-                and self.value.__code__.co_code == other.value.__code__.co_code
-            )
-
-        return self.value == other.value and self.output == other.output
+        return (
+            _callables_equivalent(self.value, other.value)
+            and self.output == other.output
+        )
 
 
 @dataclass

@@ -28,8 +28,7 @@ class ClientSettings:
     config_manager_t: ConfigManagerType = ConfigManagerType.MEMORY
     allow_setup: bool = True
     max_clients_per_connection: Optional[int] = None
-    tick_rate = 1.0
-    reconnect_timeout = 5.0
+    tick_rate: float = 1.0
     sentry_dsn: Optional[str] = None
     camera_workers: Optional[int] = None
     camera_protocols: Optional[List[Type[BaseCameraProtocol]]] = None

@@ -10,14 +10,14 @@ from types import SimpleNamespace
 from simplyprint_ws_client import PrinterConfig
 from simplyprint_ws_client.common.logging.naming import printer_logger_name
 from simplyprint_ws_client.core.protocol.connection import (
-    CloudConnection,
+    SimplyPrintConnection,
     ConnectionHint,
     ConnectionMode,
 )
 
 
 def test_multi_mode_routes_message_to_its_printer():
-    conn = CloudConnection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
+    conn = SimplyPrintConnection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
     msg = SimpleNamespace(for_client="printer-9")
     assert conn.protocol._message_logger(msg).name == printer_logger_name(
         "printer-9", "ws"
@@ -26,7 +26,7 @@ def test_multi_mode_routes_message_to_its_printer():
 
 
 def test_multi_mode_global_message_stays_global():
-    conn = CloudConnection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
+    conn = SimplyPrintConnection(hint=ConnectionHint(mode=ConnectionMode.MULTI))
     msg = SimpleNamespace(for_client=None)
     # No printer association -> the connection's (system-scope) ws logger.
     assert conn.protocol._message_logger(msg) is conn.logger
@@ -36,7 +36,7 @@ def test_multi_mode_global_message_stays_global():
 def test_single_mode_routes_to_the_connection_printer():
     config = PrinterConfig.get_new()
     config.id = 7
-    conn = CloudConnection(
+    conn = SimplyPrintConnection(
         hint=ConnectionHint(mode=ConnectionMode.SINGLE, config=config)
     )
     # SINGLE: one printer; every message belongs to it, regardless of for_client.

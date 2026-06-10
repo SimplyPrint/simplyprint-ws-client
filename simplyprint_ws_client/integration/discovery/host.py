@@ -14,7 +14,33 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Coroutine, Dict, Iterable, List, Optional, Protocol
+
+
+class DiscoveryBackendSpec(Protocol):
+    """The slice of a backend's spec the host reads: its registry key."""
+
+    @property
+    def brand(self) -> str: ...
+
+
+class DiscoveryBackend(Protocol):
+    """What the host requires of a multicast listener backend.
+
+    Structural: any object with a branded ``spec``, an ``async run()`` listener
+    coroutine, an idempotent ``stop()``, and a ``clear()`` that re-arms the stop
+    signal before a relaunch satisfies it (e.g. ``MulticastDiscoveryBackend``,
+    ``MDNSDiscoveryBackend``).
+    """
+
+    @property
+    def spec(self) -> DiscoveryBackendSpec: ...
+
+    def run(self) -> Coroutine[Any, Any, None]: ...
+
+    def stop(self) -> None: ...
+
+    def clear(self) -> None: ...
 
 
 class DiscoveryServiceHost:
@@ -22,12 +48,12 @@ class DiscoveryServiceHost:
 
     def __init__(
         self,
-        backends: Iterable[object],
+        backends: Iterable[DiscoveryBackend],
         *,
         restart_interval: float = 5.0,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self._backends: List[object] = list(backends)
+        self._backends: List[DiscoveryBackend] = list(backends)
         self._restart_interval = restart_interval
         self.logger = logger or logging.getLogger("discovery")
         self._loop: Optional[asyncio.AbstractEventLoop] = None

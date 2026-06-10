@@ -127,9 +127,28 @@ class Reconnecting(Transport):
             return
         self.stopped = False
         self.gave_up = False
-        self.task = self.provider.event_loop.create_task(self.supervise())
+        loop = self.provider.event_loop
+
+        def spawn() -> None:
+            if self.stopped or (self.task is not None and not self.task.done()):
+                return
+            self.task = loop.create_task(self.supervise())
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is loop:
+            spawn()
+        else:
+            # ``create_task`` is not thread-safe; off-loop callers (sync front
+            # doors, the paho thread) hop home first.
+            loop.call_soon_threadsafe(spawn)
 
     async def stop(self) -> None:
+        # An intentional stop is silent - no Disconnected is emitted (only a
+        # *drop* speaks). Lease.close() settles its own ready() waiters.
         self.stopped = True
         task = self.task
         self.task = None

@@ -137,6 +137,47 @@ class InlineCameraBackend:
             self._handle._set_frame(None, time.time())
 
 
+class _PauseTimer:
+    """One rescheduling pause timer instead of a new ``threading.Timer`` per poll.
+
+    ``touch()`` pushes the deadline; the single timer thread re-checks at the
+    deadline and only fires ``on_expire`` when no touch arrived in between.
+    """
+
+    def __init__(self, timeout: float, on_expire) -> None:
+        self._timeout = timeout
+        self._on_expire = on_expire
+        self._deadline = 0.0
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+
+    def touch(self) -> None:
+        with self._lock:
+            self._deadline = time.monotonic() + self._timeout
+            if self._timer is None:
+                self._schedule(self._timeout)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _schedule(self, delay: float) -> None:
+        self._timer = threading.Timer(delay, self._check)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _check(self) -> None:
+        with self._lock:
+            remaining = self._deadline - time.monotonic()
+            if remaining > 0:
+                self._schedule(remaining)
+                return
+            self._timer = None
+        self._on_expire()
+
+
 class ThreadCameraBackend:
     """A camera driven in its own thread; frames couriered onto the consumer loop."""
 
@@ -158,7 +199,9 @@ class ThreadCameraBackend:
         )
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._pause_timer: Optional[threading.Timer] = None
+        self._pause_timer: Optional[_PauseTimer] = (
+            _PauseTimer(pause_timeout, self.pause) if pause_timeout else None
+        )
 
     @property
     def _continuous(self) -> bool:
@@ -172,8 +215,13 @@ class ThreadCameraBackend:
         if self._continuous:
             self.start()
             self._refresh_timer()
-        else:  # ON_DEMAND: one-shot read in a short-lived thread
-            threading.Thread(target=self._run, args=(True,), daemon=True).start()
+            return
+        # ON_DEMAND: one-shot read; overlapping requests coalesce into the
+        # read already in flight instead of stacking a thread per request.
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, args=(True,), daemon=True)
+        self._thread.start()
 
     def start(self) -> None:
         if not self._continuous:
@@ -194,17 +242,12 @@ class ThreadCameraBackend:
         self._courier.close()
 
     def _refresh_timer(self) -> None:
-        if not self._pause_timeout or not self._continuous:
-            return
-        self._cancel_timer()
-        self._pause_timer = threading.Timer(self._pause_timeout, self.pause)
-        self._pause_timer.daemon = True
-        self._pause_timer.start()
+        if self._pause_timer is not None and self._continuous:
+            self._pause_timer.touch()
 
     def _cancel_timer(self) -> None:
         if self._pause_timer is not None:
             self._pause_timer.cancel()
-            self._pause_timer = None
 
     def _emit(self, frame) -> None:
         self._courier.post((frame, time.time()))

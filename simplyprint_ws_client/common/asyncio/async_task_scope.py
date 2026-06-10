@@ -19,6 +19,9 @@ class AsyncTaskScope(EventLoopProvider):
         # SAFETY: By design this is safe as long as the API agreements of this class is upheld.
         task = self.event_loop.create_task(*args, **kwargs)
         self.tasks.add(task)
+        # Completed tasks leave the scope immediately, so a long-lived scope
+        # never accumulates finished handles.
+        task.add_done_callback(self.tasks.discard)
         return task
 
     @contextlib.contextmanager
@@ -28,7 +31,7 @@ class AsyncTaskScope(EventLoopProvider):
         try:
             yield task
         finally:
-            self.tasks.remove(task)
+            self.tasks.discard(task)
             task.cancel()
 
     def cancel_all(self):
@@ -53,6 +56,3 @@ class AsyncTaskScope(EventLoopProvider):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cancel_all()
         return False
-
-    def __del__(self):
-        self.cancel_all()

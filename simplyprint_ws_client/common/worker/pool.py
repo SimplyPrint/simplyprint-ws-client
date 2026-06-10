@@ -43,6 +43,17 @@ OnItem = Callable[[Any, float], None]
 
 _DEFAULT_MAXSIZE = 8
 
+#: How long stop() waits for a backend thread/process before giving up.
+JOIN_TIMEOUT = 2.0
+
+
+def _join_or_warn(target, name: str, logger: logging.Logger) -> None:
+    """Join a thread/process; warn instead of silently leaking when it hangs
+    (daemon backends would otherwise hide a producer that ignores its stop)."""
+    target.join(timeout=JOIN_TIMEOUT)
+    if target.is_alive():
+        logger.warning("%s did not stop within %.1fs", name, JOIN_TIMEOUT)
+
 
 class _Backend:
     def start(self) -> None: ...
@@ -146,7 +157,7 @@ class _ThreadBackend(_Backend):
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=2.0)
+        _join_or_warn(self._thread, "worker thread", _logger)
         self._courier.close()
 
 
@@ -222,11 +233,11 @@ class _ProcessBackend(_Backend):
 
     def stop(self) -> None:
         self._stop.set()
-        self._proc.join(timeout=2.0)
+        self._proc.join(timeout=JOIN_TIMEOUT)
         if self._proc.is_alive():
             self._proc.terminate()
-            self._proc.join(timeout=2.0)
-        self._reader.join(timeout=2.0)
+            _join_or_warn(self._proc, "worker process", _logger)
+        _join_or_warn(self._reader, "worker reader thread", _logger)
         # drain=False: recycle any queued leases SYNCHRONOUSLY here (via _recycle,
         # which releases their memoryviews and slabs) before the channel is torn
         # down. The default drain=True would instead schedule delivery onto the

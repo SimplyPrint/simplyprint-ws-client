@@ -10,7 +10,6 @@ belongs in the shared layer where any polling transport can reuse it.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -46,9 +45,8 @@ class Watchdog:
         return self._expired_event.is_set()
 
     async def reset(self):
-        """Reset the watchdog timer asynchronously."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.reset_sync)
+        """Reset the watchdog timer (taking the lock is instant; no executor hop)."""
+        self.reset_sync()
 
     def reset_sync(self, offset: float = 0):
         """Reset the watchdog timer synchronously."""
@@ -56,12 +54,16 @@ class Watchdog:
             self._next_reset = time.monotonic() + self.timeout + offset
 
     def _watchdog_thread(self):
-        """Thread that checks the watchdog timer."""
+        """Thread that checks the watchdog timer.
+
+        Sleeps until the current deadline on the stop event (instead of a 1 s
+        poll), so stopping is immediate and the thread wakes only when due.
+        """
         while not self._stop_event.is_set():
             with self._lock:
-                due = self._next_reset - time.monotonic() <= 0
-            if due:
+                remaining = self._next_reset - time.monotonic()
+            if remaining <= 0:
                 self._expired_event.set()
                 logger.error("%s expired", self.name)
                 break
-            time.sleep(1)  # Sleep for a short duration to avoid busy waiting
+            self._stop_event.wait(remaining)

@@ -28,7 +28,7 @@ Everything beyond ``url``/``impl``/``pool`` is carried by one
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Literal, Optional, Tuple, Union
 
 import yarl
 
@@ -51,18 +51,22 @@ from simplyprint_ws_client.wire.pools import DefaultPools
 
 __all__ = [
     "WsKind",
+    "WsImpl",
     "WsMessage",
     "WsLease",
     "connect",
     "shutdown",
 ]
 
+#: The name of a shipped wire implementation. ``websockets`` is the default.
+WsImpl = Literal["websockets", "aiohttp"]
+
 #: The two shipped wire implementations, by name.
-SUPPORTED_IMPLS = ("websockets", "aiohttp")
+SUPPORTED_IMPLS: Tuple[WsImpl, ...] = ("websockets", "aiohttp")
 
 
 def build_pool(
-    impl: str,
+    impl: WsImpl,
     pool: Optional[Pool[WsTransport]],
     provider: Optional[EventLoopProvider] = None,
     wire_keepalive: Optional[WireKeepalive] = None,
@@ -118,7 +122,7 @@ DEFAULT_POOLS: DefaultPools[WsTransport] = DefaultPools()
 def connect(
     url: Union[str, yarl.URL],
     *,
-    impl: str = "websockets",
+    impl: WsImpl = "websockets",
     pool: Optional[Pool[WsTransport]] = None,
     options: Optional[ConnectionOptions] = None,
 ) -> WsLease:
@@ -142,7 +146,10 @@ def connect(
     options = options or ConnectionOptions()
     pool = build_pool(impl, pool, options.provider, options.wire_keepalive)
     lease = pool.connect(url, options.retry or RetryPolicy())
-    assert isinstance(lease, WsLease)
+    if not isinstance(lease, WsLease):
+        raise TypeError(
+            f"ws.connect needs a pool handing out WsLease, got {type(lease).__name__}"
+        )
     if options.app_keepalive is not None:
         lease.keepalive(options.app_keepalive)
     return lease

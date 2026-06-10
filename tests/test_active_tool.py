@@ -10,7 +10,7 @@ def test_active_material_change(client: Client):
     # Change active_material on tool0
     client.printer.tool0.active_material = 1
 
-    messages, _ = client.consume()
+    messages = client.consume()
 
     assert len(messages) == 1
 

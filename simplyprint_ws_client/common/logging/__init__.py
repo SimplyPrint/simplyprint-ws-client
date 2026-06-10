@@ -19,7 +19,7 @@ import logging
 import logging.handlers
 import queue
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from simplyprint_ws_client.common.logging.config import LoggingConfig, RoutingRule
 from simplyprint_ws_client.common.logging.naming import (
@@ -118,6 +118,13 @@ def setup_logging(
     name-based :class:`RoutingHandler`. ``config`` tunes destinations, rotation
     and rendering.
     """
+    stop, _router = _setup_logging(settings, config)
+    return stop
+
+
+def _setup_logging(
+    settings: "ClientSettings", config: Optional[LoggingConfig] = None
+) -> "Tuple[Callable[[], None], RoutingHandler]":
     config = _resolve_config(settings, config or LoggingConfig())
     restore_levels = config.policy.apply_logger_levels()
 
@@ -150,14 +157,19 @@ def setup_logging(
         router.close()
         restore_levels()
 
-    return stop
+    return stop, router
 
 
 def configure_logging(
     settings: "ClientSettings", config: Optional[LoggingConfig] = None
 ) -> LoggingFacility:
     """Set logging up (via :func:`setup_logging`) and return a
-    :class:`LoggingFacility` whose :class:`LogStore` browses/retains the result."""
+    :class:`LoggingFacility` whose :class:`LogStore` browses/retains the result.
+
+    The store's prune path closes the router's open per-scope file handles
+    first, so pruning a printer actually releases its files and the handler
+    table cannot grow with printer churn."""
     config = _resolve_config(settings, config or LoggingConfig())
-    stop = setup_logging(settings, config)
-    return LoggingFacility(store=LogStore(config), stop=stop, config=config)
+    stop, router = _setup_logging(settings, config)
+    store = LogStore(config, on_scope_pruned=router.close_scope)
+    return LoggingFacility(store=store, stop=stop, config=config)

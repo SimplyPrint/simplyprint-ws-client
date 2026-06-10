@@ -16,6 +16,7 @@ from typing import List, Optional
 from simplyprint_ws_client.integration.discovery import netif
 from simplyprint_ws_client.integration.discovery.network import (
     DiagnosticCheckResult,
+    DiagnosticReason,
     HostDiagnostic,
     HostProbeContext,
     NetworkScanContext,
@@ -56,8 +57,6 @@ class SubnetScanBackend:
         )
 
     async def _probe(self, host: str, context: HostProbeContext, timeout: float):
-        import asyncio
-
         if self.spec.context_probe is not None:
             return await asyncio.wait_for(self.spec.context_probe(context), timeout)
         return await asyncio.wait_for(self.spec.probe(host), timeout)
@@ -116,7 +115,7 @@ class SubnetScanBackend:
                 services,
                 service_checks,
                 False,
-                "required_service_closed",
+                DiagnosticReason.REQUIRED_SERVICE_CLOSED,
                 self._closed_port_message(host, context),
             )
 
@@ -126,7 +125,7 @@ class SubnetScanBackend:
                 services,
                 service_checks,
                 None,
-                "required_services_open",
+                DiagnosticReason.REQUIRED_SERVICES_OPEN,
                 f"{host} is answering on the expected {self.spec.brand} port(s)",
             )
 
@@ -142,7 +141,7 @@ class SubnetScanBackend:
             probe_check = DiagnosticCheckResult(
                 id="probe:fingerprint",
                 status="error",
-                code="probe_error",
+                code=DiagnosticReason.PROBE_ERROR,
                 label="Printer fingerprint",
                 message="Fingerprint probe failed",
                 subject=host,
@@ -153,7 +152,7 @@ class SubnetScanBackend:
                 services,
                 (*service_checks, probe_check),
                 False,
-                "probe_error",
+                DiagnosticReason.PROBE_ERROR,
                 f"{host} answered on the expected port(s), but the probe failed",
             )
 
@@ -161,7 +160,7 @@ class SubnetScanBackend:
             probe_check = DiagnosticCheckResult(
                 id="probe:fingerprint",
                 status="error",
-                code="fingerprint_mismatch",
+                code=DiagnosticReason.FINGERPRINT_MISMATCH,
                 label="Printer fingerprint",
                 message=f"Response did not match {self.spec.brand}",
                 subject=host,
@@ -172,7 +171,7 @@ class SubnetScanBackend:
                 services,
                 (*service_checks, probe_check),
                 False,
-                "fingerprint_mismatch",
+                DiagnosticReason.FINGERPRINT_MISMATCH,
                 f"{host} answered, but did not look like {self.spec.brand}",
             )
 
@@ -190,7 +189,7 @@ class SubnetScanBackend:
             services,
             (*service_checks, probe_check),
             True,
-            "matched",
+            DiagnosticReason.MATCHED,
             f"{host} matched {self.spec.brand}",
         )
 
