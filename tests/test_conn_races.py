@@ -1,6 +1,6 @@
-"""Concurrency / race-condition tests for the ``contrib.connection`` connection library.
+"""Concurrency / race-condition tests for the ``device.connection`` connection library.
 
-These tests hammer the *shared, pooled* spine of ``contrib.connection`` from many
+These tests hammer the *shared, pooled* spine of ``device.connection`` from many
 directions at once on a single asyncio loop -- which is exactly where the library
 lives: the pool refcount, a lease's ``send`` racing a generation flip, concurrent
 subscribe/unsubscribe across leases against one refcounted broker socket, and
@@ -36,31 +36,31 @@ from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.contrib.connection import mqtt as mqtt_door
-from simplyprint_ws_client.contrib.connection.aiomqtt import AioMqtt
-from simplyprint_ws_client.contrib.connection.connection import MqttConnection
-from simplyprint_ws_client.contrib.connection.events import (
+from simplyprint_ws_client.device.connection import mqtt as mqtt_door
+from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
+from simplyprint_ws_client.device.connection.lease import MqttLease
+from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
-    ConnectionEvent,
+    WireEvent,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.mqtt import (
+from simplyprint_ws_client.device.connection.mqtt import (
     MqttBroker,
     mqtt_message_route,
 )
-from simplyprint_ws_client.contrib.connection.paho import Paho
-from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
-from simplyprint_ws_client.contrib.connection.pool import Pool
-from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import (
+from simplyprint_ws_client.common.wire.paho import Paho
+from simplyprint_ws_client.common.wire.policy import RetryPolicy
+from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.reconnect import Reconnecting
+from simplyprint_ws_client.common.wire.state import ConnectionState
+from simplyprint_ws_client.common.wire.transport import (
     NotConnected,
     TransientError,
     Transport,
 )
-from simplyprint_ws_client.contrib.connection.websockets import Websockets
+from simplyprint_ws_client.common.wire.websockets import Websockets
 
 
 # --------------------------------------------------------------------------- #
@@ -130,7 +130,7 @@ class CountingTransport(Transport):
         self.url = url
         self.state = ConnectionState.DISCONNECTED
         self.generation = 0
-        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.events: EventBus[WireEvent] = EventBus()
         self.starts = 0
         self.stops = 0
         self.stop_delay = stop_delay
@@ -674,7 +674,7 @@ def mqtt_pool(
         build=build,
         key=key,
         route=mqtt_message_route,
-        lease_class=MqttConnection,
+        lease_class=MqttLease,
         provider=current_provider(),
     )
 
@@ -738,7 +738,7 @@ async def test_interleaved_sub_unsub_never_drives_refcount_negative():
     await wait_for(lambda: leases[0].connected)
     client = clients[0]
 
-    async def churn(lease: MqttConnection) -> None:
+    async def churn(lease: MqttLease) -> None:
         for _ in range(6):
             await lease.subscribe("topic")
             await asyncio.sleep(0)
@@ -1090,12 +1090,12 @@ def ws_pool(sockets: List[FakeWsSocket]) -> Pool:
             logger=silent_logger(),
         )
 
-    from simplyprint_ws_client.contrib.connection.websocket import WsConnection
+    from simplyprint_ws_client.device.connection.websocket import WsLease
 
     return Pool(
         build=build,
         key=lambda url, params: str(url),
-        lease_class=WsConnection,
+        lease_class=WsLease,
         provider=current_provider(),
     )
 
@@ -1323,7 +1323,7 @@ def paho_pool(clients: List[FakePahoClient]) -> Pool:
         build=build,
         key=key,
         route=mqtt_message_route,
-        lease_class=MqttConnection,
+        lease_class=MqttLease,
         provider=current_provider(),
     )
 
@@ -1502,7 +1502,7 @@ async def test_front_door_connect_close_race_no_leaked_subscribe_task():
 
     # The front door records topics on the lease and tasks the wire subscribe.
     lease = mqtt_door.connect(url, pool=pool)
-    assert isinstance(lease, MqttConnection)
+    assert isinstance(lease, MqttLease)
     assert lease.topics == {"room/a", "room/b"}, lease.topics
 
     # Close immediately, racing the background subscribe tasks.

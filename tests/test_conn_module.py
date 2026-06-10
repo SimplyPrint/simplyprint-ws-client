@@ -1,4 +1,4 @@
-"""Brand-free tests for the new connection library (``contrib.connection``).
+"""Brand-free tests for the new connection library (``device.connection``).
 
 Every wire is faked and injected -- no real broker, socket, or wire library is
 touched. The fakes satisfy the same seams production wires do:
@@ -26,44 +26,44 @@ import yarl
 from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
-from simplyprint_ws_client.contrib.connection import (
-    Connection,
-    MqttConnection,
-    WsConnection,
+from simplyprint_ws_client.device.connection import (
+    Lease,
+    MqttLease,
+    WsLease,
 )
-from simplyprint_ws_client.contrib.connection.events import (
+from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
-    ConnectionEvent,
+    WireEvent,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.keepalive import (
+from simplyprint_ws_client.device.connection.keepalive import (
     Keepalive,
     KeepaliveTimeout,
 )
-from simplyprint_ws_client.contrib.connection.messages import QoS
-from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
-from simplyprint_ws_client.contrib.connection.pool import Pool
-from simplyprint_ws_client.contrib.connection.reconnect import Reconnecting
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import (
+from simplyprint_ws_client.common.wire.messages import QoS
+from simplyprint_ws_client.common.wire.policy import RetryPolicy
+from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.reconnect import Reconnecting
+from simplyprint_ws_client.common.wire.state import ConnectionState
+from simplyprint_ws_client.common.wire.transport import (
     MqttTransport,
     NotConnected,
     TransientError,
     Transport,
 )
 
-from simplyprint_ws_client.contrib.connection import mqtt
-from simplyprint_ws_client.contrib.connection import websocket as ws
-from simplyprint_ws_client.contrib.connection.aiomqtt import AioMqtt
-from simplyprint_ws_client.contrib.connection.mqtt import (
+from simplyprint_ws_client.device.connection import mqtt
+from simplyprint_ws_client.device.connection import websocket as ws
+from simplyprint_ws_client.common.wire.aiomqtt import AioMqtt
+from simplyprint_ws_client.device.connection.mqtt import (
     MqttBroker,
     MqttMessage,
     mqtt_message_route,
 )
-from simplyprint_ws_client.contrib.connection.websocket import WsMessage
-from simplyprint_ws_client.contrib.connection.websockets import Websockets
+from simplyprint_ws_client.device.connection.websocket import WsMessage
+from simplyprint_ws_client.common.wire.websockets import Websockets
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 
@@ -105,7 +105,7 @@ class FakeTransport(Transport):
         self.url = url
         self.state = ConnectionState.DISCONNECTED
         self.generation = 0
-        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.events: EventBus[WireEvent] = EventBus()
         self.starts = 0
         self.stops = 0
         self.sent: List[object] = []
@@ -239,7 +239,7 @@ async def test_lease_keepalive_probes_and_times_out_when_idle():
     transports: List[FakeTransport] = []
     pool = build_pool(transports)
     lease = pool.connect(yarl.URL("ws://host/path"))
-    probes: List[Connection] = []
+    probes: List[Lease] = []
     disconnected: List[object] = []
 
     lease.event_bus.on(Disconnected, lambda event: disconnected.append(event.code))
@@ -419,11 +419,11 @@ async def test_reconnecting_gives_up_when_policy_exhausted():
 
 
 # --------------------------------------------------------------------------- #
-# Connection lease: inbound delivery, ready(), send(), ready_transport().
+# Lease lease: inbound delivery, ready(), send(), ready_transport().
 # --------------------------------------------------------------------------- #
 
 
-def lease_on(transport: FakeTransport, lease_cls=Connection) -> Connection:
+def lease_on(transport: FakeTransport, lease_cls=Lease) -> Lease:
     """A standalone lease over ``transport`` with a real (but ignored) pool.
 
     The lease only delegates ``close`` to the pool; for delivery/ready/send tests we
@@ -573,7 +573,7 @@ class WireMqttMessage:
 
 def build_mqtt_pool(clients: List[FakeAioMqttClient]) -> Pool:
     """A pool of :class:`AioMqtt` wired to fresh fake clients, keyed by broker
-    endpoint, handing out :class:`MqttConnection` leases."""
+    endpoint, handing out :class:`MqttLease` leases."""
 
     def factory(url, logger):
         client = FakeAioMqttClient()
@@ -595,7 +595,7 @@ def build_mqtt_pool(clients: List[FakeAioMqttClient]) -> Pool:
         build=build,
         key=key,
         route=mqtt_message_route,
-        lease_class=MqttConnection,
+        lease_class=MqttLease,
         provider=current_provider(),
     )
 
@@ -730,7 +730,7 @@ def build_ws_pool(sockets: List[FakeWsSocket]) -> Pool:
     return Pool(
         build=build,
         key=lambda url, params: str(url),
-        lease_class=WsConnection,
+        lease_class=WsLease,
         provider=current_provider(),
     )
 
@@ -809,7 +809,7 @@ async def test_lease_event_bus_preserves_lifecycle_order():
     lease = lease_on(transport)
     seen: List[type] = []
 
-    async def slow(event: ConnectionEvent) -> None:
+    async def slow(event: WireEvent) -> None:
         await asyncio.sleep(0)
         seen.append(type(event))
 
@@ -855,8 +855,8 @@ async def test_mqtt_connect_returns_lease_and_applies_url_topics():
     url = yarl.URL("mqtt://broker/?topic=foo/%23")  # foo/# url-encoded
 
     lease = mqtt.connect(url, pool=pool)
-    assert isinstance(lease, MqttConnection)
-    assert isinstance(lease, MqttConnection)
+    assert isinstance(lease, MqttLease)
+    assert isinstance(lease, MqttLease)
 
     # The URL's ?topic= is recorded on the lease synchronously for routing,
     # and asserted on the shared socket once it comes up.
@@ -904,8 +904,8 @@ async def test_ws_connect_returns_ws_lease():
     url = yarl.URL("wss://host/socket")
 
     lease = ws.connect(url, pool=pool)
-    assert isinstance(lease, WsConnection)
-    assert not isinstance(lease, MqttConnection)
+    assert isinstance(lease, WsLease)
+    assert not isinstance(lease, MqttLease)
 
     await wait_for(lambda: lease.connected)
     got: List[str] = []

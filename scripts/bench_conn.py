@@ -47,27 +47,27 @@ from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
-from simplyprint_ws_client.contrib.connection import mqtt, ws
-from simplyprint_ws_client.contrib.connection.connection import Connection
-from simplyprint_ws_client.contrib.connection.connection import MqttConnection
-from simplyprint_ws_client.contrib.connection.events import (
+from simplyprint_ws_client.device.connection import mqtt, ws
+from simplyprint_ws_client.device.connection.lease import Lease
+from simplyprint_ws_client.device.connection.lease import MqttLease
+from simplyprint_ws_client.common.wire.events import (
     Connected,
     Connecting,
-    ConnectionEvent,
+    WireEvent,
     Disconnected,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.errors import TransportError
-from simplyprint_ws_client.contrib.connection.messages import (
+from simplyprint_ws_client.common.wire.errors import TransportError
+from simplyprint_ws_client.common.wire.messages import (
     MqttMessage,
     QoS,
     WsMessage,
 )
-from simplyprint_ws_client.contrib.connection.mqtt import mqtt_message_route
-from simplyprint_ws_client.contrib.connection.policy import RetryPolicy
-from simplyprint_ws_client.contrib.connection.pool import Pool
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import (
+from simplyprint_ws_client.device.connection.mqtt import mqtt_message_route
+from simplyprint_ws_client.common.wire.policy import RetryPolicy
+from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.state import ConnectionState
+from simplyprint_ws_client.common.wire.transport import (
     MqttTransport,
     NotConnected,
     Transport,
@@ -108,7 +108,7 @@ class FakeTransport(Transport):
         self.url = url
         self.state = ConnectionState.DISCONNECTED
         self.generation = 1
-        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.events: EventBus[WireEvent] = EventBus()
         self.live = False
         self.sent: List[object] = []
 
@@ -140,7 +140,7 @@ class FakeMqttTransport(MqttTransport):
         self.url = url
         self.state = ConnectionState.DISCONNECTED
         self.generation = 1
-        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.events: EventBus[WireEvent] = EventBus()
         self.live = False
         self.subscriptions: List[str] = []
 
@@ -277,7 +277,7 @@ def build_mqtt_pool(transports: List[FakeMqttTransport]) -> Pool[FakeMqttTranspo
         build=build,
         key=lambda url, _params: str(url),
         route=mqtt_message_route,
-        lease_class=MqttConnection,
+        lease_class=MqttLease,
         provider=EventLoopProvider(loop=asyncio.get_running_loop()),
     )
 
@@ -292,7 +292,7 @@ async def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None
     raise TimeoutError("benchmark condition did not complete")
 
 
-async def close_lease(lease: Connection) -> None:
+async def close_lease(lease: Lease) -> None:
     await lease.close()
     await asyncio.sleep(0)
 
@@ -457,7 +457,7 @@ async def mqtt_topic_pool_throughput(
     transports: List[FakeMqttTransport] = []
     pool = build_mqtt_pool(transports)
     transport_count = min(transport_count, topic_count)
-    leases: List[MqttConnection] = []
+    leases: List[MqttLease] = []
     topics: List[str] = []
     processed = 0
 
@@ -469,8 +469,8 @@ async def mqtt_topic_pool_throughput(
         endpoint = index % transport_count
         topic = f"bench/{endpoint}/{index}"
         lease = pool.connect(yarl.URL(f"mqtt://broker-{endpoint}/"))
-        if not isinstance(lease, MqttConnection):
-            raise TypeError("mqtt pool did not return an MqttConnection")
+        if not isinstance(lease, MqttLease):
+            raise TypeError("mqtt pool did not return an MqttLease")
         await lease.subscribe(topic)
         lease.event_bus.on(MessageReceived, handler)
         leases.append(lease)
@@ -529,7 +529,7 @@ async def mqtt_flaky_topic_pool_throughput(
     transports: List[FakeMqttTransport] = []
     pool = build_mqtt_pool(transports)
     transport_count = min(transport_count, topic_count)
-    leases: List[MqttConnection] = []
+    leases: List[MqttLease] = []
     topics: List[str] = []
     lease_counts = [0 for _ in range(transport_count)]
     processed = 0
@@ -557,8 +557,8 @@ async def mqtt_flaky_topic_pool_throughput(
         endpoint = index % transport_count
         topic = f"bench/flaky/{endpoint}/{index}"
         lease = pool.connect(yarl.URL(f"mqtt://flaky-broker-{endpoint}/"))
-        if not isinstance(lease, MqttConnection):
-            raise TypeError("mqtt pool did not return an MqttConnection")
+        if not isinstance(lease, MqttLease):
+            raise TypeError("mqtt pool did not return an MqttLease")
         await lease.subscribe(topic)
         lease.event_bus.on(MessageReceived, on_message)
         lease.event_bus.on(Connecting, on_connecting)

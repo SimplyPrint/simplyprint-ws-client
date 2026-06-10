@@ -16,11 +16,11 @@ from simplyprint_ws_client import (
     PrinterConfig,
     PrinterStatus,
 )
-from simplyprint_ws_client.shared.camera.base import (
+from simplyprint_ws_client.device.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
 )
-from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
+from simplyprint_ws_client.device.camera.mixin import ClientCameraMixin
 
 
 def expt_smooth(target, actual, alpha, dt) -> float:

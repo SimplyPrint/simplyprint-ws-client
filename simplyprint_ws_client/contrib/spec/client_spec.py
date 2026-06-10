@@ -34,8 +34,8 @@ from simplyprint_ws_client.core.settings import ClientSpec
 
 if TYPE_CHECKING:
     from simplyprint_ws_client import PrinterConfig
-    from simplyprint_ws_client.contrib.accounts import AccountProvider
-    from simplyprint_ws_client.contrib.discovery.spec import (
+    from simplyprint_ws_client.device.accounts import AccountProvider
+    from simplyprint_ws_client.device.discovery.spec import (
         MDNSSpec,
         MulticastSpec,
         NetworkServiceSpec,

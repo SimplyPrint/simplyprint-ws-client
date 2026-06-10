@@ -2,7 +2,7 @@
 
 This is the SimplyPrint **protocol** multiplexing layer, and it lives in ``core``
 on purpose -- it is *not* the brand-free connection pool
-(:mod:`...contrib.connection.pool`) and must not be folded into it. The two share
+(:mod:`...device.connection.pool`) and must not be folded into it. The two share
 a vague silhouette ("fan one socket to N consumers") but differ in the essential
 logic, which is the test for whether things are the same (they are not):
 
@@ -18,7 +18,7 @@ logic, which is the test for whether things are the same (they are not):
   the no-brand-leak rule. So this stays here.
 
 * **Reconnection is not duplicated here.** Each backend :class:`CloudConnection` rides
-  the shared :class:`~...contrib.connection.reconnect.Reconnecting` engine (connect /
+  the shared :class:`~...common.wire.reconnect.Reconnecting` engine (connect /
   backoff / liveness / single version bump). In MULTI mode the one shared
   ``CloudConnection`` gets that for free; :class:`ClientView` only fans its events to the
   right client(s). There is no PAUSE state: a client's "pause" is releasing its hold

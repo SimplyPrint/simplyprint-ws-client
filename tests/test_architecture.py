@@ -27,7 +27,7 @@ BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centa
 
 # The layer dirs the alias/star shim scans cover (root __init__.py's lazy PEP 562
 # re-export hub is the one sanctioned exception and lives outside these dirs).
-LAYER_DIRS = ("cloud", "common", "contrib", "core", "shared")
+LAYER_DIRS = ("cloud", "common", "contrib", "core", "device", "shared")
 
 
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
@@ -110,10 +110,10 @@ _DISCOVERY_LEAK_TOKENS = (
 
 
 def test_discovery_has_no_brand_ports_or_topics():
-    """contrib/discovery is brand-agnostic machinery: even as plain strings, brand
+    """device/discovery is brand-agnostic machinery: even as plain strings, brand
     ports / SSDP topic shapes must not appear (they live only in each integration's
     per-brand discovery spec)."""
-    root = LIB_PKG / "contrib" / "discovery"
+    root = LIB_PKG / "device" / "discovery"
     offenders = []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -122,7 +122,7 @@ def test_discovery_has_no_brand_ports_or_topics():
         for token in _DISCOVERY_LEAK_TOKENS:
             if token in text:
                 offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
-    assert offenders == [], f"brand port/topic leak in contrib/discovery: {offenders}"
+    assert offenders == [], f"brand port/topic leak in device/discovery: {offenders}"
 
 
 # Brand cloud field / login-type tokens that must never appear in the shared
@@ -132,10 +132,10 @@ _ACCOUNT_LEAK_TOKENS = ("verifycode", "tfakey", "bambulab")
 
 
 def test_accounts_has_no_brand_field_tokens():
-    """contrib/accounts is the neutral cloud-account surface: no brand cloud API
+    """device/accounts is the neutral cloud-account surface: no brand cloud API
     field / login-type token may appear (they live only in each integration's
     concrete provider)."""
-    root = LIB_PKG / "contrib" / "accounts"
+    root = LIB_PKG / "device" / "accounts"
     offenders = []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -144,7 +144,7 @@ def test_accounts_has_no_brand_field_tokens():
         for token in _ACCOUNT_LEAK_TOKENS:
             if token in text:
                 offenders.append(f"{path.relative_to(LIB_PKG)}: {token}")
-    assert offenders == [], f"brand field-token leak in contrib/accounts: {offenders}"
+    assert offenders == [], f"brand field-token leak in device/accounts: {offenders}"
 
 
 class TestNoShims:
@@ -206,17 +206,17 @@ class TestNoShims:
     def test_job_lock_module_removed(self):
         """SHIM (B1): job_lock.py is gone; set_active_job absorbed into FileTransfer.
 
-        ``contrib/transfer/job_lock.py`` exposed a free ``set_active_job()`` (a
+        ``transfer/job_lock.py`` (now under device/) exposed a free ``set_active_job()`` (a
         misnomer — it owned no lock, just three lines of active-job bookkeeping).
         That behavior now lives on the prepare-lifecycle-owning class as
         ``FileTransfer._set_active_job_for_prepare``. This guards against the
         module being resurrected and the free function creeping back into the
-        ``contrib.transfer`` surface.
+        ``device.transfer`` surface.
         """
         import importlib
 
         # 1. The module no longer exists.
-        jl = LIB_PKG / "contrib" / "transfer" / "job_lock.py"
+        jl = LIB_PKG / "device" / "transfer" / "job_lock.py"
         assert not jl.exists(), (
             "job_lock.py must be deleted; set_active_job is now "
             "FileTransfer._set_active_job_for_prepare"
@@ -224,13 +224,13 @@ class TestNoShims:
 
         # 2. Importing the dead module path raises ImportError.
         with pytest.raises(ImportError):
-            importlib.import_module("simplyprint_ws_client.contrib.transfer.job_lock")
+            importlib.import_module("simplyprint_ws_client.device.transfer.job_lock")
 
-        # 3. set_active_job is NOT exported from contrib.transfer.
-        from simplyprint_ws_client.contrib import transfer
+        # 3. set_active_job is NOT exported from device.transfer.
+        from simplyprint_ws_client.device import transfer
 
         assert not hasattr(transfer, "set_active_job"), (
-            "contrib.transfer still exports a `set_active_job` free function"
+            "device.transfer still exports a `set_active_job` free function"
         )
 
         # 4. The behavior lives on FileTransfer.

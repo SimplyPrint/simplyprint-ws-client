@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from simplyprint_ws_client import FileProgressStateEnum
-from simplyprint_ws_client.contrib.transfer import download_to_file
+from simplyprint_ws_client.device.transfer import download_to_file
 
 
 class FakeContent:

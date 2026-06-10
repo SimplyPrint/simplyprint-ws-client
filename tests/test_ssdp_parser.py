@@ -1,6 +1,6 @@
 """Tests for the shared SSDP request parser."""
 
-from simplyprint_ws_client.contrib.discovery import (
+from simplyprint_ws_client.device.discovery import (
     DiscoveredDevice,
     SSDPRequest,
     SSDPRequestParser,

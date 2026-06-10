@@ -8,7 +8,7 @@ from simplyprint_ws_client.cloud.config import PrinterConfig
 from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode
 from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
-from simplyprint_ws_client.shared.camera.base import BaseCameraProtocol
+from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
 from simplyprint_ws_client.cloud.api.url_builder import SimplyPrintBackend
 
 TAnyClient = TypeVar("TAnyClient", bound=Client)

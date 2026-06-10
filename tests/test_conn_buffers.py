@@ -8,15 +8,15 @@ from typing import List, Optional
 import pytest
 import yarl
 
-from simplyprint_ws_client.contrib.connection import Connection
-from simplyprint_ws_client.contrib.connection.events import (
+from simplyprint_ws_client.device.connection import Lease
+from simplyprint_ws_client.common.wire.events import (
     Connected,
-    ConnectionEvent,
+    WireEvent,
     MessageReceived,
 )
-from simplyprint_ws_client.contrib.connection.pool import Pool
-from simplyprint_ws_client.contrib.connection.state import ConnectionState
-from simplyprint_ws_client.contrib.connection.transport import Transport
+from simplyprint_ws_client.device.connection.pool import Pool
+from simplyprint_ws_client.common.wire.state import ConnectionState
+from simplyprint_ws_client.common.wire.transport import Transport
 from simplyprint_ws_client.common.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
@@ -26,7 +26,7 @@ class FakeTransport(Transport):
         self.url = url
         self.state = ConnectionState.DISCONNECTED
         self.generation = 0
-        self.events: EventBus[ConnectionEvent] = EventBus()
+        self.events: EventBus[WireEvent] = EventBus()
         self.live = False
         self.stops = 0
 
@@ -217,7 +217,7 @@ async def test_lease_close_cancels_owned_delivery_task():
 async def test_direct_lease_event_bus_does_not_drop_bursts():
     transports: List[FakeTransport] = []
     pool = build_pool(transports)
-    lease: Connection = pool.connect(yarl.URL("ws://host/path"))
+    lease: Lease = pool.connect(yarl.URL("ws://host/path"))
     got = []
 
     async def on_message(event: MessageReceived) -> None:
