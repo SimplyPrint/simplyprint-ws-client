@@ -5,7 +5,7 @@ The names below are the supported, author-facing public API. In short:
 * Subclass :class:`Client` to boil your device into a :class:`PrinterState`, and
   mark demand/message handlers with :func:`configure`. (The device-side authoring
   base builds on this.)
-* Declare your client type with a :class:`ClientSpec`, configure the process via
+* Declare your client type with a :class:`PrinterSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
 Deeper modules (``simplyprint_ws_client.cloud.*``, ``...common.*``, ``...contrib.*``)
@@ -50,7 +50,7 @@ _PUBLIC = (
     "configure",
     "ClientApp",
     "ClientSettings",
-    "ClientSpec",
+    "PrinterSpec",
     "ConnectionMode",
     "PrinterConfig",
     "Config",

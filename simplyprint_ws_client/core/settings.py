@@ -1,49 +1,18 @@
-__all__ = ["ClientSettings", "ClientFactory", "ClientSpec"]
+__all__ = ["ClientSettings"]
 
 from dataclasses import dataclass
-from typing import Optional, Type, Union, Callable, Protocol, TypeVar, List, Sequence
+from typing import Optional, Type, List, Sequence
 
-from simplyprint_ws_client.cloud.client import Client
-from simplyprint_ws_client.cloud.config import PrinterConfig
 from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.cloud.protocol.connection import ConnectionMode
 from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.device.camera.base import BaseCameraProtocol
 from simplyprint_ws_client.cloud.api.url_builder import SimplyPrintBackend
-
-TAnyClient = TypeVar("TAnyClient", bound=Client)
-TAnyPrinterConfig = TypeVar("TAnyPrinterConfig", bound=PrinterConfig)
-
-
-class ClientFactory(Protocol):
-    def __call__(self, config: TAnyPrinterConfig, *args, **kwargs) -> TAnyClient: ...
-
-
-TClientFactory = Union[Type[TAnyClient], ClientFactory]
-TConfigFactory = Union[Type[TAnyPrinterConfig], Callable[..., TAnyPrinterConfig]]
-
-
-@dataclass(frozen=True)
-class ClientSpec:
-    key: str
-    client_factory: TClientFactory
-    config_factory: TConfigFactory
-    name: Optional[str] = None
-    config_manager_t: Optional[ConfigManagerType] = None
-    allow_setup: Optional[bool] = None
-    #: Camera protocol classes this client type can drive. Generic (every entry
-    #: is a library ``BaseCameraProtocol``), so an integration declares its
-    #: per-client cameras here instead of in a parallel descriptor.
-    camera_protocols: tuple[Type[BaseCameraProtocol], ...] = ()
-
-    def storage_name(self, app_name: Optional[str], multiple: bool) -> Optional[str]:
-        if self.name is not None:
-            return self.name
-
-        if not multiple:
-            return app_name
-
-        return f"{app_name}-{self.key}" if app_name else self.key
+from simplyprint_ws_client.integration.spec import (
+    PrinterSpec,
+    TClientFactory,
+    TConfigFactory,
+)
 
 
 @dataclass
@@ -64,9 +33,9 @@ class ClientSettings:
     sentry_dsn: Optional[str] = None
     camera_workers: Optional[int] = None
     camera_protocols: Optional[List[Type[BaseCameraProtocol]]] = None
-    client_specs: Optional[Sequence[ClientSpec]] = None
+    client_specs: Optional[Sequence[PrinterSpec]] = None
 
-    def resolved_client_specs(self) -> tuple[ClientSpec, ...]:
+    def resolved_client_specs(self) -> tuple[PrinterSpec, ...]:
         if self.client_specs is not None:
             specs = tuple(self.client_specs)
 
@@ -86,7 +55,7 @@ class ClientSettings:
             )
 
         return (
-            ClientSpec(
+            PrinterSpec(
                 key="default",
                 client_factory=self.client_factory,
                 config_factory=self.config_factory,
@@ -96,7 +65,7 @@ class ClientSettings:
             ),
         )
 
-    def get_client_spec(self, key: Optional[str] = None) -> ClientSpec:
+    def get_client_spec(self, key: Optional[str] = None) -> PrinterSpec:
         specs = self.resolved_client_specs()
 
         if key is None:

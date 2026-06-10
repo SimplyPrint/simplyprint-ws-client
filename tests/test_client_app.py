@@ -2,7 +2,7 @@ import pytest
 
 from simplyprint_ws_client import (
     ClientSettings,
-    ClientSpec,
+    PrinterSpec,
     Client,
     PrinterConfig,
     ClientApp,
@@ -60,8 +60,8 @@ def test_multi_client_specs_route_configs_by_type():
     settings = ClientSettings(
         name="multi",
         client_specs=(
-            ClientSpec("first", FirstClient, PrinterConfig),
-            ClientSpec("second", SecondClient, SecondConfig),
+            PrinterSpec("first", FirstClient, PrinterConfig),
+            PrinterSpec("second", SecondClient, SecondConfig),
         ),
     )
     app = ClientApp(settings)
@@ -86,8 +86,8 @@ def test_multi_client_specs_require_key_for_ambiguous_config_type():
     settings = ClientSettings(
         name="multi",
         client_specs=(
-            ClientSpec("first", FirstClient, PrinterConfig),
-            ClientSpec("second", SecondClient, PrinterConfig),
+            PrinterSpec("first", FirstClient, PrinterConfig),
+            PrinterSpec("second", SecondClient, PrinterConfig),
         ),
     )
     app = ClientApp(settings)

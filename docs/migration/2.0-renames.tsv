@@ -64,3 +64,9 @@ simplyprint_ws_client.integration.client.PrinterClient._start_connection	(delete
 simplyprint_ws_client.integration.client.PrinterClient._connection_components	(deleted — teardown() stops declared drivers)	api	C
 simplyprint_ws_client.integration.client.PrinterClient.on_connected_to_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_connected	api	C
 simplyprint_ws_client.integration.client.PrinterClient.on_disconnected_from_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_disconnected	api	C
+simplyprint_ws_client.core.settings.ClientSpec	simplyprint_ws_client.integration.spec.PrinterSpec	class	C
+simplyprint_ws_client.contrib.spec.client_spec.PrinterClientSpec	simplyprint_ws_client.integration.spec.PrinterSpec	class	C
+simplyprint_ws_client.contrib.flow	simplyprint_ws_client.integration.flow	module	C
+simplyprint_ws_client.contrib.spec	simplyprint_ws_client.integration.spec	module	C
+simplyprint_ws_client.contrib.presentation	simplyprint_ws_client.integration.presentation	module	C
+simplyprint_ws_client.contrib.tasks	simplyprint_ws_client.integration.tasks	module	C

@@ -15,7 +15,7 @@ from simplyprint_ws_client.cloud.config import PrinterConfig
 from simplyprint_ws_client.core.config import ConfigManager
 from simplyprint_ws_client.core.connection_manager import ClientList
 from simplyprint_ws_client.core.scheduler import Scheduler
-from simplyprint_ws_client.core.settings import ClientSettings, ClientSpec
+from simplyprint_ws_client.core.settings import ClientSettings, PrinterSpec
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
 from simplyprint_ws_client.device.camera.pool import CameraPool
 from simplyprint_ws_client.cloud.api.sentry import Sentry
@@ -29,7 +29,7 @@ class ClientApp(SyncStoppable):
     scheduler: Scheduler
     config_manager: ConfigManager[PrinterConfig]
     config_managers: Dict[str, ConfigManager[PrinterConfig]]
-    client_specs: Dict[str, ClientSpec]
+    client_specs: Dict[str, PrinterSpec]
     camera_pool: Optional[CameraPool] = None
     logger: logging.Logger
 
@@ -119,7 +119,7 @@ class ClientApp(SyncStoppable):
 
     def _get_client_spec(
         self, config: Optional[PrinterConfig] = None, client_key: Optional[str] = None
-    ) -> ClientSpec:
+    ) -> PrinterSpec:
         if client_key is not None:
             return self.client_specs[client_key]
 
