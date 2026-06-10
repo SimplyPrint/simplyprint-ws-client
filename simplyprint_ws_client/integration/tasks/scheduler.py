@@ -1,6 +1,6 @@
 """The one place that drives a scheduler backend: :class:`SchedulerService`.
 
-Reads the :data:`~simplyprint_ws_client.contrib.tasks.registry.REGISTRY` once at
+Reads the :data:`~simplyprint_ws_client.integration.tasks.registry.REGISTRY` once at
 startup and arranges every task's firing on APScheduler (3.x; the v4 ``add_job``
 -> ``add_schedule`` rename is confined to this file). It is also the single entry
 point for the two firing paths a task supports:
@@ -41,9 +41,9 @@ from simplyprint_ws_client.contrib.status.registry import (
     StatusRegistry,
     StatusState,
 )
-from simplyprint_ws_client.contrib.tasks.context import TaskContext
-from simplyprint_ws_client.contrib.tasks.registry import REGISTRY, TaskRegistry
-from simplyprint_ws_client.contrib.tasks.spec import TaskSpec
+from simplyprint_ws_client.integration.tasks.context import TaskContext
+from simplyprint_ws_client.integration.tasks.registry import REGISTRY, TaskRegistry
+from simplyprint_ws_client.integration.tasks.spec import TaskSpec
 
 logger = logging.getLogger("simplyprint.tasks")
 

@@ -3,14 +3,14 @@
 A ``TaskSpec`` is *what* a task is and *how* it should run -- its name, the
 coroutine that does the work, and the run policy (interval or cron, timeout,
 overlap guards). It deliberately knows nothing about *when* it actually fires or
-*who* fires it: a :class:`~simplyprint_ws_client.contrib.tasks.scheduler.SchedulerService`
+*who* fires it: a :class:`~simplyprint_ws_client.integration.tasks.scheduler.SchedulerService`
 reads the spec and arranges the firing, and the same spec can be fired on demand.
 
 This is the split APScheduler v4 itself adopts (Task vs Schedule vs Job);
 modelling it here means our own code never re-couples them and a future v4 move
 is confined to the scheduler. A spec names no brand and holds no live object --
 it is pure data plus a coroutine, registered once at import time via
-:meth:`~simplyprint_ws_client.contrib.tasks.registry.TaskRegistry.periodic`.
+:meth:`~simplyprint_ws_client.integration.tasks.registry.TaskRegistry.periodic`.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from datetime import timedelta
 from typing import Awaitable, Callable, Optional
 
 #: A task body. Receives the runtime
-#: :class:`~simplyprint_ws_client.contrib.tasks.context.TaskContext` and performs
+#: :class:`~simplyprint_ws_client.integration.tasks.context.TaskContext` and performs
 #: one unit of work; its return value is ignored -- a task reports by publishing
 #: to the status registry, not by returning.
 TaskFn = Callable[..., Awaitable[object]]
@@ -44,7 +44,7 @@ class TaskSpec:
 
     fn: TaskFn
     """The coroutine that does the work. Invoked as ``fn(ctx)`` with a
-    :class:`~simplyprint_ws_client.contrib.tasks.context.TaskContext`."""
+    :class:`~simplyprint_ws_client.integration.tasks.context.TaskContext`."""
 
     interval: Optional[timedelta] = None
     """Fixed-cadence schedule. Mutually exclusive with ``cron``."""

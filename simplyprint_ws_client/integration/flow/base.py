@@ -306,7 +306,7 @@ async def resolve(value):
 
 class Step(ABC):
     """One stage of a flow. Subclass for bespoke logic; or compose the kit in
-    :mod:`simplyprint_ws_client.contrib.flow.steps`.
+    :mod:`simplyprint_ws_client.integration.flow.steps`.
 
     A step is asked to :meth:`run` with the accumulated ``state`` and the
     ``answer`` to the prompt it last :class:`Ask` ed (``None`` before it has

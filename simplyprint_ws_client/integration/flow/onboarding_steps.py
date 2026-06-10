@@ -1,6 +1,6 @@
 """Shared building blocks for add-printer onboarding flows.
 
-These sit on top of the generic :mod:`~simplyprint_ws_client.contrib.flow` engine:
+These sit on top of the generic :mod:`~simplyprint_ws_client.integration.flow` engine:
 they are factories that build add-printer :class:`FieldsStep` s (a model picker, a
 manual-address field). The library owns neutral step construction only --
 integrations adapt their own model catalogues, image URLs, state keys, and address
@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 from pydantic import ConfigDict, Field, create_model
 
-from simplyprint_ws_client.contrib.flow.steps import FieldsStep
+from simplyprint_ws_client.integration.flow.steps import FieldsStep
 
 #: The trailing "I don't know my model" option every picker offers, so a user is
 #: never blocked and an unknown model falls back to the generic guide.

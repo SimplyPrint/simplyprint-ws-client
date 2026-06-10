@@ -1,6 +1,6 @@
 """Runtime handle a task receives when it runs: :class:`TaskContext`.
 
-A :class:`~simplyprint_ws_client.contrib.tasks.spec.TaskSpec` is pure
+A :class:`~simplyprint_ws_client.integration.tasks.spec.TaskSpec` is pure
 declaration; when the scheduler (or an on-demand trigger) runs the task it calls
 ``spec.fn(ctx)`` with a ``TaskContext``. The context is how a task reaches the
 wired runtime -- chiefly the

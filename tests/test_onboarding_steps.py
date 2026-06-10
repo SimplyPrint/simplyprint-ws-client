@@ -1,7 +1,7 @@
 from ipaddress import IPv4Address
 from typing import Union
 
-from simplyprint_ws_client.contrib.flow import (
+from simplyprint_ws_client.integration.flow import (
     ManualAddressStep,
     ModelChoiceCatalog,
 )

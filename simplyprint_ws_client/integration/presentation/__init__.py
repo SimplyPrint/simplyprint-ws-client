@@ -1,6 +1,6 @@
 """Reusable printer-card presentation contract (see :mod:`.base`)."""
 
-from simplyprint_ws_client.contrib.presentation.base import (
+from simplyprint_ws_client.integration.presentation.base import (
     EditableField,
     EditableFieldOption,
     NAME_FIELD,

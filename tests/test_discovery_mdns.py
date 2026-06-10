@@ -276,7 +276,7 @@ async def test_discovery_service_builds_mdns_backend_and_snapshots():
 
 
 def test_printer_client_spec_mdns_hook_is_opt_in():
-    from simplyprint_ws_client.contrib.spec.client_spec import PrinterClientSpec
+    from simplyprint_ws_client.integration.spec import PrinterClientSpec
 
     assert PrinterClientSpec.mdns_spec() is None
     assert PrinterClientSpec.provides("mdns_spec") is False

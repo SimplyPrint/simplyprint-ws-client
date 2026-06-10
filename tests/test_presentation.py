@@ -1,4 +1,4 @@
-from simplyprint_ws_client.contrib.presentation import default_printer_presentation
+from simplyprint_ws_client.integration.presentation import default_printer_presentation
 
 
 def test_default_printer_presentation_does_not_infer_config_fields():

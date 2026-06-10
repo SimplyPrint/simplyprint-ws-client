@@ -3,9 +3,9 @@
 Every recurring or triggerable task is declared with the
 :meth:`REGISTRY.periodic <TaskRegistry.periodic>` decorator next to the coroutine
 that implements it. The registry is a passive inventory -- it collects
-:class:`~simplyprint_ws_client.contrib.tasks.spec.TaskSpec` s and never runs
+:class:`~simplyprint_ws_client.integration.tasks.spec.TaskSpec` s and never runs
 anything. At startup the app's single
-:class:`~simplyprint_ws_client.contrib.tasks.scheduler.SchedulerService` walks the
+:class:`~simplyprint_ws_client.integration.tasks.scheduler.SchedulerService` walks the
 registry and arranges the firing; that service is the *only* code that touches
 the scheduler backend.
 
@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Callable, Dict, Optional, ValuesView
 
-from simplyprint_ws_client.contrib.tasks.spec import TaskFn, TaskSpec
+from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
 
 
 class TaskRegistry:

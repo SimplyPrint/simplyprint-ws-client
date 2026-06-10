@@ -29,7 +29,7 @@ from typing import (
     Union,
 )
 
-from simplyprint_ws_client.contrib.flow.base import (
+from simplyprint_ws_client.integration.flow.base import (
     Advance,
     Ask,
     Choice,

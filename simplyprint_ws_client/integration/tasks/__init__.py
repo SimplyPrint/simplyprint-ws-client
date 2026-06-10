@@ -18,7 +18,7 @@ Example -- a producer codes against this contract::
     import time
     from datetime import timedelta
 
-    from simplyprint_ws_client.contrib.tasks import REGISTRY, TaskContext
+    from simplyprint_ws_client.integration.tasks import REGISTRY, TaskContext
     from simplyprint_ws_client.contrib.status import StatusEntry, StatusState
 
     @REGISTRY.periodic(interval=timedelta(hours=1), name="ota.check")
@@ -33,10 +33,10 @@ Example -- a producer codes against this contract::
         ))
 """
 
-from simplyprint_ws_client.contrib.tasks.context import TaskContext
-from simplyprint_ws_client.contrib.tasks.registry import REGISTRY, TaskRegistry
-from simplyprint_ws_client.contrib.tasks.scheduler import SchedulerService
-from simplyprint_ws_client.contrib.tasks.spec import TaskFn, TaskSpec
+from simplyprint_ws_client.integration.tasks.context import TaskContext
+from simplyprint_ws_client.integration.tasks.registry import REGISTRY, TaskRegistry
+from simplyprint_ws_client.integration.tasks.scheduler import SchedulerService
+from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
 
 __all__ = [
     "TaskSpec",

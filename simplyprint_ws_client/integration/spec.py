@@ -41,9 +41,9 @@ if TYPE_CHECKING:
         NetworkServiceSpec,
         SubnetScanSpec,
     )
-    from simplyprint_ws_client.contrib.flow import Flow
-    from simplyprint_ws_client.contrib.presentation import PrinterPresentation
-    from simplyprint_ws_client.contrib.tasks import TaskRegistry
+    from simplyprint_ws_client.integration.flow import Flow
+    from simplyprint_ws_client.integration.presentation import PrinterPresentation
+    from simplyprint_ws_client.integration.tasks import TaskRegistry
 
 
 class BackgroundService(Protocol):
@@ -172,7 +172,7 @@ class PrinterClientSpec(ClientSpec):
         to hide secrets, expose editable fields, or resolve model-specific photos
         override this hook in their own spec.
         """
-        from simplyprint_ws_client.contrib.presentation import (
+        from simplyprint_ws_client.integration.presentation import (
             default_printer_presentation,
         )
 

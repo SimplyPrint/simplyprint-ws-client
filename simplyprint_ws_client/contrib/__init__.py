@@ -3,7 +3,7 @@
 ``contrib`` is the home for the library's building blocks -- the
 :mod:`~simplyprint_ws_client.device.connection` subsystem (pooled, self-healing
 connections with the per-protocol ``mqtt`` / ``ws`` front doors), the guided
-:mod:`~simplyprint_ws_client.contrib.flow` engine, and the
+:mod:`~simplyprint_ws_client.integration.flow` engine, and the
 :mod:`~simplyprint_ws_client.contrib.logging` facility. Import the submodule you
 need (e.g. ``from simplyprint_ws_client.device.connection import ws``); the common
 names are also re-exported from the package root ``simplyprint_ws_client``.

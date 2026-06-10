@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import pytest
 
-from simplyprint_ws_client.contrib.flow import (
+from simplyprint_ws_client.integration.flow import (
     ActionStep,
     Advance,
     Ask,
@@ -498,7 +498,7 @@ async def test_fields_step_validates_with_pydantic_schema():
 def test_model_input_schema_stamps_field_order_for_renderers():
     from pydantic import BaseModel, ConfigDict, Field
 
-    from simplyprint_ws_client.contrib.flow import (
+    from simplyprint_ws_client.integration.flow import (
         fields_from_schema,
         model_input_schema,
     )
@@ -536,7 +536,7 @@ def test_model_input_schema_stamps_field_order_for_renderers():
 async def test_finalize_false_stops_at_terminal_then_commits():
     """The two-phase bridge: advance to the terminal boundary without folding
     (finalize=False -> Ready), then resume the sealed state to commit (Done)."""
-    from simplyprint_ws_client.contrib.flow import Ready, advance_flow
+    from simplyprint_ws_client.integration.flow import Ready, advance_flow
 
     flow = make_add_printer_flow(
         [FakeDevice(host="10.0.0.5", serial="S", name="A")], reachable={"10.0.0.5"}
@@ -564,7 +564,7 @@ async def test_finalize_false_stops_at_terminal_then_commits():
 
 @pytest.mark.asyncio
 async def test_cursor_is_carried_but_ignored_by_finish():
-    from simplyprint_ws_client.contrib.flow import CURSOR_KEY
+    from simplyprint_ws_client.integration.flow import CURSOR_KEY
 
     seen = {}
 
@@ -601,7 +601,7 @@ async def test_cursor_is_carried_but_ignored_by_finish():
 async def test_choice_step_branches_via_include():
     """A ChoiceStep writes the chosen value; later steps include on it, so one
     flow forks (LAN vs cloud) without the engine knowing the condition."""
-    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep
 
     flow = Flow(
         id="connect",
@@ -650,7 +650,7 @@ async def test_choice_step_branches_via_include():
 
 @pytest.mark.asyncio
 async def test_choice_step_emits_choice_screen():
-    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep, advance_flow
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep, advance_flow
 
     flow = Flow(
         id="c",
@@ -683,7 +683,7 @@ async def test_choice_step_emits_choice_screen():
 async def test_action_step_handles_resend_action():
     """A screen action (resend) routes to the step's on_action handler with no
     answer, re-issuing without advancing."""
-    from simplyprint_ws_client.contrib.flow import advance_flow
+    from simplyprint_ws_client.integration.flow import advance_flow
 
     sent = {"count": 0}
 
@@ -727,7 +727,7 @@ async def test_action_step_handles_resend_action():
 
 @pytest.mark.asyncio
 async def test_step_carries_markdown_content_and_kind():
-    from simplyprint_ws_client.contrib.flow import advance_flow
+    from simplyprint_ws_client.integration.flow import advance_flow
 
     flow = Flow(
         id="i",
@@ -760,7 +760,7 @@ async def test_step_carries_markdown_content_and_kind():
 async def test_discovery_manual_entry_routes_through_manual():
     """A discovery step with no candidates still offers manual entry, and a filled
     manual field routes through the manual handler."""
-    from simplyprint_ws_client.contrib.flow import advance_flow
+    from simplyprint_ws_client.integration.flow import advance_flow
 
     async def source(_state):
         return []
@@ -799,7 +799,7 @@ async def test_discovery_manual_entry_routes_through_manual():
 @pytest.mark.asyncio
 async def test_choice_step_skipped_when_preseeded():
     """A pre-seeded choice value (a deep link) skips the choice screen entirely."""
-    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep
 
     flow = Flow(
         id="c",
@@ -829,7 +829,7 @@ async def test_phase_include_branches_outline_and_marks_active_step():
     out of ``outline`` and never runs, and ``active_position`` names the live phase
     and substep straight from the cursor -- so a UI can render and track the stepper
     before every screen is answered, with no hand-tagged phase strings."""
-    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep
 
     def is_cloud(s):
         return s.get("mode") == "cloud"
@@ -1080,7 +1080,7 @@ async def test_prefilled_field_edited_value_overrides():
 
 @pytest.mark.asyncio
 async def test_recommended_choice_is_carried_to_the_screen():
-    from simplyprint_ws_client.contrib.flow import Choice, ChoiceStep
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep
 
     flow = Flow(
         id="r",
