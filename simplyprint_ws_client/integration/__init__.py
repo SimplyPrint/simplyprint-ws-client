@@ -10,6 +10,7 @@ import importlib as _importlib
 
 _PUBLIC = {
     "PrinterClient": ".client",
+    "JobEdge": ".client",
     "AppUpdater": ".client",
     "DeviceDriver": ".driver",
     "DeviceAuthError": ".driver",

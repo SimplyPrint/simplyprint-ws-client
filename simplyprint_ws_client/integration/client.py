@@ -19,8 +19,9 @@ the class:
 * ``poll_device`` / ``refresh_device_credentials``
                             -- the polling cycle and the re-auth seam
 * ``_resolve_camera_uri``   -- the device's current camera URL (or None)
-* ``_on_job_start`` / ``_on_job_finish`` / ``_on_job_progress``
-                            -- capture/classify the device's job fields
+* ``on_job_start`` / ``on_job_finish`` / ``on_job_progress``
+                            -- capture/classify the device's job fields (each
+                               receives a :class:`JobEdge` carrying ``raw``)
 * ``_stop_connection``      -- extra device teardown after drivers stop
 * ``_tick_progress``        -- drive a client-side progress shim each tick
 
@@ -37,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import (
     TYPE_CHECKING,
@@ -54,7 +56,17 @@ from typing import (
 from simplyprint_ws_client.cloud.client import ClientConfigChangedEvent
 from simplyprint_ws_client.cloud.config import PrinterConfig
 from simplyprint_ws_client.cloud.state import PrinterStatus
-from simplyprint_ws_client.cloud.protocol.messages import PluginInstallDemandData
+from simplyprint_ws_client.cloud.protocol.messages import (
+    CancelDemandData,
+    GcodeDemandData,
+    PauseDemandData,
+    PluginInstallDemandData,
+    ResumeDemandData,
+    SkipObjectsDemandData,
+    SystemRestartDemandData,
+    SystemShutdownDemandData,
+    TerminalDemandData,
+)
 from simplyprint_ws_client.device.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 
@@ -93,6 +105,20 @@ async def _host_usage() -> dict:
     return _host_usage_snapshot
 
 
+@dataclass(frozen=True)
+class JobEdge:
+    """One status transition handed to the job-edge hooks.
+
+    ``raw`` is whatever brand payload the ``apply_status`` caller passed along --
+    the device's print dict, raw state enum, ... -- so a hook never has to read
+    smuggled instance attributes to see what produced the edge.
+    """
+
+    new_status: PrinterStatus
+    previous_status: Optional[PrinterStatus]
+    raw: object = None
+
+
 class AppUpdater(Protocol):
     """The connector's self-update entry point, wired once by the integration.
 
@@ -125,6 +151,11 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     #: the class attribute when their camera wants a different cache window.
     camera_pause_timeout: int = 10
     camera_max_cache_age: timedelta = timedelta(seconds=1)
+
+    #: Whether the PAUSING hold applies: some firmwares keep reporting PRINTING
+    #: until a pause lands, so the brand opts in at the class level (this used to
+    #: be a per-call ``guard_pause=`` flag repeated at every call site).
+    hold_pausing: ClassVar[bool] = False
 
     #: Connector self-updater, wired once by the integration (``None`` = updates
     #: not wired, so a plugin-install demand is a no-op). See :class:`AppUpdater`.
@@ -206,6 +237,49 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         """Re-mint expired device credentials (update the config) and return
         ``True`` to have the driver restart with them. Default: cannot refresh."""
         return False
+
+    # -- the demand surface (typed, discoverable; autowired by name) ---------
+    # Override what your device supports; each default is a no-op (logged at
+    # debug). An override registers exactly once -- autowire resolves one
+    # attribute per name through the MRO -- and may use any tolerated arity.
+
+    def _unhandled_demand(self, name: str) -> None:
+        self.logger.debug("demand %s received but not implemented", name)
+
+    async def on_pause(self, data: PauseDemandData) -> None:
+        """SimplyPrint asks the printer to pause the running job."""
+        self._unhandled_demand("pause")
+
+    async def on_resume(self, data: ResumeDemandData) -> None:
+        """SimplyPrint asks the printer to resume a paused job."""
+        self._unhandled_demand("resume")
+
+    async def on_cancel(self, data: CancelDemandData) -> None:
+        """SimplyPrint asks the printer to cancel the running job."""
+        self._unhandled_demand("cancel")
+
+    async def on_gcode(self, data: GcodeDemandData) -> None:
+        """SimplyPrint sends gcode lines (``data.list``) to run on the device."""
+        self._unhandled_demand("gcode")
+
+    async def on_terminal(self, data: TerminalDemandData) -> None:
+        """SimplyPrint toggles terminal/console streaming for this printer."""
+        self._unhandled_demand("terminal")
+
+    async def on_skip_objects(self, data: SkipObjectsDemandData) -> None:
+        """SimplyPrint asks the printer to skip printing named objects."""
+        self._unhandled_demand("skip_objects")
+
+    async def on_system_restart(self, data: SystemRestartDemandData) -> None:
+        """Restart the machine this client runs on. Opt-in (the old
+        PhysicalClient auto-restarted): override and call
+        ``PhysicalMachine.restart()`` when this client IS the host."""
+        self._unhandled_demand("system_restart")
+
+    async def on_system_shutdown(self, data: SystemShutdownDemandData) -> None:
+        """Shut down the machine this client runs on. Opt-in, like
+        :meth:`on_system_restart` (``PhysicalMachine.shutdown()``)."""
+        self._unhandled_demand("system_shutdown")
 
     async def _stop_connection(self) -> None:
         """Extra device teardown after the drivers stop (close an HTTP session,
@@ -325,49 +399,52 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         self,
         new_status: PrinterStatus,
         *,
+        raw: object = None,
         downloading: bool = False,
-        guard_pause: bool = False,
         apply: bool = True,
     ) -> PrinterStatus:
         """Run the canonical guard -> edge -> apply pipeline shared by all devices.
 
-        ``new_status`` is the device-state mapping (step 1, subclass-owned).
-        Then: hold ``CANCELLING`` (always), hold ``PAUSING`` (when ``guard_pause``;
-        some devices don't), hold ``DOWNLOADING`` (when ``downloading``); dispatch
-        the job-start / job-finish / in-progress edge to the subclass hook; and
-        apply the status unless ``apply`` is ``False`` (a device with a "state
-        unknown" sentinel passes ``apply=False`` and the edges still run --
-        matching the existing behaviour where edges fire but the assignment is
-        suppressed).
+        ``new_status`` is the device-state mapping (step 1, subclass-owned);
+        ``raw`` is the brand payload that produced it, carried to the edge hooks
+        on the :class:`JobEdge`. Then: hold ``CANCELLING`` (always), hold
+        ``PAUSING`` (when the class opts in via :attr:`hold_pausing`), hold
+        ``DOWNLOADING`` (when ``downloading``); dispatch the job-start /
+        job-finish / in-progress edge to the subclass hook; and apply the status
+        unless ``apply`` is ``False`` (a device with a "state unknown" sentinel
+        passes ``apply=False`` and the edges still run -- matching the existing
+        behaviour where edges fire but the assignment is suppressed).
 
         Returns the guarded status.
         """
         new_status = self.hold_status_on_cancel(new_status)
-        if guard_pause:
+        if self.hold_pausing:
             new_status = self.hold_status_on_pause(new_status)
         new_status = self.hold_status_while_downloading(new_status, downloading)
 
+        edge = JobEdge(new_status, self.printer.status, raw)
         if self.is_job_start(new_status):
             self.printer.job_info.started = True
-            self._on_job_start(new_status)
+            self.on_job_start(edge)
         elif self.is_job_finish(new_status):
-            self._on_job_finish(new_status)
+            self.on_job_finish(edge)
         elif new_status == PrinterStatus.PRINTING:
-            self._on_job_progress(new_status)
+            self.on_job_progress(edge)
 
         if apply:
             self.printer.status = new_status
         return new_status
 
-    def _on_job_start(self, new_status: PrinterStatus) -> None:
+    def on_job_start(self, edge: JobEdge) -> None:
         """Capture device job-start fields (filename/progress/layer/time, reprint
-        detection). ``job_info.started`` is already set by :meth:`apply_status`."""
+        detection) from ``edge.raw``. ``job_info.started`` is already set by
+        :meth:`apply_status`."""
 
-    def _on_job_finish(self, new_status: PrinterStatus) -> None:
-        """Classify the finish: set exactly one of ``job_info.finished`` /
-        ``.cancelled`` / ``.failed`` from the device's terminal state."""
+    def on_job_finish(self, edge: JobEdge) -> None:
+        """Classify the finish from ``edge.raw``: set exactly one of
+        ``job_info.finished`` / ``.cancelled`` / ``.failed``."""
 
-    def _on_job_progress(self, new_status: PrinterStatus) -> None:
+    def on_job_progress(self, edge: JobEdge) -> None:
         """Update in-progress job fields (progress/layer/time). Default no-op."""
 
     def _init_camera(self, **kwargs) -> None:
