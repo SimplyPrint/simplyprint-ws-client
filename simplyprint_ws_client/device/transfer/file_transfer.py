@@ -78,6 +78,11 @@ class FileTransfer(ABC):
 
     #: Default transfer-type label recorded while a prepare is in flight.
     transfer_type: str = "file"
+    #: Whether READY waits for the firmware to confirm the started print (the
+    #: full await-firmware gate). Brands whose device API gives no usable
+    #: confirmation (download -> upload -> done shapes) set this False and
+    #: ``mark_transfer_complete`` lands READY immediately.
+    await_firmware_start: bool = True
     #: Fallback message when a start is rejected with no specific device error.
     reject_message: str = "Print start was rejected by the printer"
     #: Grace window for the firmware to confirm a started print.
@@ -132,8 +137,12 @@ class FileTransfer(ABC):
         """File reached the printer and the start command was sent; arm the
         grace timer. State stays DOWNLOADING -- READY is only set once the
         firmware actually starts, so a concurrent ``fail_prepare`` is never
-        clobbered."""
+        clobbered. With :attr:`await_firmware_start` False there is no gate to
+        arm: READY lands now."""
         if not self.is_preparing_to_print or self._is_awaiting_firmware_start:
+            return
+        if not self.await_firmware_start:
+            self._mark_ready("no firmware gate")
             return
         self._prepare_awaiting_since = time.monotonic()
         self.client.printer.file_progress.percent = 100
@@ -403,15 +412,17 @@ class FileTransfer(ABC):
     ) -> PurePosixPath:
         """Push ``local_path`` to the printer; return its remote path."""
 
-    @abstractmethod
     async def _send_start(
         self, path: PurePosixPath, data: FileDemandData, md5checksum: Optional[str]
     ) -> None:
-        """Issue the brand command(s) that start printing ``path``."""
+        """Issue the brand command(s) that start printing ``path``. Default:
+        nothing to send (the upload itself is the handoff)."""
 
-    @abstractmethod
     def _firmware_outcome(self, changes) -> FirmwareStartOutcome:
-        """Classify a firmware state push while a prepare is in flight."""
+        """Classify a firmware state push while a prepare is in flight.
+        Default: nothing conclusive (pair with ``await_firmware_start = False``
+        unless the grace timeout alone is the desired gate)."""
+        return FirmwareStartOutcome.PENDING
 
     def _prepare_local_file(self, data: FileDemandData, local_path: Path) -> Path:
         """Transform the downloaded file for this printer (e.g. wrap as 3mf)."""

@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from yarl import URL
 
     from simplyprint_ws_client.device.discovery.device import DiscoveredDevice
+    from simplyprint_ws_client.integration.driver import DeviceDriver
 
     from simplyprint_ws_client.common.events.event_bus import EventBus
 
@@ -142,24 +143,81 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     # slice; teardown once at final cleanup (see Client docstring).
 
     async def init(self) -> None:
-        """Arm the device connection component."""
+        """Arm the device drivers (and the legacy connection-component seam)."""
+        for driver in self._device_drivers():
+            driver.start()
         await self._start_connection()
 
     async def tick(self, _delta) -> None:
         """Host housekeeping every slice: progress shim, ambient sensor, host
-        telemetry and the SimplyPrint heartbeat ping (each interval-gated)."""
+        telemetry, the SimplyPrint heartbeat ping (each interval-gated), and the
+        driver ensure-started sweep (a driver whose config wasn't ready at init
+        retries here for free)."""
         self._tick_progress()
         self.printer.ambient_temperature.tick(self.printer)
         await self.update_host_telemetry()
         await self.send_ping()
+        for driver in self._device_drivers():
+            driver.ensure_started()
 
     async def halt(self) -> None:
-        """Temporarily out of scheduling. No-op by default; HTTP-polling devices
-        override to cancel their driver task(s)."""
+        """Temporarily out of scheduling: suspend every driver. (HTTP-polling
+        devices on the legacy seam still override to cancel their tasks.)"""
+        for driver in self._device_drivers():
+            driver.suspend()
 
     async def teardown(self) -> None:
-        """Final cleanup: tear the device connection down."""
+        """Final cleanup: stop the drivers and tear the legacy seam down."""
+        for driver in self._device_drivers():
+            driver.stop()
         await self._stop_connection()
+
+    # -- device drivers (the 2.0 seam; the connection-component trio below is
+    # -- the legacy seam, deleted once every brand declares drivers instead) --
+
+    def device_drivers(self) -> Iterable["DeviceDriver"]:
+        """Declare how this client reaches its device: zero or more drivers
+        (:class:`~simplyprint_ws_client.integration.link.WsDeviceLink` /
+        :class:`~simplyprint_ws_client.integration.link.MqttDeviceLink` /
+        :class:`~simplyprint_ws_client.integration.poller.DevicePoller`).
+        Called once; the base owns when they start/suspend/stop."""
+        return ()
+
+    def _device_drivers(self) -> Tuple["DeviceDriver", ...]:
+        drivers = getattr(self, "_device_drivers_cache", None)
+        if drivers is None:
+            drivers = tuple(self.device_drivers())
+            self._device_drivers_cache = drivers
+        return drivers
+
+    async def on_device_connected(self, driver: "DeviceDriver") -> None:
+        """A driver reached the device: mark active and (re)resolve the camera.
+        Override to add device startup commands (call ``await super()...``)."""
+        self.active = True
+        self.logger.info("Connected to printer")
+        self.update_camera_uri()
+
+    async def on_device_disconnected(
+        self, driver: "DeviceDriver", reason: Optional[object] = None
+    ) -> None:
+        """A driver lost the device: mark inactive and drop the camera."""
+        self.active = False
+        self.logger.info("Disconnected from printer")
+        self.clear_camera_uri()
+
+    async def on_device_message(self, message: object, driver: "DeviceDriver") -> None:
+        """One inbound device message (a link's frame payload / an MqttMessage).
+        Push brands override; the default ignores it."""
+
+    async def poll_device(self) -> None:
+        """One poll cycle for request/response devices, driven by a
+        :class:`~simplyprint_ws_client.integration.poller.DevicePoller`."""
+        raise NotImplementedError
+
+    async def refresh_device_credentials(self, driver: "DeviceDriver") -> bool:
+        """Re-mint expired device credentials (update the config) and return
+        ``True`` to have the driver restart with them. Default: cannot refresh."""
+        return False
 
     async def _start_connection(self) -> None:
         """Establish/arm the device connection. Push devices start MQTT/WS here.
