@@ -45,7 +45,7 @@ from simplyprint_ws_client.common.utils.slugify import slugify
 from simplyprint_ws_client.device.transfer.checksum import file_md5
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client import DefaultClient
+    from simplyprint_ws_client import Client
 
 #: Seconds to wait, after the file reached the printer and the start command was
 #: sent, for the firmware to broadcast a started print state.
@@ -83,7 +83,7 @@ class FileTransfer(ABC):
     #: Grace window for the firmware to confirm a started print.
     grace_seconds: float = DEFAULT_GRACE_SECONDS
 
-    def __init__(self, client: "DefaultClient") -> None:
+    def __init__(self, client: "Client") -> None:
         self.client = client
         self.next_to_print: Optional[PreparedPrint] = None
 

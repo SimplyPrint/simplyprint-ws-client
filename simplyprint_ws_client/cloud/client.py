@@ -2,8 +2,6 @@ __all__ = [
     "Client",
     "ClientConfigChangedEvent",
     "ClientStateChangeEvent",
-    "DefaultClient",
-    "PhysicalClient",
     "ClientState",
     "configure",
 ]
@@ -82,7 +80,6 @@ from simplyprint_ws_client.common.events import EventBus, Event
 from simplyprint_ws_client.common.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.contrib.logging import printer_logger
-from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 from simplyprint_ws_client.cloud.api.simplyprint_api import SimplyPrintApi
 from simplyprint_ws_client.common.utils.backoff import Backoff, ExponentialBackoff
 
@@ -159,7 +156,12 @@ class Client(
     EventLoopProvider[asyncio.AbstractEventLoop],
     metaclass=AutowireClientMeta,
 ):
-    """A scheduling unit.
+    """One printer's agent speaking the SimplyPrint cloud protocol — a scheduling unit.
+
+    The complete cloud agent: the protocol state machine AND the default
+    prioritized message handling (intervals, tokens, setup, materials,
+    notifications — the old ``DefaultClient``, merged in 2.0). Opting out of a
+    default is overriding the handler, not picking a thinner base class.
 
     Attributes:
         v: Client version
@@ -467,15 +469,7 @@ class Client(
         """Teardown lifecycle method, final cleanup, will never be needed again."""
         pass
 
-
-class DefaultClient(Client[TConfig], ABC):
-    """
-    Default prioritized message handling.
-
-    Attributes:
-        _have_cleared_bed: Keep track of whether we have called the API successfully to prevent many irrelevant calls.
-        file_action_token: File action token
-    """
+    # file/job bookkeeping
 
     @property
     def current_job_id(self):
@@ -616,17 +610,3 @@ class DefaultClient(Client[TConfig], ABC):
 
         # Give the event the response data directly, otherwise users can handle this event manually.
         event.respond(data)
-
-
-class PhysicalClient(DefaultClient[TConfig], ABC):
-    def __init__(self, config: PrinterConfig, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
-        self.printer.populate_info_from_physical_machine()
-
-    @configure(DemandMsgType.SYSTEM_RESTART, priority=1)
-    def _on_system_restart(self):
-        PhysicalMachine.restart()
-
-    @configure(DemandMsgType.SYSTEM_SHUTDOWN, priority=1)
-    def _on_system_shutdown(self):
-        PhysicalMachine.shutdown()

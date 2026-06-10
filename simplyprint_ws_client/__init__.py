@@ -2,10 +2,9 @@
 
 The names below are the supported, author-facing public API. In short:
 
-* Subclass :class:`DefaultClient` (or the lower-level :class:`PhysicalClient`) to
-  boil your device into a :class:`PrinterState`, and mark demand/message handlers
-  with :func:`configure`. (An integration typically grows its own printer-client
-  base on top of these.)
+* Subclass :class:`Client` to boil your device into a :class:`PrinterState`, and
+  mark demand/message handlers with :func:`configure`. (The device-side authoring
+  base builds on this.)
 * Declare your client type with a :class:`ClientSpec`, configure the process via
   :class:`ClientSettings`, and run it through :class:`ClientApp`.
 
@@ -47,8 +46,6 @@ _REEXPORT_MODULES = (
 # (resolved lazily by __getattr__), just not advertised by ``import *``.
 _PUBLIC = (
     "Client",
-    "DefaultClient",
-    "PhysicalClient",
     "ClientState",
     "configure",
     "ClientApp",

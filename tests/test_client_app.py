@@ -3,16 +3,16 @@ import pytest
 from simplyprint_ws_client import (
     ClientSettings,
     ClientSpec,
-    DefaultClient,
+    Client,
     PrinterConfig,
     ClientApp,
 )
 
 
-class FirstClient(DefaultClient[PrinterConfig]): ...
+class FirstClient(Client[PrinterConfig]): ...
 
 
-class SecondClient(DefaultClient[PrinterConfig]): ...
+class SecondClient(Client[PrinterConfig]): ...
 
 
 class SecondConfig(PrinterConfig):
@@ -22,7 +22,7 @@ class SecondConfig(PrinterConfig):
 @pytest.fixture
 def app():
     settings = ClientSettings(
-        DefaultClient,
+        Client,
         PrinterConfig,
         camera_workers=0,
     )

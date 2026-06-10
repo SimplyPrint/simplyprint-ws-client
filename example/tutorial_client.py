@@ -1,5 +1,5 @@
 from simplyprint_ws_client import (
-    DefaultClient,
+    Client,
     PrinterConfig,
     ClientSettings,
     ConfigManagerType,
@@ -7,7 +7,7 @@ from simplyprint_ws_client import (
 )
 
 
-class MyPrinterClient(DefaultClient[PrinterConfig]): ...
+class MyPrinterClient(Client[PrinterConfig]): ...
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from typing import Optional
 from yarl import URL
 
 from simplyprint_ws_client import (
-    DefaultClient,
+    Client,
     FileDemandData,
     FileProgressStateEnum,
     GcodeDemandData,
@@ -69,12 +69,12 @@ class VirtualCamera(BaseCameraProtocol):
             yield _random_test_image()
 
 
-class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin):
+class VirtualClient(ClientCameraMixin[VirtualConfig]):
     job_progress_alpha: float = 2.0
     pending_job: Optional[FileDemandData] = None
 
     def __init__(self, *args, **kwargs):
-        DefaultClient.__init__(self, *args, **kwargs)
+        Client.__init__(self, *args, **kwargs)
         self.initialize_camera_mixin(**kwargs)
 
         self.printer.firmware.machine_name = "Creality K2"
