@@ -70,3 +70,13 @@ simplyprint_ws_client.contrib.flow	simplyprint_ws_client.integration.flow	module
 simplyprint_ws_client.contrib.spec	simplyprint_ws_client.integration.spec	module	C
 simplyprint_ws_client.contrib.presentation	simplyprint_ws_client.integration.presentation	module	C
 simplyprint_ws_client.contrib.tasks	simplyprint_ws_client.integration.tasks	module	C
+simplyprint_ws_client.core.app	simplyprint_ws_client.runtime.app	module	D
+simplyprint_ws_client.core.settings	simplyprint_ws_client.runtime.settings	module	D
+simplyprint_ws_client.core.scheduler	simplyprint_ws_client.runtime.scheduler	module	D
+simplyprint_ws_client.core.connection_manager	simplyprint_ws_client.runtime.manager	module	D
+simplyprint_ws_client.core.config	simplyprint_ws_client.runtime.config	module	D
+simplyprint_ws_client.contrib.logging	simplyprint_ws_client.common.logging	module	D
+simplyprint_ws_client.contrib.status	simplyprint_ws_client.runtime.status	module	D
+simplyprint_ws_client.shared.cli	simplyprint_ws_client.runtime.cli	module	D
+simplyprint_ws_client.shared.debug	simplyprint_ws_client.runtime.debug	module	D
+simplyprint_bambu.core.brand_contract.BrandContract	simplyprint_ws_client.runtime.registry.SpecRegistry (app builds SpecRegistry.of(*specs))	promotion	D
