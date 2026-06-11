@@ -88,6 +88,12 @@ ActionKind = Literal["button"]
 #: How prominently a renderer should style a :class:`Notice` callout.
 NoticeTone = Literal["info", "warning"]
 
+#: What kind of message a :class:`Notice` is, which encodes both styling and
+#: placement: a ``check`` is a prerequisite rendered as a checklist row above
+#: the inputs, a ``callout`` a boxed heads-up above the inputs, a ``footnote``
+#: fine print demoted below the primary action (next to any secondary options).
+NoticeKind = Literal["callout", "check", "footnote"]
+
 
 # screen descriptors -- the neutral, data-driven frontend contract
 
@@ -117,18 +123,19 @@ class Choice:
 
 @dataclass(frozen=True)
 class Notice:
-    """A typed callout on a screen: a titled row with an optional body, icon,
-    tone and external link.
+    """A typed message on a screen: a titled row with an optional body, tone
+    and external link.
 
     Where a prerequisite ("X must be enabled on the device") or a heads-up ("Y
     is no longer supported") belongs -- structured, so every renderer draws it
-    as a proper callout instead of parsing it out of prose ``content``.
-    Presentation-only; the engine never reads it.
+    properly instead of parsing it out of prose ``content``. ``kind`` says what
+    the message *is* (and thereby where it renders, see :data:`NoticeKind`);
+    ``tone`` how loud. Presentation-only; the engine never reads it.
     """
 
     title: str
     body: Optional[str] = None
-    icon: Optional[str] = None
+    kind: NoticeKind = "callout"
     tone: NoticeTone = "info"
     link_label: Optional[str] = None
     link_url: Optional[str] = None
