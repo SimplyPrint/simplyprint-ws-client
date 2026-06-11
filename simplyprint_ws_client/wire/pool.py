@@ -201,7 +201,7 @@ class Pool(Generic[T]):
         #: front door passes so callers get ``subscribe`` / framed ``send``.
         self.lease_class: Type[Lease[T]] = lease_class or Lease
         self.provider = provider or EventLoopProvider.default()
-        self.logger = logger or logging.getLogger("conn.pool")
+        self.logger = logger or logging.getLogger("wire.pool")
         self.endpoints: Dict[Hashable, Endpoint[T]] = {}
         #: Held only for refcount/dict bookkeeping -- never across I/O.
         self.lock = threading.Lock()

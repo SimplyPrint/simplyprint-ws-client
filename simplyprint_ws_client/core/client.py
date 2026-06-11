@@ -248,6 +248,11 @@ class Client(
     _state: VersionedState
     _should_be_allocated: bool = True
 
+    #: Whether the scheduler has run :meth:`init` for this instance. Set once
+    #: when the client enters scheduling; never reset (init is once per
+    #: lifetime -- recovery/retry paths belong in :meth:`tick`).
+    initialized: bool = False
+
     _pending_action_backoff: Backoff
     _pending_action_delay: timedelta = timedelta.min
     _pending_action_ts: datetime = datetime.min
@@ -513,15 +518,21 @@ class Client(
     # lifetime methods
 
     async def init(self):
-        """Init lifecycle method. Called once per halt, and initially."""
+        """Init lifecycle method. Called exactly once when the client enters
+        scheduling -- before the first tick and regardless of ``active``. Arm
+        device-side machinery here; it runs until :meth:`teardown`."""
         pass
 
     async def tick(self, delta: timedelta):
-        """Tick lifecycle method"""
+        """Tick lifecycle method. Called at the tick rate for every scheduled
+        client, whether or not it is allocated/added to SimplyPrint -- guard
+        SimplyPrint-side sends on :meth:`is_added` where it matters."""
         pass
 
     async def halt(self):
-        """Halt lifecycle method, temporarily not considered for scheduling."""
+        """Halt lifecycle method: the client was deallocated from SimplyPrint
+        (``active`` flipped false). SimplyPrint-side parking only -- device-side
+        work keeps running (and keeps ticking) so it can reactivate the client."""
         pass
 
     async def teardown(self):

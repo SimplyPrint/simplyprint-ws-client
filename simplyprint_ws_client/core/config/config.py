@@ -124,6 +124,12 @@ class PrinterConfig(BaseModel, Config):
     #: ``unique_id``) so a re-discovered printer can be matched to its config by
     #: MAC -- see ``stable_hardware_id``.
     mac: Optional[str] = None
+    #: A user-supplied webcam URL that overrides whatever camera the device
+    #: itself advertises. Every printer supports it: the base client resolves
+    #: it ahead of the brand's own camera probe (see
+    #: ``PrinterClient.update_camera_uri``), and the shared presentation kit
+    #: exposes it as an editable field.
+    custom_webcam_url: Optional[str] = None
 
     @staticmethod
     def keys() -> tuple:

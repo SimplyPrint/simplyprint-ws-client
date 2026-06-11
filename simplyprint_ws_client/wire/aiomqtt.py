@@ -143,7 +143,10 @@ class AioMqtt(MqttTransport, Reconnecting):
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
-            url, policy, provider, logger=logger or logging.getLogger("conn.aiomqtt")
+            url,
+            policy,
+            provider,
+            logger=logger or logging.getLogger("wire.mqtt.aiomqtt"),
         )
         self.client_factory = client_factory
         #: topic -> refcount across leases; re-asserted on every (re)connect.

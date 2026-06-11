@@ -95,7 +95,7 @@ class Websockets(WsTransport, Reconnecting):
             policy,
             provider,
             first_message_timeout=first_message_timeout,
-            logger=logger or logging.getLogger("conn.websockets"),
+            logger=logger or logging.getLogger("wire.ws.websockets"),
         )
         self.connect_factory = connect_factory
         self.connect_kwargs = dict(connect_kwargs or {})

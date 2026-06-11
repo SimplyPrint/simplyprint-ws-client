@@ -93,3 +93,12 @@ simplyprint_ws_client.integration.link.DeviceLink	simplyprint_ws_client.integrat
 simplyprint_ws_client.integration.link.WsDeviceLink	simplyprint_ws_client.integration.drivers.WsDriver	class	review
 simplyprint_ws_client.integration.link.MqttDeviceLink	simplyprint_ws_client.integration.drivers.MqttDriver	class	review
 simplyprint_ws_client.integration.{driver,link,poller}	simplyprint_ws_client.integration.drivers	module	review
+conn.paho (logger)	wire.mqtt.paho (logger)	logger	lifecycle-decoupling
+conn.aiomqtt (logger)	wire.mqtt.aiomqtt (logger)	logger	lifecycle-decoupling
+conn.websockets (logger)	wire.ws.websockets (logger)	logger	lifecycle-decoupling
+conn.aiohttp (logger)	wire.ws.aiohttp (logger)	logger	lifecycle-decoupling
+conn.pool (logger)	wire.pool (logger)	logger	lifecycle-decoupling
+conn.connection (logger)	wire.lease (logger)	logger	lifecycle-decoupling
+conn.reconnect (logger)	wire.reconnect (logger)	logger	lifecycle-decoupling
+conn.keepalive (logger)	wire.keepalive (logger)	logger	lifecycle-decoupling
+simplyprint_ws_client.integration.drivers.DeviceDriver.suspend	(removed -- drivers run init->teardown; halt no longer parks them)	method	lifecycle-decoupling

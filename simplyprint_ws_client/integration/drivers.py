@@ -13,7 +13,9 @@ loop, so a brand never writes thread-hop or re-emit plumbing again.
 The base :class:`~simplyprint_ws_client.integration.client.PrinterClient` owns
 WHEN drivers run: it starts every declared driver in ``init``, sweeps
 ``ensure_started`` each tick (a driver whose config wasn't ready yet retries for
-free), suspends on ``halt``, and stops on ``teardown``.
+free), and stops on ``teardown``. Drivers run for the client's whole scheduled
+lifetime -- they are what *produce* device reachability (and with it the
+client's ``active`` flag), so they are never gated on it.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import (
     TYPE_CHECKING,
     Awaitable,
     Callable,
+    ClassVar,
     Generic,
     Iterable,
     Optional,
@@ -79,7 +82,6 @@ class DeviceDriver(ABC):
     * :meth:`start` — idempotent and tolerant: a device whose config is not ready
       yet (no host, no credentials) logs and returns; the per-tick
       :meth:`ensure_started` sweep retries for free.
-    * :meth:`suspend` — the client left scheduling temporarily (``halt``).
     * :meth:`stop` — final teardown. Idempotent.
     * :meth:`restart` — stop + start; re-resolves URLs/sessions, which is why
       link parameters are callables.
@@ -93,9 +95,15 @@ class DeviceDriver(ABC):
     loop and restarts the driver on ``True``.
     """
 
-    def __init__(self, client: "PrinterClient", *, name: str = "device") -> None:
+    #: The driver's default name when the brand passes none. Concrete drivers
+    #: override it per kind (``mqtt``/``ws``/``poll``); the name labels log
+    #: lines AND names the per-printer log file the wire logs land in
+    #: (``<log_dir>/<uid>/<name>.log``).
+    default_name: ClassVar[str] = "device"
+
+    def __init__(self, client: "PrinterClient", *, name: Optional[str] = None) -> None:
         self.client = client
-        self.name = name
+        self.name = name or type(self).default_name
         self.is_connected: Optional[bool] = None
         self.last_message_at: Optional[float] = None
         self._refresh_lock = threading.Lock()
@@ -109,9 +117,14 @@ class DeviceDriver(ABC):
         """Cheap per-tick retry; the default just calls the idempotent start."""
         self.start()
 
-    def suspend(self) -> None:
-        """The client is temporarily out of scheduling. Default: full stop."""
-        self.stop()
+    def ensure_current(self) -> None:
+        """Re-resolve against the (possibly edited) config; restart if stale.
+
+        Called by the base printer client whenever the config changes, so an
+        edited host/credential takes effect without a process restart. The
+        default is a no-op (a poller reads its config per poll); URL-bound
+        drivers compare and restart only when the endpoint actually moved.
+        """
 
     @abstractmethod
     def stop(self) -> None:
@@ -172,7 +185,7 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         client: "PrinterClient",
         url: UrlFactory,
         *,
-        name: str = "device",
+        name: Optional[str] = None,
         options: Optional[ConnectionOptions] = None,
     ) -> None:
         super().__init__(client, name=name)
@@ -220,6 +233,10 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         if options.provider is None:
             # The lease's courier must deliver on the client's loop.
             options = replace(options, provider=self.client)
+        if options.logger is None:
+            # Wire lifecycle logs land in this printer's own log files
+            # (``printers.<uid>.<name>`` -> ``<uid>/<name>.log``).
+            options = replace(options, logger=self.client.logger.getChild(self.name))
 
         try:
             lease = self._connect(url, options)
@@ -235,6 +252,23 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         if lease.connected:
             # Attached to an already-live shared wire: deliver the edge now.
             lease.create_task(self._on_wire_connected(None))
+
+    def ensure_current(self) -> None:
+        """Restart iff the URL factory now resolves somewhere else.
+
+        A config edit that doesn't move the endpoint (a renamed printer, a
+        toggled flag) must not bounce a healthy wire; one that does (new host,
+        rotated credentials) reconnects immediately.
+        """
+        lease = self.lease
+        if lease is None or lease.closed:
+            return  # not started; start()/the tick sweep own that path
+        try:
+            url = yarl.URL(str(self._url()))
+        except Exception:  # noqa: BLE001 -- config now incomplete; keep the live wire
+            return
+        if url != lease.url:
+            self.restart()
 
     def stop(self) -> None:
         lease = self.lease
@@ -283,6 +317,8 @@ class WsDriver(LeaseDriver[WsLease, Union[str, bytes]]):
     (``str``/``bytes``) — the unwrap four brands wrote defensively is owned here.
     """
 
+    default_name = "ws"
+
     def _connect(
         self, url: Union[str, yarl.URL], options: ConnectionOptions
     ) -> WsLease:
@@ -302,6 +338,8 @@ class MqttDriver(LeaseDriver[MqttLease, MqttMessage]):
     payload — the topic is routing information the client needs).
     """
 
+    default_name = "mqtt"
+
     def __init__(
         self,
         client: "PrinterClient",
@@ -309,7 +347,7 @@ class MqttDriver(LeaseDriver[MqttLease, MqttMessage]):
         *,
         topics: Callable[[], Iterable[str]] = tuple,
         impl: "MqttImpl" = "paho",
-        name: str = "device",
+        name: Optional[str] = None,
         options: Optional[ConnectionOptions] = None,
     ) -> None:
         super().__init__(client, url, name=name, options=options)
@@ -333,6 +371,8 @@ class MqttDriver(LeaseDriver[MqttLease, MqttMessage]):
 class DevicePoller(DeviceDriver):
     """Drives ``poll_device()`` on an interval and owns the edge bookkeeping."""
 
+    default_name = "poll"
+
     def __init__(
         self,
         client: "PrinterClient",
@@ -341,7 +381,7 @@ class DevicePoller(DeviceDriver):
         poll: Optional[Callable[[], Awaitable[None]]] = None,
         offline_after: float = 300.0,
         failure_backoff: float = 10.0,
-        name: str = "device",
+        name: Optional[str] = None,
     ) -> None:
         super().__init__(client, name=name)
         self.interval = interval

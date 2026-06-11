@@ -105,7 +105,7 @@ class Aiohttp(WsTransport, Reconnecting):
             policy,
             provider,
             first_message_timeout=first_message_timeout,
-            logger=logger or logging.getLogger("conn.aiohttp"),
+            logger=logger or logging.getLogger("wire.ws.aiohttp"),
         )
         self.connect_factory = connect_factory
         #: The aiohttp session backing the live socket, or ``None`` when down.

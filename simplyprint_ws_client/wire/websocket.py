@@ -28,7 +28,9 @@ Everything beyond ``url``/``impl``/``pool`` is carried by one
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple, Union
+import logging
+
+from typing import Literal, NamedTuple, Optional, Tuple, Union
 
 import yarl
 
@@ -61,6 +63,19 @@ __all__ = [
 #: The name of a shipped wire implementation. ``websockets`` is the default.
 WsImpl = Literal["websockets", "aiohttp"]
 
+
+class WsConnectParams(NamedTuple):
+    """What one ``connect`` call carries into the pool.
+
+    The pool shares sockets by URL alone; ``retry`` and ``logger`` configure
+    the transport the *first* lease on an endpoint builds (later leases share
+    that socket, so per-lease values cannot apply).
+    """
+
+    retry: RetryPolicy
+    logger: Optional["logging.Logger"] = None
+
+
 #: The two shipped wire implementations, by name.
 SUPPORTED_IMPLS: Tuple[WsImpl, ...] = ("websockets", "aiohttp")
 
@@ -82,13 +97,19 @@ def build_pool(
         return pool
 
     def make_transport(url: yarl.URL, params: object) -> WsTransport:
-        retry = params if isinstance(params, RetryPolicy) else RetryPolicy()
+        if isinstance(params, WsConnectParams):
+            retry, logger = params.retry, params.logger
+        elif isinstance(params, RetryPolicy):
+            retry, logger = params, None
+        else:
+            retry, logger = RetryPolicy(), None
         if impl == "websockets":
             return Websockets(
                 url,
                 retry,
                 provider,
                 connect_kwargs=_websockets_keepalive_kwargs(wire_keepalive),
+                logger=logger,
             )
         if impl == "aiohttp":
             return Aiohttp(
@@ -98,6 +119,7 @@ def build_pool(
                 connect_factory=lambda u, logger: default_aiohttp_connect(
                     u, logger, heartbeat=_aiohttp_heartbeat(wire_keepalive)
                 ),
+                logger=logger,
             )
         raise ValueError(
             f"ws.connect: unknown impl {impl!r} (use 'websockets'/'aiohttp')"
@@ -145,7 +167,9 @@ def connect(
 
     options = options or ConnectionOptions()
     pool = build_pool(impl, pool, options.provider, options.wire_keepalive)
-    lease = pool.connect(url, options.retry or RetryPolicy())
+    lease = pool.connect(
+        url, WsConnectParams(options.retry or RetryPolicy(), options.logger)
+    )
     if not isinstance(lease, WsLease):
         raise TypeError(
             f"ws.connect needs a pool handing out WsLease, got {type(lease).__name__}"

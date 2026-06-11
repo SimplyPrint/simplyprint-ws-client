@@ -53,7 +53,7 @@ class ConnectionKeepalive:
     ) -> None:
         self.connection = connection
         self.policy = policy
-        self.logger = logger or logging.getLogger("conn.keepalive")
+        self.logger = logger or logging.getLogger("wire.keepalive")
         self.misses = 0
         self.timed_out = False
         self.last_activity = 0.0

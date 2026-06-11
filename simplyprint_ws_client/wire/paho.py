@@ -203,7 +203,7 @@ class Paho(MqttTransport):
         self.client_factory = client_factory
         self.keepalive = keepalive
         self.connect_failure_limit = connect_failure_limit
-        self.logger = logger or logging.getLogger("conn.paho")
+        self.logger = logger or logging.getLogger("wire.mqtt.paho")
         #: The live paho client, or ``None`` while stopped.
         self.client: Optional[PahoClient] = None
         #: topic -> lease refcount; re-asserted on every (re)connect.

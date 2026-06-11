@@ -76,7 +76,7 @@ class Reconnecting(Transport):
         self.policy = policy or RetryPolicy()
         self.provider = provider or EventLoopProvider.default()
         self.first_message_timeout = first_message_timeout
-        self.logger = logger or logging.getLogger("conn.reconnect")
+        self.logger = logger or logging.getLogger("wire.reconnect")
         self.live = False
         self.stopped = False
         self.gave_up = False

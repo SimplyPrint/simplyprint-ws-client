@@ -149,6 +149,10 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 self._cond_waiters -= 1
 
     def _should_schedule_client(self, client: Client, when: datetime):
+        # Always schedule clients that still need their once-per-lifetime init.
+        if not client.initialized:
+            return True
+
         # Always schedule clients that have changes.
         if client.has_changes:
             return True
@@ -167,8 +171,42 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         )
 
     async def _schedule_client(self, client: Client):
-        """Schedule single client."""
+        """Schedule single client.
+
+        The client's own lifecycle (``init`` once at scheduler entry, ``tick``
+        at the tick rate) runs for EVERY scheduled client, whether or not it is
+        allocated to SimplyPrint -- the device edges produced by that lifecycle
+        are what drive ``active``, so they cannot be gated on it. Allocation to
+        a SimplyPrint connection is a separate state machine keyed on
+        ``client.active``: an active client is allocated and added, an inactive
+        one is removed, deallocated and parked via ``halt``.
+        """
         try:
+            if not client.initialized:
+                # init is once per lifetime, never retried -- recovery paths
+                # belong in tick (e.g. the device-driver ensure_started sweep).
+                client.initialized = True
+                await client.init()
+
+            # Tick client.
+            last_ticked = self._last_ticked.get(client.unique_id, datetime.min)
+            now = datetime.now()
+            delta_tick = now - last_ticked
+
+            if delta_tick >= self._tick_rate_delta:
+                self._last_ticked[client.unique_id] = now
+
+                try:
+                    async with asyncio.timeout(TICK_TIMEOUT_SECONDS):
+                        await client.tick(delta_tick)
+                except Exception as e:
+                    # A slow or failing tick must not stall the allocation
+                    # state machine below: tick runs first (device side), but
+                    # its failures are its own -- it gets retried next pass
+                    # either way, while allocate/ensure_added/ensure_removed
+                    # still progress this pass.
+                    client.logger.error("Error while ticking client", exc_info=e)
+
             was_allocated = self.manager.is_allocated(client)
 
             if not client.active:
@@ -186,7 +224,6 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
 
             if not was_allocated:
                 await self.manager.allocate(client)
-                await client.init()
 
             # Progress inner client state until we reach CONNECTED state.
             # e.i. in multi printer mode until we receive the connected message.
@@ -194,18 +231,6 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 self.settings.mode, self.settings.allow_setup
             ):
                 return
-
-            # Tick client.
-            last_ticked = self._last_ticked.get(client.unique_id, datetime.min)
-            now = datetime.now()
-            delta_tick = now - last_ticked
-
-            if delta_tick >= self._tick_rate_delta:
-                self._last_ticked[client.unique_id] = now
-
-                # TODO: Manage timeouts.
-                async with asyncio.timeout(TICK_TIMEOUT_SECONDS):
-                    await client.tick(delta_tick)
 
             if not client.has_changes:
                 return

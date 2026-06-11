@@ -34,6 +34,9 @@ def test_config_fields():
         "unique_id": config1.unique_id,
         "public_ip": None,
         "mac": None,
+        # Every printer supports a user webcam override (resolved by the base
+        # PrinterClient, edited through the shared WEBCAM_URL_FIELD).
+        "custom_webcam_url": None,
     }
 
     config1.id = 1

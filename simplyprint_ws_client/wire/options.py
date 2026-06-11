@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Optional
 from simplyprint_ws_client.wire.keepalive import Keepalive
 
 if TYPE_CHECKING:
+    import logging
+
     from simplyprint_ws_client.wire.policy import RetryPolicy
     from simplyprint_ws_client.common.asyncio.event_loop_provider import (
         EventLoopProvider,
@@ -38,7 +40,10 @@ class ConnectionOptions:
     fully; paho maps its backoff onto ``reconnect_delay_set``). ``verify_tls``
     controls broker certificate verification for ``mqtts://`` - off by default
     because printer fleets routinely present self-signed certificates, but an
-    explicit, opt-in knob.
+    explicit, opt-in knob. ``logger`` names where the transport's lifecycle log
+    lines land; the device drivers default it to the printer's own child logger
+    so wire events end up in that printer's log files. Endpoints are pooled, so
+    the logger of the FIRST lease that builds a transport owns its log lines.
     """
 
     provider: Optional["EventLoopProvider"] = None
@@ -46,3 +51,4 @@ class ConnectionOptions:
     wire_keepalive: Optional[WireKeepalive] = None
     app_keepalive: Optional[Keepalive] = None
     verify_tls: bool = False
+    logger: Optional["logging.Logger"] = None

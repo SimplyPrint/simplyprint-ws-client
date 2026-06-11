@@ -42,6 +42,19 @@ ScanFn = Callable[[str, float], Awaitable[Optional[List[DiscoveredDevice]]]]
 BrandsFn = Callable[[], List[str]]
 
 
+def _normalise_host(value: Optional[str]) -> str:
+    """A host string normalised for identity comparison (same rule the web
+    layer's reconciler applies): case, scheme and trailing slashes are
+    cosmetic, so ``HTTP://Printer.local/`` and ``printer.local`` are one box."""
+    if value is None:
+        return ""
+    value = str(value).strip().lower()
+    for prefix in ("https://", "http://"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+    return value.rstrip("/")
+
+
 @dataclass(frozen=True)
 class DiscoveryResult:
     """A discovered device tagged with the brand whose scan found it.
@@ -125,7 +138,32 @@ class DiscoveryResultsStore:
     def _store(self, brand: str, device: DiscoveredDevice) -> None:
         # Dedupe on (brand, stable id); a re-scan overwrites in place, refreshing
         # the TTL so a device that keeps answering never expires under the UI.
-        key = (brand, device.serial or device.host)
+        #
+        # One physical printer can be sighted through several paths at once --
+        # a multicast announcement that carries its serial AND a subnet probe
+        # that only knows its host -- so the two key shapes are reconciled
+        # here: the serial entry is authoritative, and a host-only sighting of
+        # an already-known box refreshes that entry instead of duplicating it.
+        host = _normalise_host(device.host)
+        if device.serial:
+            # A host-only sighting of the same box may already be stored under
+            # its host key; the serial-keyed entry supersedes it.
+            try:
+                del self._results[(brand, host)]
+            except KeyError:
+                pass
+            key = (brand, device.serial)
+        else:
+            for existing_key in self._results.keys():
+                if existing_key[0] != brand:
+                    continue
+                existing = self._results.get(existing_key)
+                if existing is not None and _normalise_host(existing.host) == host:
+                    # Same box, poorer facts: keep the richer entry, refresh
+                    # its TTL so the box doesn't expire under the UI.
+                    self._results[existing_key] = existing
+                    return
+            key = (brand, host)
         self._results[key] = DiscoveryResult(
             type=brand,
             host=device.host,

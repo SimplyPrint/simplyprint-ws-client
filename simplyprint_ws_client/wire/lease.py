@@ -76,7 +76,7 @@ class Lease(Generic[T]):
         self.url = url
         self.endpoint_key = endpoint_key
         self.provider = provider or EventLoopProvider.default()
-        self.logger = logger or logging.getLogger("conn.connection")
+        self.logger = logger or logging.getLogger("wire.lease")
         #: This lease's own filtered bus; the pool emits routed events here.
         self.event_bus: EventBus[WireEvent] = EventBus()
         self._courier = Courier(

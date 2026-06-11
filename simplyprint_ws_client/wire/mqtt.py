@@ -22,6 +22,8 @@ Everything beyond ``url``/``impl``/``pool`` is carried by one
 
 from __future__ import annotations
 
+import logging
+
 from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import yarl
@@ -95,14 +97,15 @@ class MqttBroker(NamedTuple):
 class MqttConnectParams(NamedTuple):
     """What one ``connect`` call carries into the pool.
 
-    The pool shares transports by ``broker`` alone; ``retry`` and ``verify_tls``
-    configure the transport the *first* lease on a broker builds (later leases
-    share that socket, so per-lease values cannot apply).
+    The pool shares transports by ``broker`` alone; ``retry``, ``verify_tls``
+    and ``logger`` configure the transport the *first* lease on a broker builds
+    (later leases share that socket, so per-lease values cannot apply).
     """
 
     broker: MqttBroker
     retry: RetryPolicy
     verify_tls: bool = False
+    logger: Optional["logging.Logger"] = None
 
 
 def initial_topics(url: yarl.URL) -> List[str]:
@@ -133,9 +136,9 @@ def build_pool(
 
     def make_transport(url: yarl.URL, params: object) -> MqttTransport:
         if isinstance(params, MqttConnectParams):
-            retry, verify_tls = params.retry, params.verify_tls
+            retry, verify_tls, logger = params.retry, params.verify_tls, params.logger
         else:
-            retry, verify_tls = RetryPolicy(), False
+            retry, verify_tls, logger = RetryPolicy(), False, None
         if impl == "paho":
             return Paho(
                 url,
@@ -144,6 +147,7 @@ def build_pool(
                 client_factory=lambda u, logger: default_paho_client(
                     u, logger, verify_tls=verify_tls, retry=retry
                 ),
+                logger=logger,
             )
         if impl == "aiomqtt":
             return AioMqtt(
@@ -153,6 +157,7 @@ def build_pool(
                 client_factory=lambda u, logger: default_aiomqtt_client(
                     u, logger, keepalive=mqtt_keepalive, verify_tls=verify_tls
                 ),
+                logger=logger,
             )
         raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
 
@@ -213,6 +218,7 @@ def connect(
             broker=broker,
             retry=options.retry or RetryPolicy(),
             verify_tls=options.verify_tls,
+            logger=options.logger,
         ),
     )
     if not isinstance(lease, MqttLease):

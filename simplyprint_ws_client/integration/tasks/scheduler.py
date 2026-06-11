@@ -91,7 +91,17 @@ class SchedulerService:
             target=self._run_loop, name="task-scheduler", daemon=True
         )
         self._thread.start()
-        self._ready.wait()
+        # Bounded wait that watches the thread: a loop thread that dies before
+        # signalling readiness (e.g. an import failure inside _run_loop) must
+        # surface as an error, not hang the caller forever.
+        while not self._ready.wait(timeout=1.0):
+            if not self._thread.is_alive():
+                self._started = False
+                self._thread = None
+                raise RuntimeError(
+                    "task scheduler thread died before becoming ready "
+                    "(see the thread's traceback in the log)"
+                )
 
     def shutdown(self) -> None:
         """Stop firing and tear down the loop/thread. Idempotent. In-flight runs

@@ -174,30 +174,51 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     #: not wired, so a plugin-install demand is a no-op). See :class:`AppUpdater`.
     app_updater: ClassVar[Optional[AppUpdater]] = None
 
-    # init/halt are called once per halt + initially; tick every scheduling
-    # slice; teardown once at final cleanup (see Client docstring).
+    # ``active`` is a pure allocation-policy knob ("represent this printer on
+    # the SimplyPrint connection"), true for the client's whole membership.
+    # Device liveness is NOT expressed by toggling it -- an unreachable device
+    # is reported through ``printer.status`` (OFFLINE) while the printer stays
+    # allocated, so SimplyPrint keeps the printer's context (setup codes,
+    # logs, notifications) and the connection doesn't churn on a flaky wire.
+    # The scheduler runs init and tick (and therefore the drivers) regardless
+    # of this flag, because the drivers are what *detect* liveness.
+
+    # init runs once at scheduler entry; tick every scheduling slice (active or
+    # not); halt on SimplyPrint deallocation; teardown once at final cleanup
+    # (see the Client lifecycle docstrings). Drivers run from init to teardown.
 
     async def init(self) -> None:
-        """Arm the device drivers."""
+        """Arm the device drivers and keep them tracking the config."""
+        self.event_bus.on(ClientConfigChangedEvent, self._on_config_changed_base)
         for driver in self._device_drivers:
             driver.start()
 
+    def _on_config_changed_base(self) -> None:
+        """The config changed (web edit, re-discovery, refreshed credentials):
+        re-resolve the camera and let every driver decide whether its endpoint
+        moved (URL-diff -> restart). Hops to the client loop, because config
+        changes are emitted from web/worker threads too."""
+        if not self.event_loop_is_running():
+            return
+        self.submit_to_loop(self._apply_config_change())
+
+    async def _apply_config_change(self) -> None:
+        self.update_camera_uri()
+        for driver in self._device_drivers:
+            driver.ensure_current()
+
     async def tick(self, _delta) -> None:
         """Host housekeeping every slice: progress shim, ambient sensor, host
-        telemetry, the SimplyPrint heartbeat ping (each interval-gated), and the
-        driver ensure-started sweep (a driver whose config wasn't ready at init
-        retries here for free)."""
+        telemetry, the SimplyPrint heartbeat ping (interval-gated, only while
+        added), and the driver ensure-started sweep (a driver whose config
+        wasn't ready at init retries here for free)."""
         self._tick_progress()
         self.printer.ambient_temperature.tick(self.printer)
         await self.update_host_telemetry()
-        await self.send_ping()
+        if self.is_added():
+            await self.send_ping()
         for driver in self._device_drivers:
             driver.ensure_started()
-
-    async def halt(self) -> None:
-        """Temporarily out of scheduling: suspend every driver."""
-        for driver in self._device_drivers:
-            driver.suspend()
 
     async def teardown(self) -> None:
         """Final cleanup: stop the drivers, then any extra device teardown."""
@@ -221,8 +242,10 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         return tuple(self.device_drivers())
 
     async def on_device_connected(self, driver: "DeviceDriver") -> None:
-        """A driver reached the device: mark active and (re)resolve the camera.
-        Override to add device startup commands (call ``await super()...``)."""
+        """A driver reached the device: ensure allocation and (re)resolve the
+        camera. Override to add device startup commands (call
+        ``await super()...``). The OFFLINE status is *not* cleared here -- the
+        first real device report maps it through ``apply_status``."""
         self.active = True
         self.logger.info("Connected to printer")
         self.update_camera_uri()
@@ -230,9 +253,16 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     async def on_device_disconnected(
         self, driver: "DeviceDriver", reason: Optional[object] = None
     ) -> None:
-        """A driver lost the device: mark inactive and drop the camera."""
-        self.active = False
-        self.logger.info("Disconnected from printer")
+        """A driver lost the device: report it OFFLINE and drop the camera.
+
+        The printer stays allocated (``active`` untouched): liveness is status,
+        allocation is membership. The driver keeps reconnecting on its own, so
+        the connected edge restores the status when the device returns.
+        """
+        self.logger.info(
+            "Disconnected from printer%s", f" ({reason})" if reason else ""
+        )
+        self.printer.status = PrinterStatus.OFFLINE
         self.clear_camera_uri()
 
     async def on_device_message(self, message: object, driver: "DeviceDriver") -> None:
@@ -466,15 +496,27 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         )
 
     def _resolve_camera_uri(self) -> Optional["URL"]:
-        """Return the current camera URI, or ``None`` if unavailable. Device hook
-        (e.g. a custom URL from config, else the connection component's probe)."""
+        """Return the device's current camera URI, or ``None`` if unavailable.
+        Device hook (the brand's probe); a user-set ``custom_webcam_url`` wins
+        before this is even consulted (see :meth:`update_camera_uri`)."""
         return None
 
     def update_camera_uri(self) -> None:
-        """Resolve the device camera URI and hand it to the mixin, logging the
+        """Resolve the camera URI and hand it to the mixin, logging the
         outcome (and redacting any password) the way every integration did by
-        hand."""
-        camera_uri = self._resolve_camera_uri()
+        hand.
+
+        A user-supplied ``custom_webcam_url`` on the config takes precedence
+        over the brand's own camera resolution -- every printer supports a
+        custom webcam, with zero brand code.
+        """
+        custom = getattr(self.config, "custom_webcam_url", None)
+        if custom:
+            from yarl import URL as _URL
+
+            camera_uri = _URL(custom)
+        else:
+            camera_uri = self._resolve_camera_uri()
 
         if not camera_uri:
             self.logger.debug("No camera URI available")

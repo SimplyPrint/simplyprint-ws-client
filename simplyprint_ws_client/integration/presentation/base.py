@@ -57,6 +57,39 @@ NAME_FIELD = EditableField(
     max_length=64,
 )
 
+#: Every config supports a user-supplied webcam URL (the base PrinterConfig
+#: declares ``custom_webcam_url`` and the base client resolves it ahead of the
+#: brand's own camera probe), so the field ships here once instead of being
+#: re-declared per brand.
+WEBCAM_URL_FIELD = EditableField(
+    key="webcam_url",
+    config_attr="custom_webcam_url",
+    label="Webcam URL",
+    type="url",
+    placeholder="http://192.168.1.42:8080/?action=stream",
+    description="Leave blank to use the printer's own camera.",
+)
+
+
+def host_field(
+    config_attr: str = "host",
+    *,
+    label: str = "IP address",
+    placeholder: str = "192.168.1.42",
+    description: str = "The printer's address on your network. "
+    "Changing it reconnects the printer.",
+) -> EditableField:
+    """The editable device-address field, mapped to the brand's own config
+    attribute (``host``, ``local_ip``, ``duet_uri``, ...). One neutral ``host``
+    key, so the UI and PATCH contract never name a brand attribute."""
+    return EditableField(
+        key="host",
+        config_attr=config_attr,
+        label=label,
+        placeholder=placeholder,
+        description=description,
+    )
+
 
 @dataclass(frozen=True)
 class PrinterPresentation:
@@ -66,7 +99,7 @@ class PrinterPresentation:
     badges: list[dict] = field(default_factory=list)
     secrets: list[dict] = field(default_factory=list)
     private_fields: tuple[str, ...] = ()
-    editable_fields: tuple[EditableField, ...] = (NAME_FIELD,)
+    editable_fields: tuple[EditableField, ...] = (NAME_FIELD, WEBCAM_URL_FIELD)
 
 
 def _as_text(value, default: str = "") -> str:
