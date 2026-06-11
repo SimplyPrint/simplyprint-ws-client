@@ -209,7 +209,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
         if is_multi_mode and isinstance(event, SimplyPrintConnectionEstablishedEvent):
             self.logger.debug(
-                "Dropped CloudConnectionEstablishedEvent for multi-mode connection with v: %d in favor of ConnectedMsg",
+                "Dropped SimplyPrintConnectionEstablishedEvent for multi-mode connection with v: %d in favor of ConnectedMsg",
                 event.v,
             )
             return
