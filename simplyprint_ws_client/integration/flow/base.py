@@ -85,6 +85,9 @@ FieldType = Literal[
 #: The widget flavour of a :class:`StepAction` secondary action.
 ActionKind = Literal["button"]
 
+#: How prominently a renderer should style a :class:`Notice` callout.
+NoticeTone = Literal["info", "warning"]
+
 
 # screen descriptors -- the neutral, data-driven frontend contract
 
@@ -98,7 +101,9 @@ class Choice:
     optional ``description``/``icon``/``badge``) are presentation only, so a
     backend can serve a region list or a device list fully described.
     ``recommended`` lets a renderer mark the suggested default option (e.g. the
-    recommended connection mode); presentation-only, the engine never reads it.
+    recommended connection mode); ``secondary`` demotes an option to a small
+    de-emphasized affordance (an "anyway" escape hatch) instead of a primary
+    card. Both are presentation-only; the engine never reads them.
     """
 
     value: str
@@ -107,6 +112,26 @@ class Choice:
     icon: Optional[str] = None
     badge: Optional[str] = None
     recommended: bool = False
+    secondary: bool = False
+
+
+@dataclass(frozen=True)
+class Notice:
+    """A typed callout on a screen: a titled row with an optional body, icon,
+    tone and external link.
+
+    Where a prerequisite ("X must be enabled on the device") or a heads-up ("Y
+    is no longer supported") belongs -- structured, so every renderer draws it
+    as a proper callout instead of parsing it out of prose ``content``.
+    Presentation-only; the engine never reads it.
+    """
+
+    title: str
+    body: Optional[str] = None
+    icon: Optional[str] = None
+    tone: NoticeTone = "info"
+    link_label: Optional[str] = None
+    link_url: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +203,9 @@ class StepPrompt:
     input_schema: Optional[Mapping[str, Any]] = None
     options: List[Choice] = field(default_factory=list)
     actions: List[StepAction] = field(default_factory=list)
+    #: Typed callouts rendered between ``content`` and the inputs: prerequisites,
+    #: deprecation warnings -- anything that deserves a box rather than prose.
+    notices: List[Notice] = field(default_factory=list)
     #: Markdown blocks rendered *below* the inputs (after the submit button) --
     #: where a "where do I find this?" walkthrough or FAQ belongs, so it doesn't
     #: push the form down. ``content`` is the above-the-inputs counterpart.

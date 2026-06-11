@@ -34,6 +34,7 @@ from simplyprint_ws_client.integration.flow.base import (
     Ask,
     Choice,
     FlowError,
+    Notice,
     PromptKind,
     Reject,
     Step,
@@ -212,7 +213,7 @@ class ChoiceStep(Step):
 
     Later steps gate on it (``include=lambda s: s.get(key) == "lan"``), so a flow
     forks without the engine knowing the condition. ``content`` is markdown shown
-    above the options.
+    above the options; ``notices`` are typed callouts between the two.
     """
 
     def __init__(
@@ -223,6 +224,7 @@ class ChoiceStep(Step):
         label: str,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
+        notices: Optional[Sequence[Notice]] = None,
         include: Optional[Include] = None,
         show_in_outline: bool = True,
     ) -> None:
@@ -232,6 +234,7 @@ class ChoiceStep(Step):
         self.label = label
         self._help = help_text
         self._content = content or []
+        self._notices = list(notices or [])
         self._include = include
 
     def _prompt(self, content: Sequence[str]) -> StepPrompt:
@@ -242,6 +245,7 @@ class ChoiceStep(Step):
             kind="choice",
             content=list(content),
             options=list(self._options),
+            notices=list(self._notices),
         )
 
     async def run(
