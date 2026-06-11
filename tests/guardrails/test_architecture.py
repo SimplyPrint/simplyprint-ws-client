@@ -20,7 +20,8 @@ from typing import List
 import pytest
 
 # The library package root
-LIB_PKG = pathlib.Path(__file__).parent.parent / "simplyprint_ws_client"
+LIB_PKG = pathlib.Path(__file__).resolve().parents[2] / "simplyprint_ws_client"
+pytestmark = pytest.mark.guardrail
 
 # Brand names that must NEVER appear as NAME tokens in the library (case-insensitive substring)
 BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centauri")

@@ -18,9 +18,12 @@ times per printer per minute:
 import time
 from typing import List, Optional
 
+import pytest
 from pydantic import BaseModel, Field
 
 from simplyprint_ws_client.common.model import ReactiveModel, SimpleUpdateModel
+
+pytestmark = pytest.mark.performance
 
 
 class _Ctx:
