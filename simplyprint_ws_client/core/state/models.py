@@ -214,6 +214,7 @@ class MultiMaterialSolution(Enum):
             self.BAMBU_AMS_2_PRO: 4,
             self.BAMBU_AMS_LITE: 1,
             self.CREALITY_CFS: 4,
+            self.ANYCUBIC_ACE_PRO: 4,
         }.get(self)
 
     @property
