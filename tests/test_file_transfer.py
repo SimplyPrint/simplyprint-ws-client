@@ -4,14 +4,16 @@ import asyncio
 import threading
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
+from unittest.mock import patch
 
 import pytest
 
-from simplyprint_ws_client import Client, FileDemandData
+from simplyprint_ws_client import Client, FileDemandData, FileProgressStateEnum
 from simplyprint_ws_client.integration.transfer import (
     FileTransfer,
     FirmwareStartOutcome,
 )
+from simplyprint_ws_client.integration.transfer import file_transfer as ft_mod
 
 
 class _StubFileTransfer(FileTransfer):
@@ -133,3 +135,66 @@ async def test_new_transfer_cancels_stuck_previous_transfer(client: Client):
     assert first.cancelled()
     assert client.printer.current_job_id == 2
     assert transfer.is_preparing_to_print is False
+
+
+def test_connect_change_mid_prepare_keeps_download_pending(client: Client):
+    transfer = _StubFileTransfer(client=client)
+    transfer.begin_prepare()
+    client.printer.file_progress.percent = 73
+    client.printer.file_progress.message = "old"
+
+    transfer._on_client_connect_change("disconnected")
+
+    assert transfer.is_preparing_to_print is True
+    assert client.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
+    assert client.printer.file_progress.percent == 0
+    assert client.printer.file_progress.message is None
+
+
+def test_no_progress_timeout_lands_terminal_error(client: Client):
+    transfer = _StubFileTransfer(client=client)
+    with patch.object(ft_mod.time, "monotonic", return_value=1000.0):
+        transfer.begin_prepare()
+
+    with patch.object(ft_mod.time, "monotonic", return_value=1601.0):
+        assert transfer._fail_if_prepare_stalled() is True
+
+    assert transfer.is_preparing_to_print is False
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
+    assert "600s" in client.printer.file_progress.message
+
+
+@pytest.mark.asyncio
+async def test_upload_retries_keep_download_state(client: Client, monkeypatch):
+    async def fake_download_as_file(self, data, dest, clamp_progress):
+        dest.write_bytes(b"gcode")
+        clamp_progress(100)
+        return dest
+
+    monkeypatch.setattr(ft_mod.FileDownload, "download_as_file", fake_download_as_file)
+
+    class FlakyUploadTransfer(_StubFileTransfer):
+        retry_backoff_seconds = 0
+
+        def __init__(self, client):
+            super().__init__(client)
+            self.attempts = 0
+
+        async def _upload(self, local_path, on_progress):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise OSError("temporary offline")
+            on_progress(100)
+            return PurePosixPath("/") / local_path.name
+
+    transfer = FlakyUploadTransfer(client)
+    transfer.begin_prepare()
+
+    result = await transfer.download_file_and_upload(FileDemandData(file_name="job.gcode"))
+
+    assert result is not None
+    assert result[0] == PurePosixPath("job.gcode")
+    assert transfer.attempts == 3
+    assert client.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
+    assert client.printer.file_progress.percent == 100
+    transfer.end_prepare("test done")

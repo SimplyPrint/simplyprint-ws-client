@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 #: sent, for the firmware to broadcast a started print state.
 DEFAULT_GRACE_SECONDS = 60.0
 PREEMPTION_GRACE_SECONDS = 0.05
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 10 * 60.0
+DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_WATCHDOG_INTERVAL_SECONDS = 5.0
 
 #: Prepared (dest, demand, md5) ready to print once a start is requested.
 PreparedPrint = Tuple[PurePosixPath, FileDemandData, str]
@@ -58,6 +62,13 @@ PreparedPrint = Tuple[PurePosixPath, FileDemandData, str]
 
 class _TransferCancelled(Exception):
     """Cooperative cancellation raised from synchronous progress callbacks."""
+
+
+class _TransferFailed(Exception):
+    def __init__(self, user_message: str, reason: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.reason = reason
 
 
 class FirmwareStartOutcome(Enum):
@@ -87,6 +98,12 @@ class FileTransfer(ABC):
     reject_message: str = "Print start was rejected by the printer"
     #: Grace window for the firmware to confirm a started print.
     grace_seconds: float = DEFAULT_GRACE_SECONDS
+    #: Retry budget for the whole download/prepare/upload operation.
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    #: Maximum time without real download/upload/firmware progress before ERROR.
+    no_progress_timeout_seconds: float = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
+    watchdog_interval_seconds: float = DEFAULT_WATCHDOG_INTERVAL_SECONDS
 
     def __init__(self, client: "PrinterClient") -> None:
         self.client = client
@@ -110,6 +127,9 @@ class FileTransfer(ABC):
         # _download_task (asyncio only weakly references tasks).
         self._download_dispatch: Optional[object] = None
 
+        self._prepare_activity_at: Optional[float] = None
+        self._prepare_watchdog: Optional[asyncio.Task] = None
+
     @property
     def is_preparing_to_print(self) -> bool:
         return self._prepare_transfer_type is not None
@@ -129,6 +149,8 @@ class FileTransfer(ABC):
         self.client.logger.debug(f"Begin print prepare ({transfer_type})")
         self._prepare_transfer_type = transfer_type
         self._prepare_awaiting_since = None
+        self._touch_prepare_activity()
+        self._schedule_prepare_watchdog()
         self._on_begin_prepare()
         self.client.printer.file_progress.message = None
         self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
@@ -145,6 +167,7 @@ class FileTransfer(ABC):
             self._mark_ready("no firmware gate")
             return
         self._prepare_awaiting_since = time.monotonic()
+        self._touch_prepare_activity()
         self.client.printer.file_progress.percent = 100
 
     def end_prepare(self, reason: str = "done") -> None:
@@ -153,6 +176,8 @@ class FileTransfer(ABC):
         self.client.logger.debug(f"End print prepare ({reason})")
         self._prepare_transfer_type = None
         self._prepare_awaiting_since = None
+        self._prepare_activity_at = None
+        self._cancel_prepare_watchdog()
         self._on_end_prepare()
 
     def fail_prepare(self, message: str, reason: str) -> None:
@@ -259,6 +284,9 @@ class FileTransfer(ABC):
                         self.end_prepare("download cancelled")
                         return
 
+                    if not self.is_preparing_to_print:
+                        return
+
                     dest, md5checksum = result
 
                     if not data.auto_start:
@@ -273,6 +301,8 @@ class FileTransfer(ABC):
                     # Hand off to firmware; on_print_changed ends the prepare once
                     # the firmware reports a started (READY) or failed (ERROR) state.
                     await self.start_print(dest, data, md5checksum)
+                    if not self.is_preparing_to_print:
+                        return
                     self.mark_transfer_complete()
 
                 except asyncio.CancelledError:
@@ -284,6 +314,11 @@ class FileTransfer(ABC):
                             "File transfer was cancelled", "task cancelled"
                         )
                     raise
+                except _TransferFailed as e:
+                    self.client.logger.warning(
+                        f'Ensure file for "{data.file_name}" failed', exc_info=e
+                    )
+                    self.fail_prepare(e.user_message, e.reason)
                 except Exception as e:
                     self.client.logger.warning(
                         f'Ensure file for "{data.file_name}" failed', exc_info=e
@@ -324,36 +359,87 @@ class FileTransfer(ABC):
     ) -> Optional[Tuple[PurePosixPath, str]]:
         # Download is the first half of the progress bar; upload the second.
         downloader = FileDownload(self.client)
+        last_error: Optional[Exception] = None
+        total_attempts = self.retry_attempts + 1
 
-        with tempfile.TemporaryDirectory() as local_folder:
-            local_dest = Path(local_folder) / data.file_name
-            local_dest = await downloader.download_as_file(
-                data, local_dest, lambda x: x // 2
-            )
-
-            local_dest = self._prepare_local_file(data, local_dest)
-
-            def on_progress(progress):
-                self.client.printer.file_progress.percent = min(
-                    (progress // 2) + 50, 100
-                )
-                if self._download_canceller.is_set():
-                    raise _TransferCancelled("Upload cancelled")
-
+        for attempt in range(1, total_attempts + 1):
+            phase = "download"
             try:
-                dest = (await self._upload(local_dest, on_progress)).relative_to("/")
-                # Hash the final (post-transform) file, off-loop, so a large
-                # gcode can't stall the firmware-ACK grace window.
-                return dest, await file_md5(local_dest)
+                with tempfile.TemporaryDirectory() as local_folder:
+                    local_dest = Path(local_folder) / data.file_name
+                    local_dest = await downloader.download_as_file(
+                        data, local_dest, self._download_progress
+                    )
+
+                    phase = "prepare"
+                    local_dest = self._prepare_local_file(data, local_dest)
+
+                    phase = "upload"
+                    dest = (
+                        await self._upload(local_dest, self._upload_progress)
+                    ).relative_to("/")
+                    phase = "checksum"
+                    # Hash the final (post-transform) file, off-loop, so a large
+                    # gcode can't stall the firmware-ACK grace window.
+                    return dest, await file_md5(local_dest)
             except _TransferCancelled:
                 self.client.logger.info("Upload was cancelled")
                 return None
             except Exception as e:
-                self.client.logger.warning(
-                    f'Upload error for "{data.file_name}"', exc_info=e
-                )
-                self.fail_prepare(self._upload_error_message(e), f"upload error: {e}")
-                return None
+                last_error = e
+                if self._download_canceller.is_set():
+                    self.client.logger.info("Transfer was cancelled")
+                    return None
+
+                if self._has_prepare_stalled():
+                    raise _TransferFailed(
+                        f"No file transfer progress for {int(self.no_progress_timeout_seconds)}s",
+                        "transfer stalled",
+                    ) from e
+
+                if attempt >= total_attempts:
+                    raise _TransferFailed(
+                        self._transfer_error_message(e, phase),
+                        f"transfer failed after {attempt} attempts: {e}",
+                    ) from e
+
+                self._mark_transfer_retrying(e, attempt, total_attempts)
+                await asyncio.sleep(self.retry_backoff_seconds)
+
+        if last_error is not None:
+            raise _TransferFailed(
+                self._transfer_error_message(last_error, "transfer"),
+                f"transfer failed after {total_attempts} attempts: {last_error}",
+            ) from last_error
+        return None
+
+    def _transfer_error_message(self, error: Exception, phase: str) -> str:
+        if phase == "upload":
+            return self._upload_error_message(error)
+        return f"Failed to {phase} file: {error}"
+
+    def _download_progress(self, progress: float) -> float:
+        self._touch_prepare_activity()
+        return progress // 2
+
+    def _upload_progress(self, progress: float) -> None:
+        self._touch_prepare_activity()
+        self.client.printer.file_progress.percent = min((progress // 2) + 50, 100)
+        if self._download_canceller.is_set():
+            raise _TransferCancelled("Upload cancelled")
+
+    def _mark_transfer_retrying(
+        self, error: Exception, attempt: int, total_attempts: int
+    ) -> None:
+        self.client.logger.warning(
+            "File transfer attempt %s/%s failed; retrying",
+            attempt,
+            total_attempts,
+            exc_info=error,
+        )
+        self.client.printer.file_progress.message = None
+        self.client.printer.file_progress.percent = 0
+        self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
 
     async def start_print(
         self,
@@ -387,6 +473,9 @@ class FileTransfer(ABC):
         if not self.is_preparing_to_print:
             return
 
+        if changes:
+            self._touch_prepare_activity()
+
         outcome = self._firmware_outcome(changes)
         if outcome is FirmwareStartOutcome.STARTED:
             self._mark_ready("firmware started")
@@ -411,16 +500,66 @@ class FileTransfer(ABC):
                 or f"Print did not start within {int(self.grace_seconds)}s",
                 "grace expired",
             )
+            return
+
+        self._fail_if_prepare_stalled()
 
     def _on_client_connect_change(self, *_args, **_kwargs) -> None:
-        # Mid-prepare (dis)connect: land file_progress in ERROR so the backend
-        # invariant (exactly one terminal per job_id) holds even when the
-        # prepare is interrupted by a connection blip.
-        if self.is_preparing_to_print:
-            self.fail_prepare(
-                "Printer connection changed during file transfer",
-                "client (dis)connected",
-            )
+        if not self.is_preparing_to_print:
+            return
+
+        self.client.logger.warning(
+            "Printer connection changed during file transfer; keeping transfer pending"
+        )
+        self.client.printer.file_progress.message = None
+        self.client.printer.file_progress.percent = 0
+        self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
+        if self._is_awaiting_firmware_start:
+            self._prepare_awaiting_since = time.monotonic()
+
+    def _touch_prepare_activity(self) -> None:
+        self._prepare_activity_at = time.monotonic()
+
+    def _has_prepare_stalled(self) -> bool:
+        if self._prepare_activity_at is None:
+            return False
+        return (
+            time.monotonic() - self._prepare_activity_at
+            > self.no_progress_timeout_seconds
+        )
+
+    def _fail_if_prepare_stalled(self) -> bool:
+        if not self.is_preparing_to_print or not self._has_prepare_stalled():
+            return False
+        self.fail_prepare(
+            f"No file transfer progress for {int(self.no_progress_timeout_seconds)}s",
+            "transfer stalled",
+        )
+        return True
+
+    def _schedule_prepare_watchdog(self) -> None:
+        if self._prepare_watchdog is not None and not self._prepare_watchdog.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._prepare_watchdog = loop.create_task(self._prepare_watchdog_loop())
+
+    def _cancel_prepare_watchdog(self) -> None:
+        if self._prepare_watchdog is None:
+            return
+        self._prepare_watchdog.cancel()
+        self._prepare_watchdog = None
+
+    async def _prepare_watchdog_loop(self) -> None:
+        try:
+            while self.is_preparing_to_print:
+                await asyncio.sleep(self.watchdog_interval_seconds)
+                if self._fail_if_prepare_stalled():
+                    return
+        except asyncio.CancelledError:
+            pass
 
     @abstractmethod
     async def _upload(

@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from simplyprint_ws_client import FileProgressStateEnum
+from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
+from simplyprint_ws_client.core.files import file_download as file_download_module
+from simplyprint_ws_client.core.files.file_download import FileDownload, FileDownloadError
 from simplyprint_ws_client.integration.transfer import download_to_file
 
 
@@ -41,6 +43,52 @@ class FakeSession:
     def get(self, url):
         self.urls.append(url)
         return self.response
+
+
+class FakeAioContent:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def iter_any(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class FakeAioResponse:
+    def __init__(self, chunks=(), *, status=200, headers=None):
+        self.content = FakeAioContent(chunks)
+        self.status = status
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+
+class FakeAioSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.urls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+    def get(self, url):
+        self.urls.append(url)
+        return self.responses.pop(0)
+
+
+def patch_aio_session(monkeypatch, session):
+    monkeypatch.setattr(
+        file_download_module.aiohttp,
+        "ClientSession",
+        lambda timeout: session,
+    )
 
 
 @pytest.mark.asyncio
@@ -85,3 +133,63 @@ async def test_download_to_file_marks_error_on_size_mismatch():
 
     assert progress.state == FileProgressStateEnum.ERROR
     assert "size mismatch" in progress.message
+
+
+@pytest.mark.asyncio
+async def test_file_download_rejects_missing_urls(client):
+    downloader = FileDownload(client)
+
+    with pytest.raises(FileDownloadError, match="No file URL provided"):
+        await downloader.download_as_bytes(FileDemandData(file_name="file.gcode"))
+
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
+    assert client.printer.file_progress.message == "No file URL provided"
+
+
+@pytest.mark.asyncio
+async def test_file_download_rejects_empty_success_response(client, tmp_path, monkeypatch):
+    session = FakeAioSession([FakeAioResponse([], headers={"content-length": "0"})])
+    patch_aio_session(monkeypatch, session)
+    downloader = FileDownload(client)
+
+    with pytest.raises(FileDownloadError, match="was empty"):
+        await downloader.download_as_file(
+            FileDemandData(file_name="file.gcode", cdn_url="https://cdn.test/file.gcode"),
+            tmp_path / "file.gcode",
+        )
+
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
+    assert client.printer.file_progress.message == (
+        "Downloaded file from https://cdn.test/file.gcode was empty"
+    )
+    assert session.urls == ["https://cdn.test/file.gcode"]
+
+
+@pytest.mark.asyncio
+async def test_file_download_falls_back_after_empty_primary(client, tmp_path, monkeypatch):
+    session = FakeAioSession(
+        [
+            FakeAioResponse([], headers={"content-length": "0"}),
+            FakeAioResponse([b"abc"], headers={"content-length": "3"}),
+        ]
+    )
+    patch_aio_session(monkeypatch, session)
+    downloader = FileDownload(client)
+
+    dest = await downloader.download_as_file(
+        FileDemandData(
+            file_name="file.gcode",
+            cdn_url="https://cdn.test/file.gcode",
+            url="https://fallback.test/file.gcode",
+        ),
+        tmp_path / "file.gcode",
+    )
+
+    assert dest.read_bytes() == b"abc"
+    assert client.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
+    assert client.printer.file_progress.percent == 100
+    assert client.printer.file_progress.message is None
+    assert session.urls == [
+        "https://cdn.test/file.gcode",
+        "https://fallback.test/file.gcode",
+    ]

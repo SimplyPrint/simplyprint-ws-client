@@ -52,6 +52,11 @@ class FileDownload:
         # Support fallback urls in case the primary one fails
         valid_urls = [data.cdn_url, data.url]
 
+        if not any(valid_urls):
+            self.state.state = FileProgressStateEnum.ERROR
+            self.state.message = "No file URL provided"
+            raise FileDownloadError(self.state.message)
+
         # Chunk the download so we can get progress
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             while valid_urls:
@@ -93,6 +98,11 @@ class FileDownload:
                                     else total_percentage
                                 )
 
+                        if downloaded == 0:
+                            self.state.message = f"Downloaded file from {url} was empty"
+                            continue
+
+                        self.state.message = None
                         break
                 except (OSError, SSLError, ClientError, asyncio.TimeoutError) as e:
                     self.state.message = f"Failed to download file from {url}: {e}"
@@ -107,6 +117,9 @@ class FileDownload:
             else:
                 # If we exhausted all URLs and none worked, set the state to error.
                 self.state.state = FileProgressStateEnum.ERROR
+                if not self.state.message:
+                    self.state.message = "Failed to download file"
+                raise FileDownloadError(self.state.message)
 
     async def download_as_bytes(
         self, data: FileDemandData, clamp_progress: Optional[Callable] = None
