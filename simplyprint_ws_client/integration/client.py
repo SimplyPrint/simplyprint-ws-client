@@ -520,6 +520,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
         if not camera_uri:
             self.logger.debug("No camera URI available")
+            self.clear_camera_uri()
             return
 
         if camera_uri.password:

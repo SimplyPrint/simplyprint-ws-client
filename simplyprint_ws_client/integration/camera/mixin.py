@@ -71,11 +71,31 @@ class ClientCameraMixin(Client[_T]):
     @camera_uri.setter
     def camera_uri(self, uri: Optional[URL] = None):
         """Returns whether it has changed the camera URI"""
+        if uri is None:
+            if self._camera_handle:
+                self._camera_handle.stop()
+                self._camera_logger.debug(
+                    f"Cleared previous camera handle ID {self._camera_handle.id}."
+                )
+                self._camera_handle = None
+                self.event_loop.call_soon_threadsafe(self._stream_setup.clear)
+            self._camera_uri = None
+            self._camera_status = "ok"
+            try:
+                self.printer.webcam_info.connected = False
+            except AttributeError:
+                pass
+            return
+
         if self._camera_pool is None:
             self._camera_status = "err"
             self._camera_logger.debug(
                 f"Dropped camera URI {uri} because no camera pool is available."
             )
+            try:
+                self.printer.webcam_info.connected = False
+            except AttributeError:
+                pass
             return
 
         # If the camera URI is the same, don't recreate the camera.

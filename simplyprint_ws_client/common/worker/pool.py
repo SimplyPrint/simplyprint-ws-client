@@ -276,7 +276,7 @@ class WorkerPool:
         *,
         event_loop_provider: Optional[EventLoopProvider] = None,
         n_slabs: int = 24,
-        slab_size: int = 512 * 1024,
+        slab_size: int = 768 * 1024,
         overflow: OverflowPolicy = OverflowPolicy.DROP_OLDEST,
         maxsize: int = _DEFAULT_MAXSIZE,
     ) -> None:

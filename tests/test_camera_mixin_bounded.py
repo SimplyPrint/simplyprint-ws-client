@@ -14,6 +14,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from yarl import URL
 
 from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
 from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
@@ -33,6 +34,68 @@ def _bare_mixin() -> ClientCameraMixin:
     mixin._CAMERA_SETUP_TIMEOUT = 0.02
     mixin._CAMERA_FRAME_TIMEOUT = 0.02
     return mixin
+
+
+class _FakeCameraHandle:
+    id = 7
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class _FakeCameraPool:
+    def __init__(self):
+        self.handle = _FakeCameraHandle()
+
+    def create(self, uri, *, pause_timeout=None):
+        return self.handle
+
+
+def _camera_mixin_with_pool() -> ClientCameraMixin:
+    mixin = _bare_mixin()
+    mixin._camera_pool = _FakeCameraPool()
+    mixin._camera_uri = None
+    mixin._camera_status = "ok"
+    mixin._camera_pause_timeout = 10
+    mixin._request_count = 0
+    mixin.event_loop = SimpleNamespace(
+        call_soon_threadsafe=lambda callback, *args: callback(*args)
+    )
+    mixin.printer = SimpleNamespace(webcam_info=SimpleNamespace(connected=False))
+    return mixin
+
+
+def test_clearing_camera_uri_disconnects_webcam_and_stops_handle():
+    mixin = _camera_mixin_with_pool()
+
+    mixin.camera_uri = URL("http://camera.local/stream")
+    handle = mixin._camera_handle
+    assert handle is not None
+    assert mixin.printer.webcam_info.connected is True
+
+    mixin.camera_uri = None
+
+    assert handle.stopped is True
+    assert mixin._camera_handle is None
+    assert mixin.camera_uri is None
+    assert mixin.camera_status == "ok"
+    assert mixin.printer.webcam_info.connected is False
+
+
+def test_camera_uri_without_pool_does_not_advertise_connected_webcam():
+    mixin = _bare_mixin()
+    mixin._camera_pool = None
+    mixin._camera_uri = None
+    mixin._camera_status = "ok"
+    mixin.printer = SimpleNamespace(webcam_info=SimpleNamespace(connected=True))
+
+    mixin.camera_uri = URL("http://camera.local/stream")
+
+    assert mixin.camera_status == "err"
+    assert mixin.printer.webcam_info.connected is False
 
 
 @pytest.mark.asyncio

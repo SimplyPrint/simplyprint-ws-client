@@ -57,7 +57,7 @@ _FREE = 0
 _IN_USE = 1
 
 _DEFAULT_SLABS = 24
-_DEFAULT_SLAB_SIZE = 512 * 1024
+_DEFAULT_SLAB_SIZE = 768 * 1024
 
 
 def _attach_shm(name: str) -> "shared_memory.SharedMemory":

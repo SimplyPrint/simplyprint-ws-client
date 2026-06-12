@@ -131,6 +131,24 @@ class SubnetScanBackend:
 
         try:
             record = await self._probe(host, context, timeout)
+        except asyncio.TimeoutError:
+            probe_check = DiagnosticCheckResult(
+                id="probe:fingerprint",
+                status="error",
+                code=DiagnosticReason.PROBE_ERROR,
+                label="Printer fingerprint",
+                message="Fingerprint probe timed out",
+                subject=host,
+                detail={"brand": self.spec.brand, "timeout": timeout},
+            )
+            return self._diagnostic(
+                host,
+                services,
+                (*service_checks, probe_check),
+                False,
+                DiagnosticReason.PROBE_ERROR,
+                f"{host} answered on the expected port(s), but the probe timed out",
+            )
         except Exception:
             self.logger.debug(
                 "discovery diagnostic probe failed for %s at %s",
@@ -211,6 +229,14 @@ class SubnetScanBackend:
                     return await self._probe(host, context, timeout)
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    self.logger.debug(
+                        "discovery probe timed out for %s at %s after %.1fs",
+                        self.spec.brand,
+                        host,
+                        timeout,
+                    )
+                    return None
                 except Exception:
                     self.logger.debug(
                         "discovery probe failed for %s at %s",
