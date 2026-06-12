@@ -3,6 +3,7 @@ import base64
 import datetime
 import logging
 import os
+import time
 from typing import Optional, Literal, TypeVar
 
 from yarl import URL
@@ -34,6 +35,10 @@ class ClientCameraMixin(Client[_T]):
     _stream_lock: CancelableLock
     _stream_setup: asyncio.Event
     _request_count: int = 0
+    #: ``time.time()`` of the last published stream frame. A cached frame that
+    #: arrived after this is *unseen* by the server and can be served with zero
+    #: latency instead of blocking until the camera produces its next frame.
+    _last_stream_frame_at: Optional[float] = None
 
     def initialize_camera_mixin(
         self,
@@ -81,6 +86,7 @@ class ClientCameraMixin(Client[_T]):
                 self.event_loop.call_soon_threadsafe(self._stream_setup.clear)
             self._camera_uri = None
             self._camera_status = "ok"
+            self._last_stream_frame_at = None
             try:
                 self.printer.webcam_info.connected = False
             except AttributeError:
@@ -177,6 +183,7 @@ class ClientCameraMixin(Client[_T]):
             self._camera_handle.pause()
         self._stream_lock.cancel()
         self._request_count = 0
+        self._last_stream_frame_at = None
 
     async def on_test_webcam(self):
         await self.on_webcam_snapshot()
@@ -212,13 +219,31 @@ class ClientCameraMixin(Client[_T]):
             data = WebcamSnapshotDemandData()
             attempt = 0
 
+    def _allowed_cache_age(
+        self, data: WebcamSnapshotDemandData
+    ) -> Optional[datetime.timedelta]:
+        """How old a cached frame may be to satisfy this request.
+
+        Snapshot events (``data.id``) tolerate ``max_cache_age``. Stream
+        requests accept any frame newer than the last one we published --
+        it is unseen by the server, so waiting for the camera's *next* frame
+        only adds latency (a full frame period on slow chamber cams). The
+        first frame of a stream session has no publish reference and falls
+        back to ``max_cache_age``.
+        """
+        if data.id is not None:
+            return self._camera_max_cache_age
+
+        if self._last_stream_frame_at is None:
+            return self._camera_max_cache_age
+
+        return datetime.timedelta(seconds=time.time() - self._last_stream_frame_at)
+
     async def _receive_frame_with_retries(
         self, data: WebcamSnapshotDemandData, attempt: int, retry_timeout: float
     ) -> Optional[bytes]:
         if not await self._wait_for_camera():
             return None
-
-        is_snapshot_event = data.id is not None
 
         while True:
             handle = self._camera_handle
@@ -227,17 +252,15 @@ class ClientCameraMixin(Client[_T]):
 
             st = datetime.datetime.now()
 
-            # Block until the camera is ready, but we will sometimes allow
-            # snapshot events to use existing images if they are new enough,
-            # but only once. Bounded: a dead camera worker counts as a failed
-            # attempt instead of holding the dispatch hostage forever.
+            # Block until the camera is ready, but serve an already-received
+            # frame when it is acceptable: snapshot events may reuse a frame up
+            # to ``max_cache_age`` old; stream requests may serve any frame the
+            # server has not seen yet (zero-latency while the worker is hot).
+            # Bounded: a dead camera worker counts as a failed attempt instead
+            # of holding the dispatch hostage forever.
             try:
                 frame = await asyncio.wait_for(
-                    handle.receive_frame(
-                        allow_cache_age=self._camera_max_cache_age
-                        if is_snapshot_event
-                        else None
-                    ),
+                    handle.receive_frame(allow_cache_age=self._allowed_cache_age(data)),
                     self._CAMERA_FRAME_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -282,6 +305,7 @@ class ClientCameraMixin(Client[_T]):
             await self.printer.intervals.wait_for("webcam")
             b64frame = base64.b64encode(frame).decode("utf-8")
             await self.send(StreamMsg(b64frame))
+            self._last_stream_frame_at = time.time()
 
             if self._request_count > 0:
                 self._request_count -= 1

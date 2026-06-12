@@ -42,7 +42,7 @@ async def fake_transport():
 
 @pytest_asyncio.fixture
 async def connection(fake_transport):
-    """Create a CloudConnection whose transport factory yields the fake transport."""
+    """Create a SimplyPrintConnection whose transport factory yields the fake transport."""
 
     def factory(url, provider, logger):
         fake_transport.url = url
@@ -234,7 +234,7 @@ async def test_first_message_timeout_version_increment_is_single_not_double(
     first-message timeout. It verifies that the first dropped transport attempt
     increments the protocol version exactly once.
     """
-    # Capture CloudConnectionLostEvent to know when timeout was handled
+    # Capture SimplyPrintConnectionLostEvent to know when timeout was handled
     lost_events = []
     first_lost = asyncio.Event()
 
@@ -319,7 +319,7 @@ async def test_poll_failure_increments_version_via_exception_handler(
             f"This indicates a double-increment bug in the exception handler path."
         )
         assert len(lost_events) == 1, (
-            "Should have emitted exactly one CloudConnectionLostEvent"
+            "Should have emitted exactly one SimplyPrintConnectionLostEvent"
         )
 
         # Clean up

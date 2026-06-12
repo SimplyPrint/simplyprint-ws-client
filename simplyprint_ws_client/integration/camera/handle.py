@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import threading
+import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from simplyprint_ws_client.integration.camera.base import FrameT
@@ -31,8 +32,11 @@ class CameraHandle(StoppableInterface):
 
     _waiters: List[asyncio.Future]
     _frame_time_window: List[float]
-    _last_poll_time: Optional[datetime.datetime] = None
     _cached_frame: Optional[FrameT] = None
+    _cached_frame_at: Optional[float] = None
+    """``time.time()`` timestamp of when ``_cached_frame`` arrived (the
+    producer's emit time), so cache decisions are about the *frame's* age --
+    never about how recently somebody polled."""
 
     def __init__(
         self, pool: "CameraPool", camera_id: int, driver: Optional[Any] = None
@@ -54,6 +58,7 @@ class CameraHandle(StoppableInterface):
                 self._frame_time_window.pop(0)
 
             self._cached_frame = data
+            self._cached_frame_at = timestamp if data is not None else None
 
             while self._waiters:
                 fut = self._waiters.pop(0)
@@ -67,22 +72,26 @@ class CameraHandle(StoppableInterface):
     async def receive_frame(
         self, allow_cache_age: Optional[datetime.timedelta] = None
     ) -> FrameT:
-        # Always ask for a new frame.
+        # Always ask for a new frame (for continuous cameras this also
+        # (re)starts a paused worker and refreshes its pause timer).
+        now = time.time()
         self._poll()
 
-        # Although we might want to serve an old frame if it's not too old.
-        now = datetime.datetime.now()
+        # Serve the cached frame when the *frame itself* is fresh enough --
+        # this is the zero-latency path for live streams (the worker pushes
+        # frames continuously; a demand should never block on the next one
+        # when an unseen frame is already here).
         with self._lock:
             if allow_cache_age is not None and self._cached_frame is not None:
                 if (
-                    self._last_poll_time is not None
-                    and self._last_poll_time + allow_cache_age > now
+                    self._cached_frame_at is not None
+                    and self._cached_frame_at + allow_cache_age.total_seconds() > now
                 ):
                     return self._cached_frame
 
                 self._cached_frame = None
+                self._cached_frame_at = None
 
-            self._last_poll_time = now
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         with self._lock:

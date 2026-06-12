@@ -1,4 +1,4 @@
-"""CloudConnection routes each WS message's log line to the printer it belongs to.
+"""SimplyPrintConnection routes each WS message's log line to the printer it belongs to.
 
 The headline requirement: backend WebSocket messages about a printer land in that
 printer's log file (``<uid>/ws.log``), not the global one -- while genuinely

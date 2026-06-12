@@ -162,7 +162,13 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     #: Camera mixin tuning consumed by :meth:`_init_camera`. Subclasses override
     #: the class attribute when their camera wants a different cache window.
-    camera_pause_timeout: int = 10
+    #: How long a continuous camera worker may sit unpolled before it pauses.
+    #: Must comfortably exceed the cloud's stream-demand cadence (~15s between
+    #: webcam_snapshot demands): at 10s the worker paused between every two
+    #: demands and each frame paid a full worker respawn + camera connect
+    #: (1-2s on RTSP) instead of ~0ms from the hot stream. ``stream_off``
+    #: still pauses immediately; this is only the lost-demand safety net.
+    camera_pause_timeout: int = 60
     camera_max_cache_age: timedelta = timedelta(seconds=1)
 
     #: Whether the PAUSING hold applies: some firmwares keep reporting PRINTING

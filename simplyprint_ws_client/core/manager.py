@@ -1,4 +1,4 @@
-"""CloudConnection strategy: allocate / deallocate a client onto a backend socket.
+"""SimplyPrintConnection strategy: allocate / deallocate a client onto a backend socket.
 
 This is the SimplyPrint **protocol** multiplexing layer, and it lives in ``core``
 on purpose -- it is *not* the brand-free connection pool
@@ -9,20 +9,20 @@ logic, which is the test for whether things are the same (they are not):
 * The brand-free pool routes by one rule -- ``topic_of(payload) == lease.route`` --
   and is forbidden from knowing any message type. The backend's MULTI routing is
   protocol-aware: a global ``ConnectedMsg`` is *broadcast* to every client as
-  :class:`CloudConnectionEstablishedEvent`; ``MultiPrinterAdded/RemovedMsg`` route by a
+  :class:`SimplyPrintConnectionEstablishedEvent`; ``MultiPrinterAdded/RemovedMsg`` route by a
   *different* field (``msg.data.unique_id``); ordinary messages route by
-  ``for_client``; the raw transport ``CloudConnectionEstablishedEvent`` is *suppressed*
-  in favour of ``ConnectedMsg``; ``CloudConnectionLostEvent`` is broadcast. Broadcast,
+  ``for_client``; the raw transport ``SimplyPrintConnectionEstablishedEvent`` is *suppressed*
+  in favour of ``ConnectedMsg``; ``SimplyPrintConnectionLostEvent`` is broadcast. Broadcast,
   multi-field routing, and event translation have no expression in the pool's
   single-key model -- and teaching it ``ConnectedMsg``/``for_client`` would breach
   the no-brand-leak rule. So this stays here.
 
-* **Reconnection is not duplicated here.** Each backend :class:`CloudConnection` rides
+* **Reconnection is not duplicated here.** Each backend :class:`SimplyPrintConnection` rides
   the shared :class:`~...common.wire.reconnect.Reconnecting` engine (connect /
   backoff / liveness / single version bump). In MULTI mode the one shared
-  ``CloudConnection`` gets that for free; :class:`ClientView` only fans its events to the
+  ``SimplyPrintConnection`` gets that for free; :class:`ClientView` only fans its events to the
   right client(s). There is no PAUSE state: a client's "pause" is releasing its hold
-  (``deallocate``), and when the last client leaves a view its ``CloudConnection`` is
+  (``deallocate``), and when the last client leaves a view its ``SimplyPrintConnection`` is
   disconnected (``engine.stop()``) -- the refcount/lease lifecycle, protocol-side.
 """
 
@@ -107,12 +107,12 @@ class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
 
 class ClientView(Emitter, MutableSet[Client], Hashable):
     """The protocol-aware fan-out over the clients sharing one backend
-    :class:`CloudConnection` -- the multiplexing the brand-free pool deliberately does
+    :class:`SimplyPrintConnection` -- the multiplexing the brand-free pool deliberately does
     not do (see the module docstring). :meth:`emit` is the routing brain: it
     broadcasts the global handshake, routes per-printer messages by ``for_client``
     (or ``data.unique_id`` for add/remove), suppresses the raw transport
     ``established``, and broadcasts ``lost`` -- delivering each onto the target
-    client's own event bus. Reconnection is the ``CloudConnection``'s engine's job, not
+    client's own event bus. Reconnection is the ``SimplyPrintConnection``'s engine's job, not
     this object's; a view only decides *who hears what*."""
 
     mode: ConnectionMode
@@ -176,7 +176,7 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
             # For multi-printer connections the `connected` message is the `established` message.
             if isinstance(msg, ConnectedMsg) and msg.for_client is None:
                 self.logger.debug(
-                    "Converted base ConnectedMsg to CloudConnectionEstablishedEvent with v: %d.",
+                    "Converted base ConnectedMsg to SimplyPrintConnectionEstablishedEvent with v: %d.",
                     v,
                 )
                 await self._emit_all(SimplyPrintConnectionEstablishedEvent(v))
@@ -293,7 +293,7 @@ class ClientConnectionManager(
         loop would stall every other printer on it.
         """
         self.logger.info(
-            "CloudConnection %s suspects it is unable to connect. Running connectivity test suite and generating log file",
+            "SimplyPrintConnection %s suspects it is unable to connect. Running connectivity test suite and generating log file",
             connection.url,
         )
 
@@ -486,7 +486,7 @@ class ClientConnectionManager(
 
         # Tell removed the client it has lost its connection, since it no longer receives messages.
         # This must be awaited (not emit_task) to prevent a race condition where the client
-        # is re-allocated before the CloudConnectionLostEvent handler runs, causing the handler
+        # is re-allocated before the SimplyPrintConnectionLostEvent handler runs, causing the handler
         # to overwrite the state set by allocate() and permanently sticking the client in
         # CONNECTING state.
         await client.event_bus.emit(SimplyPrintConnectionLostEvent(client.v))

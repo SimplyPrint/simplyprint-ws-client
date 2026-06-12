@@ -1,4 +1,4 @@
-"""Tests that :class:`CloudConnection` composes protocol over a transport."""
+"""Tests that :class:`SimplyPrintConnection` composes protocol over a transport."""
 
 import asyncio
 from unittest.mock import patch

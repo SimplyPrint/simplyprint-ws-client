@@ -76,7 +76,7 @@ def _client_list(count: int):
 
 def _fake_connections(monkeypatch):
     _RecordingConnection.instances = []
-    # 2.0 re-pin: CloudConnection was renamed SimplyPrintConnection; the seam
+    # 2.0 re-pin: SimplyPrintConnection was renamed SimplyPrintConnection; the seam
     # and every assertion are unchanged.
     monkeypatch.setattr(
         connection_manager_module, "SimplyPrintConnection", _RecordingConnection
