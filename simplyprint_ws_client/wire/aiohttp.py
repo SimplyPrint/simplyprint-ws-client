@@ -75,6 +75,11 @@ async def default_aiohttp_connect(
     except (ClientError, AiohttpWebSocketError, OSError, asyncio.TimeoutError) as error:
         await session.close()
         raise TransientError.wrap(error)
+    except BaseException:
+        # A cancellation (stop()/open-timeout landing mid-connect) must not
+        # leak the half-open session; close it and let the cancel propagate.
+        await session.close()
+        raise
     return session, ws
 
 
@@ -98,6 +103,7 @@ class Aiohttp(WsTransport, Reconnecting):
         *,
         connect_factory: AiohttpConnectFactory = default_aiohttp_connect,
         first_message_timeout: Optional[float] = None,
+        open_timeout: Optional[float] = Reconnecting.DEFAULT_OPEN_TIMEOUT,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
@@ -105,6 +111,7 @@ class Aiohttp(WsTransport, Reconnecting):
             policy,
             provider,
             first_message_timeout=first_message_timeout,
+            open_timeout=open_timeout,
             logger=logger or logging.getLogger("wire.ws.aiohttp"),
         )
         self.connect_factory = connect_factory
@@ -156,18 +163,23 @@ class Aiohttp(WsTransport, Reconnecting):
 
     async def write(self, message: Union[str, bytes, bytearray]) -> None:
         """Put one ``message`` on the link: ``str`` as a text frame, ``bytes`` as a
-        binary frame."""
+        binary frame. A closed/errored socket maps to a
+        :class:`~simplyprint_ws_client.wire.transport.TransientError`, mirroring
+        :meth:`recv`, so callers see the typed wire-error family."""
         ws = self.ws
         if ws is None:
             raise TransientError("websocket is not open")
-        if isinstance(message, str):
-            await ws.send_str(message)
-        elif isinstance(message, (bytes, bytearray)):
-            await ws.send_bytes(bytes(message))
-        else:
+        if not isinstance(message, (str, bytes, bytearray)):
             raise TypeError(
                 f"aiohttp transport sends str or bytes, not {type(message).__name__}"
             )
+        try:
+            if isinstance(message, str):
+                await ws.send_str(message)
+            else:
+                await ws.send_bytes(bytes(message))
+        except Exception as error:  # noqa: BLE001 -- closed/errored socket
+            raise TransientError.wrap(error, code=ws.close_code)
 
     async def aclose(self) -> None:
         """Tear the websocket and its session down. Idempotent and never raises."""

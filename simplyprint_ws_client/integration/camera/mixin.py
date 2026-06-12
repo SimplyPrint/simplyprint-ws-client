@@ -125,18 +125,35 @@ class ClientCameraMixin(Client[_T]):
         event loop during GC)."""
         self.camera_uri = None
 
-    async def on_stream_on(self):
-        if not self._camera_handle:
-            await self._stream_setup.wait()
+    #: How long a demand waits for a camera handle to be configured before
+    #: giving up. These handlers run inline on the connection's dispatch, so an
+    #: unbounded wait here wedges the whole wire (recv never runs, the
+    #: keepalive kills the socket under a CONNECTED state). Bounded = harmless.
+    _CAMERA_SETUP_TIMEOUT = 10.0
 
-        if self._camera_handle is not None:
+    #: How long one frame read may take before it counts as a failed attempt.
+    #: A camera worker that died or a frozen source must never hold the
+    #: dispatch hostage on a future nobody will resolve.
+    _CAMERA_FRAME_TIMEOUT = 30.0
+
+    async def _wait_for_camera(self) -> bool:
+        """Wait (briefly, bounded) for a camera handle; False when none came."""
+        if self._camera_handle:
+            return True
+        try:
+            await asyncio.wait_for(
+                self._stream_setup.wait(), self._CAMERA_SETUP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return False
+        return self._camera_handle is not None
+
+    async def on_stream_on(self):
+        if await self._wait_for_camera():
             self._camera_handle.start()
 
     async def on_stream_off(self):
-        if not self._camera_handle:
-            await self._stream_setup.wait()
-
-        if self._camera_handle is not None:
+        if await self._wait_for_camera():
             self._camera_handle.pause()
         self._stream_lock.cancel()
         self._request_count = 0
@@ -178,8 +195,8 @@ class ClientCameraMixin(Client[_T]):
     async def _receive_frame_with_retries(
         self, data: WebcamSnapshotDemandData, attempt: int, retry_timeout: float
     ) -> Optional[bytes]:
-        if not self._camera_handle:
-            await self._stream_setup.wait()
+        if not await self._wait_for_camera():
+            return None
 
         is_snapshot_event = data.id is not None
 
@@ -192,12 +209,19 @@ class ClientCameraMixin(Client[_T]):
 
             # Block until the camera is ready, but we will sometimes allow
             # snapshot events to use existing images if they are new enough,
-            # but only once.
-            frame = await handle.receive_frame(
-                allow_cache_age=self._camera_max_cache_age
-                if is_snapshot_event
-                else None
-            )
+            # but only once. Bounded: a dead camera worker counts as a failed
+            # attempt instead of holding the dispatch hostage forever.
+            try:
+                frame = await asyncio.wait_for(
+                    handle.receive_frame(
+                        allow_cache_age=self._camera_max_cache_age
+                        if is_snapshot_event
+                        else None
+                    ),
+                    self._CAMERA_FRAME_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                frame = None
 
             if frame:
                 self._camera_logger.debug(

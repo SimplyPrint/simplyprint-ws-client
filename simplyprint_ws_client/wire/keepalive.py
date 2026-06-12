@@ -13,6 +13,7 @@ from simplyprint_ws_client.wire.events import (
     Disconnected,
     MessageReceived,
 )
+from simplyprint_ws_client.wire.reconnect import Reconnecting
 from simplyprint_ws_client.wire.transport import TransientError
 
 if TYPE_CHECKING:
@@ -111,11 +112,20 @@ class ConnectionKeepalive:
         if self.misses >= self.policy.max_misses:
             self.timed_out = True
             self.misses = 0
+            reason = KeepaliveTimeout(self.policy.timeout_message)
+            transport = self.connection.transport
+            if isinstance(transport, Reconnecting):
+                # Heal, don't just report: trip the supervised attempt so the
+                # zombie wire tears down and reconnects. Supervise then emits
+                # the ONE real ``Disconnected(code=KeepaliveTimeout)`` --
+                # emitting a synthetic one here too would double the edge.
+                transport.trip(transport.generation, reason)
+                return
+            # Self-healing transports (paho owns its own thread + reconnect
+            # loop) cannot be tripped; the synthetic lease-level event remains
+            # the report so drivers still see the device go quiet.
             await self.connection.event_bus.emit(
-                Disconnected(
-                    self.connection.generation,
-                    code=KeepaliveTimeout(self.policy.timeout_message),
-                )
+                Disconnected(self.connection.generation, code=reason)
             )
             return
 

@@ -16,8 +16,9 @@ What each region pins (the engine's contract, read straight off ``reconnect.py``
   brings the wire back;
 * ``recv`` returning ``None`` -> the frame is skipped (no ``MessageReceived``), the
   stream keeps flowing, and no generation churn happens;
-* ``write`` raising -> it propagates to the ``send`` caller and does *not* by
-  itself end the supervised attempt (a drop must come from ``recv``/``open``);
+* ``write`` raising -> it propagates to the ``send`` caller AND trips the
+  supervised attempt (a wire that fails a write is dead or dying);
+* ``open`` hanging -> bounded by ``open_timeout``; a timeout is a failed attempt;
 * ``aclose`` raising -> swallowed by ``teardown``; supervision survives it;
 * ``RetryPolicy`` ``max_attempts`` / ``give_up_after`` exhaustion -> the loop stops,
   stays ``DISCONNECTED``, ``supervising()`` is ``False``, and a lease's
@@ -325,13 +326,17 @@ async def test_recv_none_is_skipped_no_message_no_generation_churn():
 
 
 # --------------------------------------------------------------------------- #
-# write() raising.
+# write() raising. NEW CONTRACT (the keepalive-wedge fix): a wire that fails a
+# write is dead or dying, so the failed send *trips* the attempt -- the loop
+# tears down and reconnects -- instead of leaving a dead wire looking
+# CONNECTED. The caller still gets the original exception.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_write_raising_propagates_to_send_caller_and_keeps_link_up():
-    """A write failure surfaces to send()'s caller; the supervised link stays up."""
+async def test_write_raising_propagates_to_send_caller_and_trips_the_link():
+    """A write failure surfaces to send()'s caller AND ends the attempt: the
+    supervised loop tears the dead wire down and brings up a fresh one."""
     boom = OSError("socket write failed")
     downs: List[Any] = []
     wire = make_wire(write_error=boom)
@@ -344,12 +349,13 @@ async def test_write_raising_propagates_to_send_caller_and_keeps_link_up():
             await wire.send("payload")
         assert excinfo.value is boom
 
-        # write() raising is the send caller's problem, not a wire drop: the
-        # supervised attempt is untouched, no Disconnected, generation unchanged.
-        await asyncio.sleep(0.02)
-        assert downs == []
-        assert wire.connected
-        assert wire.generation == 1
+        # The failed send trips the attempt: one Disconnected for the dead
+        # wire, then a reconnect on the next generation.
+        wire.write_error = None
+        await wait_for(lambda: len(downs) == 1)
+        await wait_for(lambda: wire.connected and wire.generation == 2)
+        await wire.send("payload")
+        assert wire.sent == ["payload"]
     finally:
         await wire.stop()
 
@@ -1062,29 +1068,32 @@ async def test_drop_storm_generations_stay_contiguous_and_balanced():
 
 
 # --------------------------------------------------------------------------- #
-# write() failing repeatedly never ends the supervised attempt: the wire stays
-# up across many failed sends; only recv()/open() drop a link.
+# write() failing persistently: every failed send trips its attempt, so the
+# wire cycles through supervised reconnects -- it never wedges CONNECTED on a
+# dead socket and never stops supervising. The caller always gets a typed
+# refusal: the write's own error on a live wire, NotConnected between attempts.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_repeated_write_failures_never_drop_the_link():
-    """Many failed send()s in a row leave the supervised link fully intact."""
-    downs: List[Any] = []
+async def test_repeated_write_failures_cycle_supervised_reconnects():
+    """Persistently failing send()s churn supervised reconnects, never a wedge."""
     wire = make_wire(write_error=ConnectionResetError("write keeps failing"))
-    wire.events.on(Disconnected, lambda e: downs.append(e))
     wire.start()
     try:
         await wait_for(lambda: wire.connected)
         for _ in range(25):
-            with pytest.raises(ConnectionResetError):
+            with pytest.raises((ConnectionResetError, NotConnected)):
                 await wire.send(b"x")
-        await asyncio.sleep(0.02)
-        assert downs == []  # not one of the 25 write failures dropped the link
-        assert wire.connected
-        assert wire.generation == 1
-        assert wire.writes == 25  # every send reached write()
-        assert wire.sent == []  # ...and none succeeded
+            await asyncio.sleep(0)  # let the trip/reconnect interleave
+        assert wire.supervising()  # the loop never gives up on write failures
+        assert wire.sent == []  # ...and no failed send was reported delivered
+
+        # The moment writes heal, the supervised wire settles and delivers.
+        wire.write_error = None
+        await wait_for(lambda: wire.connected)
+        await wire.send(b"ok")
+        assert wire.sent == [b"ok"]
     finally:
         await wire.stop()
 
@@ -1260,4 +1269,77 @@ async def test_lease_close_while_handler_is_parked_no_leak():
         leaked = after - before - {asyncio.current_task(), wire.task}
         assert leaked == set(), f"leaked delivery task: {leaked}"
     finally:
+        await wire.stop()
+
+
+# --------------------------------------------------------------------------- #
+# open() is bounded at the supervise level: a hung connect is a failed attempt
+# (backoff, retry), never CONNECTING forever.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_hung_open_times_out_and_the_next_attempt_proceeds():
+    """A blocked open() ends after open_timeout with a TransientError-coded
+    Disconnected, the half-open wire is torn down, and the loop retries."""
+    release = asyncio.Event()
+    opens = []
+
+    class HungOpenWire(ChaosWire):
+        async def open(self) -> None:
+            opens.append(self.generation)
+            if len(opens) == 1:
+                await release.wait()  # first attempt hangs
+            await super().open()
+
+    downs: List[Any] = []
+    wire = HungOpenWire(
+        yarl.URL("ws://chaos/x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+        logger=silent_logger(),
+    )
+    wire.open_timeout = 0.05
+    wire.events.on(Disconnected, lambda e: downs.append(e))
+    wire.start()
+    try:
+        await wait_for(lambda: wire.connected and wire.generation == 1)
+        assert len(opens) == 2  # attempt 1 timed out, attempt 2 connected
+        assert len(downs) == 1
+        assert isinstance(downs[0].code, TransientError)
+        assert "open timed out" in str(downs[0].code)
+        assert wire.closes >= 1  # the half-open attempt was torn down
+    finally:
+        release.set()
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_open_timeout_none_keeps_open_unbounded():
+    """open_timeout=None preserves the legacy unbounded open()."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowOpenWire(ChaosWire):
+        async def open(self) -> None:
+            started.set()
+            await release.wait()
+            await super().open()
+
+    wire = SlowOpenWire(
+        yarl.URL("ws://chaos/x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+        logger=silent_logger(),
+    )
+    wire.open_timeout = None
+    wire.start()
+    try:
+        await asyncio.wait_for(started.wait(), 2.0)
+        await asyncio.sleep(0.1)  # far past any small bound: still CONNECTING
+        assert wire.state is ConnectionState.CONNECTING
+        release.set()
+        await wait_for(lambda: wire.connected)
+    finally:
+        release.set()
         await wire.stop()

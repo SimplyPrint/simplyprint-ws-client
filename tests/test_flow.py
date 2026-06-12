@@ -1276,3 +1276,36 @@ def test_recipe_identify_label_none_keeps_step_default():
         identify_label="Which one?",
     )
     assert labelled.phases[0].steps[0].label == "Which one?"
+
+
+@pytest.mark.asyncio
+async def test_select_step_matches_a_none_sentinel_item():
+    """A source may end with ``None`` as an "add another" sentinel item; choosing
+    it must advance (regression: it was indistinguishable from "no match" and
+    rejected as no-longer-available)."""
+    step = SelectStep(
+        "account",
+        source=lambda _state: ["a1", None],
+        option=lambda item: ("__new__", "Sign in") if item is None else (item, item),
+        pick=lambda _state, item: {} if item is None else {"account": item},
+        label="Choose an account",
+    )
+    flow = Flow(
+        id="pick",
+        title="Pick",
+        phases=[Phase("pick", "Pick", steps=[step])],
+        finish=lambda state: dict(state),
+    )
+
+    prompt = await advance_flow(flow, {})
+    assert isinstance(prompt, Prompt)
+    assert [option.value for option in prompt.prompt.options] == ["a1", "__new__"]
+
+    done = await advance_flow(flow, prompt.state, {"account": "__new__"})
+    assert isinstance(done, Done)
+    assert "account" not in done.value
+
+    # A genuinely unknown value still rejects.
+    rejected = await advance_flow(flow, prompt.state, {"account": "gone"})
+    assert isinstance(rejected, Failed)
+    assert "no longer available" in (rejected.message or "")

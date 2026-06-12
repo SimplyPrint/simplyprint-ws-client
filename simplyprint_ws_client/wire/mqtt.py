@@ -106,6 +106,9 @@ class MqttConnectParams(NamedTuple):
     retry: RetryPolicy
     verify_tls: bool = False
     logger: Optional["logging.Logger"] = None
+    #: Bound on one connect attempt for the supervised async impls
+    #: (``None`` = the transport's own default; paho owns its own timeouts).
+    open_timeout: Optional[float] = None
 
 
 def initial_topics(url: yarl.URL) -> List[str]:
@@ -137,8 +140,10 @@ def build_pool(
     def make_transport(url: yarl.URL, params: object) -> MqttTransport:
         if isinstance(params, MqttConnectParams):
             retry, verify_tls, logger = params.retry, params.verify_tls, params.logger
+            open_timeout = params.open_timeout
         else:
             retry, verify_tls, logger = RetryPolicy(), False, None
+            open_timeout = None
         if impl == "paho":
             return Paho(
                 url,
@@ -150,6 +155,10 @@ def build_pool(
                 logger=logger,
             )
         if impl == "aiomqtt":
+            # ``None`` means "the transport's own default", not "unbounded".
+            timeout_kwargs = (
+                {} if open_timeout is None else {"open_timeout": open_timeout}
+            )
             return AioMqtt(
                 url,
                 retry,
@@ -158,6 +167,7 @@ def build_pool(
                     u, logger, keepalive=mqtt_keepalive, verify_tls=verify_tls
                 ),
                 logger=logger,
+                **timeout_kwargs,
             )
         raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
 
@@ -219,6 +229,7 @@ def connect(
             retry=options.retry or RetryPolicy(),
             verify_tls=options.verify_tls,
             logger=options.logger,
+            open_timeout=options.open_timeout,
         ),
     )
     if not isinstance(lease, MqttLease):

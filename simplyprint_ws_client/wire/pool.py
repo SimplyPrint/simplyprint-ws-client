@@ -228,13 +228,19 @@ class Pool(Generic[T]):
                 endpoint.attach()
                 self.endpoints[endpoint_key] = endpoint
                 started = transport
+            shared = endpoint.transport
             lease = self.lease_class(
-                self, endpoint.transport, parsed, endpoint_key, provider=self.provider
+                self, shared, parsed, endpoint_key, provider=self.provider
             )
             endpoint.add_lease(lease)
 
         if started is not None:
             started.start()
+        elif not shared.supervising():
+            # A fresh lease on an endpoint whose transport permanently gave up
+            # (bounded retry policy exhausted) re-arms supervision -- start()
+            # resets the give-up and is a no-op on a live wire.
+            shared.start()
         return lease
 
     def release(self, lease: "Lease[T]") -> Optional[T]:

@@ -52,3 +52,6 @@ class ConnectionOptions:
     app_keepalive: Optional[Keepalive] = None
     verify_tls: bool = False
     logger: Optional["logging.Logger"] = None
+    #: Bound on one connect attempt for the supervised async transports
+    #: (``None`` = the transport's own default; paho owns its own timeouts).
+    open_timeout: Optional[float] = None

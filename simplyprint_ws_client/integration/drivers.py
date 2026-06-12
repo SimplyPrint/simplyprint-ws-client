@@ -41,11 +41,12 @@ import yarl
 
 from simplyprint_ws_client.wire import mqtt as mqtt_front_door
 from simplyprint_ws_client.wire import websocket as ws_front_door
-from simplyprint_ws_client.wire.errors import FatalError
+from simplyprint_ws_client.wire.errors import FatalError, TransientError
 from simplyprint_ws_client.wire.events import Connected, Disconnected, MessageReceived
 from simplyprint_ws_client.wire.lease import Lease, MqttLease, WsLease
 from simplyprint_ws_client.wire.messages import MqttMessage, WsMessage
 from simplyprint_ws_client.wire.options import ConnectionOptions
+from simplyprint_ws_client.wire.reconnect import Reconnecting
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.integration.client import PrinterClient
@@ -192,6 +193,21 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         self._url = url
         self._options = options
         self.lease: Optional[TLease] = None
+        # restart() is single-flight: concurrent requests coalesce into the
+        # in-flight sequence, which loops once more (re-resolving the URL) so
+        # the newest config always wins.
+        self._restart_lock = threading.Lock()
+        self._restarting = False
+        self._restart_again = False
+        self._stopped = False
+        #: Surfaced start-failure state (public: a warnings surface reads it):
+        #: how many consecutive tick sweeps failed to even build/lease the
+        #: link, and the last reason. Without this a printer whose URL cannot
+        #: resolve shows "connecting" forever with the error buried at DEBUG.
+        self.consecutive_start_failures = 0
+        self.last_start_error: Optional[str] = None
+        self.last_start_error_at: Optional[float] = None
+        self._start_failure_edge_fired = False
 
     def _connect(self, url: Union[str, yarl.URL], options: ConnectionOptions) -> TLease:
         raise NotImplementedError
@@ -206,7 +222,18 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         return lease is not None and lease.connected and self.is_connected is True
 
     def start(self) -> None:
-        if self.lease is not None and not self.lease.closed:
+        self._stopped = False
+        lease = self.lease
+        if lease is not None and not lease.closed:
+            if not lease.transport.supervising():
+                # The shared wire permanently gave up (bounded retry policy
+                # exhausted): the lease is open but nothing would ever
+                # reconnect it. start() re-arms supervision for every lease
+                # on the endpoint; the tick sweep retries this for free.
+                self.client.logger.debug(
+                    "%s link gave up retrying; re-arming supervision", self.name
+                )
+                lease.transport.start()
             return
         try:
             loop = self.client.event_loop
@@ -223,10 +250,12 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
             # The factory is pure; it signals "credentials must be minted"
             # and the client's refresh hook does the (off-loop) work.
             self.client.logger.debug("%s link needs credentials: %s", self.name, error)
+            self._count_start_failure(error)
             self.request_credential_refresh()
             return
         except Exception as error:  # noqa: BLE001 -- config not ready yet; tick retries
             self.client.logger.debug("cannot start %s link yet: %s", self.name, error)
+            self._count_start_failure(error)
             return
 
         options = self._options or ConnectionOptions()
@@ -242,9 +271,14 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
             lease = self._connect(url, options)
         except Exception as error:  # noqa: BLE001 -- bad URL/params; tick retries
             self.client.logger.debug("cannot start %s link yet: %s", self.name, error)
+            self._count_start_failure(error)
             return
 
         self.lease = lease
+        self.consecutive_start_failures = 0
+        self.last_start_error = None
+        self.last_start_error_at = None
+        self._start_failure_edge_fired = False
         lease.event_bus.on(MessageReceived, self._on_wire_message)
         lease.event_bus.on(Connected, self._on_wire_connected)
         lease.event_bus.on(Disconnected, self._on_wire_disconnected)
@@ -252,6 +286,38 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         if lease.connected:
             # Attached to an already-live shared wire: deliver the edge now.
             lease.create_task(self._on_wire_connected(None))
+
+    #: Consecutive failed start sweeps (~one per 1s tick) before the printer
+    #: is reported OFFLINE with the failure as the reason. Below the bound the
+    #: outage may be transient startup ordering; past it the user must see it.
+    START_FAILURE_EDGE_AFTER = 30
+
+    def _count_start_failure(self, error: Exception) -> None:
+        """Track one failed start sweep; flip the offline edge exactly once."""
+        self.consecutive_start_failures += 1
+        self.last_start_error = str(error) or type(error).__name__
+        self.last_start_error_at = time.monotonic()
+        if (
+            self._start_failure_edge_fired
+            or self.consecutive_start_failures < self.START_FAILURE_EDGE_AFTER
+        ):
+            return
+        self._start_failure_edge_fired = True
+        self.is_connected = False
+        reason = f"link could not start: {self.last_start_error}"
+        coro = self.client.on_device_disconnected(self, reason=reason)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        try:
+            loop = self.client.event_loop
+        except RuntimeError:
+            loop = None
+        if loop is not None and running is loop:
+            loop.create_task(coro)
+        else:
+            self.client.submit_to_loop(coro)
 
     def ensure_current(self) -> None:
         """Restart iff the URL factory now resolves somewhere else.
@@ -271,11 +337,67 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
             self.restart()
 
     def stop(self) -> None:
+        self._stopped = True
         lease = self.lease
         self.lease = None
         if lease is None:
             return
         lease.close_soon()
+
+    def restart(self) -> None:
+        """Stop and start again -- properly sequenced.
+
+        The old lease is closed and AWAITED before the new one is built: its
+        refcount release stops the shared transport (a plain stop+start would
+        re-lease the still-open endpoint and never actually bounce the wire),
+        and its handlers detach before the new lease exists (so a stale
+        ``Disconnected`` can never clobber the fresh link). When the endpoint
+        is not moving, the shared wire is additionally kicked via ``trip`` --
+        sibling leases may hold the refcount above zero, and a stuck-but-open
+        connection must still reconnect. Sync-callable from any thread;
+        single-flight with coalescing.
+        """
+        with self._restart_lock:
+            if self._restarting:
+                self._restart_again = True
+                return
+            self._restarting = True
+        self.client.submit_to_loop(self._restart_sequence())
+
+    async def _restart_sequence(self) -> None:
+        try:
+            while True:
+                try:
+                    lease, self.lease = self.lease, None
+                    if lease is not None and not lease.closed:
+                        await self._bounce(lease)
+                    if not self._stopped:
+                        self.start()
+                except Exception:  # noqa: BLE001 -- a failed bounce must not wedge restarts
+                    self.client.logger.warning(
+                        "%s restart failed", self.name, exc_info=True
+                    )
+                with self._restart_lock:
+                    if not self._restart_again:
+                        return
+                    self._restart_again = False
+        finally:
+            with self._restart_lock:
+                self._restarting = False
+
+    async def _bounce(self, lease: TLease) -> None:
+        """Tear one lease fully down, kicking the shared wire when the
+        endpoint is not moving (same URL: siblings keep the transport leased,
+        so close/reopen alone would hand back the same stuck wire)."""
+        try:
+            same_url = yarl.URL(str(self._url())) == lease.url
+        except Exception:  # noqa: BLE001 -- config in flux counts as "moved"
+            same_url = False
+        if same_url and isinstance(lease.transport, Reconnecting):
+            lease.transport.trip(
+                lease.transport.generation, TransientError("driver restart")
+            )
+        await lease.close()
 
     def send_soon(self, message: object) -> bool:
         """Schedule a send if the wire is up; ``False`` (and no raise) if not."""
@@ -381,12 +503,17 @@ class DevicePoller(DeviceDriver):
         poll: Optional[Callable[[], Awaitable[None]]] = None,
         offline_after: float = 300.0,
         failure_backoff: float = 10.0,
+        poll_timeout: float = 30.0,
         name: Optional[str] = None,
     ) -> None:
         super().__init__(client, name=name)
         self.interval = interval
         self.offline_after = offline_after
         self.failure_backoff = failure_backoff
+        #: Hard bound on one ``poll_device()`` call. A poll stuck on a dead
+        #: socket must count as a failure and keep the silence clock running --
+        #: an unbounded poll would freeze the loop and the offline edge with it.
+        self.poll_timeout = poll_timeout
         self._poll = poll
         self._task: Optional[asyncio.Task] = None
 
@@ -430,9 +557,16 @@ class DevicePoller(DeviceDriver):
         while True:
             failed = False
             try:
-                await (self._poll or self.client.poll_device)()
+                await asyncio.wait_for(
+                    (self._poll or self.client.poll_device)(), self.poll_timeout
+                )
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                failed = True
+                self.client.logger.debug(
+                    "%s poll timed out after %.0fs", self.name, self.poll_timeout
+                )
             except DeviceAuthError:
                 failed = True
                 self.request_credential_refresh()

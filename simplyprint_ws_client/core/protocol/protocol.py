@@ -28,6 +28,7 @@ from simplyprint_ws_client.wire.events import (
 )
 from simplyprint_ws_client.wire.messages import WsMessage
 from simplyprint_ws_client.wire.transport import WsTransport
+from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.utils.bounded_variable import BoundedInterval
@@ -45,7 +46,24 @@ WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
 
 
 class SimplyPrintProtocol:
-    """Client-side SimplyPrint WS protocol over a reconnecting transport."""
+    """Client-side SimplyPrint WS protocol over a reconnecting transport.
+
+    Inbound dispatch is decoupled from the transport's supervise task by one
+    FIFO :class:`Courier`: the transport-bus handlers only enqueue, so ``recv``
+    (and with it drop detection) stays live no matter how slow or wedged a
+    downstream client handler is. Lifecycle events ride the same queue as
+    messages, so the dispatch order -- and therefore which ``v`` an inbound
+    message observes -- is exactly what inline dispatch produced; a message
+    queued before a ``Disconnected`` still dispatches first, with the pre-bump
+    ``v``. Nothing is flushed on disconnect for the same reason: dropping those
+    messages would *change* semantics, not preserve them.
+    """
+
+    #: Queue depth past which a stalled inbound dispatch is reported (once per
+    #: attach epoch). The courier is unbounded -- SimplyPrint inbound is
+    #: low-volume control traffic and demands must never shed -- so a watchdog
+    #: log is the surfacing for a sink that stopped draining.
+    DISPATCH_STALL_THRESHOLD = 100
 
     def __init__(self, connection, logger: logging.Logger) -> None:
         self.connection = connection
@@ -55,22 +73,61 @@ class SimplyPrintProtocol:
         self.v = 0
         self._suspect = WsSuspectConnectionBoundedInterval.create_variable(0)
         self.transport: Optional[WsTransport] = None
+        self._courier: Optional[Courier] = None
+        self._stall_reported = False
 
     def attach(self, transport: WsTransport) -> None:
         self.detach()
         self.transport = transport
-        transport.events.on(Connected, self._on_connected)
-        transport.events.on(Disconnected, self._on_disconnected)
-        transport.events.on(MessageReceived, self._on_message)
+        self._courier = Courier(
+            sink=self._dispatch,
+            is_async_sink=True,
+            provider=self.connection,
+            policy=OverflowPolicy.UNBOUNDED,
+            logger=self.logger,
+        )
+        self._stall_reported = False
+        transport.events.on(Connected, self._enqueue)
+        transport.events.on(Disconnected, self._enqueue)
+        transport.events.on(MessageReceived, self._enqueue)
 
     def detach(self) -> None:
         transport = self.transport
         if transport is None:
             return
-        transport.events.off(Connected, self._on_connected)
-        transport.events.off(Disconnected, self._on_disconnected)
-        transport.events.off(MessageReceived, self._on_message)
+        transport.events.off(Connected, self._enqueue)
+        transport.events.off(Disconnected, self._enqueue)
+        transport.events.off(MessageReceived, self._enqueue)
         self.transport = None
+        courier, self._courier = self._courier, None
+        if courier is not None:
+            courier.close(drain=False)
+
+    def _enqueue(self, event) -> None:
+        """Transport-bus handler: queue and return -- never await dispatch."""
+        courier = self._courier
+        if courier is None:
+            return
+        courier.post(event)
+        if (
+            not self._stall_reported
+            and courier.pending() >= self.DISPATCH_STALL_THRESHOLD
+        ):
+            self._stall_reported = True
+            self.logger.error(
+                "SimplyPrint inbound dispatch stalled: %d events queued "
+                "(a client handler is not returning)",
+                courier.pending(),
+            )
+
+    async def _dispatch(self, event) -> None:
+        """Courier sink: route one queued event to its protocol handler."""
+        if isinstance(event, MessageReceived):
+            await self._on_message(event)
+        elif isinstance(event, Connected):
+            await self._on_connected(event)
+        elif isinstance(event, Disconnected):
+            await self._on_disconnected(event)
 
     async def _on_connected(self, _event: Connected) -> None:
         self._suspect.reset()

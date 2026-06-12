@@ -344,12 +344,16 @@ class SelectStep(Step):
             fields=[self._manual_field] if self._manual_field is not None else [],
         )
 
-    def _match(self, items: Sequence[object], chosen: object) -> Optional[object]:
+    #: Distinguishes "no candidate matched" from a matched candidate that is
+    #: itself ``None`` (a source may use ``None`` as an "add another" sentinel).
+    _NO_MATCH = object()
+
+    def _match(self, items: Sequence[object], chosen: object) -> object:
         for item in items:
             value, _label = self._option(item)
             if str(value) == str(chosen):
                 return item
-        return None
+        return self._NO_MATCH
 
     async def run(
         self,
@@ -372,7 +376,7 @@ class SelectStep(Step):
                 return Advance(await resolve(handler(state, value)))
 
             item = self._match(items, answer.get(self.key))
-            if item is None:
+            if item is self._NO_MATCH:
                 content = await _resolve_content(self._content, state)
                 return Reject(
                     "That option is no longer available",

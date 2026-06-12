@@ -210,6 +210,23 @@ async def test_pool_distinct_endpoints_get_distinct_transports():
 
 
 @pytest.mark.asyncio
+async def test_pool_rearms_a_gave_up_transport_on_new_lease():
+    """A fresh lease on an endpoint whose transport permanently gave up must
+    re-arm supervision -- otherwise every later lease shares a dead wire that
+    nothing will ever reconnect."""
+    transports: List[FakeTransport] = []
+    pool = build_pool(transports)
+    url = yarl.URL("ws://host/path")
+
+    pool.connect(url)
+    await transports[0].go_down(terminal=True)  # retry policy exhausted
+
+    second = pool.connect(url)
+    assert second.transport is transports[0]  # still the shared endpoint wire
+    assert transports[0].starts == 2  # ...but the new lease re-armed it
+
+
+@pytest.mark.asyncio
 async def test_pool_refcounts_and_tears_down_on_last_close():
     transports: List[FakeTransport] = []
     pool = build_pool(transports)
@@ -369,6 +386,218 @@ async def test_reconnecting_send_raises_not_connected_when_down():
         await wait_for(lambda: wire.connected)
         await wire.send("ok")
         assert wire.sent == ["ok"]
+    finally:
+        await wire.stop()
+
+
+class FlakySendWire(DrivableWire):
+    """A :class:`DrivableWire` whose ``write`` fails on demand -- the shape of a
+    socket that died under the sender before ``recv`` observed the drop."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.write_error: Optional[Exception] = None
+
+    async def write(self, message: object) -> None:
+        if self.write_error is not None:
+            raise self.write_error
+        await super().write(message)
+
+
+@pytest.mark.asyncio
+async def test_failed_send_trips_the_attempt_and_reconnects():
+    """A failed send must end the attempt even though recv never raised --
+    regression: the wire stayed CONNECTED on a dead socket, every send failed
+    forever, and no Disconnected reached the UI. The send's typed error (close
+    code included) is what the Disconnected carries."""
+    downs: List[Any] = []
+    ups: List[int] = []
+    wire = FlakySendWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.events.on(Connected, lambda e: ups.append(e.generation))
+    wire.events.on(Disconnected, lambda e: downs.append((e.generation, e.code)))
+    wire.start()
+    try:
+        await wait_for(lambda: wire.generation == 1 and wire.connected)
+
+        wire.write_error = TransientError("dead socket", code=1011)
+        with pytest.raises(TransientError):
+            await wire.send("ping")
+
+        # The trip announces the drop tagged with the send's failure -- the
+        # typed error passes through whole, close code and all.
+        await wait_for(lambda: len(downs) == 1)
+        assert downs[0][0] == 1
+        assert isinstance(downs[0][1], TransientError)
+        assert downs[0][1].code == 1011
+
+        # ...and the loop reconnects; the fresh wire sends again.
+        wire.write_error = None
+        await wait_for(lambda: wire.generation == 2 and wire.connected)
+        assert ups == [1, 2]
+        await wire.send("ok")
+        assert "ok" in wire.sent
+    finally:
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_send_unwedges_a_blocked_dispatch():
+    """A trip must end the attempt even while inbound dispatch is stuck
+    mid-await -- the in-flight handler is cancelled, the wire reconnects."""
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def stuck_handler(event: MessageReceived) -> None:
+        entered.set()
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    wire = FlakySendWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.events.on(MessageReceived, stuck_handler)
+    wire.start()
+    try:
+        await wait_for(lambda: wire.connected)
+        wire.inbox.put_nowait("wedge")
+        await asyncio.wait_for(entered.wait(), 2.0)
+
+        # The supervise task is stuck dispatching; recv cannot observe a drop.
+        wire.write_error = RuntimeError("dead socket")
+        with pytest.raises(RuntimeError):
+            await wire.send("ping")
+
+        await wait_for(lambda: wire.generation == 2 and wire.connected)
+        assert cancelled.is_set()  # the wedged handler was cancelled, not leaked
+    finally:
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_trip_is_ignored():
+    """A send that captured a previous attempt's wire must not kill the new,
+    healthy one: a trip for an old generation is a no-op."""
+    wire = DrivableWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.start()
+    try:
+        await wait_for(lambda: wire.generation == 1 and wire.connected)
+        wire.trip(0, RuntimeError("stale"))
+        await asyncio.sleep(0.05)
+        assert wire.connected and wire.generation == 1
+    finally:
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_websockets_write_wraps_send_errors_with_close_code():
+    """A dead socket under ``send`` surfaces as the typed wire error with the
+    library's close code attached, mirroring ``recv`` -- never the raw
+    ``websockets`` exception."""
+    from websockets.exceptions import ConnectionClosedError as WsClosed
+    from websockets.frames import Close
+
+    transport = Websockets(yarl.URL("ws://x"), provider=current_provider())
+
+    class DeadSocket:
+        async def send(self, frame: object) -> None:
+            raise WsClosed(None, Close(1011, "keepalive ping timeout"))
+
+    transport.socket = DeadSocket()  # type: ignore[assignment]
+    with pytest.raises(TransientError) as excinfo:
+        await transport.write("hi")
+    assert excinfo.value.code == 1011
+    assert isinstance(excinfo.value.transport_error, WsClosed)
+
+
+@pytest.mark.asyncio
+async def test_send_failure_inside_connected_handler_trips_the_attempt():
+    """The tripwire is armed before Connected is announced, so the classic
+    "hello on connect" send that fails ends this very attempt instead of
+    being silently dropped (and the wire then wedging on a blocked recv)."""
+    failures: List[Exception] = []
+    wire = FlakySendWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.write_error = RuntimeError("dead at hello")
+
+    async def hello(event: Connected) -> None:
+        if event.generation != 1:
+            return
+        try:
+            await wire.send("hello")
+        except RuntimeError as error:
+            failures.append(error)
+
+    wire.events.on(Connected, hello)
+    wire.start()
+    try:
+        # Attempt 1 dies on its own hello; attempt 2 makes no send and lives.
+        await wait_for(lambda: wire.connected and wire.generation == 2)
+        assert len(failures) == 1
+    finally:
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_raising_lifecycle_listener_does_not_kill_supervision():
+    """A buggy Connecting/Disconnected listener is logged, not fatal -- the
+    supervisor keeps reconnecting (regression: it died silently, leaving
+    state DISCONNECTED, ready() waiters hung, and nothing logged)."""
+
+    async def bad_listener(event) -> None:
+        raise RuntimeError("listener bug")
+
+    wire = DrivableWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.events.on(Connecting, bad_listener)
+    wire.events.on(Disconnected, bad_listener)
+    wire.start()
+    try:
+        await wait_for(lambda: wire.connected and wire.generation == 1)
+        wire.inbox.put_nowait(TransientError("drop"))  # Disconnected listener raises
+        await wait_for(lambda: wire.connected and wire.generation == 2)
+        assert wire.supervising()
+    finally:
+        await wire.stop()
+
+
+@pytest.mark.asyncio
+async def test_raising_connected_listener_does_not_drop_a_healthy_wire():
+    """A buggy Connected listener must not churn a healthy link."""
+
+    async def bad_listener(event) -> None:
+        raise RuntimeError("listener bug")
+
+    wire = DrivableWire(
+        yarl.URL("ws://x"),
+        policy=RetryPolicy(backoff=ConstantBackoff(0)),
+        provider=current_provider(),
+    )
+    wire.events.on(Connected, bad_listener)
+    wire.start()
+    try:
+        await wait_for(lambda: wire.connected and wire.generation == 1)
+        await asyncio.sleep(0.05)
+        assert wire.connected and wire.generation == 1
     finally:
         await wire.stop()
 
@@ -933,3 +1162,63 @@ async def test_front_doors_share_one_transport_per_endpoint():
     assert a.transport is b.transport
     await a.close()
     await b.close()
+
+
+@pytest.mark.asyncio
+async def test_ws_front_door_passes_open_timeout_to_the_transport():
+    """ConnectionOptions.open_timeout reaches the transport the pool builds;
+    omitted means the transport keeps its own default."""
+    from simplyprint_ws_client.wire.websocket import build_pool
+
+    pool = build_pool("websockets", None, current_provider())
+    lease = pool.connect(
+        yarl.URL("ws://host/x"),
+        ws.WsConnectParams(RetryPolicy(), None, 12.5),
+    )
+    assert lease.transport.open_timeout == 12.5
+    await lease.close()
+
+    pool = build_pool("websockets", None, current_provider())
+    lease = pool.connect(
+        yarl.URL("ws://host/y"),
+        ws.WsConnectParams(RetryPolicy(), None, None),
+    )
+    assert lease.transport.open_timeout == Reconnecting.DEFAULT_OPEN_TIMEOUT
+    await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_timeout_trips_a_reconnecting_transport():
+    """On a supervised wire a keepalive timeout HEALS, not just reports: the
+    attempt is tripped, exactly one real Disconnected(KeepaliveTimeout) per
+    dead generation reaches the lease, and the wire reconnects."""
+    wires: List[DrivableWire] = []
+
+    def build(url: yarl.URL, params: object) -> DrivableWire:
+        wire = DrivableWire(
+            url,
+            policy=RetryPolicy(backoff=ConstantBackoff(0)),
+            provider=current_provider(),
+        )
+        wires.append(wire)
+        return wire
+
+    pool = Pool(
+        build=build, key=lambda url, params: str(url), provider=current_provider()
+    )
+    lease = pool.connect(yarl.URL("ws://host/path"))
+    downs: List[Disconnected] = []
+    lease.event_bus.on(Disconnected, lambda e: downs.append(e))
+    lease.keepalive(Keepalive(interval=0.01, max_misses=1))
+    try:
+        (wire,) = wires
+        await wait_for(lambda: wire.connected and wire.generation == 1)
+        # No inbound activity: the keepalive times out, trips the attempt,
+        # and the supervised loop reconnects on the next generation.
+        await wait_for(lambda: wire.generation >= 2 and wire.connected)
+
+        gen1_downs = [e for e in downs if e.generation == 1]
+        assert len(gen1_downs) == 1  # one real edge; no synthetic double
+        assert isinstance(gen1_downs[0].code, KeepaliveTimeout)
+    finally:
+        await lease.close()

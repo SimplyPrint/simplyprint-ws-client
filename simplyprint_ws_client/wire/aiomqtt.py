@@ -140,12 +140,14 @@ class AioMqtt(MqttTransport, Reconnecting):
         provider: Optional[EventLoopProvider[asyncio.AbstractEventLoop]] = None,
         *,
         client_factory: MqttClientFactory = default_aiomqtt_client,
+        open_timeout: Optional[float] = Reconnecting.DEFAULT_OPEN_TIMEOUT,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
             url,
             policy,
             provider,
+            open_timeout=open_timeout,
             logger=logger or logging.getLogger("wire.mqtt.aiomqtt"),
         )
         self.client_factory = client_factory

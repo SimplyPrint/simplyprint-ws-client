@@ -74,6 +74,8 @@ class WsConnectParams(NamedTuple):
 
     retry: RetryPolicy
     logger: Optional["logging.Logger"] = None
+    #: Bound on one connect attempt (``None`` = the transport's own default).
+    open_timeout: Optional[float] = None
 
 
 #: The two shipped wire implementations, by name.
@@ -99,10 +101,13 @@ def build_pool(
     def make_transport(url: yarl.URL, params: object) -> WsTransport:
         if isinstance(params, WsConnectParams):
             retry, logger = params.retry, params.logger
+            open_timeout = params.open_timeout
         elif isinstance(params, RetryPolicy):
-            retry, logger = params, None
+            retry, logger, open_timeout = params, None, None
         else:
-            retry, logger = RetryPolicy(), None
+            retry, logger, open_timeout = RetryPolicy(), None, None
+        # ``None`` means "the transport's own default", not "unbounded".
+        timeout_kwargs = {} if open_timeout is None else {"open_timeout": open_timeout}
         if impl == "websockets":
             return Websockets(
                 url,
@@ -110,6 +115,7 @@ def build_pool(
                 provider,
                 connect_kwargs=_websockets_keepalive_kwargs(wire_keepalive),
                 logger=logger,
+                **timeout_kwargs,
             )
         if impl == "aiohttp":
             return Aiohttp(
@@ -120,6 +126,7 @@ def build_pool(
                     u, logger, heartbeat=_aiohttp_heartbeat(wire_keepalive)
                 ),
                 logger=logger,
+                **timeout_kwargs,
             )
         raise ValueError(
             f"ws.connect: unknown impl {impl!r} (use 'websockets'/'aiohttp')"
@@ -168,7 +175,10 @@ def connect(
     options = options or ConnectionOptions()
     pool = build_pool(impl, pool, options.provider, options.wire_keepalive)
     lease = pool.connect(
-        url, WsConnectParams(options.retry or RetryPolicy(), options.logger)
+        url,
+        WsConnectParams(
+            options.retry or RetryPolicy(), options.logger, options.open_timeout
+        ),
     )
     if not isinstance(lease, WsLease):
         raise TypeError(

@@ -88,6 +88,7 @@ class Websockets(WsTransport, Reconnecting):
         connect_factory: Optional[ConnectFactory] = None,
         connect_kwargs: Optional[dict] = None,
         first_message_timeout: Optional[float] = None,
+        open_timeout: Optional[float] = Reconnecting.DEFAULT_OPEN_TIMEOUT,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__(
@@ -95,6 +96,7 @@ class Websockets(WsTransport, Reconnecting):
             policy,
             provider,
             first_message_timeout=first_message_timeout,
+            open_timeout=open_timeout,
             logger=logger or logging.getLogger("wire.ws.websockets"),
         )
         self.connect_factory = connect_factory
@@ -131,12 +133,20 @@ class Websockets(WsTransport, Reconnecting):
         ``str`` is sent as a text frame and ``bytes`` as a binary frame. The
         WebSocket front door is responsible for reducing its ``WsMessage`` family
         to a bare ``str``/``bytes`` before it reaches here, so this transport never
-        imports the framing types it does not own.
+        imports the framing types it does not own. A ``websockets``
+        ``ConnectionClosed`` (the wire dropped under the send) maps to a
+        :class:`~simplyprint_ws_client.wire.transport.TransientError`, mirroring
+        :meth:`recv`, so callers see the typed wire-error family -- never the
+        library's raw exception.
         """
         socket = self.socket
         if socket is None:
             raise TransientError("websocket not connected")
-        await socket.send(as_frame(message))
+        frame = as_frame(message)
+        try:
+            await socket.send(frame)
+        except Exception as error:  # noqa: BLE001 -- ConnectionClosed et al.
+            raise TransientError.wrap(error, code=websocket_close_code(error))
 
     async def aclose(self) -> None:
         """Close the live wire. Idempotent and never raises."""

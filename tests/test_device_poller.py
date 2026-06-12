@@ -108,3 +108,28 @@ async def test_auth_error_runs_single_flight_credential_refresh():
         await _wait_for(lambda: client.refreshes >= 1)
     finally:
         poller.stop()
+
+
+@pytest.mark.asyncio
+async def test_hung_poll_counts_as_failure_and_keeps_the_edge_clock():
+    """A poll stuck on a dead socket is bounded by poll_timeout -- the loop
+    keeps running and the silence clock still flips the offline edge
+    (regression: an unbounded poll froze the loop and the edge with it)."""
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    client = FakeClient(asyncio.get_running_loop(), hang)
+    poller = DevicePoller(
+        client,
+        interval=0.01,
+        offline_after=0.05,
+        failure_backoff=0.01,
+        poll_timeout=0.02,
+    )
+    poller.start()
+    try:
+        await _wait_for(lambda: client.disconnected_edges)
+        assert poller.is_connected is False
+    finally:
+        poller.stop()

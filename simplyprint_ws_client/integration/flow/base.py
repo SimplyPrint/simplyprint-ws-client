@@ -405,6 +405,9 @@ class Flow(Generic[T]):
     finish: Callable[[Mapping[str, object]], Union[T, Awaitable[T]]]
     #: Human label of what the flow yields (for a UI; never load-bearing).
     produces: str = ""
+    #: One UI line for a flow picker: what running this flow gets the user
+    #: (e.g. shown under the brand name when choosing an account type to link).
+    description: Optional[str] = None
     #: The state keys a *caller* may seed when starting the flow (the facts a
     #: discovered/deep-linked device carries in: a host, a serial, a model, a
     #: branch mode). A stateless front door intersects an untrusted launch context
