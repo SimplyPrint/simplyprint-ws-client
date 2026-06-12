@@ -1,4 +1,5 @@
 from simplyprint_ws_client.core.autowire import AutowireClientMeta, configure, autowire
+from simplyprint_ws_client.core.protocol.messages import WebcamSnapshotDemandData
 from simplyprint_ws_client.core.protocol.models import ServerMsgType, DemandMsgType
 
 
@@ -102,3 +103,47 @@ def test_metaclass_autoconfiguration():
 
     assert hasattr(AutowireClient1.custom_handler, "_event_bus_event")
     assert AutowireClient1.custom_handler._event_bus_event == "custom_event"
+
+
+class ClientWithPrivateHelpers(metaclass=AutowireClientMeta):
+    """Private helpers must never be inferred into listeners by signature."""
+
+    def __init__(self):
+        self.event_bus = None
+
+    def _helper_with_demand_annotation(self, data: WebcamSnapshotDemandData):
+        # Returns a non-None value: were this registered, the event bus would
+        # replace the emit args with it for every later listener.
+        return object()
+
+    @configure(ServerMsgType.STREAM_RECEIVED)
+    def _explicit_private_handler(self): ...
+
+    def on_webcam_snapshot(self, data=None): ...
+
+
+def test_private_methods_are_not_inferred_as_listeners():
+    """A private single-arg method annotated with a demand-data model is an
+    implementation detail, not a listener. (Production bug: a private helper
+    taking WebcamSnapshotDemandData was auto-registered, and its non-None
+    return value replaced the demand data for the real handler.)"""
+    helper = ClientWithPrivateHelpers._helper_with_demand_annotation
+    assert getattr(helper, "_event_bus_event", None) is None
+
+
+def test_explicitly_configured_private_handler_still_works():
+    """@configure on a private method remains honored, including the zero-arg
+    wrap that drops the event payload."""
+    handler = ClientWithPrivateHelpers._explicit_private_handler
+    assert handler._event_bus_event == ServerMsgType.STREAM_RECEIVED
+    assert getattr(handler, "_event_bus_wrap", False) is True
+
+
+def test_camera_mixin_private_cache_helper_is_not_a_listener():
+    """The exact production regression: ClientCameraMixin._allowed_cache_age
+    takes WebcamSnapshotDemandData and returns a timedelta; it must not be
+    wired as a WEBCAM_SNAPSHOT listener."""
+    from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
+
+    helper = ClientCameraMixin._allowed_cache_age
+    assert getattr(helper, "_event_bus_event", None) is None

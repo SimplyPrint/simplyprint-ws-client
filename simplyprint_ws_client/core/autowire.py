@@ -98,7 +98,14 @@ def autoconfigure(attr: Callable):
             attr._event_bus_event = event_guess
             return
 
-    # We extract event information given one argument.
+    # We extract event information given one argument -- but never for
+    # private functions: a ``_helper(self, data: SomeDemandData)`` is an
+    # implementation detail, and silently registering it as a listener is a
+    # trap (a non-None return *replaces* the emit args for every later
+    # listener). Private handlers opt in explicitly via ``@configure``.
+    if name.startswith("_"):
+        return
+
     if len(parameters) != 1:
         return
 
