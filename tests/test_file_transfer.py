@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 from unittest.mock import patch
@@ -14,6 +15,8 @@ from simplyprint_ws_client.integration.transfer import (
     FirmwareStartOutcome,
 )
 from simplyprint_ws_client.integration.transfer import file_transfer as ft_mod
+
+from tests._loop_heartbeat import LoopHeartbeat
 
 
 class _StubFileTransfer(FileTransfer):
@@ -137,6 +140,72 @@ async def test_new_transfer_cancels_stuck_previous_transfer(client: Client):
     assert transfer.is_preparing_to_print is False
 
 
+# -- async hooks: locate skips download; offload runs off the loop ----------- #
+
+
+@pytest.mark.asyncio
+async def test_locate_existing_hit_skips_the_download(client: Client):
+    located = (PurePosixPath("/remote/job.gcode"), "md5existing")
+    downloads = {"n": 0}
+
+    class LocatingTransfer(_StubFileTransfer):
+        async def _locate_existing(self, data):
+            return located
+
+        async def download_file_and_upload(self, data):
+            downloads["n"] += 1
+            return PurePosixPath("never"), "never"
+
+    transfer = LocatingTransfer(client)
+    result = await transfer.ensure_file(FileDemandData(file_name="job.gcode"))
+
+    assert result == located
+    assert downloads["n"] == 0  # the located file short-circuits the download
+
+
+@pytest.mark.asyncio
+async def test_offload_falls_back_to_a_thread_without_an_app(client: Client):
+    assert client.offload is None  # a client built outside an app has no lanes
+    transfer = _StubFileTransfer(client=client)
+
+    ran_on = await transfer._offload(threading.get_ident)
+
+    assert ran_on != threading.get_ident()  # ran on a worker thread, value returned
+
+
+@pytest.mark.asyncio
+async def test_slow_prepare_does_not_stall_the_loop(client: Client, monkeypatch):
+    async def fake_download_as_file(self, data, dest, clamp_progress):
+        dest.write_bytes(b"gcode")
+        clamp_progress(100)
+        return dest
+
+    monkeypatch.setattr(ft_mod.FileDownload, "download_as_file", fake_download_as_file)
+
+    class SlowPrepareTransfer(_StubFileTransfer):
+        async def _prepare_local_file(self, data, local_path):
+            # A blocking transform offloaded off the loop (no app => a thread).
+            return await self._offload(lambda: (time.sleep(2.0), local_path)[1])
+
+        async def _upload(self, local_path, on_progress):
+            return PurePosixPath("/") / local_path.name  # absolute (relative_to "/")
+
+    transfer = SlowPrepareTransfer(client)
+    transfer.begin_prepare()
+
+    async with LoopHeartbeat(interval=0.01) as hb:
+        task = asyncio.create_task(
+            transfer.download_file_and_upload(FileDemandData(file_name="job.gcode"))
+        )
+        await asyncio.sleep(0.3)  # the 2s prepare is running off the loop
+        assert not task.done()
+        result = await task
+
+    assert hb.max_gap_ms < 200  # the loop kept beating through the slow prepare
+    assert result is not None
+    transfer.end_prepare("done")
+
+
 def test_connect_change_mid_prepare_keeps_download_pending(client: Client):
     transfer = _StubFileTransfer(client=client)
     transfer.begin_prepare()
@@ -190,7 +259,9 @@ async def test_upload_retries_keep_download_state(client: Client, monkeypatch):
     transfer = FlakyUploadTransfer(client)
     transfer.begin_prepare()
 
-    result = await transfer.download_file_and_upload(FileDemandData(file_name="job.gcode"))
+    result = await transfer.download_file_and_upload(
+        FileDemandData(file_name="job.gcode")
+    )
 
     assert result is not None
     assert result[0] == PurePosixPath("job.gcode")

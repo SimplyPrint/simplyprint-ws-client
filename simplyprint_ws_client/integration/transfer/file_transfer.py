@@ -30,6 +30,7 @@ genuine state transition.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import tempfile
 import threading
 import time
@@ -108,6 +109,23 @@ class FileTransfer(ABC):
     def __init__(self, client: "PrinterClient") -> None:
         self.client = client
         self.next_to_print: Optional[PreparedPrint] = None
+
+        # The three hooks run on the app loop and must be async (offloading their
+        # blocking parts via _offload). Warn loudly if an out-of-tree brand still
+        # overrides one synchronously rather than silently re-blocking the loop.
+        cls = type(self)
+        for name, hook in (
+            ("_pre_ensure", cls._pre_ensure),
+            ("_locate_existing", cls._locate_existing),
+            ("_prepare_local_file", cls._prepare_local_file),
+        ):
+            if not inspect.iscoroutinefunction(hook):
+                client.logger.warning(
+                    "%s.%s must be async def (it runs on the app loop); a sync "
+                    "override blocks it -- offload via self._offload",
+                    cls.__name__,
+                    name,
+                )
 
         # Prepare lifecycle. None transfer_type => no prepare in flight.
         # awaiting_since flips from None to a monotonic timestamp at
@@ -201,7 +219,13 @@ class FileTransfer(ABC):
         except RuntimeError:
             running_loop = None
 
-        client_loop = getattr(self.client, "event_loop", None)
+        # The client's own loop. EventLoopProvider.event_loop always exists but
+        # raises when no loop is set -- that "no loop" case is client_loop = None.
+        try:
+            client_loop = self.client.event_loop
+        except RuntimeError:
+            client_loop = None
+
         if running_loop is not None and (
             client_loop is None or running_loop is client_loop
         ):
@@ -210,10 +234,9 @@ class FileTransfer(ABC):
             task.add_done_callback(self._on_dispatch_done)
             return
 
-        submit_to_loop = getattr(self.client, "submit_to_loop", None)
-        if submit_to_loop is not None:
-            self._download_dispatch = submit_to_loop(coro)
-        elif client_loop is not None:
+        if client_loop is not None:
+            # Cross-thread: marshal onto the client's loop. This is exactly what
+            # PrinterClient.submit_to_loop does (run_coroutine_threadsafe).
             self._download_dispatch = asyncio.run_coroutine_threadsafe(
                 coro, client_loop
             )
@@ -342,9 +365,9 @@ class FileTransfer(ABC):
         # Slugify the file name (this is the one we compare with).
         data.file_name = slugify(data.file_name)
 
-        self._pre_ensure()
+        await self._pre_ensure()
 
-        existing = self._locate_existing(data)
+        existing = await self._locate_existing(data)
         if existing is not None:
             return existing
 
@@ -372,7 +395,7 @@ class FileTransfer(ABC):
                     )
 
                     phase = "prepare"
-                    local_dest = self._prepare_local_file(data, local_dest)
+                    local_dest = await self._prepare_local_file(data, local_dest)
 
                     phase = "upload"
                     dest = (
@@ -579,18 +602,33 @@ class FileTransfer(ABC):
         unless the grace timeout alone is the desired gate)."""
         return FirmwareStartOutcome.PENDING
 
-    def _prepare_local_file(self, data: FileDemandData, local_path: Path) -> Path:
-        """Transform the downloaded file for this printer (e.g. wrap as 3mf)."""
+    async def _offload(self, fn: Callable, *args):
+        """Run a brand's blocking hook work off the loop, on the transfer lane.
+
+        The single seam a brand uses to push synchronous FTP/HTTP/zip work off
+        the app loop. ``Client.offload`` is the app's lanes; it is ``None`` only
+        for a client built outside an app (unit tests), where a plain thread is
+        the right fallback. Args are positional; bind keywords with a closure."""
+        offload = self.client.offload
+        if offload is not None:
+            return await offload.run_transfer(fn, *args)
+        return await asyncio.to_thread(fn, *args)
+
+    async def _prepare_local_file(self, data: FileDemandData, local_path: Path) -> Path:
+        """Transform the downloaded file for this printer (e.g. wrap as 3mf).
+        Async: a brand offloads its blocking transform via :meth:`_offload`."""
         return local_path
 
-    def _locate_existing(
+    async def _locate_existing(
         self, data: FileDemandData
     ) -> Optional[Tuple[PurePosixPath, str]]:
-        """Return an already-present remote file to skip re-upload, else None."""
+        """Return an already-present remote file to skip re-upload, else None.
+        Async: a brand offloads its blocking lookup via :meth:`_offload`."""
         return None
 
-    def _pre_ensure(self) -> None:
-        """Run before locating/downloading (e.g. reset the FTP connection)."""
+    async def _pre_ensure(self) -> None:
+        """Run before locating/downloading (e.g. reset the FTP connection).
+        Async: a brand offloads its blocking reset via :meth:`_offload`."""
 
     def _on_progress_tick(self, changes) -> None:
         """React to in-firmware transfer progress (brands that download CDN-side)."""
