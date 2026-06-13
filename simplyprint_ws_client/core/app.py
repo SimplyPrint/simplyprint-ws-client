@@ -4,7 +4,7 @@ import asyncio
 import atexit
 import logging
 import threading
-from typing import Dict, Optional, cast
+from typing import Dict, Optional
 
 from simplyprint_ws_client.core.client import (
     Client,
@@ -13,10 +13,12 @@ from simplyprint_ws_client.core.client import (
 )
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.config import ConfigManager
+from simplyprint_ws_client.core.config.flusher import ConfigFlusher
 from simplyprint_ws_client.core.manager import ClientList
 from simplyprint_ws_client.core.scheduler import Scheduler
 from simplyprint_ws_client.core.settings import ClientSettings, PrinterSpec
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
+from simplyprint_ws_client.common.asyncio.offload import Offload
 from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.core.api.sentry import Sentry
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
@@ -29,8 +31,14 @@ class ClientApp(SyncStoppable):
     scheduler: Scheduler
     config_manager: ConfigManager[PrinterConfig]
     config_managers: Dict[str, ConfigManager[PrinterConfig]]
+    #: One coalesced flusher per config manager; the change-event listener
+    #: triggers these instead of flushing inline on the loop.
+    config_flushers: Dict[str, ConfigFlusher]
     client_specs: Dict[str, PrinterSpec]
     camera_pool: Optional[CameraPool] = None
+    #: The app's bounded blocking-work lanes; the only sanctioned hop for a
+    #: blocking call off the loop. Created unconditionally, shut down last.
+    offload: Offload
     logger: logging.Logger
 
     _app_event_loop: asyncio.AbstractEventLoop
@@ -68,6 +76,14 @@ class ClientApp(SyncStoppable):
             for spec in specs
         }
         self.config_manager = next(iter(self.config_managers.values()))
+        # The single owner of every blocking-call hop off the app loop.
+        self.offload = Offload()
+        # Coalesce the chatty config-change flush off the loop (registration in
+        # add/remove still flushes directly -- see below).
+        self.config_flushers = {
+            key: ConfigFlusher(manager, self.offload, loop=self._app_event_loop)
+            for key, manager in self.config_managers.items()
+        }
         self.logger = logger
 
         if settings.backend is not None:
@@ -93,6 +109,11 @@ class ClientApp(SyncStoppable):
         except Exception as e:
             self.logger.exception("An error occurred in the main loop: %s", e)
             raise
+        finally:
+            # Drain any pending config write while the loop is still alive (the
+            # Runner has not closed it yet). aclose runs the final flush off-loop.
+            for flusher in self.config_flushers.values():
+                await flusher.aclose()
 
     def run_blocking(self, debug=False, contexts: Optional[list] = None):
         contexts = contexts or []
@@ -192,14 +213,18 @@ class ClientApp(SyncStoppable):
             config_manager.flush(config)
 
             client = spec.client_factory(
-                config, event_loop_provider=self.scheduler, camera_pool=self.camera_pool
+                config,
+                event_loop_provider=self.scheduler,
+                camera_pool=self.camera_pool,
+                offload=self.offload,
             )
 
+            # Coalesce + offload the chatty change flush; trigger() is a cheap,
+            # thread-safe "mark dirty" (covers emits from device threads).
+            flusher = self.config_flushers[spec.key]
             client.event_bus.on(
                 ClientConfigChangedEvent,
-                lambda *args, **kwargs: config_manager.flush(
-                    cast(PrinterConfig, client.config)
-                ),
+                lambda *args, **kwargs: flusher.trigger(),
             )
 
             client.event_bus.on(ClientStateChangeEvent, self.scheduler.signal)
@@ -245,7 +270,16 @@ class ClientApp(SyncStoppable):
                 self._app_instance.join()
                 self._app_instance = None
 
+            # Loop is dead now; if run()'s finally never executed (crash / no run),
+            # write any still-pending config change synchronously so it is not lost.
+            for flusher in self.config_flushers.values():
+                flusher.flush_now_if_dirty()
+
             if self.camera_pool is not None:
                 self.camera_pool.stop()
+
+            # Last: after the loop is dead and no camera reconcile can submit,
+            # join the blocking-work lanes so teardown leaks no executor threads.
+            self.offload.shutdown(wait=True)
 
             self.logger.info("Stopped.")

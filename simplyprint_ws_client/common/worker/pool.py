@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing as mp
+import queue
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -57,7 +58,17 @@ def _join_or_warn(target, name: str, logger: logging.Logger) -> None:
 
 class _Backend:
     def start(self) -> None: ...
-    def stop(self) -> None: ...
+
+    def request_stop(self) -> None:
+        """Signal the producer to stop. MUST be non-blocking -- it runs on the
+        consumer loop. The blocking join happens later in :meth:`finalize`."""
+        ...
+
+    def finalize(self) -> None:
+        """Join the backend's thread/process and release its resources. Blocks;
+        only ever called from the pool's reaper thread (or, at full teardown,
+        from :meth:`WorkerPool.stop`)."""
+        ...
 
 
 class _InlineBackend(_Backend):
@@ -95,7 +106,7 @@ class _InlineBackend(_Backend):
         except Exception:  # noqa: BLE001
             _logger.exception("inline producer failed")
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         def _kill() -> None:
             if self._stop is not None:
                 self._stop.set()
@@ -106,6 +117,11 @@ class _InlineBackend(_Backend):
             self._provider.event_loop.call_soon_threadsafe(_kill)
         except RuntimeError:
             pass
+
+    def finalize(self) -> None:
+        # The producer is a task on the consumer loop, cancelled by request_stop;
+        # there is no thread/process to join.
+        pass
 
 
 class _ThreadBackend(_Backend):
@@ -155,8 +171,10 @@ class _ThreadBackend(_Backend):
         except Exception:  # noqa: BLE001
             _logger.exception("threaded producer failed")
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
+
+    def finalize(self) -> None:
         _join_or_warn(self._thread, "worker thread", _logger)
         self._courier.close()
 
@@ -231,8 +249,10 @@ class _ProcessBackend(_Backend):
         self._proc.start()
         self._reader.start()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
+
+    def finalize(self) -> None:
         self._proc.join(timeout=JOIN_TIMEOUT)
         if self._proc.is_alive():
             self._proc.terminate()
@@ -251,19 +271,29 @@ class WorkerHandle:
     """The parent-side handle for one allocated producer."""
 
     def __init__(
-        self, worker_id: int, backend: _Backend, release: Callable[[int], None]
+        self,
+        worker_id: int,
+        backend: _Backend,
+        release: Callable[[int], None],
+        reap: Callable[[_Backend], None],
     ) -> None:
         self.id = worker_id
         self._backend = backend
         self._release = release
+        self._reap = reap
         self._stopped = False
 
     def stop(self) -> None:
+        """Stop the worker WITHOUT blocking: signal the producer, hand the
+        backend to the pool's reaper for its join, and release the slot. Safe to
+        call on the consumer loop -- the up-to-``JOIN_TIMEOUT`` join never runs
+        here."""
         if self._stopped:
             return
         self._stopped = True
         try:
-            self._backend.stop()
+            self._backend.request_stop()
+            self._reap(self._backend)
         finally:
             self._release(self.id)
 
@@ -288,6 +318,13 @@ class WorkerPool:
         self._handles: Dict[int, WorkerHandle] = {}
         self._next_id = 0
         self._lock = threading.Lock()
+        # The single owner of every blocking thread/process join. Lazily started
+        # on the first stop so a pool that never stops a worker spawns no thread.
+        self._reap_queue: "queue.Queue[Optional[_Backend]]" = queue.Queue()
+        self._reaper: Optional[threading.Thread] = None
+        self._reaper_lock = threading.Lock()
+        self._stopped = False
+        self._reaper_done = False
 
     def allocate(
         self,
@@ -341,7 +378,7 @@ class WorkerPool:
         with self._lock:
             worker_id = self._next_id
             self._next_id += 1
-            handle = WorkerHandle(worker_id, backend, self._release)
+            handle = WorkerHandle(worker_id, backend, self._release, self._reap)
             self._handles[worker_id] = handle
 
         backend.start()
@@ -351,9 +388,61 @@ class WorkerPool:
         with self._lock:
             self._handles.pop(worker_id, None)
 
+    def _reap(self, backend: _Backend) -> None:
+        """Hand a stopped backend to the reaper for its blocking join. Never
+        blocks the caller. After the pool is fully torn down (reaper joined), a
+        late stop finalizes inline so nothing leaks."""
+        with self._reaper_lock:
+            if self._reaper_done:
+                finalize_inline = True
+            else:
+                self._ensure_reaper_locked()
+                finalize_inline = False
+        if finalize_inline:
+            self._finalize_one(backend)
+        else:
+            self._reap_queue.put(backend)
+
+    def _ensure_reaper_locked(self) -> None:
+        # Caller holds ``self._reaper_lock``.
+        if self._reaper is None:
+            self._reaper = threading.Thread(
+                target=self._reaper_loop, name="sp-worker-reaper", daemon=True
+            )
+            self._reaper.start()
+
+    def _reaper_loop(self) -> None:
+        while True:
+            backend = self._reap_queue.get()
+            if backend is None:  # sentinel: the pool is stopping
+                return
+            self._finalize_one(backend)
+
+    @staticmethod
+    def _finalize_one(backend: _Backend) -> None:
+        try:
+            backend.finalize()
+        except Exception:  # noqa: BLE001 -- one bad finalize must not wedge the reaper
+            _logger.exception("worker finalize failed")
+
     def stop(self) -> None:
+        """Stop every worker and drain the reaper. Idempotent. This is the ONE
+        sanctioned place a blocking join runs (each backend's join is internally
+        bounded by ``JOIN_TIMEOUT`` + terminate), so teardown leaks no thread,
+        process, or shared-memory segment."""
+        with self._reaper_lock:
+            if self._stopped:
+                return
+            self._stopped = True
         with self._lock:
             handles = list(self._handles.values())
             self._handles.clear()
         for handle in handles:
-            handle.stop()
+            handle.stop()  # request_stop + enqueue on the reaper + release
+        with self._reaper_lock:
+            reaper = self._reaper
+        if reaper is not None:
+            self._reap_queue.put(None)  # sentinel
+            reaper.join()
+            with self._reaper_lock:
+                self._reaper_done = True

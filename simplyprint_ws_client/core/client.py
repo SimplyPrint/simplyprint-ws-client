@@ -13,6 +13,7 @@ from abc import ABC
 from datetime import timedelta, datetime
 from enum import IntEnum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Generic,
     NamedTuple,
@@ -25,6 +26,9 @@ from typing import (
 )
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.common.asyncio.offload import Offload
 
 try:
     from typing import Unpack
@@ -258,16 +262,23 @@ class Client(
     _pending_action_ts: datetime = datetime.min
     _pending_action_log_ts: datetime = datetime.min
 
+    #: The app's bounded blocking-work lanes, injected by ``ClientApp`` at
+    #: construction. ``None`` outside the app (e.g. in unit tests); callers that
+    #: offload must tolerate its absence (``FileTransfer`` falls back to a thread).
+    offload: "Optional[Offload]" = None
+
     def __init__(
         self,
         config: TConfig,
         *,
         event_loop_provider: Optional[EventLoopProvider] = None,
+        offload: "Optional[Offload]" = None,
         **kwargs,
     ):
         ABC.__init__(self)
         Generic.__init__(self)
         EventLoopProvider.__init__(self, provider=event_loop_provider)
+        self.offload = offload
         self._state = VersionedState(-1, ClientState.CONNECTING)
         self._pending_action_backoff = ExponentialBackoff(10, 600, 3600)
         self.event_bus = EventBus(event_loop_provider=self)

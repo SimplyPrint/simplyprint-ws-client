@@ -5,6 +5,7 @@ import inspect
 import logging
 import threading
 import time
+from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Type, final
 
 from yarl import URL
@@ -24,6 +25,7 @@ from simplyprint_ws_client.integration.camera.commands import (
     StopCamera,
 )
 from simplyprint_ws_client.integration.camera.handle import CameraHandle
+from simplyprint_ws_client.common.asyncio.coalescing_task import CoalescingTask
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.utils.stoppable import ProcessStoppable
 from simplyprint_ws_client.common.utils.synchronized import Synchronized
@@ -75,7 +77,27 @@ async def _async_camera_producer(
         emit(None, time.time())
 
 
+class _Desired(Enum):
+    """The state a camera's worker should converge to. Commands set it; one
+    coalesced reconcile applies it -- so a storm of start/pause/poll collapses to
+    a single transition instead of a worker allocate/stop per command."""
+
+    RUNNING = auto()  #: a continuous worker should be streaming
+    PAUSED = auto()  #: no worker (idle / stream off)
+    STOPPED = auto()  #: released; no worker, never again
+
+
 class CameraWorkerBackend:
+    """Drives one camera's worker toward a desired state.
+
+    ``poll``/``start``/``pause``/``stop`` are cheap and may be called from any
+    thread (device handlers, the pause timer, the loop): they record the desired
+    state and ``trigger`` a single :class:`CoalescingTask`. The reconcile retires
+    the current worker (non-blocking, via the pool reaper) and allocates at most
+    one new worker, so rapid toggles never pile up workers. A monotonic
+    ``_generation`` guards delivery: a retired worker's late frame is dropped.
+    """
+
     def __init__(
         self,
         worker_pool: WorkerPool,
@@ -83,6 +105,7 @@ class CameraWorkerBackend:
         protocol: BaseCameraProtocol,
         handle: CameraHandle,
         release: Callable[[int], None],
+        provider: EventLoopProvider,
         pause_timeout: Optional[int] = None,
     ) -> None:
         self._worker_pool = worker_pool
@@ -96,6 +119,10 @@ class CameraWorkerBackend:
             _PauseTimer(pause_timeout, self.pause) if pause_timeout else None
         )
         self._lock = threading.Lock()
+        self._desired = _Desired.PAUSED
+        self._oneshot = False  # a one-shot (ON_DEMAND) poll is pending
+        self._generation = 0
+        self._reconcile = CoalescingTask(self._reconcile_once, provider=provider)
 
     @property
     def _continuous(self) -> bool:
@@ -104,50 +131,88 @@ class CameraWorkerBackend:
     def poll(self) -> None:
         if self._continuous:
             self.start()
-            self._refresh_timer()
             return
-        self._replace_worker(continuous=False)
+        with self._lock:
+            self._oneshot = True
+        self._reconcile.trigger()
 
     def start(self) -> None:
         if not self._continuous:
             return
         with self._lock:
-            if self._worker is not None:
-                return
-        self._replace_worker(continuous=True)
+            self._desired = _Desired.RUNNING
+        self._reconcile.trigger()
         self._refresh_timer()
 
     def pause(self) -> None:
         self._cancel_timer()
         with self._lock:
-            worker = self._worker
-            self._worker = None
-        if worker is not None:
-            worker.stop()
+            self._desired = _Desired.PAUSED
+        self._reconcile.trigger()
 
     def stop(self) -> None:
-        self.pause()
-        self._release(self._handle.id)
-
-    def _replace_worker(self, *, continuous: bool) -> None:
+        self._cancel_timer()
         with self._lock:
-            old_worker = self._worker
-            self._worker = None
-        if old_worker is not None:
-            old_worker.stop()
+            self._desired = _Desired.STOPPED
+        # Release the pool slot now, preserving today's timing (the handle is
+        # gone from the pool map immediately); the worker is retired by the
+        # reconcile on a live loop, or by WorkerPool.stop at teardown.
+        self._release(self._handle.id)
+        self._reconcile.trigger()
 
+    async def _reconcile_once(self) -> None:
+        with self._lock:
+            desired = self._desired
+            oneshot = self._oneshot
+            self._oneshot = False
+            old = self._worker
+
+            # Already in the wanted steady state: nothing to do (no churn).
+            if desired is _Desired.RUNNING and old is not None and not oneshot:
+                return
+
+            # Otherwise retire whatever exists; a new worker is started below if
+            # wanted. Bumping the generation invalidates the old worker's frames.
+            self._worker = None
+            self._generation += 1
+            generation = self._generation
+
+            start_continuous = desired is _Desired.RUNNING
+            start_oneshot = oneshot and desired is not _Desired.STOPPED
+            want_new = start_continuous or start_oneshot
+
+        if old is not None:
+            old.stop()  # non-blocking: signalled now, joined on the reaper
+
+        if not want_new:
+            return
+
+        worker = self._allocate(continuous=start_continuous, generation=generation)
+        with self._lock:
+            if self._generation == generation:
+                self._worker = worker
+                worker = None  # installed
+        if worker is not None:
+            # A newer reconcile superseded us mid-allocate; retire the orphan.
+            worker.stop()
+
+    def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
         producer = (
             _async_camera_producer if self._protocol.is_async else _sync_camera_producer
         )
-        worker = self._worker_pool.allocate(
+
+        def on_item(payload, timestamp, _generation: int = generation) -> None:
+            # Drop frames from a worker that has since been retired.
+            if _generation == self._generation:
+                self._handle._set_frame(payload, timestamp)
+
+        return self._worker_pool.allocate(
             self._context,
             producer,
-            self._handle._set_frame,
+            on_item,
             args=(self._protocol, continuous),
             is_async=self._protocol.is_async,
         )
-        with self._lock:
-            self._worker = worker
 
     def _refresh_timer(self) -> None:
         if self._pause_timer is not None and self._continuous:
@@ -231,6 +296,7 @@ class CameraPool(ProcessStoppable, Synchronized):
             protocol,
             handle,
             self._release,
+            self._provider,
             pause_timeout,
         )
         with self:

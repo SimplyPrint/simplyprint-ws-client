@@ -45,6 +45,9 @@ class EditableField:
     max: float | None = None
     pattern: str | None = None
     options: tuple[EditableFieldOption, ...] = ()
+    # A rarely-changed/optional field a renderer may tuck behind an "advanced"
+    # disclosure so the common fields aren't crowded out. Presentation-only.
+    advanced: bool = False
 
 
 #: Every config has a friendly `name`.
@@ -68,6 +71,7 @@ WEBCAM_URL_FIELD = EditableField(
     type="url",
     placeholder="http://192.168.1.42:8080/?action=stream",
     description="Leave blank to use the printer's own camera.",
+    advanced=True,
 )
 
 
