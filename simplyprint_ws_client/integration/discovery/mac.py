@@ -17,20 +17,26 @@ from __future__ import annotations
 import re
 import socket
 import subprocess
+import sys
 from typing import Optional
 
+from simplyprint_ws_client.common.process import run as run_command
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 
-#: host -> resolved MAC, cached briefly so passive re-announcements (which can
-#: arrive every few seconds per printer) do not repeat subprocess/socket work
-#: on the caller's loop. Negative results are not cached - a cold neighbour
-#: table can warm up between announcements.
-_MAC_CACHE_TTL = 60
+#: host -> resolved MAC / unresolved marker. Passive re-announcements can arrive
+#: every few seconds per printer, so cache both hits and misses to avoid repeatedly
+#: shelling out to neighbour-table tools on the caller's loop.
+_MAC_CACHE_TTL = 15 * 60
+_MAC_NEGATIVE_CACHE_TTL = 5 * 60
 _mac_cache: ExpiringDict = ExpiringDict(ttl=_MAC_CACHE_TTL)
+_mac_negative_cache: ExpiringDict = ExpiringDict(ttl=_MAC_NEGATIVE_CACHE_TTL)
 
 # A normalised, fully-specified unicast MAC (six octets, not the all-zero /
 # broadcast placeholders the neighbour table parks against unresolved entries).
-_MAC_RE = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}")
+_MAC_RE = re.compile(
+    r"(?<![0-9a-f])(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?![0-9a-f])"
+    r"|(?<![0-9a-f])(?:[0-9a-f]{2}-){5}[0-9a-f]{2}(?![0-9a-f])"
+)
 _EMPTY_MACS = {"00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"}
 
 # Ports worth a quick knock to populate the neighbour table when it is cold. The
@@ -73,6 +79,8 @@ def _warm_neighbour_table(ip: str, timeout: float) -> None:
 
 def _mac_from_proc(ip: str) -> Optional[str]:
     """Read the Linux ARP table (``/proc/net/arp``) for ``ip``'s MAC."""
+    if sys.platform != "linux":
+        return None
     try:
         with open("/proc/net/arp", "r", encoding="utf-8") as handle:
             lines = handle.readlines()
@@ -86,25 +94,35 @@ def _mac_from_proc(ip: str) -> Optional[str]:
 
 
 def _mac_from_command(ip: str, timeout: float) -> Optional[str]:
-    """Fall back to the OS neighbour tools (``ip neigh`` / ``arp``) for ``ip``."""
-    for argv in (["ip", "neigh", "show", ip], ["arp", "-n", ip]):
-        try:
-            completed = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        mac = _first_mac(completed.stdout)
-        if mac is not None:
-            return mac
+    """Fall back to one native neighbour-table command for this platform."""
+    argv = _neighbour_command(ip)
+    if argv is None:
+        return None
+    try:
+        completed = run_command(
+            argv,
+            action="resolve MAC from OS neighbour table",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _first_mac(completed.stdout)
+
+
+def _neighbour_command(ip: str) -> Optional[list[str]]:
+    if sys.platform == "win32":
+        return ["arp", "-a", ip]
+    if sys.platform == "darwin":
+        return ["arp", "-n", ip]
+    if sys.platform == "linux":
+        return ["ip", "neigh", "show", ip]
     return None
 
 
 def _normalise_mac(value: str) -> Optional[str]:
-    mac = value.strip().lower()
+    mac = value.strip().lower().replace("-", ":")
     if _MAC_RE.fullmatch(mac) and mac not in _EMPTY_MACS:
         return mac
     return None
@@ -112,8 +130,9 @@ def _normalise_mac(value: str) -> Optional[str]:
 
 def _first_mac(text: str) -> Optional[str]:
     for match in _MAC_RE.finditer(text.lower()):
-        if match.group(0) not in _EMPTY_MACS:
-            return match.group(0)
+        mac = _normalise_mac(match.group(0))
+        if mac is not None:
+            return mac
     return None
 
 
@@ -128,15 +147,20 @@ def resolve_mac(host: str, *, warm: bool = True, timeout: float = 0.3) -> Option
     cached = _mac_cache.get(host)
     if cached is not None:
         return cached
+    if host in _mac_negative_cache:
+        return None
     ip = _resolve_host_ip(host)
     if ip is None:
+        _mac_negative_cache[host] = True
         return None
     mac = _mac_from_proc(ip)
-    if mac is None:
-        mac = _mac_from_command(ip, timeout)
     if mac is None and warm:
         _warm_neighbour_table(ip, timeout)
-        mac = _mac_from_proc(ip) or _mac_from_command(ip, timeout)
+        mac = _mac_from_proc(ip)
+    if mac is None:
+        mac = _mac_from_command(ip, timeout)
     if mac is not None:
         _mac_cache[host] = mac
+    else:
+        _mac_negative_cache[host] = True
     return mac

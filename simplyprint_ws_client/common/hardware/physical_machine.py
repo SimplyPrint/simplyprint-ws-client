@@ -3,23 +3,25 @@ import os
 import platform
 import re
 import socket
-import subprocess
 from typing import Optional
 
 import netifaces
 import psutil
 
+from simplyprint_ws_client.common.process import check_output as system_check_output
+from simplyprint_ws_client.common.process import run as run_command
 from simplyprint_ws_client.common.utils.exception_as_value import exception_as_value
 
 
 def callonce(func):
-    result = None
+    unset = object()
+    result = unset
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         nonlocal result
 
-        if result is None:
+        if result is unset:
             result = func(*args, **kwargs)
 
         return result
@@ -33,9 +35,17 @@ def callonce(func):
 # since none of the commands we call do anything important that needs time to run.
 # To reproduce the issue spawning MultiProcessing processes while calling check_output / run
 # seems to do the trick.
-capped_check_output = functools.partial(
-    subprocess.check_output, shell=False, timeout=1.0
-)
+def capped_check_output(*args, **kwargs):
+    call_kwargs = {
+        "shell": False,
+        "timeout": 1.0,
+        **kwargs,
+    }
+    return system_check_output(
+        *args,
+        action="read host hardware info",
+        **call_kwargs,
+    )
 
 
 class PhysicalMachine:
@@ -249,17 +259,23 @@ class PhysicalMachine:
     @classmethod
     def restart(cls):
         if platform.system() == "Linux":
-            os.system("sudo reboot")
+            run_command(["sudo", "reboot"], action="restart Linux host")
         elif platform.system() == "Darwin":
-            os.system("reboot")
+            run_command(["reboot"], action="restart macOS host")
         elif platform.system() == "Windows":
-            os.system("shutdown /r /t 1")
+            run_command(
+                ["shutdown", "/r", "/t", "1"],
+                action="restart Windows host",
+            )
 
     @classmethod
     def shutdown(cls):
         if platform.system() == "Linux":
-            os.system("sudo shutdown now")
+            run_command(["sudo", "shutdown", "now"], action="shut down Linux host")
         elif platform.system() == "Darwin":
-            os.system("shutdown now")
+            run_command(["shutdown", "now"], action="shut down macOS host")
         elif platform.system() == "Windows":
-            os.system("shutdown /s /t 1")
+            run_command(
+                ["shutdown", "/s", "/t", "1"],
+                action="shut down Windows host",
+            )
