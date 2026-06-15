@@ -93,11 +93,14 @@ def test_routing_camera_and_worker_get_their_own_scope(tmp_path):
     handler.emit(_record("supervisor", "system line", logging.INFO))
     _drain(handler)
 
-    assert (tmp_path / "camera" / "camera.log").read_text().strip().endswith(
-        "camera line"
+    assert (
+        (tmp_path / "camera" / "camera.log").read_text().strip().endswith("camera line")
     )
-    assert (tmp_path / "workers" / "workers.log").read_text().strip().endswith(
-        "worker line"
+    assert (
+        (tmp_path / "workers" / "workers.log")
+        .read_text()
+        .strip()
+        .endswith("worker line")
     )
     system = (tmp_path / "system.log").read_text()
     assert "system line" in system
@@ -359,6 +362,83 @@ def test_logstore_prune_and_compress(tmp_path):
     store.compress_rotated_files()
     with open(tmp_path / "active" / "main.log.1", "rb") as handle:
         assert handle.read(2) == b"\x1f\x8b"
+
+
+def test_routing_clear_file_truncates_live_file(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record(printer_logger_name("p7"), "first line"))
+    _drain(handler)
+    path = tmp_path / "p7" / "main.log"
+    assert path.read_text().strip().endswith("first line")
+
+    # The active file is truncated in place (not unlinked) and stays present.
+    assert handler.clear_file(str(path)) is True
+    assert path.read_text() == ""
+
+    # Logging keeps working and the next record starts a fresh file, with no
+    # sparse gap from a stale write position.
+    handler.emit(_record(printer_logger_name("p7"), "second line"))
+    _drain(handler)
+    text = path.read_text()
+    assert "first line" not in text
+    assert text.strip().endswith("second line")
+    handler.close()
+
+
+def test_routing_clear_file_unknown_path_returns_false(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    # A rotated backup no handler holds isn't owned -> caller should unlink it.
+    assert handler.clear_file(str(tmp_path / "p7" / "main.log.1")) is False
+    handler.close()
+
+
+def test_logstore_delete_file_truncates_active_log(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record(printer_logger_name("p7"), "live line"))
+    _drain(handler)
+    path = tmp_path / "p7" / "main.log"
+
+    store = LogStore(
+        LoggingConfig(log_dir=tmp_path),
+        on_scope_pruned=handler.close_scope,
+        on_file_cleared=handler.clear_file,
+    )
+    store.delete_file("p7", "main.log")
+    # Active log is truncated, not removed: unlinking an open handle fails on
+    # Windows, and logging must be able to keep appending.
+    assert path.is_file()
+    assert path.read_text() == ""
+    handler.close()
+
+
+def test_logstore_delete_file_unlinks_inactive_backup(tmp_path):
+    _write(tmp_path / "p7" / "main.log.1", "old\n")
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    store = LogStore(
+        LoggingConfig(log_dir=tmp_path),
+        on_file_cleared=handler.clear_file,
+    )
+    store.delete_file("p7", "main.log.1")
+    assert not (tmp_path / "p7" / "main.log.1").exists()
+    handler.close()
+
+
+def test_logstore_delete_scope_closes_handlers_before_rmtree(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record(printer_logger_name("p7"), "live line"))
+    _drain(handler)
+
+    closed = []
+
+    def on_pruned(scope):
+        closed.append(scope)
+        handler.close_scope(scope)
+
+    store = LogStore(LoggingConfig(log_dir=tmp_path), on_scope_pruned=on_pruned)
+    store.delete_scope("p7")
+    assert closed == ["p7"]  # handles released before the directory is removed
+    assert not (tmp_path / "p7").exists()
+    handler.close()
 
 
 def test_logstore_bundle_and_system_undeletable(tmp_path):

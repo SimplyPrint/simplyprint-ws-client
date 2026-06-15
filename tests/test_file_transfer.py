@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+import simplyprint_ws_client.const as ws_const
 from simplyprint_ws_client import Client, FileDemandData, FileProgressStateEnum
 from simplyprint_ws_client.integration.transfer import (
     FileTransfer,
@@ -204,6 +205,44 @@ async def test_slow_prepare_does_not_stall_the_loop(client: Client, monkeypatch)
     assert hb.max_gap_ms < 200  # the loop kept beating through the slow prepare
     assert result is not None
     transfer.end_prepare("done")
+
+
+@pytest.mark.asyncio
+async def test_download_file_and_upload_uses_app_cache_tempdir(
+    client: Client, monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(
+        type(ws_const.APP_DIRS),
+        "user_cache_path",
+        property(lambda self: cache),
+    )
+
+    async def fake_download_as_file(self, data, dest, clamp_progress):
+        dest.write_bytes(b"gcode")
+        clamp_progress(100)
+        return dest
+
+    monkeypatch.setattr(ft_mod.FileDownload, "download_as_file", fake_download_as_file)
+    seen = {}
+
+    class InspectingTransfer(_StubFileTransfer):
+        async def _upload(self, local_path, on_progress):
+            seen["temp_dir"] = local_path.parent
+            on_progress(100)
+            return PurePosixPath("/") / local_path.name
+
+    transfer = InspectingTransfer(client)
+    transfer.begin_prepare()
+
+    result = await transfer.download_file_and_upload(
+        FileDemandData(file_name="job.gcode")
+    )
+
+    assert result is not None
+    assert seen["temp_dir"].parent == cache / "transfers"
+    assert not seen["temp_dir"].exists()
+    transfer.end_prepare("test done")
 
 
 def test_connect_change_mid_prepare_keeps_download_pending(client: Client):

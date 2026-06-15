@@ -91,6 +91,7 @@ class LogStore:
         *,
         root: Optional[Path] = None,
         on_scope_pruned: Optional[Callable[[str], None]] = None,
+        on_file_cleared: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self._config = config or LoggingConfig()
         self._root = Path(root) if root is not None else self._config.resolve_log_dir()
@@ -100,6 +101,10 @@ class LogStore:
         #: Invoked with each scope about to be pruned, so the live routing
         #: handler can close its open file handles first.
         self._on_scope_pruned = on_scope_pruned
+        #: Invoked to truncate a still-open log file in place (deleting an active
+        #: log unlinks an open handle, which fails on Windows). Returns True when
+        #: the routing handler owns that path, so we know not to also unlink it.
+        self._on_file_cleared = on_file_cleared
 
     @property
     def root(self) -> Path:
@@ -337,7 +342,14 @@ class LogStore:
         return buffer
 
     def delete_file(self, scope: str, name: str) -> None:
-        self.resolve_file(scope, name).unlink(missing_ok=True)
+        """Clear a log file. The *active* file (the one the logging facility holds
+        open) is truncated to zero in place rather than unlinked -- unlinking an
+        open handle fails on Windows and orphans the live inode on POSIX. An
+        inactive rotated backup, which no handler holds, is removed."""
+        path = self.resolve_file(scope, name)
+        if self._on_file_cleared is not None and self._on_file_cleared(str(path)):
+            return  # the routing handler owns it -> truncated in place
+        path.unlink(missing_ok=True)
 
     def delete_scope(self, scope: str) -> None:
         """Delete a printer scope's directory. The system scope can't be deleted."""
@@ -349,6 +361,14 @@ class LogStore:
         scope_dir = self._root / scope
         if not scope_dir.is_dir():
             raise LogNotFound(scope)
+
+        # Release the scope's open file handles first -- Windows cannot remove a
+        # directory holding an open file (matches prune_unused_scopes).
+        if self._on_scope_pruned is not None:
+            try:
+                self._on_scope_pruned(scope)
+            except Exception:  # noqa: BLE001 -- deletion must not stop on a handler
+                logger.debug("close_scope(%s) failed", scope, exc_info=True)
 
         shutil.rmtree(scope_dir, ignore_errors=True)
 

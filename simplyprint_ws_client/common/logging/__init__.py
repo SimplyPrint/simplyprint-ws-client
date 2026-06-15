@@ -170,5 +170,9 @@ def configure_logging(
     table cannot grow with printer churn."""
     config = _resolve_config(settings, config or LoggingConfig())
     stop, router = _setup_logging(settings, config)
-    store = LogStore(config, on_scope_pruned=router.close_scope)
+    store = LogStore(
+        config,
+        on_scope_pruned=router.close_scope,
+        on_file_cleared=router.clear_file,
+    )
     return LoggingFacility(store=store, stop=stop, config=config)

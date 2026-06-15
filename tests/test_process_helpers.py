@@ -1,3 +1,7 @@
+import logging
+
+import pytest
+
 from simplyprint_ws_client.common import process
 
 
@@ -71,6 +75,25 @@ def test_check_output_hides_windows_console(monkeypatch):
 
     assert process.check_output(["tool"], action="test output") == b"ok"
     assert captured["kwargs"]["creationflags"] == 0x08000000
+
+
+def test_check_output_missing_executable_logs_debug_not_warning(monkeypatch, caplog):
+    # A missing optional host tool (e.g. iwgetid) must not spam a WARNING +
+    # traceback at startup -- it's expected; log it at debug and re-raise so the
+    # caller can degrade gracefully.
+    def fake_check_output(args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "iwgetid")
+
+    monkeypatch.setattr(process.subprocess, "check_output", fake_check_output)
+    caplog.set_level(logging.DEBUG, logger="system.command")
+
+    with pytest.raises(FileNotFoundError):
+        process.check_output(["iwgetid", "-r"], action="read host hardware info")
+
+    assert "system command unavailable: read host hardware info" in caplog.text
+    # No warning, and no traceback was logged.
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "Traceback" not in caplog.text
 
 
 def test_popen_hides_windows_console_and_logs(monkeypatch, caplog):

@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -40,8 +39,12 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
-from simplyprint_ws_client.core.files.file_download import FileDownload
 from simplyprint_ws_client.common.utils.slugify import slugify
+from simplyprint_ws_client.common.utils.temp import (
+    app_cache_path,
+    cache_temporary_directory,
+)
+from simplyprint_ws_client.core.files.file_download import FileDownload
 
 from simplyprint_ws_client.integration.transfer.checksum import file_md5
 
@@ -388,7 +391,9 @@ class FileTransfer(ABC):
         for attempt in range(1, total_attempts + 1):
             phase = "download"
             try:
-                with tempfile.TemporaryDirectory() as local_folder:
+                with cache_temporary_directory(
+                    "sp-transfer-", root=app_cache_path("transfers")
+                ) as local_folder:
                     local_dest = Path(local_folder) / data.file_name
                     local_dest = await downloader.download_as_file(
                         data, local_dest, self._download_progress

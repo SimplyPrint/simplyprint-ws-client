@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 __all__ = ["RoutingHandler", "JsonLogFormatter", "PassthroughQueueHandler"]
 
+logger = logging.getLogger(__name__)
+
 
 class JsonLogFormatter(logging.Formatter):
     """Render a record as one JSON line, tagged with its log scope."""
@@ -123,6 +125,46 @@ class RoutingHandler(logging.Handler):
 
         for handler in handlers:
             handler.close()
+
+    def clear_file(self, path: str) -> bool:
+        """Truncate a live destination's file to zero *in place*.
+
+        Used when the user "deletes" a log that the logging facility is actively
+        writing: unlinking an open file fails on Windows and orphans the live
+        handler's inode on POSIX, so we reset it to empty instead. The handler's
+        own write position is reset too, so logging continues seamlessly without
+        leaving a sparse file.
+
+        Returns ``True`` when ``path`` is a destination this handler manages
+        (whether or not its stream is open yet -- handlers open lazily), so the
+        caller can fall back to unlinking an inactive rotated backup that no
+        handler holds.
+        """
+        with self._lock:
+            handler = self._handlers.get(path)
+        if handler is None:
+            return False
+        # Hold the handler's own lock so we don't race an in-flight emit on the
+        # same stream.
+        handler.acquire()
+        try:
+            stream = getattr(handler, "stream", None)
+            if stream is not None:
+                stream.seek(0)
+                stream.truncate()
+                stream.flush()
+            else:
+                # delay=True handler that hasn't opened yet: truncate on disk so
+                # the next emit appends to an empty file.
+                try:
+                    open(path, "w").close()
+                except OSError:
+                    logger.debug(
+                        "clear_file: could not truncate %s", path, exc_info=True
+                    )
+        finally:
+            handler.release()
+        return True
 
     def close(self) -> None:
         with self._lock:

@@ -70,6 +70,12 @@ def run(
     logger.debug("system command start: %s", label)
     try:
         completed = subprocess.run(args, **_with_hidden_window(kwargs))
+    except FileNotFoundError:
+        # The executable isn't installed -- expected for optional host tools
+        # (e.g. iwgetid on a box without wireless-tools). Not a failure worth a
+        # warning + traceback; the caller still gets the raise to handle.
+        logger.debug("system command unavailable: %s", label)
+        raise
     except (OSError, subprocess.SubprocessError):
         logger.warning("system command failed to start: %s", label, exc_info=True)
         raise
@@ -92,6 +98,11 @@ def check_output(
     logger.debug("system command start: %s", label)
     try:
         output = subprocess.check_output(args, **_with_hidden_window(kwargs))
+    except FileNotFoundError:
+        # Optional host tool not installed (e.g. iwgetid on a box without
+        # wireless-tools) -- expected, so debug not warning, and no traceback.
+        logger.debug("system command unavailable: %s", label)
+        raise
     except (OSError, subprocess.SubprocessError):
         logger.warning("system command failed: %s", label, exc_info=True)
         raise
@@ -113,6 +124,10 @@ def popen(
     logger.debug("system command spawn: %s", label)
     try:
         process = subprocess.Popen(args, **_with_hidden_window(kwargs))
+    except FileNotFoundError:
+        # Optional host tool not installed -- expected, so debug not warning.
+        logger.debug("system command unavailable: %s", label)
+        raise
     except OSError:
         logger.warning("system command failed to spawn: %s", label, exc_info=True)
         raise
