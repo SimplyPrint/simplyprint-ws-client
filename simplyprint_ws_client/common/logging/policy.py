@@ -12,8 +12,11 @@ from simplyprint_ws_client.common.logging.naming import PRINTER_ROOT, is_printer
 DEFAULT_NOISY_LOGGERS: Tuple[str, ...] = (
     "aiohttp",
     "asyncio",
+    "charset_normalizer",
     "httpcore",
     "httpx",
+    "multipart",
+    "paho",
     "PIL",
     "tzlocal",
     "urllib3",

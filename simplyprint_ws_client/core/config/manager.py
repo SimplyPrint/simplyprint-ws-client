@@ -78,6 +78,14 @@ class ConfigManager(ABC, Generic[TConfig]):
     def clear(self):
         self.configurations.clear()
 
+    @property
+    def storage_path(self) -> Optional[Path]:
+        """The single on-disk file backing this manager, or ``None`` for stores
+        that are not a single file (memory, SQLite). Used by config export/backup
+        to enumerate the files that make up the registry without reaching into a
+        subclass's private attributes."""
+        return None
+
     @abstractmethod
     def flush(self, config: Optional[TConfig] = None):
         """

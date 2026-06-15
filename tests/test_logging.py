@@ -84,12 +84,37 @@ def test_routing_per_printer_and_system(tmp_path):
     handler.close()
 
 
+def test_routing_camera_and_worker_get_their_own_scope(tmp_path):
+    # Shared (non-printer) camera/worker loggers route to their own scope dirs,
+    # never into the system catch-all.
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record("camera.pool", "camera line", logging.WARNING))
+    handler.emit(_record("worker.pool", "worker line", logging.WARNING))
+    handler.emit(_record("supervisor", "system line", logging.INFO))
+    _drain(handler)
+
+    assert (tmp_path / "camera" / "camera.log").read_text().strip().endswith(
+        "camera line"
+    )
+    assert (tmp_path / "workers" / "workers.log").read_text().strip().endswith(
+        "worker line"
+    )
+    system = (tmp_path / "system.log").read_text()
+    assert "system line" in system
+    assert "camera line" not in system
+    assert "worker line" not in system
+    # Only the system file sits at the log root; camera/worker live in subdirs.
+    assert {p.name for p in tmp_path.glob("*.log")} == {"system.log"}
+    handler.close()
+
+
 def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
     handler.emit(_record("supervisor", "system debug", logging.DEBUG))
     handler.emit(_record("supervisor", "system info", logging.INFO))
     handler.emit(_record("websockets.client", "websocket info", logging.INFO))
     handler.emit(_record("websockets.client", "websocket warning", logging.WARNING))
+    handler.emit(_record("paho.mqtt.client", "paho info", logging.INFO))
     handler.emit(
         _record(printer_logger_name("p7", "mqtt"), "mqtt debug", logging.DEBUG)
     )
@@ -101,6 +126,8 @@ def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     assert "websocket warning" in system
     assert "system debug" not in system
     assert "websocket info" not in system
+    # paho (the MQTT stack) is clamped to warnings like the other noisy roots.
+    assert "paho info" not in system
     assert "mqtt debug" in printer
     handler.close()
 
@@ -138,7 +165,9 @@ def test_routing_dotted_uid_round_trips_to_one_dir(tmp_path):
     handler.close()
 
 
-def test_configure_logging_uses_app_name_for_default_system_file(tmp_path):
+def test_configure_logging_uses_fixed_system_stem(tmp_path):
+    # The system log is the fixed, brand-free ``system.log`` -- never derived
+    # from ``ClientSettings.name`` (so it no longer becomes ``BambuClient.log``).
     facility = configure_logging(
         ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
     )
@@ -148,9 +177,9 @@ def test_configure_logging_uses_app_name_for_default_system_file(tmp_path):
         facility.stop()
         logging.basicConfig(handlers=[], force=True)
 
-    assert facility.config.system_log_stem == "BambuClient"
-    assert (tmp_path / "BambuClient.log").read_text().strip().endswith("boot")
-    assert not (tmp_path / "system.log").exists()
+    assert facility.config.system_log_stem == "system"
+    assert (tmp_path / "system.log").read_text().strip().endswith("boot")
+    assert not (tmp_path / "BambuClient.log").exists()
 
 
 def test_configure_logging_sets_effective_levels_for_performance(tmp_path):
@@ -241,7 +270,7 @@ def test_development_policy_keeps_noisy_debug_suppressed(tmp_path):
         facility.stop()
         logging.basicConfig(handlers=[], force=True)
 
-    system = (tmp_path / "BambuClient.log").read_text()
+    system = (tmp_path / "system.log").read_text()
     assert "system debug" in system
     assert "websocket debug" not in system
 

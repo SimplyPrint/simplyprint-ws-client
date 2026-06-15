@@ -1,9 +1,20 @@
 import datetime
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from simplyprint_ws_client.common.utils.file_tail import strip_log_file
+
+
+@dataclass(frozen=True)
+class BackupInfo:
+    """One rotated backup of a file (``{name}.bak.N``)."""
+
+    path: Path
+    index: int
+    size: int
+    modified_at: float
 
 
 class FileBackup:
@@ -71,6 +82,34 @@ class FileBackup:
 
         # Now create the new backup by copying the original file
         shutil.copy(file, file.parent / f"{file.name}.bak.0")
+
+    @staticmethod
+    def list_backups(file: Path) -> List[BackupInfo]:
+        """Existing ``{file.name}.bak.N`` backups for ``file``, newest first
+        (index 0). The single source of truth for the rotation naming, so callers
+        listing backups never re-derive the glob."""
+        infos: List[BackupInfo] = []
+        prefix = f"{file.name}.bak."
+        for backup in file.parent.glob(f"{file.name}.bak.*"):
+            try:
+                index = int(backup.name[len(prefix) :])
+            except ValueError:
+                continue
+            try:
+                stat = backup.stat()
+            except OSError:
+                continue
+            infos.append(
+                BackupInfo(
+                    path=backup,
+                    index=index,
+                    size=stat.st_size,
+                    modified_at=stat.st_mtime,
+                )
+            )
+
+        infos.sort(key=lambda info: info.index)
+        return infos
 
     @staticmethod
     def strip_log_file(file: Path, max_size: int = 100 * 1024 * 1024):

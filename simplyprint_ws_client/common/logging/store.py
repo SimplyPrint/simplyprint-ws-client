@@ -95,6 +95,8 @@ class LogStore:
         self._config = config or LoggingConfig()
         self._root = Path(root) if root is not None else self._config.resolve_log_dir()
         self._system_scope = self._config.system_scope
+        #: Non-printer scopes (camera, worker pools) that prune must never delete.
+        self._reserved_scopes = tuple(self._config.reserved_scopes)
         #: Invoked with each scope about to be pruned, so the live routing
         #: handler can close its open file handles first.
         self._on_scope_pruned = on_scope_pruned
@@ -358,12 +360,13 @@ class LogStore:
     def prune_unused_scopes(self, active_unique_ids: Iterable[str]) -> None:
         """Remove per-printer directories for printers that no longer exist.
 
-        The system scope and any active ``unique_id`` are always kept.
+        The system scope, the reserved non-printer scopes (camera, worker pools)
+        and any active ``unique_id`` are always kept.
         """
         if not self._root.exists():
             return
 
-        keep = {self._system_scope, *active_unique_ids}
+        keep = {self._system_scope, *self._reserved_scopes, *active_unique_ids}
 
         for child in self._root.iterdir():
             if not child.is_dir() or child.name in keep:

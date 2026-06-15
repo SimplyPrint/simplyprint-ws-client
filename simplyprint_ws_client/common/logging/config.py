@@ -29,6 +29,23 @@ FormatterKind = Literal["text", "json"]
 #: Resolves a matched logger name to ``(scope, file_stem)``.
 NameResolver = Callable[[str], Tuple[str, str]]
 
+#: Logger-name roots for shared (non-printer) subsystems, and the on-disk scopes
+#: they route to. These are generic infrastructure names (no brand): camera
+#: capture and the generic worker pool each get their own scope directory so they
+#: never spam the system log.
+CAMERA_LOGGER_ROOT = "camera"
+WORKER_LOGGER_ROOT = "worker"
+CAMERA_SCOPE = "camera"
+WORKER_SCOPE = "workers"
+
+
+def _camera_resolver(_logger_name: str) -> Tuple[str, str]:
+    return CAMERA_SCOPE, CAMERA_SCOPE
+
+
+def _worker_resolver(_logger_name: str) -> Tuple[str, str]:
+    return WORKER_SCOPE, WORKER_SCOPE
+
 
 @dataclass(frozen=True)
 class RoutingRule:
@@ -57,17 +74,25 @@ class LoggingConfig:
 
     log_dir: Optional[Path] = None
     system_scope: str = "system"
-    # None -> setup_logging uses ClientSettings.name; RoutingHandler alone falls
-    # back to <log_dir>/<system_scope>.log.
-    system_log_stem: Optional[str] = None
+    # The system log file stem -- fixed and brand-free, so the app/system log is
+    # always ``<log_dir>/system.log`` rather than ``<ClientSettings.name>.log``.
+    # Kept as a separate axis from ``system_scope`` (scope = UI grouping; stem =
+    # filename). ``RoutingHandler`` alone also falls back to ``system_scope``.
+    system_log_stem: Optional[str] = "system"
     max_bytes: int = DEFAULT_MAX_BYTES
     backup_count: int = DEFAULT_BACKUP_COUNT
     text_format: str = DEFAULT_TEXT_FORMAT
     date_format: str = DEFAULT_DATE_FORMAT
     json_output: bool = False
     policy: LoggingPolicy = field(default_factory=LoggingPolicy)
-    #: Custom routing rules; ``None`` -> the default per-printer + system rules.
+    #: Custom routing rules; ``None`` -> the default per-printer + camera + worker
+    #: + system rules.
     routes: Optional[List[RoutingRule]] = None
+    #: Non-printer scope directories the default routing produces. Prune keeps
+    #: these (alongside the system scope and active printers), so a printer-churn
+    #: prune never deletes shared-subsystem logs. Override when passing custom
+    #: ``routes`` that resolve to other fixed scopes.
+    reserved_scopes: Tuple[str, ...] = (CAMERA_SCOPE, WORKER_SCOPE)
 
     def resolve_log_dir(self) -> Path:
         if self.log_dir is not None:
@@ -102,6 +127,10 @@ class LoggingConfig:
         if self.routes is not None:
             rules = list(self.routes)
         else:
-            rules = [RoutingRule("printer", PRINTER_ROOT, kind, printer_resolver)]
+            rules = [
+                RoutingRule("printer", PRINTER_ROOT, kind, printer_resolver),
+                RoutingRule("camera", CAMERA_LOGGER_ROOT, kind, _camera_resolver),
+                RoutingRule("workers", WORKER_LOGGER_ROOT, kind, _worker_resolver),
+            ]
         rules.append(RoutingRule("system", None, kind))
         return rules

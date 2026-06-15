@@ -3,8 +3,9 @@
 Records route purely by their (plain, dotted) logger name -- no ``ClientName``
 str-subclass, no custom Logger class. Per-printer loggers
 (``simplyprint.printer.<uid>[.<sub>]``, made via :func:`printer_logger`) land in
-``<log_dir>/<uid>/<sub>.log``; everything else in one root-level app log
-(``<log_dir>/<ClientSettings.name>.log`` by default).
+``<log_dir>/<uid>/<sub>.log``; camera and worker-pool loggers get their own scope
+directories (``<log_dir>/camera/`` and ``<log_dir>/workers/``); everything else
+goes to one root-level app log (``<log_dir>/system.log``).
 Output is plain text or one-line JSON, chosen per routing rule, so a record can be
 rendered differently per destination.
 
@@ -100,13 +101,11 @@ def _resolve_config(settings: "ClientSettings", config: LoggingConfig) -> Loggin
             live_system_level=logging.DEBUG,
         )
 
-    if config.system_log_stem is not None:
-        return replace(config, policy=policy)
-
-    from simplyprint_ws_client.common.utils.slugify import slugify
-
-    stem = slugify(settings.name or "") or config.system_scope
-    return replace(config, system_log_stem=stem, policy=policy)
+    # The system log file is the fixed, brand-free ``system.log`` (see
+    # ``LoggingConfig.system_log_stem``); the filename is never derived from
+    # ``settings.name``. ``RoutingHandler`` falls back to ``system_scope`` if a
+    # caller explicitly clears the stem, which still yields ``system.log``.
+    return replace(config, policy=policy)
 
 
 def setup_logging(

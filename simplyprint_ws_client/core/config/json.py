@@ -9,6 +9,7 @@ from typing import Optional
 
 from simplyprint_ws_client.core.config.manager import ConfigManager
 from simplyprint_ws_client.core.config import Config
+from simplyprint_ws_client.core.files.atomic import atomic_write_text
 from simplyprint_ws_client.core.files.file_backup import FileBackup
 
 
@@ -28,14 +29,12 @@ class JsonConfigManager(ConfigManager):
                 for config in self.get_all()
                 if not config.is_empty()
             ]
-            # Atomic: write to a temp file and replace, so a crash mid-write
-            # can never destroy the printer registry.
-            tmp = self._json_file.with_suffix(".json.tmp")
-            with open(tmp, "w") as file:
-                json.dump(data, file, indent=4)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(tmp, self._json_file)
+            # Atomic + collision-proof: a unique temp file in the same dir is
+            # replaced onto the target, so a crash mid-write can never destroy
+            # the printer registry and two writers can never race on a shared
+            # ``<name>.json.tmp`` (which let the first os.replace consume the
+            # temp out from under the second -> FileNotFoundError).
+            atomic_write_text(self._json_file, json.dumps(data, indent=4))
 
     def load(self):
         self._ensure_json_file()
@@ -78,12 +77,17 @@ class JsonConfigManager(ConfigManager):
             FileBackup.backup_file(self._json_file, *args, **kwargs)
 
     @property
+    def storage_path(self) -> Path:
+        return self._json_file
+
+    @property
     def _json_file(self) -> Path:
         return self.base_directory / f"{self.name}.json"
 
     def _ensure_json_file(self):
         with self._file_lock:
+            # Heal a config dir that was removed at runtime, not just at __init__.
+            self.base_directory.mkdir(parents=True, exist_ok=True)
             if not self._json_file.exists():
                 # Always create a valid JSON file, to prevent issues.
-                with open(self._json_file, "w") as file:
-                    json.dump([], file, indent=4)
+                atomic_write_text(self._json_file, json.dumps([], indent=4))

@@ -6,11 +6,29 @@ __all__ = [
     "JsonConfigManager",
     "Config",
     "PrinterConfig",
+    "ConfigBundle",
+    "BundleSource",
+    "BundleManifest",
+    "BundleEntry",
+    "RestoreReport",
+    "BundleError",
+    "BundleCorrupt",
+    "BundleVersionError",
 ]
 
 from enum import Enum
 from typing import Type
 
+from simplyprint_ws_client.core.config.bundle import (
+    BundleCorrupt,
+    BundleEntry,
+    BundleError,
+    BundleManifest,
+    BundleSource,
+    BundleVersionError,
+    ConfigBundle,
+    RestoreReport,
+)
 from simplyprint_ws_client.core.config.config import Config, PrinterConfig
 from simplyprint_ws_client.core.config.json import JsonConfigManager
 from simplyprint_ws_client.core.config.manager import ConfigManager

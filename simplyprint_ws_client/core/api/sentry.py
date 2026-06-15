@@ -1,6 +1,7 @@
 import logging
+import re
 import traceback
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, Callable, List
 
 import sentry_sdk
 from sentry_sdk.integrations import Integration
@@ -18,6 +19,41 @@ MAX_UNIQUE_EXCEPTIONS = 100
 MAX_SAMPLES_PER_EXC = 5
 DEFAULT_SAMPLE_RATE = 0.1
 
+# Generic, brand-free PII redaction applied to every outgoing event. The aim is
+# that only the error itself (message + traceback) leaves the device -- never a
+# user's home path, a LAN address, a MAC/hardware id, or a secret. Patterns are
+# pattern-based on purpose: this library cannot know brand-specific shapes (access
+# codes, serials, printer names), so an integration registers those via
+# ``Sentry.register_scrubber`` (see ``extra_scrubbers``).
+_HOME_PATH = re.compile(r"(/(?:home|Users)/)[^/\s\"']+")
+_WIN_HOME = re.compile(r"([A-Za-z]:\\Users\\)[^\\\s\"']+")
+#: ``scheme://user:pass@host`` -- strips embedded credentials from any URL (e.g.
+#: a broker connection string), keeping the scheme so the error stays legible.
+_URL_USERINFO = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
+_MAC = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b")
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+#: ``name = value`` / ``name: value`` for clearly-secret names (separator must be
+#: ``=`` or ``:`` so "key error" / "status code: 200" are not mangled).
+_SECRET_KV = re.compile(
+    r"(?i)\b(token|access[_\-\s]?code|api[_\-]?key|secret[_\-]?key|password|passwd|pwd|secret|authorization)"
+    r"(\s*[=:]\s*)"
+    r"([^\s,;&\"']+)"
+)
+_BEARER = re.compile(r"(?i)\b(bearer)\s+([A-Za-z0-9._\-]+)")
+#: A long opaque run (tokens, JWT segments, base64/hex secrets).
+_LONG_RUN = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
+
+_SCRUB_PATTERNS: List[tuple] = [
+    (_HOME_PATH, r"\1<user>"),
+    (_WIN_HOME, r"\1<user>"),
+    (_URL_USERINFO, r"\1<redacted>@"),
+    (_MAC, "<mac>"),
+    (_IPV4, "<ip>"),
+    (_SECRET_KV, r"\1\2<redacted>"),
+    (_BEARER, r"\1 <redacted>"),
+    (_LONG_RUN, "<redacted>"),
+]
+
 
 class Sentry:
     """
@@ -25,6 +61,11 @@ class Sentry:
     """
 
     integrations: List[Integration] = []
+
+    #: Integration-supplied redactions, applied after the built-in patterns. An
+    #: integration registers brand-specific scrubbers (access codes, serials,
+    #: printer names) here; the library never knows their shapes.
+    extra_scrubbers: List[Callable[[str], str]] = []
 
     # Hash of exception + count, if the count is greater than 5, we will not send the exception.
     __seen_exceptions = dict()
@@ -37,6 +78,16 @@ class Sentry:
         cls.integrations.append(integration)
 
     @classmethod
+    def register_scrubber(cls, scrubber: Callable[[str], str]) -> None:
+        """Register a brand-specific text redaction run on every event field.
+
+        ``scrubber`` takes a string and returns it with brand-specific PII
+        removed (e.g. an 8-char access code or a printer serial). It composes
+        after the library's generic patterns.
+        """
+        cls.extra_scrubbers.append(scrubber)
+
+    @classmethod
     def is_initialized(cls):
         return sentry_sdk.Hub.current.client is not None
 
@@ -45,13 +96,19 @@ class Sentry:
         if settings.sentry_dsn is None:
             return
 
+        # Only report from real (managed/production) installs. Source and dev
+        # runs must never send events -- their noise is not actionable.
+        if settings.development:
+            return
+
         if cls.is_initialized():
             return
 
-        # Default integrations
+        # Capture nothing as breadcrumbs (the INFO firehose), only ERROR+ as
+        # events -- with their tracebacks intact.
         cls.add_integration(
             LoggingIntegration(
-                level=logging.INFO,
+                level=None,
                 event_level=logging.ERROR,
             )
         )
@@ -62,10 +119,11 @@ class Sentry:
         try:
             sentry_sdk.init(
                 dsn=settings.sentry_dsn,
-                enable_tracing=True,
+                # Errors only -- no performance tracing/profiling volume.
+                traces_sample_rate=0.0,
                 error_sampler=cls._error_sampler,
-                traces_sampler=cls._traces_sampler,
-                profiles_sampler=cls._profiles_sampler,
+                before_send=cls._before_send,
+                send_default_pii=False,
                 integrations=cls.integrations,
                 release=f"{settings.name}@{settings.version}",
                 environment=(
@@ -85,6 +143,35 @@ class Sentry:
 
         except Exception as e:
             logging.exception(e)
+
+    @classmethod
+    def _scrub_text(cls, text: str) -> str:
+        for pattern, repl in _SCRUB_PATTERNS:
+            text = pattern.sub(repl, text)
+        for scrubber in cls.extra_scrubbers:
+            try:
+                text = scrubber(text)
+            except Exception:  # noqa: BLE001 -- a bad scrubber must not drop the event
+                pass
+        return text
+
+    @classmethod
+    def _scrub_value(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return cls._scrub_text(value)
+        if isinstance(value, dict):
+            return {key: cls._scrub_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._scrub_value(item) for item in value]
+        return value
+
+    @classmethod
+    def _before_send(cls, event: dict, hint: dict) -> dict:
+        """Redact PII from every string field of an outgoing event."""
+        try:
+            return cls._scrub_value(event)
+        except Exception:  # noqa: BLE001 -- never let scrubbing drop a real error
+            return event
 
     @classmethod
     def _get_sample_rate_from_hash(cls, exception_hash: int) -> float:
@@ -124,12 +211,4 @@ class Sentry:
         except (AttributeError, Exception):
             pass
 
-        return DEFAULT_SAMPLE_RATE
-
-    @classmethod
-    def _traces_sampler(cls, context: dict) -> float:
-        return DEFAULT_SAMPLE_RATE
-
-    @classmethod
-    def _profiles_sampler(cls, context: dict) -> float:
         return DEFAULT_SAMPLE_RATE
