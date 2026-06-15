@@ -13,6 +13,13 @@ from simplyprint_ws_client.common.process import run as run_command
 from simplyprint_ws_client.common.utils.exception_as_value import exception_as_value
 
 
+_MACOS_AIRPORT_PATH = (
+    "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/"
+    "Resources/airport"
+)
+_MACOS_NETWORKSETUP_PATH = "/usr/sbin/networksetup"
+
+
 def callonce(func):
     unset = object()
     result = unset
@@ -184,25 +191,56 @@ class PhysicalMachine:
     @callonce
     @exception_as_value(return_default=True)
     def __ssid_macos() -> Optional[str]:
-        airport_output = map(
-            functools.partial(str.split, sep=": "),
-            map(
-                str.strip,
-                capped_check_output(
-                    [
-                        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
-                        "-I",
-                    ]
+        if os.path.exists(_MACOS_AIRPORT_PATH):
+            try:
+                airport_output = (
+                    capped_check_output([_MACOS_AIRPORT_PATH, "-I"])
+                    .decode("utf-8")
+                    .strip()
                 )
-                .decode("utf-8")
-                .strip()
-                .split("\n"),
-            ),
-        )
+            except Exception:
+                airport_output = ""
 
-        for field, value in airport_output:
-            if field == "SSID":
-                return value
+            for line in airport_output.splitlines():
+                field, _, value = line.strip().partition(":")
+                if field == "SSID":
+                    return value.strip() or None
+
+        if not os.path.exists(_MACOS_NETWORKSETUP_PATH):
+            return None
+
+        hardware_ports = (
+            capped_check_output([_MACOS_NETWORKSETUP_PATH, "-listallhardwareports"])
+            .decode("utf-8")
+            .strip()
+        )
+        wifi_device = None
+        hardware_port = None
+
+        for line in hardware_ports.splitlines():
+            field, _, value = line.strip().partition(":")
+            value = value.strip()
+
+            if field == "Hardware Port":
+                hardware_port = value
+            elif field == "Device" and hardware_port in {"Wi-Fi", "AirPort"}:
+                wifi_device = value
+                break
+
+        if wifi_device is None:
+            return None
+
+        output = (
+            capped_check_output(
+                [_MACOS_NETWORKSETUP_PATH, "-getairportnetwork", wifi_device]
+            )
+            .decode("utf-8")
+            .strip()
+        )
+        field, _, value = output.partition(":")
+
+        if field == "Current Wi-Fi Network":
+            return value.strip() or None
 
     @staticmethod
     @callonce

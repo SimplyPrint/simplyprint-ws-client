@@ -46,6 +46,39 @@ def test_physical_machine_check_output_uses_system_command_wrapper(monkeypatch):
     assert captured["kwargs"]["timeout"] == 1.0
 
 
+def test_macos_ssid_uses_networksetup_when_airport_is_missing(monkeypatch):
+    calls = []
+
+    def fake_exists(path):
+        return path == physical_machine._MACOS_NETWORKSETUP_PATH
+
+    def fake_check_output(argv):
+        calls.append(argv)
+        if argv == [physical_machine._MACOS_NETWORKSETUP_PATH, "-listallhardwareports"]:
+            return (
+                b"Hardware Port: Ethernet\n"
+                b"Device: en7\n\n"
+                b"Hardware Port: Wi-Fi\n"
+                b"Device: en0\n"
+                b"Ethernet Address: aa:bb:cc:dd:ee:ff\n"
+            )
+        if argv == [
+            physical_machine._MACOS_NETWORKSETUP_PATH,
+            "-getairportnetwork",
+            "en0",
+        ]:
+            return b"Current Wi-Fi Network: Shop Floor\n"
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(physical_machine.os.path, "exists", fake_exists)
+    monkeypatch.setattr(physical_machine, "capped_check_output", fake_check_output)
+
+    ssid_macos = physical_machine.PhysicalMachine._PhysicalMachine__ssid_macos.__wrapped__
+
+    assert ssid_macos() == "Shop Floor"
+    assert all(physical_machine._MACOS_AIRPORT_PATH not in call for call in calls)
+
+
 def test_discovery_mac_command_uses_system_command_wrapper(monkeypatch):
     calls = []
 
