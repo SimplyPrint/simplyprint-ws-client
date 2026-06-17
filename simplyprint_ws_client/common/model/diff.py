@@ -134,15 +134,21 @@ class SimpleUpdateModel(UpdateModel):
                     if not isinstance(value2, list):
                         continue
 
-                    # Like the scalar path below, this reports *touched*
-                    # elements (consumers filter with ``has_changed()``); a
-                    # list whose element diffs are all empty is not reported.
+                    # Index-aligned merge that also grows/shrinks the list,
+                    # reporting touched elements only (filtered by has_changed()).
                     changes: List[Optional[Any]] = []
                     any_touched = False
-                    min_length = min(len(value1), len(value2))
+                    old_length, new_length = len(value1), len(value2)
 
-                    for i in range(min_length):
-                        if isinstance(value1[i], UpdateModel):
+                    for i in range(max(old_length, new_length)):
+                        if i >= new_length:
+                            changes.append(UpdatedField(value1[i], None))
+                            any_touched = True
+                        elif i >= old_length:
+                            value1.append(value2[i])
+                            changes.append(UpdatedField(None, value2[i]))
+                            any_touched = True
+                        elif isinstance(value1[i], UpdateModel):
                             element_diff = value1[i].update_model(value2[i])
                             changes.append(element_diff or None)
                             any_touched = any_touched or bool(element_diff)
@@ -150,6 +156,9 @@ class SimpleUpdateModel(UpdateModel):
                             changes.append(UpdatedField(value1[i], value2[i]))
                             value1[i] = value2[i]
                             any_touched = True
+
+                    if old_length > new_length:
+                        del value1[new_length:]
 
                     if any_touched:
                         updated_fields[name] = changes

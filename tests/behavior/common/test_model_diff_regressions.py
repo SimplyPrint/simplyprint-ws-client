@@ -36,6 +36,41 @@ def test_model_list_diff_is_index_aligned():
     assert left.items[1].a == 3
 
 
+def test_model_list_diff_appends_new_elements():
+    """An incoming list longer than the existing one must grow it, not truncate."""
+    left = _Outer(items=[_Inner(a=1)])
+    right = _Outer(items=[_Inner(), _Inner(a=2)])
+
+    changes = left.update_model(right)
+
+    assert [item.a for item in left.items] == [1, 2]
+    assert changes["items"][0] is None
+    assert changes["items"][1] == UpdatedField(None, left.items[1])
+    assert changes["items"][1].has_changed()
+
+
+def test_model_list_diff_truncates_removed_elements():
+    """An incoming list shorter than the existing one must drop the stale tail."""
+    left = _Outer(items=[_Inner(a=1), _Inner(a=2)])
+    right = _Outer(items=[_Inner()])
+
+    changes = left.update_model(right)
+
+    assert [item.a for item in left.items] == [1]
+    assert changes["items"][0] is None
+    assert changes["items"][1] == UpdatedField(_Inner(a=2), None)
+
+
+def test_scalar_list_diff_grows_and_shrinks():
+    grow_left = _Outer(nums=[1])
+    grow_left.update_model(_Outer(nums=[1, 2]))
+    assert grow_left.nums == [1, 2]
+
+    shrink_left = _Outer(nums=[1, 2, 3])
+    shrink_left.update_model(_Outer(nums=[9]))
+    assert shrink_left.nums == [9]
+
+
 def test_scalar_list_element_changes_are_reported():
     left = _Outer(nums=[1, 2, 3])
     right = _Outer(nums=[1, 5, 3])
