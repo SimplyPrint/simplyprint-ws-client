@@ -4,6 +4,8 @@ __all__ = [
     "ClientStateChangeEvent",
     "ClientState",
     "configure",
+    "PeripheralDefinitionEntry",
+    "PeripheralDefinitions",
 ]
 
 import asyncio
@@ -15,7 +17,9 @@ from enum import IntEnum
 from typing import (
     TYPE_CHECKING,
     Any,
+    Dict,
     Generic,
+    Literal,
     NamedTuple,
     Optional,
     TypeVar,
@@ -31,9 +35,9 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.common.asyncio.offload import Offload
 
 try:
-    from typing import Unpack
+    from typing import NotRequired, TypedDict, Unpack
 except ImportError:
-    from typing_extensions import Unpack
+    from typing_extensions import NotRequired, TypedDict, Unpack
 
 from simplyprint_ws_client.core.autowire import (
     configure,
@@ -56,6 +60,8 @@ from simplyprint_ws_client.core.protocol.events import (
 from simplyprint_ws_client.core.protocol.messages import (
     SetMaterialDataDemandData,
     MaterialDataMsg,
+    PeripheralDefinitionsMsg,
+    PeripheralMsg,
     MultiPrinterRemoveConnectionMsg,
     MultiPrinterRemovedMsg,
     MultiPrinterAddedMsg,
@@ -134,6 +140,17 @@ class ClientConfigChangedEvent(Event): ...
 class ClientStateChangeEvent(Event): ...
 
 
+class PeripheralDefinitionEntry(TypedDict):
+    f: Literal["r", "w", "rw"]
+    n: NotRequired[str]
+    d: NotRequired[str]
+    o: NotRequired[int]
+    vt: NotRequired[Literal["bool", "percent"]]
+
+
+PeripheralDefinitions = Dict[str, PeripheralDefinitionEntry]
+
+
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
 
 # Map message producers
@@ -145,7 +162,7 @@ _CLIENT_MSG_PRODUCERS = {
     FirmwareMsg: ["firmware"],
     FirmwareWarningMsg: ["firmware_warning"],
     ToolMsg: ["tools.*.active_material"],
-    TemperatureMsg: ["bed.temperature", "tools.*.temperature"],
+    TemperatureMsg: ["bed.temperature", "chamber.temperature", "tools.*.temperature"],
     AmbientTemperatureMsg: ["ambient_temperature.ambient"],
     StateChangeMsg: ["status"],
     JobInfoMsg: ["job_info"],
@@ -165,6 +182,7 @@ _CLIENT_MSG_PRODUCERS = {
     NotificationMsg: [
         "notifications.notifications",
     ],
+    PeripheralMsg: ["peripherals.entries"],
 }
 
 _CLIENT_MSG_MAP = {k: v for v, keys in _CLIENT_MSG_PRODUCERS.items() for k in keys}
@@ -599,6 +617,11 @@ class Client(
             )
         await self.send(NotificationMsg(data={"events": [NotificationEvent(**kwargs)]}))
 
+    def get_current_peripheral_definitions(
+        self,
+    ) -> Optional[PeripheralDefinitions]:
+        return None
+
     # Default event handling.
 
     @configure(ServerMsgType.ERROR, priority=1)
@@ -684,6 +707,15 @@ class Client(
         await self.send(
             MaterialDataMsg(data=dict(MaterialDataMsg.build_refresh(self.printer)))
         )
+
+    @configure(DemandMsgType.REFRESH_PERIPHERALS, priority=1)
+    async def _on_refresh_peripherals(self):
+        definitions = self.get_current_peripheral_definitions()
+
+        if not definitions:
+            return
+
+        await self.send(PeripheralDefinitionsMsg(data=definitions), skip_dispatch=True)
 
     @configure(DemandMsgType.RESOLVE_NOTIFICATION, priority=1)
     async def _on_resolve_notification(self, data: ResolveNotificationDemandData):

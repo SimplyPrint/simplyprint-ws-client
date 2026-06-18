@@ -40,6 +40,8 @@ __all__ = [
     "SetPrinterProfileDemandData",
     "SetMaterialDataDemandData",
     "RefreshMaterialDataDemandData",
+    "RefreshPeripheralsDemandData",
+    "PeripheralActionDemandData",
     "MMSMapEntry",
     "SkipObjectsDemandData",
     "ResolveNotificationDemandData",
@@ -87,6 +89,8 @@ __all__ = [
     "MeshDataMsg",
     "LogsSentMsg",
     "MaterialDataMsg",
+    "PeripheralMsg",
+    "PeripheralDefinitionsMsg",
     "NotificationMsg",
     "ObjectsData",
     "ObjectsMsg",
@@ -400,6 +404,47 @@ class RefreshMaterialDataDemandData(BaseModel):
     )
 
 
+class RefreshPeripheralsDemandData(BaseModel):
+    demand: Literal[DemandMsgType.REFRESH_PERIPHERALS] = (
+        DemandMsgType.REFRESH_PERIPHERALS
+    )
+
+
+class PeripheralActionDemandData(BaseModel):
+    demand: Literal[DemandMsgType.PERIPHERAL_ACTION] = DemandMsgType.PERIPHERAL_ACTION
+    id: str
+    a: str
+    v: Optional[Any] = None
+
+    @property
+    def action(self) -> str:
+        return self.a
+
+    @property
+    def value(self) -> Optional[Any]:
+        return self.v
+
+    @property
+    def on(self) -> Optional[bool]:
+        return self.v if isinstance(self.v, bool) else None
+
+    @property
+    def percent(self) -> Optional[float]:
+        if isinstance(self.v, bool):
+            return 100.0 if self.v else 0.0
+
+        if isinstance(self.v, (int, float)):
+            return float(self.v)
+
+        if isinstance(self.v, str):
+            try:
+                return float(self.v)
+            except ValueError:
+                return None
+
+        return None
+
+
 class SkipObjectsDemandData(BaseModel):
     demand: Literal[DemandMsgType.SKIP_OBJECTS] = DemandMsgType.SKIP_OBJECTS
     objects: List[Union[str, int]] = Field(default_factory=list)
@@ -499,6 +544,8 @@ DemandMsgKind = Union[
     SetPrinterProfileDemandData,
     SetMaterialDataDemandData,
     RefreshMaterialDataDemandData,
+    RefreshPeripheralsDemandData,
+    PeripheralActionDemandData,
     SkipObjectsDemandData,
     ResolveNotificationDemandData,
     GetGcodeScriptBackupsDemandData,
@@ -692,6 +739,9 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
         if state.bed.temperature.model_has_changed:
             yield "bed", state.bed.temperature.to_list()
 
+        if state.chamber.temperature.model_has_changed:
+            yield "chamber", state.chamber.temperature.to_list()
+
         for i, tool in enumerate(state.tools):
             if not tool.temperature.model_has_changed:
                 continue
@@ -701,6 +751,8 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.bed.model_reset_changed("temperature")
         state.bed.temperature.model_reset_changed()
+        state.chamber.model_reset_changed("temperature")
+        state.chamber.temperature.model_reset_changed()
 
         for tool in state.tools:
             tool.model_reset_changed("temperature")
@@ -711,7 +763,8 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
         if any(
             "target" in x.model_self_changed_fields
             for x in chain(
-                (state.bed.temperature,), map(lambda t: t.temperature, state.tools)
+                (state.bed.temperature, state.chamber.temperature),
+                map(lambda t: t.temperature, state.tools),
             )
         ):
             return DispatchMode.DISPATCH
@@ -967,6 +1020,38 @@ class MaterialDataMsg(ClientMsg[Literal[ClientMsgType.MATERIAL_DATA]]):
             for m in t.materials:
                 m.model_reset_changed(v=v)
             t.model_reset_changed("materials", *self._TOOL_FIELDS, v=v)
+
+
+class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
+    @classmethod
+    def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
+        for peripheral in state.peripherals.entries.values():
+            if not peripheral.model_has_changed:
+                continue
+
+            yield (
+                peripheral.id,
+                peripheral.model_dump(
+                    exclude={"id"},
+                    exclude_none=True,
+                    mode="json",
+                    by_alias=True,
+                ),
+            )
+
+    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+        state.peripherals.model_reset_changed("entries", v=v)
+
+        for peripheral in state.peripherals.entries.values():
+            peripheral.model_reset_changed(v=v)
+
+    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
+        return state.intervals.dispatch_mode("peripheral")
+
+
+class PeripheralDefinitionsMsg(
+    ClientMsg[Literal[ClientMsgType.PERIPHERAL_DEFINITIONS]]
+): ...
 
 
 class NotificationMsg(ClientMsg[Literal[ClientMsgType.NOTIFICATION]]):

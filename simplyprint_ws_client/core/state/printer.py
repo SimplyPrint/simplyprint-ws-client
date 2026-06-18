@@ -168,6 +168,116 @@ class PSUState(ReactiveModel):
     on: bool = False
 
 
+_PERIPHERAL_UNSET = object()
+
+
+class PeripheralHandle:
+    def __init__(self, peripherals: "PeripheralsState", peripheral_id: str):
+        self.peripherals = peripherals
+        self.peripheral_id = peripheral_id
+
+    @property
+    def state(self) -> Optional["PeripheralState"]:
+        return self.peripherals.get(self.peripheral_id)
+
+    @property
+    def value(self) -> Optional[Any]:
+        return self.state.value if self.state else None
+
+    @property
+    def available(self) -> Optional[bool]:
+        return self.state.available if self.state else None
+
+    @property
+    def updated(self) -> Optional[int]:
+        return self.state.updated if self.state else None
+
+    def set(
+        self,
+        value: Any,
+        *,
+        available: Optional[bool] = _PERIPHERAL_UNSET,
+        updated: Optional[int] = _PERIPHERAL_UNSET,
+    ) -> "PeripheralState":
+        return self.peripherals.update(
+            self.peripheral_id,
+            value=value,
+            available=available,
+            updated=updated,
+        )
+
+    def update(
+        self,
+        *,
+        value: Any = _PERIPHERAL_UNSET,
+        available: Optional[bool] = _PERIPHERAL_UNSET,
+        updated: Optional[int] = _PERIPHERAL_UNSET,
+    ) -> "PeripheralState":
+        return self.peripherals.update(
+            self.peripheral_id,
+            value=value,
+            available=available,
+            updated=updated,
+        )
+
+
+class PeripheralState(ReactiveModel):
+    id: str
+    value: Optional[Any] = Field(None, alias="v")
+    available: Optional[bool] = Field(None, alias="a")
+    updated: Optional[int] = Field(None, alias="u")
+
+
+class PeripheralsState(ReactiveModel):
+    entries: Dict[str, PeripheralState] = Field(default_factory=dict)
+
+    def get(self, peripheral_id: str) -> Optional[PeripheralState]:
+        return self.entries.get(peripheral_id)
+
+    def peripheral(self, peripheral_id: str) -> PeripheralHandle:
+        return PeripheralHandle(self, peripheral_id)
+
+    def light(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripheral(f"light:{name}")
+
+    def fan(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripheral(f"fan:{name}")
+
+    def door(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripheral(f"door:{name}")
+
+    def power(self, name: Union[str, int] = "psu") -> PeripheralHandle:
+        return self.peripheral(f"power:{name}")
+
+    def update(
+        self,
+        peripheral_id: str,
+        *,
+        value: Any = _PERIPHERAL_UNSET,
+        available: Optional[bool] = _PERIPHERAL_UNSET,
+        updated: Optional[int] = _PERIPHERAL_UNSET,
+    ) -> PeripheralState:
+        entry = self.entries.get(peripheral_id)
+
+        if entry is None:
+            entry = PeripheralState(id=peripheral_id)
+            entry.provide_context(self)
+            self.entries[peripheral_id] = entry
+            self.model_set_changed("entries")
+            entry.model_set_changed("id")
+
+        if value is not _PERIPHERAL_UNSET:
+            entry.value = value
+
+        if available is not _PERIPHERAL_UNSET:
+            entry.available = available
+
+        if updated is not _PERIPHERAL_UNSET:
+            entry.updated = updated
+
+        return entry
+
+
 class JobInfoState(ReactiveModel, validate_assignment=True):
     progress: Optional[float] = None
     initial_estimate: Optional[float] = None
@@ -301,6 +411,13 @@ class BedState(ReactiveModel):
         return self.temperature.is_heating()
 
 
+class ChamberState(ReactiveModel):
+    temperature: TemperatureState = Field(default_factory=TemperatureState)
+
+    def is_heating(self) -> bool:
+        return self.temperature.is_heating()
+
+
 class ToolState(ReactiveModel):
     nozzle: int
     type: Optional[NozzleType] = None
@@ -370,6 +487,7 @@ class PrinterState(ReactiveModel):
     # General state.
     status: Optional[PrinterStatus] = None
     bed: BedState = Field(default_factory=BedState)
+    chamber: ChamberState = Field(default_factory=ChamberState)
     tools: List[ToolState] = Field(default_factory=lambda: [ToolState(nozzle=0)])
     mms_layout: List[MaterialLayoutEntry] = Field(default_factory=list)
 
@@ -396,6 +514,7 @@ class PrinterState(ReactiveModel):
     filament_sensor: PrinterFilamentSensorState = Field(
         default_factory=PrinterFilamentSensorState
     )
+    peripherals: PeripheralsState = Field(default_factory=PeripheralsState)
     ambient_temperature: AmbientTemperatureState = Field(
         default_factory=AmbientTemperatureState
     )
@@ -499,6 +618,21 @@ class PrinterState(ReactiveModel):
             for i, tool in enumerate(self.tools):
                 tool.material_count = max(material_count_per_nozzle.get(i, 1), 1)
 
+    def peripheral(self, peripheral_id: str) -> PeripheralHandle:
+        return self.peripherals.peripheral(peripheral_id)
+
+    def light(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripherals.light(name)
+
+    def fan(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripherals.fan(name)
+
+    def door(self, name: Union[str, int]) -> PeripheralHandle:
+        return self.peripherals.door(name)
+
+    def power(self, name: Union[str, int] = "psu") -> PeripheralHandle:
+        return self.peripherals.power(name)
+
     def is_printing(self, *status) -> bool:
         """If any of the statuses are printing, return True. Default behavior is to check own status."""
         if len(status) == 0:
@@ -507,7 +641,7 @@ class PrinterState(ReactiveModel):
         return PrinterStatus.is_printing(*status)
 
     def is_heating(self) -> bool:
-        return any([h.is_heating() for h in (self.bed.temperature, *self.tools)])
+        return any([h.is_heating() for h in (self.bed, self.chamber, *self.tools)])
 
     def populate_info_from_physical_machine(self, *skip: str):
         """Set information about the physical machine the client is running on."""
