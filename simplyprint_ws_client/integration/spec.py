@@ -54,6 +54,7 @@ if TYPE_CHECKING:
         SubnetScanSpec,
     )
     from simplyprint_ws_client.integration.flow import Flow
+    from simplyprint_ws_client.integration.model_catalogue import ModelCatalogue
     from simplyprint_ws_client.integration.presentation import PrinterPresentation
     from simplyprint_ws_client.integration.tasks import TaskRegistry
 
@@ -316,13 +317,67 @@ class PrinterSpec:
 
         The default is intentionally boring and metadata-driven. Brands that need
         to hide secrets, expose editable fields, or resolve model-specific photos
-        override this hook in their own spec.
+        override this hook in their own spec -- or, for the common
+        model-image/model-name case only, override :meth:`model_catalogue`
+        instead and let :meth:`model_aware_presentation` do the work.
         """
         from simplyprint_ws_client.integration.presentation import (
             default_printer_presentation,
         )
 
         return default_printer_presentation(cls.metadata.image_url)
+
+    @classmethod
+    def model_catalogue(cls) -> "Optional[ModelCatalogue]":
+        """This type's model catalogue -- the four universal operations
+        (label / image / resolve / picker) keyed by the string value stored in
+        a config's ``device_type`` field -- or ``None`` if this type has no
+        per-model identity (single-model, or model-agnostic like a generic
+        RepRapFirmware board).
+
+        Read off the class (no ``build``); surfaces ask
+        ``spec.model_catalogue() is not None`` or ``spec.provides(
+        "model_catalogue")`` before using it. Returning a catalogue is the
+        declarative alternative to overriding :meth:`printer_presentation`
+        just to populate ``model_name`` and ``image_url`` from
+        ``config.device_type`` -- see :meth:`model_aware_presentation`.
+        """
+        return None
+
+    @classmethod
+    def model_aware_presentation(
+        cls, config: "PrinterConfig"
+    ) -> "PrinterPresentation":
+        """Default-by-catalogue presentation: the metadata-driven
+        :meth:`printer_presentation` enriched with ``model_name`` and
+        ``image_url`` resolved from ``config.device_type`` via
+        :meth:`model_catalogue`.
+
+        Brands that need to add secrets / editable fields / a connection
+        summary override :meth:`printer_presentation` and call this as the
+        base (then ``replace`` the result). Brands with no catalogue fall
+        through to the plain metadata-driven default.
+        """
+        from dataclasses import replace
+
+        from simplyprint_ws_client.integration.presentation import (
+            default_printer_presentation,
+        )
+
+        base = default_printer_presentation(cls.metadata.image_url)
+        catalogue = cls.model_catalogue()
+        if catalogue is None:
+            return base
+        value = getattr(config, "device_type", None)
+        if not value or value == catalogue.unknown_value:
+            return base
+        image = catalogue.image_url(value)
+        model_name = catalogue.model_name(value)
+        return replace(
+            base,
+            image_url=image or base.image_url,
+            model_name=model_name,
+        )
 
     @classmethod
     def provides(cls, capability: str) -> bool:

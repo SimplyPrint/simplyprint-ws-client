@@ -8,6 +8,7 @@ liveness -- so a client that enters scheduling inactive (or goes inactive)
 must keep running init/tick, or it can never recover.
 """
 
+import logging
 from datetime import timedelta
 
 import pytest
@@ -155,3 +156,49 @@ async def test_failing_tick_does_not_stall_the_allocation_machine(scheduler, cli
     await scheduler._schedule_client(client)
     assert not scheduler.manager.is_allocated(client)
     assert client.halt_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tick_timeout_is_logged_once_without_traceback(scheduler, client, caplog):
+    async def timeout_tick(delta):
+        raise TimeoutError("send ping timed out")
+
+    client.tick = timeout_tick
+    caplog.set_level(logging.DEBUG, logger=client.logger.name)
+
+    await scheduler._schedule_client(client)
+    scheduler._last_ticked.clear()
+    await scheduler._schedule_client(client)
+
+    records = [record for record in caplog.records if record.name == client.logger.name]
+    assert not [record for record in records if record.levelno >= logging.ERROR]
+    assert len([record for record in records if record.levelno == logging.WARNING]) == 1
+    assert "Error while ticking client" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_quiet_tick_failure_resets_after_success(scheduler, client, caplog):
+    calls = 0
+
+    async def flaky_tick(delta):
+        nonlocal calls
+        calls += 1
+        if calls != 2:
+            raise TimeoutError("send ping timed out")
+
+    client.tick = flaky_tick
+    caplog.set_level(logging.WARNING, logger=client.logger.name)
+
+    await scheduler._schedule_client(client)
+    scheduler._last_ticked.clear()
+    await scheduler._schedule_client(client)
+    scheduler._last_ticked.clear()
+    await scheduler._schedule_client(client)
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == client.logger.name and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 2
