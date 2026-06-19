@@ -1029,14 +1029,14 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
             if not peripheral.model_has_changed:
                 continue
 
+            data = {}
+            for field_name, alias in (("value", "v"), ("available", "a"), ("updated", "u")):
+                if field_name in peripheral.model_changed_fields:
+                    data[alias] = getattr(peripheral, field_name)
+
             yield (
                 peripheral.id,
-                peripheral.model_dump(
-                    exclude={"id"},
-                    exclude_none=True,
-                    mode="json",
-                    by_alias=True,
-                ),
+                data,
             )
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:

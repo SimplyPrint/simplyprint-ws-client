@@ -712,7 +712,7 @@ class Client(
     async def _on_refresh_peripherals(self):
         definitions = self.get_current_peripheral_definitions()
 
-        if not definitions:
+        if definitions is None:
             return
 
         await self.send(PeripheralDefinitionsMsg(data=definitions), skip_dispatch=True)
