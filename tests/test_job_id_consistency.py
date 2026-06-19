@@ -81,7 +81,9 @@ def test_job_id_consistency_flow(client: Client):
     job_info_msg.reset_changes(client.printer)
     assert client.printer.current_job_id is None
 
-    # Going back to operational should also clear job_id if it wasn't already cleared
+    # Going back to operational does not clear job_id. Some printers briefly flap
+    # to operational between file_progress and job_info.started; only terminal
+    # job_info clears the id.
     client.printer.current_job_id = job_id  # Set it again
     client.printer.status = PrinterStatus.OPERATIONAL
 
@@ -90,6 +92,27 @@ def test_job_id_consistency_flow(client: Client):
 
     assert status_msg is not None
 
-    # After reset_changes is called, job_id should be cleared
+    # After reset_changes is called, job_id should still be retained.
     status_msg.reset_changes(client.printer)
-    assert client.printer.current_job_id is None
+    assert client.printer.current_job_id == job_id
+
+
+def test_operational_state_does_not_clear_pending_job_id(client: Client):
+    job_id = 5788086
+    client.printer.status = PrinterStatus.DOWNLOADING
+    client.printer.current_job_id = job_id
+    client.consume()
+
+    client.printer.status = PrinterStatus.OPERATIONAL
+    msgs, _ = client.consume()
+    status_msg = next(m for m in msgs if isinstance(m, StateChangeMsg))
+    status_msg.reset_changes(client.printer)
+
+    assert client.printer.current_job_id == job_id
+
+    client.printer.status = PrinterStatus.PRINTING
+    client.printer.job_info.started = True
+    msgs, _ = client.consume()
+    job_info_msg = next(m for m in msgs if isinstance(m, JobInfoMsg))
+
+    assert job_info_msg.data["job_id"] == job_id

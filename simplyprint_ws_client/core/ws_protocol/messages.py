@@ -132,7 +132,6 @@ from ..state import (
     JobInfoState,
     MaterialEntry,
     JobObjectEntry,
-    PrinterStatus,
     NotificationActionResponses,
 )
 
@@ -737,10 +736,6 @@ class StateChangeMsg(ClientMsg[Literal[ClientMsgType.STATUS]]):
         yield "new", state.status
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        # When the printer goes operational, we can clear the current job id.
-        if state.status == PrinterStatus.OPERATIONAL:
-            state.current_job_id = None
-
         state.model_reset_changed("status")
 
 
