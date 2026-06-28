@@ -194,6 +194,7 @@ class MultiMaterialSolution(Enum):
     BOXTURTLE = "boxturtle"
     CREALITY_CFS = "creality_cfs"
     ANYCUBIC_ACE_PRO = "anycubic_ace_pro"
+    ELEGOO_CANVAS = "elegoo_canvas"
     VIRTUAL = "virtual"
     CUSTOM = "custom"
 
@@ -202,6 +203,7 @@ class MultiMaterialSolution(Enum):
         return self in {
             self.CREALITY_CFS,
             self.ANYCUBIC_ACE_PRO,
+            self.ELEGOO_CANVAS,
             self.BAMBU_AMS,
             self.BAMBU_AMS_2_PRO,
             self.BAMBU_AMS_HT,
@@ -217,6 +219,7 @@ class MultiMaterialSolution(Enum):
             self.BAMBU_AMS_LITE: 1,
             self.CREALITY_CFS: 4,
             self.ANYCUBIC_ACE_PRO: 4,
+            self.ELEGOO_CANVAS: 4,
         }.get(self)
 
     @property
