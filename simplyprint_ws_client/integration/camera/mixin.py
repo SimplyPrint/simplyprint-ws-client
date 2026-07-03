@@ -35,6 +35,8 @@ class ClientCameraMixin(Client[_T]):
     _stream_lock: CancelableLock
     _stream_setup: asyncio.Event
     _request_count: int = 0
+    _webcam_snapshot_queue: Optional[asyncio.Queue[WebcamSnapshotDemandData]] = None
+    _webcam_snapshot_task: Optional[asyncio.Task] = None
     #: ``time.time()`` of the last published stream frame. A cached frame that
     #: arrived after this is *unseen* by the server and can be served with zero
     #: latency instead of blocking until the camera produces its next frame.
@@ -62,6 +64,8 @@ class ClientCameraMixin(Client[_T]):
         self._camera_logger.setLevel(
             logging.DEBUG if self._camera_debug else logging.INFO
         )
+        self._webcam_snapshot_queue = None
+        self._webcam_snapshot_task = None
 
     @property
     def camera_status(self) -> Literal["ok", "new", "err"]:
@@ -132,9 +136,7 @@ class ClientCameraMixin(Client[_T]):
 
         # Check if we left off with a request that needs to be sent.
         if self._request_count > 0:
-            asyncio.run_coroutine_threadsafe(
-                self.on_webcam_snapshot(), loop=self.event_loop
-            )
+            self.event_loop.call_soon_threadsafe(self.on_webcam_snapshot)
 
         # Mark the webcam as connected if it's not already.
         if not self.printer.webcam_info.connected:
@@ -186,7 +188,7 @@ class ClientCameraMixin(Client[_T]):
         self._last_stream_frame_at = None
 
     async def on_test_webcam(self):
-        await self.on_webcam_snapshot()
+        await self._run_webcam_snapshot()
 
     @configure(DemandMsgType.WEBCAM_SNAPSHOT, priority=2)
     def _before_webcam_snapshot(self, data: WebcamSnapshotDemandData):
@@ -197,7 +199,79 @@ class ClientCameraMixin(Client[_T]):
     #: Frame-read attempts per snapshot request before giving up.
     _SNAPSHOT_MAX_ATTEMPTS = 5
 
-    async def on_webcam_snapshot(
+    def on_webcam_snapshot(
+        self,
+        data: Optional[WebcamSnapshotDemandData] = None,
+    ) -> None:
+        """Queue webcam work without blocking the inbound websocket dispatch.
+
+        The server sends webcam demands over the same ordered dispatch path as
+        add/reconnect/control messages. Frame capture and snapshot upload can
+        legitimately take seconds, so the listener must return immediately.
+        """
+        data = data or WebcamSnapshotDemandData()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.event_loop.call_soon_threadsafe(self.on_webcam_snapshot, data)
+            return
+
+        queue = self._ensure_webcam_snapshot_queue()
+        try:
+            queue.put_nowait(data)
+        except asyncio.QueueFull:
+            self._camera_logger.warning("Dropped webcam demand; queue is full.")
+            return
+
+        task = self._webcam_snapshot_task
+        if task is None or task.done():
+            self._webcam_snapshot_task = loop.create_task(
+                self._drain_webcam_snapshot_queue()
+            )
+            self._webcam_snapshot_task.add_done_callback(
+                self._on_webcam_snapshot_task_done
+            )
+
+    def _ensure_webcam_snapshot_queue(self) -> asyncio.Queue[WebcamSnapshotDemandData]:
+        queue = self._webcam_snapshot_queue
+        if queue is None:
+            queue = asyncio.Queue(maxsize=20)
+            self._webcam_snapshot_queue = queue
+        return queue
+
+    def _on_webcam_snapshot_task_done(self, task: asyncio.Task) -> None:
+        if self._webcam_snapshot_task is task:
+            self._webcam_snapshot_task = None
+
+        if task.cancelled():
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+
+        if exc is not None:
+            self._camera_logger.error("Webcam demand worker failed.", exc_info=exc)
+
+    async def _drain_webcam_snapshot_queue(self) -> None:
+        queue = self._ensure_webcam_snapshot_queue()
+
+        while True:
+            try:
+                data = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            try:
+                await self._run_webcam_snapshot(data)
+            except Exception as e:
+                self._camera_logger.warning("Webcam demand failed.", exc_info=e)
+            finally:
+                queue.task_done()
+
+    async def _run_webcam_snapshot(
         self,
         data: Optional[WebcamSnapshotDemandData] = None,
         attempt=0,
@@ -292,7 +366,13 @@ class ClientCameraMixin(Client[_T]):
         """Deliver one frame; True when the stream should keep going."""
         # Capture snapshot events and send them to the API
         if data.id is not None:
-            await SimplyPrintApi.post_snapshot(data.id, frame, endpoint=data.endpoint)
+            try:
+                await SimplyPrintApi.post_snapshot(
+                    data.id, frame, endpoint=data.endpoint
+                )
+            except Exception as e:
+                self._camera_logger.warning("Failed to post snapshot.", exc_info=e)
+                return False
             self._camera_logger.debug(f"Posted snapshot to API with id {data.id}")
             return False
 

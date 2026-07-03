@@ -17,6 +17,7 @@ import pytest
 from yarl import URL
 
 from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
+from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApiError
 from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.core.protocol.messages import WebcamSnapshotDemandData
 
@@ -103,7 +104,22 @@ async def test_snapshot_demand_without_camera_returns_bounded():
     """No camera ever configured: the demand gives up within the setup bound
     instead of waiting on ``_stream_setup`` forever."""
     mixin = _bare_mixin()
-    await asyncio.wait_for(mixin.on_webcam_snapshot(), timeout=1.0)
+    await asyncio.wait_for(mixin._run_webcam_snapshot(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_demand_listener_returns_immediately():
+    """The websocket dispatch listener must only queue camera work.
+
+    Actual frame capture/upload runs in the background so slow cameras or
+    snapshot uploads cannot stall all inbound SimplyPrint messages.
+    """
+    mixin = _bare_mixin()
+
+    mixin.on_webcam_snapshot()
+
+    assert mixin._webcam_snapshot_task is not None
+    await asyncio.wait_for(mixin._webcam_snapshot_task, timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -134,3 +150,23 @@ async def test_dead_camera_worker_counts_as_failed_attempts():
         timeout=2.0,
     )
     assert frame is None
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_upload_does_not_escape_dispatch(monkeypatch):
+    mixin = _bare_mixin()
+
+    async def fail_post_snapshot(*args, **kwargs):
+        raise SimplyPrintApiError("boom")
+
+    monkeypatch.setattr(
+        "simplyprint_ws_client.integration.camera.mixin.SimplyPrintApi.post_snapshot",
+        fail_post_snapshot,
+    )
+
+    keep_streaming = await mixin._publish_frame(
+        WebcamSnapshotDemandData(id="snapshot-id"),
+        b"jpeg",
+    )
+
+    assert keep_streaming is False
