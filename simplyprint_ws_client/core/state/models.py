@@ -195,6 +195,7 @@ class MultiMaterialSolution(Enum):
     CREALITY_CFS = "creality_cfs"
     ANYCUBIC_ACE_PRO = "anycubic_ace_pro"
     ELEGOO_CANVAS = "elegoo_canvas"
+    SNAPMAKER_U1 = "snapmaker_u1"
     VIRTUAL = "virtual"
     CUSTOM = "custom"
 
