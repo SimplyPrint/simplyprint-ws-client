@@ -17,6 +17,20 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class TlsClientAuth:
+    """Mutual-TLS material issued by a printer at pairing time.
+
+    The printer is its own CA; ``ca_pem`` is the printer's root certificate
+    used to verify the broker's server cert. ``cert_pem`` / ``key_pem`` are
+    the client credential the broker requires to accept the connection.
+    """
+
+    ca_pem: str
+    cert_pem: str
+    key_pem: str
+
+
+@dataclass(frozen=True)
 class WireKeepalive:
     """Transport-native ping/keepalive knobs.
 
@@ -40,10 +54,13 @@ class ConnectionOptions:
     fully; paho maps its backoff onto ``reconnect_delay_set``). ``verify_tls``
     controls broker certificate verification for ``mqtts://`` - off by default
     because printer fleets routinely present self-signed certificates, but an
-    explicit, opt-in knob. ``logger`` names where the transport's lifecycle log
-    lines land; the device drivers default it to the printer's own child logger
-    so wire events end up in that printer's log files. Endpoints are pooled, so
-    the logger of the FIRST lease that builds a transport owns its log lines.
+    explicit, opt-in knob. ``tls_client_auth`` supplies mutual-TLS credentials
+    issued by the printer at pairing time; when set it takes precedence over
+    ``verify_tls`` (paho only - aiomqtt raises ValueError). ``logger`` names where
+    the transport's lifecycle log lines land; the device drivers default it to the
+    printer's own child logger so wire events end up in that printer's log files.
+    Endpoints are pooled, so the logger of the FIRST lease that builds a transport
+    owns its log lines.
     """
 
     provider: Optional["EventLoopProvider"] = None
@@ -51,6 +68,7 @@ class ConnectionOptions:
     wire_keepalive: Optional[WireKeepalive] = None
     app_keepalive: Optional[Keepalive] = None
     verify_tls: bool = False
+    tls_client_auth: Optional[TlsClientAuth] = None
     logger: Optional["logging.Logger"] = None
     #: Bound on one connect attempt for the supervised async transports
     #: (``None`` = the transport's own default; paho owns its own timeouts).

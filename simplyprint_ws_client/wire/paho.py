@@ -24,6 +24,9 @@ importing this module never drags the dependency in.
 from __future__ import annotations
 
 import logging
+import os
+import ssl
+import tempfile
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
 
@@ -46,6 +49,7 @@ from simplyprint_ws_client.wire.messages import (
     mqtt_message_from_inbound,
 )
 from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.options import TlsClientAuth
 from simplyprint_ws_client.wire.transport import (
     FatalError,
     MqttTransport,
@@ -53,7 +57,50 @@ from simplyprint_ws_client.wire.transport import (
     TransientError,
 )
 
-__all__ = ["Paho", "PahoClientFactory", "default_paho_client"]
+__all__ = [
+    "Paho",
+    "PahoClientFactory",
+    "client_cert_ssl_context",
+    "default_paho_client",
+]
+
+
+def client_cert_ssl_context(auth: TlsClientAuth) -> ssl.SSLContext:
+    """Build an SSL context for mutual-TLS from printer-issued PEM strings.
+
+    The printer is its own CA; hostname verification is off because the server
+    cert's CN is the printer's serial number, not its IP. CA verification stays
+    on (``CERT_REQUIRED``) so a rogue broker is rejected. ``load_cert_chain``
+    only accepts file paths, so the PEM strings are written to 0o600 files in
+    a private temporary directory, loaded, then immediately deleted.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cadata=auth.ca_pem)
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        cert_path = os.path.join(tmp_dir, "cert.pem")
+        key_path = os.path.join(tmp_dir, "key.pem")
+        for path, data in ((cert_path, auth.cert_pem), (key_path, auth.key_pem)):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, data.encode())
+            finally:
+                os.close(fd)
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    finally:
+        for path in (cert_path, key_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+    return ctx
+
 
 if TYPE_CHECKING:
     from paho.mqtt.client import MQTTMessage
@@ -128,6 +175,7 @@ def default_paho_client(
     logger: logging.Logger,
     *,
     verify_tls: bool = False,
+    tls_client_auth: Optional[TlsClientAuth] = None,
     retry: Optional["RetryPolicy"] = None,
 ) -> PahoClient:
     """Build a real ``paho.mqtt.client.Client``, TLS-enabled for ``mqtts://``.
@@ -136,12 +184,12 @@ def default_paho_client(
     keeps the socket alive itself (``reconnect_on_failure``), which is why
     :class:`Paho` adapts it instead of supervising it. ``verify_tls`` is off by
     default - printer fleets routinely present self-signed broker certificates -
-    but is an explicit choice via ``ConnectionOptions``. A ``retry`` policy's
-    backoff is mapped onto paho's ``reconnect_delay_set`` bounds (paho cannot
-    express give-up limits, so those are ignored here).
+    but is an explicit choice via ``ConnectionOptions``. ``tls_client_auth``
+    takes precedence when set: the broker requires a client certificate signed
+    by the printer's own CA (see :func:`client_cert_ssl_context`). A ``retry``
+    policy's backoff is mapped onto paho's ``reconnect_delay_set`` bounds (paho
+    cannot express give-up limits, so those are ignored here).
     """
-    import ssl
-
     import paho.mqtt.client as paho  # lazy: importing this module must not need paho
 
     client = paho.Client(
@@ -149,7 +197,12 @@ def default_paho_client(
         reconnect_on_failure=True,
     )
     if url.scheme == "mqtts":
-        if verify_tls:
+        if tls_client_auth is not None:
+            client.tls_set_context(client_cert_ssl_context(tls_client_auth))
+            # the cert names the printer's serial, not its host - paho layers
+            # its own hostname check on top of the context, so disable it too
+            client.tls_insecure_set(True)
+        elif verify_tls:
             client.tls_set(tls_version=ssl.PROTOCOL_TLS)
         else:
             client.tls_set(tls_version=ssl.PROTOCOL_TLS, cert_reqs=ssl.CERT_NONE)

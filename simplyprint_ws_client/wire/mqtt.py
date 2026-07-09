@@ -40,6 +40,7 @@ from simplyprint_ws_client.wire.transport import MqttTransport
 from simplyprint_ws_client.wire.lease import MqttLease
 from simplyprint_ws_client.wire.options import (
     ConnectionOptions,
+    TlsClientAuth,
     WireKeepalive,
 )
 from simplyprint_ws_client.wire.pool import Pool
@@ -97,14 +98,16 @@ class MqttBroker(NamedTuple):
 class MqttConnectParams(NamedTuple):
     """What one ``connect`` call carries into the pool.
 
-    The pool shares transports by ``broker`` alone; ``retry``, ``verify_tls``
-    and ``logger`` configure the transport the *first* lease on a broker builds
-    (later leases share that socket, so per-lease values cannot apply).
+    The pool shares transports by ``broker`` alone; ``retry``, ``verify_tls``,
+    ``tls_client_auth`` and ``logger`` configure the transport the *first* lease
+    on a broker builds (later leases share that socket, so per-lease values
+    cannot apply).
     """
 
     broker: MqttBroker
     retry: RetryPolicy
     verify_tls: bool = False
+    tls_client_auth: Optional[TlsClientAuth] = None
     logger: Optional["logging.Logger"] = None
     #: Bound on one connect attempt for the supervised async impls
     #: (``None`` = the transport's own default; paho owns its own timeouts).
@@ -140,9 +143,11 @@ def build_pool(
     def make_transport(url: yarl.URL, params: object) -> MqttTransport:
         if isinstance(params, MqttConnectParams):
             retry, verify_tls, logger = params.retry, params.verify_tls, params.logger
+            tls_client_auth = params.tls_client_auth
             open_timeout = params.open_timeout
         else:
             retry, verify_tls, logger = RetryPolicy(), False, None
+            tls_client_auth = None
             open_timeout = None
         if impl == "paho":
             return Paho(
@@ -150,11 +155,20 @@ def build_pool(
                 provider=provider,
                 keepalive=mqtt_keepalive or 60,
                 client_factory=lambda u, logger: default_paho_client(
-                    u, logger, verify_tls=verify_tls, retry=retry
+                    u,
+                    logger,
+                    verify_tls=verify_tls,
+                    tls_client_auth=tls_client_auth,
+                    retry=retry,
                 ),
                 logger=logger,
             )
         if impl == "aiomqtt":
+            if tls_client_auth is not None:
+                raise ValueError(
+                    "mqtt.connect: tls_client_auth requires impl='paho'; "
+                    "aiomqtt does not support mutual-TLS client certificates"
+                )
             # ``None`` means "the transport's own default", not "unbounded".
             timeout_kwargs = (
                 {} if open_timeout is None else {"open_timeout": open_timeout}
@@ -228,6 +242,7 @@ def connect(
             broker=broker,
             retry=options.retry or RetryPolicy(),
             verify_tls=options.verify_tls,
+            tls_client_auth=options.tls_client_auth,
             logger=options.logger,
             open_timeout=options.open_timeout,
         ),
