@@ -1,4 +1,4 @@
-"""Cloud messages retain FIFO routing but execute independently per message."""
+"""Cloud message handling stays on the protocol's single FIFO consumer."""
 
 import asyncio
 
@@ -29,73 +29,36 @@ def _snapshot(request_id: str) -> DemandMsg:
 
 
 @pytest.mark.asyncio
-async def test_slow_message_does_not_block_later_message():
+async def test_incoming_message_awaits_handler_completion():
     client = _client()
     slow_entered = asyncio.Event()
     release_slow = asyncio.Event()
-    fast_finished = asyncio.Event()
 
     async def handler(data: WebcamSnapshotDemandData) -> None:
-        if data.id == "slow":
-            slow_entered.set()
-            await release_slow.wait()
-        else:
-            fast_finished.set()
+        slow_entered.set()
+        await release_slow.wait()
 
     client.event_bus.on(DemandMsgType.WEBCAM_SNAPSHOT, handler, priority=10)
 
-    client._on_connection_incoming(_snapshot("slow"), 0)
+    slow = asyncio.create_task(client._on_connection_incoming(_snapshot("slow"), 0))
     await asyncio.wait_for(slow_entered.wait(), 1.0)
-    client._on_connection_incoming(_snapshot("fast"), 0)
-
-    await asyncio.wait_for(fast_finished.wait(), 0.2)
-    assert any(not task.done() for task in client._inbound_tasks)
+    assert not slow.done()
 
     release_slow.set()
-    await client.shutdown_inbound_dispatch()
-    assert not client._inbound_tasks
+    await slow
 
 
 @pytest.mark.asyncio
-async def test_handler_failure_is_observed_and_later_messages_continue(caplog):
+async def test_handler_failure_propagates_to_protocol_consumer():
     client = _client()
-    handled = asyncio.Event()
 
     async def handler(data: WebcamSnapshotDemandData) -> None:
-        if data.id == "bad":
-            raise RuntimeError("broken handler")
-        handled.set()
+        raise RuntimeError(f"broken handler: {data.id}")
 
     client.event_bus.on(DemandMsgType.WEBCAM_SNAPSHOT, handler, priority=10)
 
-    with caplog.at_level("ERROR"):
-        client._on_connection_incoming(_snapshot("bad"), 0)
-        client._on_connection_incoming(_snapshot("good"), 0)
-        await asyncio.wait_for(handled.wait(), 1.0)
-        await asyncio.sleep(0)
-
-    assert any("inbound handler failed" in record.message for record in caplog.records)
-    await client.shutdown_inbound_dispatch()
-
-
-@pytest.mark.asyncio
-async def test_shutdown_cancels_and_awaits_owned_message_tasks():
-    client = _client()
-    entered = asyncio.Event()
-
-    async def blocked(_data: WebcamSnapshotDemandData) -> None:
-        entered.set()
-        await asyncio.Event().wait()
-
-    client.event_bus.on(DemandMsgType.WEBCAM_SNAPSHOT, blocked, priority=10)
-    client._on_connection_incoming(_snapshot("blocked"), 0)
-    await asyncio.wait_for(entered.wait(), 1.0)
-
-    task = next(iter(client._inbound_tasks))
-    await client.shutdown_inbound_dispatch()
-
-    assert task.cancelled()
-    assert not client._inbound_tasks
+    with pytest.raises(RuntimeError, match="broken handler: bad"):
+        await client._on_connection_incoming(_snapshot("bad"), 0)
 
 
 @pytest.mark.asyncio

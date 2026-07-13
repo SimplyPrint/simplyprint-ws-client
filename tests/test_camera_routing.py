@@ -23,6 +23,10 @@ from simplyprint_ws_client.integration.camera.base import (
     CameraProtocolPollingMode,
 )
 from simplyprint_ws_client.integration.camera.pool import CameraPool
+from simplyprint_ws_client.integration.camera.mjpeg import (
+    MJPEGSnapshotCamera,
+    MJPEGStreamCamera,
+)
 from simplyprint_ws_client.common.worker.context import ExecutionContext
 
 
@@ -129,6 +133,11 @@ def _pool(loop):
 
 def test_async_protocol_routes_to_inline():
     assert CameraPool._route(_AsyncStream) is ExecutionContext.INLINE
+
+
+def test_http_camera_protocols_do_not_allocate_workers():
+    assert CameraPool._route(MJPEGSnapshotCamera) is ExecutionContext.INLINE
+    assert CameraPool._route(MJPEGStreamCamera) is ExecutionContext.INLINE
 
 
 def test_sync_protocol_routes_to_process():

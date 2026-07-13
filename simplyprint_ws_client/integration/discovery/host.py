@@ -16,6 +16,8 @@ import logging
 import threading
 from typing import Any, Coroutine, Dict, Iterable, List, Optional, Protocol
 
+from simplyprint_ws_client.common.asyncio.offload import install_default_executor
+
 
 class DiscoveryBackendSpec(Protocol):
     """The slice of a backend's spec the host reads: its registry key."""
@@ -82,6 +84,11 @@ class DiscoveryServiceHost:
         self._started = True
         self._ready.clear()
         self._loop = asyncio.new_event_loop()
+        install_default_executor(
+            self._loop,
+            workers=2,
+            thread_name_prefix="sp-discovery",
+        )
         self._thread = threading.Thread(
             target=self._run_loop, name="discovery-host", daemon=True
         )

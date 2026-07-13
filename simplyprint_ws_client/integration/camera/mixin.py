@@ -31,6 +31,9 @@ class _CameraWork:
 
 
 class ClientCameraMixin(Client[_T]):
+    #: Queue entries, not tasks. Stream demand is coalesced to one entry, while
+    #: ID'd snapshots remain individual up to this hard memory bound.
+    _CAMERA_QUEUE_MAXSIZE = 20
     _camera_pool: Optional[CameraPool] = None
     _camera_uri: Optional[URL] = None
     _camera_handle: Optional[CameraHandle] = None
@@ -78,7 +81,7 @@ class ClientCameraMixin(Client[_T]):
         self._camera_logger.setLevel(
             logging.DEBUG if self._camera_debug else logging.INFO
         )
-        self._camera_work_queue = asyncio.Queue()
+        self._camera_work_queue = asyncio.Queue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
         self._camera_worker_task = None
         self._camera_active_task = None
         self._camera_active_kind = None
@@ -239,9 +242,12 @@ class ClientCameraMixin(Client[_T]):
     async def on_test_webcam(self):
         self._ensure_camera_worker()
         done = asyncio.get_running_loop().create_future()
-        self._camera_work_queue.put_nowait(
-            _CameraWork("test", WebcamSnapshotDemandData(), done)
-        )
+        try:
+            self._camera_work_queue.put_nowait(
+                _CameraWork("test", WebcamSnapshotDemandData(), done)
+            )
+        except asyncio.QueueFull:
+            raise RuntimeError("Camera work queue is full") from None
         await done
 
     #: Frame-read attempts per snapshot request before giving up.
@@ -277,7 +283,17 @@ class ClientCameraMixin(Client[_T]):
                     self._camera_snapshot_backlog,
                 )
 
-        self._camera_work_queue.put_nowait(_CameraWork(kind, data))
+        try:
+            self._camera_work_queue.put_nowait(_CameraWork(kind, data))
+        except asyncio.QueueFull:
+            self._camera_snapshot_backlog = max(
+                0, self._camera_snapshot_backlog - 1
+            )
+            self._camera_logger.warning(
+                "Dropped camera snapshot %s because the %d-entry queue is full.",
+                data.id,
+                self._CAMERA_QUEUE_MAXSIZE,
+            )
 
     async def _resume_webcam_stream(self) -> None:
         """Resume existing stream credit after a camera handle appears."""
@@ -287,15 +303,22 @@ class ClientCameraMixin(Client[_T]):
     def _queue_stream_marker(self) -> None:
         if self._camera_stream_pending or self._request_count <= 0:
             return
+        try:
+            self._camera_work_queue.put_nowait(
+                _CameraWork("stream", WebcamSnapshotDemandData())
+            )
+        except asyncio.QueueFull:
+            # Credits remain in _request_count, so a later completed snapshot or
+            # camera reconfiguration can enqueue the single stream marker.
+            return
         self._camera_stream_pending = True
-        self._camera_work_queue.put_nowait(
-            _CameraWork("stream", WebcamSnapshotDemandData())
-        )
 
     def _ensure_camera_worker(self) -> None:
         """Lazily create the one owner of frame reads and uploads."""
         if not hasattr(self, "_camera_work_queue"):
-            self._camera_work_queue = asyncio.Queue()
+            self._camera_work_queue = asyncio.Queue(
+                maxsize=self._CAMERA_QUEUE_MAXSIZE
+            )
             self._camera_worker_task = None
             self._camera_active_task = None
             self._camera_active_kind = None
@@ -366,12 +389,9 @@ class ClientCameraMixin(Client[_T]):
                 elif work.kind == "stream":
                     if not result and self._request_count > 0:
                         self._request_count -= 1
+                    self._camera_stream_pending = False
                     if self._request_count > 0 and not self._camera_closing:
-                        self._camera_work_queue.put_nowait(
-                            _CameraWork("stream", WebcamSnapshotDemandData())
-                        )
-                    else:
-                        self._camera_stream_pending = False
+                        self._queue_stream_marker()
 
                 if work.done is not None and not work.done.done():
                     if worker_cancelled:
@@ -381,6 +401,12 @@ class ClientCameraMixin(Client[_T]):
                     else:
                         work.done.set_result(result)
                 self._camera_work_queue.task_done()
+                if (
+                    work.kind != "stream"
+                    and self._request_count > 0
+                    and not self._camera_closing
+                ):
+                    self._queue_stream_marker()
 
     async def _process_camera_work(self, work: _CameraWork) -> bool:
         frame = await self._receive_frame_with_retries(work.data, 0, 5)

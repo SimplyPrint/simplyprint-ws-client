@@ -303,12 +303,6 @@ class Client(
         self.printer = PrinterState(config=config)
         self.printer.provide_context(weakref.ref(self))
         self.logger = printer_logger(self.unique_id)
-        # Routing and version acceptance happen inline, in protocol FIFO order.
-        # The potentially slow application handlers run independently per
-        # message so one snapshot/upload cannot stall every later WS message.
-        self._inbound_tasks: Dict[asyncio.Task, asyncio.Handle] = {}
-        self._accept_inbound = True
-        self._inbound_backlog_reported = False
         autowire(self)
 
     @property
@@ -470,7 +464,7 @@ class Client(
     # internal methods
 
     @configure(SimplyPrintConnectionIncomingEvent)
-    def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
+    async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
         if self.v > v:
             self.logger.warning("Dropped incoming message %s with v: %d.", msg, v)
             return
@@ -491,63 +485,12 @@ class Client(
             event = msg.type
             args = (msg,)
 
-        if not self._accept_inbound:
-            self.logger.debug("Dropped incoming %s during client teardown.", event)
-            return
-
-        task = self.event_loop.create_task(
-            self.event_bus.emit(event, *args),
-            name=f"sp-inbound:{self.unique_id}:{event}:v{v}",
-        )
-        warning = self.event_loop.call_later(
-            60.0, self._warn_slow_inbound, task, event, v
-        )
-        self._inbound_tasks[task] = warning
-        task.add_done_callback(self._on_inbound_done)
-
-        if len(self._inbound_tasks) >= 100 and not self._inbound_backlog_reported:
-            self._inbound_backlog_reported = True
-            self.logger.warning(
-                "SimplyPrint inbound handler backlog reached %d tasks.",
-                len(self._inbound_tasks),
-            )
-
-    def _warn_slow_inbound(self, task: asyncio.Task, event, v: int) -> None:
-        if task in self._inbound_tasks and not task.done():
-            self.logger.warning(
-                "SimplyPrint inbound handler still running after 60s: "
-                "event=%s v=%d task=%s",
-                event,
-                v,
-                task.get_name(),
-            )
-
-    def _on_inbound_done(self, task: asyncio.Task) -> None:
-        warning = self._inbound_tasks.pop(task, None)
-        if warning is not None:
-            warning.cancel()
-
-        if self._inbound_backlog_reported and len(self._inbound_tasks) < 50:
-            self._inbound_backlog_reported = False
-
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            self.logger.error(
-                "SimplyPrint inbound handler failed: task=%s",
-                task.get_name(),
-                exc_info=(type(error), error, error.__traceback__),
-            )
-
-    async def shutdown_inbound_dispatch(self) -> None:
-        """Stop accepting cloud work and await cancellation of owned tasks."""
-        self._accept_inbound = False
-        tasks = tuple(self._inbound_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Preserve the protocol's single FIFO consumer. Handlers that start
+        # long-running work must admit it into their own bounded/coalescing
+        # subsystem and return quickly (camera and file transfer both do so).
+        # Creating a task per wire message hides violations of that contract and
+        # makes the application's total task count unbounded.
+        await self.event_bus.emit(event, *args)
 
     @configure(SimplyPrintConnectionEstablishedEvent)
     def _on_connection_established(self, event: SimplyPrintConnectionEstablishedEvent):
@@ -633,7 +576,7 @@ class Client(
 
     async def teardown(self):
         """Teardown lifecycle method, final cleanup, will never be needed again."""
-        await self.shutdown_inbound_dispatch()
+        pass
 
     # file/job bookkeeping
 

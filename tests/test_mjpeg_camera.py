@@ -20,24 +20,47 @@ class FakeResponse:
         self._body = body
         self._chunks = list(chunks or [])
 
-    def read(self, _size=-1):
-        if self._chunks:
-            return self._chunks.pop(0)
-        return self._body
+        if not self._chunks and body:
+            self._chunks = [body]
+        self.content = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def iter_chunked(self, _size):
+        for chunk in self._chunks:
+            yield chunk
 
 
-def _patch_urlopen(monkeypatch, response):
+def _patch_session(monkeypatch, response):
     calls = []
 
-    def urlopen(request, *args, **kwargs):
-        calls.append((request, args, kwargs))
-        return response
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            calls.append(("session", args, kwargs))
 
-    monkeypatch.setattr(mjpeg.urllib.request, "urlopen", urlopen)
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def get(self, url, *args, **kwargs):
+            calls.append((url, args, kwargs))
+            return response
+
+    monkeypatch.setattr(mjpeg.aiohttp, "ClientSession", FakeSession)
     return calls
 
 
-def test_snapshot_camera_extracts_multipart_frame_with_case_sensitive_boundary(
+@pytest.mark.asyncio
+async def test_snapshot_camera_extracts_multipart_frame_with_case_sensitive_boundary(
     monkeypatch,
 ):
     body = (
@@ -50,23 +73,31 @@ def test_snapshot_camera_extracts_multipart_frame_with_case_sensitive_boundary(
         headers={"Content-Type": 'multipart/x-mixed-replace; boundary="FrameBoundary"'},
         body=body,
     )
-    calls = _patch_urlopen(monkeypatch, response)
+    calls = _patch_session(monkeypatch, response)
 
-    frames = list(MJPEGSnapshotCamera(URL("mjpeg://printer/snapshot")).read())
+    frames = [
+        frame
+        async for frame in MJPEGSnapshotCamera(
+            URL("mjpeg://printer/snapshot")
+        ).read()
+    ]
 
     assert frames == [JPEG_ONE]
-    assert calls[0][0].full_url == "http://printer/snapshot"
+    assert calls[1][0] == "http://printer/snapshot"
 
 
-def test_snapshot_camera_rejects_multipart_without_boundary(monkeypatch):
+@pytest.mark.asyncio
+async def test_snapshot_camera_rejects_multipart_without_boundary(monkeypatch):
     response = FakeResponse(headers={"Content-Type": "multipart/x-mixed-replace"})
-    _patch_urlopen(monkeypatch, response)
+    _patch_session(monkeypatch, response)
 
     with pytest.raises(CameraProtocolConnectionError, match="without boundary"):
-        list(MJPEGSnapshotCamera(URL("http://printer/snapshot")).read())
+        async for _ in MJPEGSnapshotCamera(URL("http://printer/snapshot")).read():
+            pass
 
 
-def test_stream_camera_extracts_multipart_frames_across_chunks(monkeypatch):
+@pytest.mark.asyncio
+async def test_stream_camera_extracts_multipart_frames_across_chunks(monkeypatch):
     response = FakeResponse(
         headers={"Content-Type": "multipart/x-mixed-replace; boundary=FrameBoundary"},
         chunks=[
@@ -77,13 +108,17 @@ def test_stream_camera_extracts_multipart_frames_across_chunks(monkeypatch):
             b"\r\n--FrameBoundary\r\n",
         ],
     )
-    calls = _patch_urlopen(monkeypatch, response)
+    calls = _patch_session(monkeypatch, response)
 
-    frames = MJPEGStreamCamera(URL("mjpeg-stream://printer/stream")).read()
+    frames = []
+    with pytest.raises(CameraProtocolConnectionError, match="stream ended"):
+        async for frame in MJPEGStreamCamera(
+            URL("mjpeg-stream://printer/stream")
+        ).read():
+            frames.append(frame)
 
-    assert next(frames) == JPEG_ONE
-    assert next(frames) == JPEG_TWO
-    assert calls[0][0].full_url == "http://printer/stream"
+    assert frames == [JPEG_ONE, JPEG_TWO]
+    assert calls[1][0] == "http://printer/stream"
 
 
 def test_frame_parser_uses_content_length_before_next_boundary():
@@ -101,14 +136,19 @@ def test_frame_parser_uses_content_length_before_next_boundary():
     assert frames == [JPEG_ONE]
 
 
-def test_stream_camera_extracts_raw_jpeg_frames_without_boundary(monkeypatch):
+@pytest.mark.asyncio
+async def test_stream_camera_extracts_raw_jpeg_frames_without_boundary(monkeypatch):
     response = FakeResponse(
         headers={"Content-Type": "image/jpeg"},
         chunks=[b"noise" + JPEG_ONE + b"middle" + JPEG_TWO],
     )
-    _patch_urlopen(monkeypatch, response)
+    _patch_session(monkeypatch, response)
 
-    frames = MJPEGStreamCamera(URL("mjpeg-stream://printer/stream")).read()
+    frames = []
+    with pytest.raises(CameraProtocolConnectionError, match="stream ended"):
+        async for frame in MJPEGStreamCamera(
+            URL("mjpeg-stream://printer/stream")
+        ).read():
+            frames.append(frame)
 
-    assert next(frames) == JPEG_ONE
-    assert next(frames) == JPEG_TWO
+    assert frames == [JPEG_ONE, JPEG_TWO]

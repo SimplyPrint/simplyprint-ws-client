@@ -13,6 +13,7 @@ import asyncio
 import logging
 from typing import List, Optional
 
+from simplyprint_ws_client.common.asyncio.bounded_dispatch import map_concurrently
 from simplyprint_ws_client.integration.discovery import netif
 from simplyprint_ws_client.integration.discovery.network import (
     DiagnosticCheckResult,
@@ -218,35 +219,36 @@ class SubnetScanBackend:
         if hosts is None:
             hosts = netif.scan_hosts()
 
-        semaphore = asyncio.Semaphore(self.spec.concurrency)
-
         async def probe_one(host: str):
-            async with semaphore:
-                context = await self._host_context(host)
-                if not context.required_services_open:
-                    return None
-                try:
-                    return await self._probe(host, context, timeout)
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    self.logger.debug(
-                        "discovery probe timed out for %s at %s after %.1fs",
-                        self.spec.brand,
-                        host,
-                        timeout,
-                    )
-                    return None
-                except Exception:
-                    self.logger.debug(
-                        "discovery probe failed for %s at %s",
-                        self.spec.brand,
-                        host,
-                        exc_info=True,
-                    )
-                    return None
+            context = await self._host_context(host)
+            if not context.required_services_open:
+                return None
+            try:
+                return await self._probe(host, context, timeout)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                self.logger.debug(
+                    "discovery probe timed out for %s at %s after %.1fs",
+                    self.spec.brand,
+                    host,
+                    timeout,
+                )
+                return None
+            except Exception:
+                self.logger.debug(
+                    "discovery probe failed for %s at %s",
+                    self.spec.brand,
+                    host,
+                    exc_info=True,
+                )
+                return None
 
-        results = await asyncio.gather(*(probe_one(host) for host in hosts))
+        results = await map_concurrently(
+            probe_one,
+            hosts,
+            concurrency=self.spec.concurrency,
+        )
 
         records: dict = {}
         for record in results:

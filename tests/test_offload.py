@@ -11,7 +11,10 @@ import threading
 
 import pytest
 
-from simplyprint_ws_client.common.asyncio.offload import Offload
+from simplyprint_ws_client.common.asyncio.offload import (
+    Offload,
+    install_default_executor,
+)
 
 
 def _raise() -> None:
@@ -71,3 +74,27 @@ def test_double_shutdown_is_a_noop():
     off = Offload()
     off.shutdown()
     off.shutdown()  # must not raise
+
+
+def test_owned_loop_default_executor_is_explicitly_bounded():
+    loop = asyncio.new_event_loop()
+    executor = install_default_executor(
+        loop,
+        workers=2,
+        thread_name_prefix="sp-test-loop",
+    )
+    try:
+        name = loop.run_until_complete(
+            asyncio.to_thread(lambda: threading.current_thread().name)
+        )
+        assert executor._max_workers == 2
+        assert name.startswith("sp-test-loop")
+    finally:
+        # Direct shutdown keeps this test compatible with sandboxes where
+        # shutdown_default_executor's extra helper thread cannot signal home.
+        executor.shutdown(wait=True)
+        loop.close()
+
+    assert not any(
+        thread.name.startswith("sp-test-loop") for thread in threading.enumerate()
+    )

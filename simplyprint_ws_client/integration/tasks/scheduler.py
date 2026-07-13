@@ -41,6 +41,7 @@ from simplyprint_ws_client.core.status.registry import (
     StatusRegistry,
     StatusState,
 )
+from simplyprint_ws_client.common.asyncio.offload import install_default_executor
 from simplyprint_ws_client.integration.tasks.context import TaskContext
 from simplyprint_ws_client.integration.tasks.registry import REGISTRY, TaskRegistry
 from simplyprint_ws_client.integration.tasks.spec import TaskSpec
@@ -87,6 +88,11 @@ class SchedulerService:
         self._started = True
         self._ready.clear()
         self._loop = asyncio.new_event_loop()
+        install_default_executor(
+            self._loop,
+            workers=2,
+            thread_name_prefix="sp-scheduler",
+        )
         self._thread = threading.Thread(
             target=self._run_loop, name="task-scheduler", daemon=True
         )

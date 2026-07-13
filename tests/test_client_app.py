@@ -8,6 +8,9 @@ from simplyprint_ws_client import (
     ClientApp,
 )
 from simplyprint_ws_client.core.client import ClientConfigChangedEvent
+from simplyprint_ws_client.integration.camera.pool import (
+    DEFAULT_CAMERA_PROCESS_WORKERS,
+)
 
 
 class FirstClient(Client[PrinterConfig]): ...
@@ -79,6 +82,21 @@ def test_multi_client_specs_route_configs_by_type():
         assert app.get_config_manager(client_key="first").contains(first_config)
         assert app.get_config_manager(client_key="second").contains(second_config)
         assert app.config_manager is app.get_config_manager(client_key="first")
+    finally:
+        app.stop()
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(0, DEFAULT_CAMERA_PROCESS_WORKERS), (1, 1)],
+)
+def test_camera_worker_setting_controls_process_budget(configured, expected):
+    app = ClientApp(
+        ClientSettings(Client, PrinterConfig, camera_workers=configured)
+    )
+    try:
+        assert app.camera_pool is not None
+        assert app.camera_pool.process_workers == expected
     finally:
         app.stop()
 

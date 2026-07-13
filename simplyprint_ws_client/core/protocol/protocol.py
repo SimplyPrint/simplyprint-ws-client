@@ -52,10 +52,11 @@ class SimplyPrintProtocol:
     FIFO :class:`Courier`: the transport-bus handlers only enqueue, so ``recv``
     (and with it drop detection) stays live no matter how slow or wedged a
     downstream client handler is. Lifecycle events and message routing ride the
-    same queue, so parsing, client selection and version acceptance remain FIFO.
-    Once the target client accepts a message it owns that message's application
-    task; slow handlers no longer hold up this protocol queue. A message queued
-    before a ``Disconnected`` still routes first with the pre-bump ``v``.
+    same queue, so parsing, client selection, application dispatch and version
+    acceptance remain FIFO. Long-running handlers must hand work to their own
+    bounded/coalescing subsystem and return quickly; the protocol deliberately
+    does not create an unbounded task per message. A message queued before a
+    ``Disconnected`` still routes first with the pre-bump ``v``.
     """
 
     #: Queue depth past which a stalled inbound dispatch is reported (once per

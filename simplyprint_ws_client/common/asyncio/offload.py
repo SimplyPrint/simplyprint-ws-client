@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Callable, TypeVar
 
-__all__ = ["Offload"]
+__all__ = ["Offload", "install_default_executor"]
 
 T = TypeVar("T")
 
@@ -37,6 +37,32 @@ T = TypeVar("T")
 DEFAULT_IO_WORKERS = 4
 #: Long-haul work needs width so one slow item does not block the rest.
 DEFAULT_TRANSFER_WORKERS = 8
+#: Fallback work on any one owned event loop (``asyncio.to_thread``, DNS, and
+#: legacy ``run_in_executor(None, ...)``). Explicit lanes above remain preferred.
+DEFAULT_LOOP_WORKERS = 4
+
+
+def install_default_executor(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    workers: int = DEFAULT_LOOP_WORKERS,
+    thread_name_prefix: str = "sp-loop",
+) -> ThreadPoolExecutor:
+    """Give an owned loop an explicit, bounded fallback executor.
+
+    Python otherwise creates up to ``min(32, cpu_count + 4)`` threads *per
+    loop*. SimplyPrint owns several loops, so leaving that implicit multiplies
+    the process-wide thread budget. The loop owns and shuts down the returned
+    executor as part of its normal close lifecycle.
+    """
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    executor = ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix=thread_name_prefix,
+    )
+    loop.set_default_executor(executor)
+    return executor
 
 
 class Offload:

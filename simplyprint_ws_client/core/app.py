@@ -18,7 +18,10 @@ from simplyprint_ws_client.core.manager import ClientList
 from simplyprint_ws_client.core.scheduler import Scheduler
 from simplyprint_ws_client.core.settings import ClientSettings, PrinterSpec
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
-from simplyprint_ws_client.common.asyncio.offload import Offload
+from simplyprint_ws_client.common.asyncio.offload import (
+    Offload,
+    install_default_executor,
+)
 from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.core.api.sentry import Sentry
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
@@ -60,6 +63,10 @@ class ClientApp(SyncStoppable):
         # For older python versions we want to set the event loop that loop mixins use
         # before we can initialize objects that require it.
         self._app_event_loop = settings.event_loop_backend.new_event_loop()
+        install_default_executor(
+            self._app_event_loop,
+            thread_name_prefix="sp-app-loop",
+        )
         asyncio.set_event_loop(self._app_event_loop)
 
         self.settings = settings
@@ -95,7 +102,10 @@ class ClientApp(SyncStoppable):
         if self.settings.camera_workers is not None:
             # The scheduler is the app's EventLoopProvider; INLINE/THREAD cameras
             # deliver frames onto its loop.
-            self.camera_pool = CameraPool(event_loop_provider=self.scheduler)
+            self.camera_pool = CameraPool(
+                event_loop_provider=self.scheduler,
+                process_workers=self.settings.camera_workers,
+            )
             self.camera_pool.protocols.extend(self.settings.camera_protocols or [])
 
     async def run(self):

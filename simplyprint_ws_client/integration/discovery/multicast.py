@@ -20,6 +20,9 @@ import logging
 import socket
 import time
 
+from simplyprint_ws_client.common.asyncio.bounded_dispatch import (
+    BoundedAsyncDispatcher,
+)
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 from simplyprint_ws_client.integration.discovery.multicast_base import (
     MulticastListenerBase,
@@ -31,25 +34,47 @@ from simplyprint_ws_client.integration.discovery.ssdp import SSDPRequestParser
 class _MulticastProtocol(asyncio.DatagramProtocol):
     """Parses datagrams, caches mapped devices, and fans out the spec's event."""
 
+    _QUEUE_MAXSIZE = 128
+    _WORKERS = 2
+    _IDLE_TIMEOUT = 1.0
+
     def __init__(self, spec: MulticastSpec, devices: ExpiringDict, emit, logger):
         self._spec = spec
         self._devices = devices
         self._emit = emit  # async callable(record) | None
         self._logger = logger
-        #: In-flight datagram handlers; retained because asyncio holds tasks
-        #: weakly and an unreferenced one can be collected mid-flight.
-        self._handle_tasks: "set[asyncio.Task]" = set()
+        self._dispatch = BoundedAsyncDispatcher(
+            self._handle,
+            workers=self._WORKERS,
+            maxsize=self._QUEUE_MAXSIZE,
+            idle_timeout=self._IDLE_TIMEOUT,
+            on_overflow=self._on_overflow,
+            on_error=self._on_dispatch_error,
+        )
+
+    def connection_made(self, _transport) -> None:
+        self._dispatch.open()
 
     def datagram_received(self, data: bytes, addr) -> None:
         request = SSDPRequestParser.parse(data)
         if request is None:
             return
 
-        task = asyncio.create_task(self._handle(request, addr))
-        self._handle_tasks.add(task)
-        task.add_done_callback(self._handle_tasks.discard)
+        self._dispatch.submit((request, addr))
 
-    async def _handle(self, request, addr) -> None:
+    def _on_overflow(self) -> None:
+        self._logger.warning(
+            "discovery queue full for %s; dropping datagrams",
+            self._spec.brand,
+        )
+
+    def _on_dispatch_error(self, exc: Exception) -> None:
+        self._logger.error(
+            "discovery handler failed for %s", self._spec.brand, exc_info=exc
+        )
+
+    async def _handle(self, item) -> None:
+        request, addr = item
         try:
             record = self._spec.mapper(request, addr)
         except Exception:
@@ -72,6 +97,7 @@ class _MulticastProtocol(asyncio.DatagramProtocol):
         self._logger.error("multicast error for %s", self._spec.brand, exc_info=exc)
 
     def connection_lost(self, exc) -> None:
+        self._dispatch.close()
         if exc:
             self._logger.error(
                 "multicast connection lost for %s", self._spec.brand, exc_info=exc

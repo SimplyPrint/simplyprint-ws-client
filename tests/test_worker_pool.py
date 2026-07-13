@@ -41,6 +41,12 @@ def _sync_producer(emit, is_stopped, count, size):
         time.sleep(0.001)
 
 
+def _cooperative_producer(emit, is_stopped):
+    emit(b"started", 0.0)
+    while not is_stopped():
+        time.sleep(0.01)
+
+
 async def _async_producer(emit, is_stopped, count, size):
     """An async producer (INLINE / THREAD)."""
     for i in range(count):
@@ -165,6 +171,72 @@ async def test_process_rejects_an_async_producer():
     )
     with pytest.raises(ValueError):
         pool.allocate(ExecutionContext.PROCESS, _async_producer, lambda d, t: None)
+
+
+@pytest.mark.asyncio
+async def test_bounded_process_lane_waits_instead_of_spawning_past_limit(monkeypatch):
+    loop = asyncio.get_running_loop()
+    provider = EventLoopProvider(loop=loop)
+    pool = WorkerPool(
+        event_loop_provider=provider,
+        max_process_workers=1,
+    )
+    allocated = []
+
+    class FakeHandle:
+        def __init__(self, release_capacity):
+            self._release_capacity = release_capacity
+
+        def stop(self):
+            self._release_capacity()
+
+    def fake_allocate(*_args, _release_capacity=None, **_kwargs):
+        handle = FakeHandle(_release_capacity)
+        allocated.append(handle)
+        return handle
+
+    monkeypatch.setattr(pool, "allocate", fake_allocate)
+
+    first = await pool.allocate_async(
+        ExecutionContext.PROCESS,
+        _cooperative_producer,
+        lambda _data, _ts: None,
+    )
+    assert len(allocated) == 1
+
+    second_allocation = asyncio.create_task(
+        pool.allocate_async(
+            ExecutionContext.PROCESS,
+            _cooperative_producer,
+            lambda _data, _ts: None,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not second_allocation.done()
+    assert len(allocated) == 1
+
+    first.stop()
+    second = await asyncio.wait_for(second_allocation, 1.0)
+    assert len(allocated) == 2
+
+    second.stop()
+    pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_bounded_process_lane_rejects_sync_allocation_bypass():
+    pool = WorkerPool(
+        event_loop_provider=EventLoopProvider(loop=asyncio.get_running_loop()),
+        max_process_workers=1,
+    )
+    with pytest.raises(RuntimeError, match="allocate_async"):
+        pool.allocate(
+            ExecutionContext.PROCESS,
+            _sync_producer,
+            lambda _data, _ts: None,
+            args=(1, 1),
+        )
+    pool.stop()
 
 
 # -- reaper: stops never block the loop; teardown leaks nothing -------------- #

@@ -165,6 +165,7 @@ async def test_stream_demands_coalesce_behind_one_camera_worker():
 @pytest.mark.asyncio
 async def test_snapshot_failure_does_not_kill_fifo_camera_worker():
     mixin = _bare_mixin()
+    mixin._request_count = 0
     calls = []
 
     async def process(work):
@@ -183,6 +184,22 @@ async def test_snapshot_failure_does_not_kill_fifo_camera_worker():
     assert not mixin._camera_worker_task.done()
     assert mixin._camera_snapshot_backlog == 0
     await mixin.shutdown_camera_mixin()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_queue_has_a_hard_entry_limit(caplog):
+    mixin = _bare_mixin()
+    mixin._request_count = 0
+    mixin._camera_closing = True  # keep the owner stopped so the queue stays full
+
+    for index in range(mixin._CAMERA_QUEUE_MAXSIZE + 1):
+        await mixin.on_webcam_snapshot(
+            WebcamSnapshotDemandData(id=f"snapshot-{index}")
+        )
+
+    assert mixin._camera_work_queue.qsize() == mixin._CAMERA_QUEUE_MAXSIZE
+    assert mixin._camera_snapshot_backlog == mixin._CAMERA_QUEUE_MAXSIZE
+    assert "queue is full" in caplog.text
 
 
 @pytest.mark.asyncio

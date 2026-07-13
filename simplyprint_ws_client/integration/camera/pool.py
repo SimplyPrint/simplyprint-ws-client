@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import threading
 import time
 from enum import Enum, auto
@@ -31,6 +32,9 @@ from simplyprint_ws_client.common.utils.stoppable import ProcessStoppable
 from simplyprint_ws_client.common.utils.synchronized import Synchronized
 from simplyprint_ws_client.common.worker.context import ExecutionContext
 from simplyprint_ws_client.common.worker.pool import WorkerHandle, WorkerPool
+
+
+DEFAULT_CAMERA_PROCESS_WORKERS = min(2, max(1, os.cpu_count() or 1))
 
 
 async def _resolve_aiter(protocol: BaseCameraProtocol):
@@ -168,7 +172,12 @@ class CameraWorkerBackend:
             old = self._worker
 
             # Already in the wanted steady state: nothing to do (no churn).
-            if desired is _Desired.RUNNING and old is not None and not oneshot:
+            if (
+                desired is _Desired.RUNNING
+                and old is not None
+                and not old.stopped
+                and not oneshot
+            ):
                 return
 
             # Otherwise retire whatever exists; a new worker is started below if
@@ -187,7 +196,9 @@ class CameraWorkerBackend:
         if not want_new:
             return
 
-        worker = self._allocate(continuous=start_continuous, generation=generation)
+        worker = await self._allocate(
+            continuous=start_continuous, generation=generation
+        )
         with self._lock:
             if self._generation == generation:
                 self._worker = worker
@@ -196,7 +207,7 @@ class CameraWorkerBackend:
             # A newer reconcile superseded us mid-allocate; retire the orphan.
             worker.stop()
 
-    def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
+    async def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
         producer = (
             _async_camera_producer if self._protocol.is_async else _sync_camera_producer
         )
@@ -206,7 +217,7 @@ class CameraWorkerBackend:
             if _generation == self._generation:
                 self._handle._set_frame(payload, timestamp)
 
-        return self._worker_pool.allocate(
+        return await self._worker_pool.allocate_async(
             self._context,
             producer,
             on_item,
@@ -228,14 +239,26 @@ class CameraPool(ProcessStoppable, Synchronized):
     protocols: List[Type[BaseCameraProtocol]]
     allocations: Dict[int, CameraHandle]
 
-    def __init__(self, *, event_loop_provider=None, **kwargs):
+    def __init__(
+        self,
+        *,
+        event_loop_provider=None,
+        process_workers: int = 0,
+        **kwargs,
+    ):
         ProcessStoppable.__init__(self, **kwargs)
         Synchronized.__init__(self)
 
         self.protocols = []
         self.allocations = {}
         self._provider = event_loop_provider or EventLoopProvider.default()
-        self._workers = WorkerPool(event_loop_provider=self._provider)
+        if process_workers < 0:
+            raise ValueError("process_workers must not be negative")
+        self.process_workers = process_workers or DEFAULT_CAMERA_PROCESS_WORKERS
+        self._workers = WorkerPool(
+            event_loop_provider=self._provider,
+            max_process_workers=self.process_workers,
+        )
         self._id_counter = 0
 
     def submit_request(self, req: Request):

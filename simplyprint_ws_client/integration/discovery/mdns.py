@@ -25,6 +25,9 @@ import dns.name
 import dns.rdataclass
 import dns.rdatatype
 
+from simplyprint_ws_client.common.asyncio.bounded_dispatch import (
+    BoundedAsyncDispatcher,
+)
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 from simplyprint_ws_client.integration.discovery.multicast_base import (
@@ -216,6 +219,10 @@ class MDNSResponseParser:
 class _MDNSProtocol(asyncio.DatagramProtocol):
     """Parses datagrams, chains DNS-SD follow-ups, caches devices, emits events."""
 
+    _QUEUE_MAXSIZE = 128
+    _WORKERS = 2
+    _IDLE_TIMEOUT = 1.0
+
     def __init__(self, spec: MDNSSpec, devices: ExpiringDict, emit, logger, queried):
         self._spec = spec
         self._devices = devices
@@ -223,22 +230,36 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         self._logger = logger
         self._queried = queried  # TTL'd set of already-issued follow-up names
         self._transport = None
-        #: In-flight datagram handlers; retained because asyncio holds tasks
-        #: weakly and an unreferenced one can be collected mid-flight.
-        self._handle_tasks: "set[asyncio.Task]" = set()
+        self._dispatch = BoundedAsyncDispatcher(
+            self._handle,
+            workers=self._WORKERS,
+            maxsize=self._QUEUE_MAXSIZE,
+            idle_timeout=self._IDLE_TIMEOUT,
+            on_overflow=self._on_overflow,
+            on_error=self._on_dispatch_error,
+        )
 
     def connection_made(self, transport) -> None:
         self._transport = transport
+        self._dispatch.open()
 
     def datagram_received(self, data: bytes, addr) -> None:
         response = MDNSResponseParser.parse(data)
         if response is None:
             return
-        task = asyncio.create_task(self._handle(response, addr))
-        self._handle_tasks.add(task)
-        task.add_done_callback(self._handle_tasks.discard)
+        self._dispatch.submit((response, addr))
 
-    async def _handle(self, response, addr) -> None:
+    def _on_overflow(self) -> None:
+        self._logger.warning(
+            "mdns queue full for %s; dropping datagrams",
+            self._spec.brand,
+        )
+
+    def _on_dispatch_error(self, exc: Exception) -> None:
+        self._logger.error("mdns handler failed for %s", self._spec.brand, exc_info=exc)
+
+    async def _handle(self, item) -> None:
+        response, addr = item
         self._chain_follow_ups(response)
 
         try:
@@ -277,6 +298,14 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         if isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             return
         self._logger.error("mdns error for %s", self._spec.brand, exc_info=exc)
+
+    def connection_lost(self, exc) -> None:
+        self._transport = None
+        self._dispatch.close()
+        if exc:
+            self._logger.error(
+                "mdns connection lost for %s", self._spec.brand, exc_info=exc
+            )
 
 
 class MDNSDiscoveryBackend(MulticastListenerBase):

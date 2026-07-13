@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import re
 import ssl
-import urllib.request
 from collections.abc import Iterator
 from typing import Optional, Union
 
+import aiohttp
 from yarl import URL
 
 from simplyprint_ws_client.integration.camera.base import (
@@ -33,6 +33,8 @@ _JPEG_START = b"\xff\xd8"
 _JPEG_END = b"\xff\xd9"
 _HEADER_SEPARATOR = b"\r\n\r\n"
 _TIMEOUT = 10
+_MAX_FRAME_BYTES = 8 * 1024 * 1024
+_CHUNK_SIZE = 2**16
 
 
 def _to_http_url(uri: URL) -> str:
@@ -177,72 +179,75 @@ class MJPEGSnapshotCamera(BaseCameraProtocol):
     """Captures a single JPEG frame from an HTTP(S) or mjpeg:// snapshot URL."""
 
     polling_mode = CameraProtocolPollingMode.ON_DEMAND
-    is_async = False
+    is_async = True
 
     @staticmethod
     def test(uri: URL) -> bool:
         return uri.scheme in ("http", "https", "mjpeg")
 
-    def read(self):
+    async def read(self):
         url = _to_http_url(self.uri)
-        req = urllib.request.Request(url)
-
         ctx = _create_ssl_context() if self.uri.scheme == "https" else None
-        resp = urllib.request.urlopen(req, timeout=_TIMEOUT, context=ctx)
+        timeout = aiohttp.ClientTimeout(total=_TIMEOUT)
+        raw_data = bytearray()
 
-        content_type = resp.headers.get("Content-Type", "")
-        raw_data = None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, ssl=ctx) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                if (
+                    "multipart" in content_type.lower()
+                    and _extract_boundary(content_type) is None
+                ):
+                    raise CameraProtocolConnectionError(
+                        "Multipart response without boundary."
+                    )
+                async for chunk in resp.content.iter_chunked(_CHUNK_SIZE):
+                    raw_data.extend(chunk)
+                    frame = extract_jpeg_frame(raw_data)
+                    if frame is not None:
+                        yield frame
+                        return
+                    if len(raw_data) > _MAX_FRAME_BYTES:
+                        raise CameraProtocolConnectionError(
+                            "Camera frame exceeded the 8 MiB limit."
+                        )
 
-        if "multipart" in content_type.lower():
-            boundary = _extract_boundary(content_type)
-
-            if boundary is None:
-                raise CameraProtocolConnectionError(
-                    "Multipart response without boundary."
-                )
-
-            body = resp.read()
-            boundary_bytes = boundary.encode()
-            parts = body.split(b"--" + boundary_bytes)
-
-            for part in parts:
-                raw_data = extract_jpeg_frame(part)
-                if raw_data is not None:
-                    break
-        else:
-            raw_data = resp.read()
-
-        if raw_data is None or len(raw_data) == 0:
-            raise CameraProtocolConnectionError(
-                "No image data received from the camera."
-            )
-
-        yield raw_data
+        # Preserve support for non-JPEG snapshot endpoints. SimplyPrint usually
+        # receives JPEG, but the old implementation forwarded any non-empty body.
+        if raw_data:
+            yield bytes(raw_data)
+            return
+        raise CameraProtocolConnectionError(
+            "No image data received from the camera."
+        )
 
 
 class MJPEGStreamCamera(BaseCameraProtocol):
     """Reads a continuous MJPEG stream from an mjpeg-stream:// URL."""
 
     polling_mode = CameraProtocolPollingMode.CONTINUOUS
-    is_async = False
+    is_async = True
 
     @staticmethod
     def test(uri: URL) -> bool:
         return uri.scheme == "mjpeg-stream"
 
-    def read(self):
+    async def read(self):
         url = _to_http_url(self.uri)
-        req = urllib.request.Request(url)
-        resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
+        timeout = aiohttp.ClientTimeout(
+            total=None, connect=_TIMEOUT, sock_read=_TIMEOUT
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                parser = MJPEGFrameParser(resp.headers.get("Content-Type", ""))
+                async for chunk in resp.content.iter_chunked(_CHUNK_SIZE):
+                    for frame in parser.feed(chunk):
+                        yield frame
+                    if len(parser.buffer) > _MAX_FRAME_BYTES:
+                        raise CameraProtocolConnectionError(
+                            "MJPEG frame exceeded the 8 MiB limit."
+                        )
 
-        content_type = resp.headers.get("Content-Type", "")
-        parser = MJPEGFrameParser(content_type)
-        chunk_size = 2**16
-
-        while True:
-            chunk = resp.read(chunk_size)
-
-            if not chunk:
-                raise CameraProtocolConnectionError("MJPEG stream ended.")
-
-            yield from parser.feed(chunk)
+        raise CameraProtocolConnectionError("MJPEG stream ended.")

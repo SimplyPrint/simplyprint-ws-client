@@ -80,11 +80,13 @@ class _InlineBackend(_Backend):
         producer: Producer,
         on_item: OnItem,
         args: Tuple,
+        on_done: Callable[[], None],
     ) -> None:
         self._provider = provider
         self._producer = producer
         self._on_item = on_item
         self._args = args
+        self._on_done = on_done
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
 
@@ -105,6 +107,8 @@ class _InlineBackend(_Backend):
             raise
         except Exception:  # noqa: BLE001
             _logger.exception("inline producer failed")
+        finally:
+            self._on_done()
 
     def request_stop(self) -> None:
         def _kill() -> None:
@@ -137,11 +141,13 @@ class _ThreadBackend(_Backend):
         is_async: bool,
         policy: OverflowPolicy,
         maxsize: int,
+        on_done: Callable[[], None],
     ) -> None:
         self._producer = producer
         self._args = args
         self._is_async = is_async
         self._stop = threading.Event()
+        self._on_done = on_done
         self._courier: Courier = Courier(
             sink=lambda item: on_item(item[0], item[1]),
             provider=provider,
@@ -170,6 +176,8 @@ class _ThreadBackend(_Backend):
                 self._producer(emit, self._stop.is_set, *self._args)
         except Exception:  # noqa: BLE001
             _logger.exception("threaded producer failed")
+        finally:
+            self._on_done()
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -210,10 +218,12 @@ class _ProcessBackend(_Backend):
         maxsize: int,
         n_slabs: int,
         slab_size: int,
+        on_done: Callable[[], None],
     ) -> None:
         self._on_item = on_item
         self._channel = SharedSlabChannel.create(n_slabs=n_slabs, slab_size=slab_size)
         self._stop = mp.Event()
+        self._on_done = on_done
         self._proc = mp.Process(
             target=_process_main,
             args=(producer, args, self._channel.child_args(), self._stop),
@@ -239,11 +249,19 @@ class _ProcessBackend(_Backend):
         lease.release()  # a superseded/dropped frame still owns its slab
 
     def _read_loop(self) -> None:
-        while not self._stop.is_set():
-            lease = self._channel.recv(timeout=0.5)
-            if lease is None:
-                continue
-            self._courier.post(lease)
+        try:
+            while not self._stop.is_set():
+                lease = self._channel.recv(timeout=0.5)
+                if lease is not None:
+                    self._courier.post(lease)
+                    continue
+                # A one-shot producer exits after its first frame. Retire it
+                # immediately instead of leaving its reader thread and process
+                # handle alive until the next camera demand.
+                if not self._proc.is_alive():
+                    return
+        finally:
+            self._on_done()
 
     def start(self) -> None:
         self._proc.start()
@@ -275,25 +293,37 @@ class WorkerHandle:
         worker_id: int,
         backend: _Backend,
         release: Callable[[int], None],
-        reap: Callable[[_Backend], None],
+        reap: Callable[[_Backend, Optional[Callable[[], None]]], None],
+        release_capacity: Optional[Callable[[], None]] = None,
     ) -> None:
         self.id = worker_id
         self._backend = backend
         self._release = release
         self._reap = reap
+        self._release_capacity = release_capacity
         self._stopped = False
+        self._lock = threading.Lock()
+
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
+
+    def _backend_done(self) -> None:
+        self.stop()
 
     def stop(self) -> None:
         """Stop the worker WITHOUT blocking: signal the producer, hand the
         backend to the pool's reaper for its join, and release the slot. Safe to
         call on the consumer loop -- the up-to-``JOIN_TIMEOUT`` join never runs
         here."""
-        if self._stopped:
-            return
-        self._stopped = True
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
         try:
             self._backend.request_stop()
-            self._reap(self._backend)
+            self._reap(self._backend, self._release_capacity)
         finally:
             self._release(self.id)
 
@@ -309,18 +339,26 @@ class WorkerPool:
         slab_size: int = 768 * 1024,
         overflow: OverflowPolicy = OverflowPolicy.DROP_OLDEST,
         maxsize: int = _DEFAULT_MAXSIZE,
+        max_process_workers: Optional[int] = None,
     ) -> None:
         self._provider = event_loop_provider or EventLoopProvider.default()
         self._n_slabs = n_slabs
         self._slab_size = slab_size
         self._overflow = overflow
         self._maxsize = maxsize
+        if max_process_workers is not None and max_process_workers < 1:
+            raise ValueError("max_process_workers must be at least 1")
+        self._process_slots = (
+            asyncio.Semaphore(max_process_workers)
+            if max_process_workers is not None
+            else None
+        )
         self._handles: Dict[int, WorkerHandle] = {}
         self._next_id = 0
         self._lock = threading.Lock()
         # The single owner of every blocking thread/process join. Lazily started
         # on the first stop so a pool that never stops a worker spawns no thread.
-        self._reap_queue: "queue.Queue[Optional[_Backend]]" = queue.Queue()
+        self._reap_queue: "queue.Queue[Optional[tuple[_Backend, Optional[Callable[[], None]]]]]" = queue.Queue()
         self._reaper: Optional[threading.Thread] = None
         self._reaper_lock = threading.Lock()
         self._stopped = False
@@ -335,20 +373,39 @@ class WorkerPool:
         args: Tuple = (),
         is_async: Optional[bool] = None,
         overflow: Optional[OverflowPolicy] = None,
+        _release_capacity: Optional[Callable[[], None]] = None,
     ) -> WorkerHandle:
         """Run ``producer`` in ``context``, routing each item to ``on_item``.
 
         ``on_item(payload, timestamp)`` always fires on the consumer loop.
         ``is_async`` is inferred from ``producer`` when omitted.
         """
+        if self._stopped:
+            raise RuntimeError("worker pool is stopped")
+        if (
+            context is ExecutionContext.PROCESS
+            and self._process_slots is not None
+            and _release_capacity is None
+        ):
+            raise RuntimeError(
+                "bounded PROCESS workers require await allocate_async(...)"
+            )
         policy = overflow or self._overflow
         if is_async is None:
             is_async = asyncio.iscoroutinefunction(producer)
 
+        handle_ref: list[WorkerHandle] = []
+
+        def on_done() -> None:
+            if handle_ref:
+                handle_ref[0]._backend_done()
+
         if context is ExecutionContext.INLINE:
             if not is_async:
                 raise ValueError("INLINE requires an async producer")
-            backend: _Backend = _InlineBackend(self._provider, producer, on_item, args)
+            backend: _Backend = _InlineBackend(
+                self._provider, producer, on_item, args, on_done
+            )
         elif context is ExecutionContext.THREAD:
             backend = _ThreadBackend(
                 self._provider,
@@ -358,6 +415,7 @@ class WorkerPool:
                 is_async=is_async,
                 policy=policy,
                 maxsize=self._maxsize,
+                on_done=on_done,
             )
         elif context is ExecutionContext.PROCESS:
             if is_async:
@@ -371,6 +429,7 @@ class WorkerPool:
                 maxsize=self._maxsize,
                 n_slabs=self._n_slabs,
                 slab_size=self._slab_size,
+                on_done=on_done,
             )
         else:  # pragma: no cover -- exhaustive
             raise ValueError(f"unknown execution context {context!r}")
@@ -378,17 +437,80 @@ class WorkerPool:
         with self._lock:
             worker_id = self._next_id
             self._next_id += 1
-            handle = WorkerHandle(worker_id, backend, self._release, self._reap)
+            handle = WorkerHandle(
+                worker_id,
+                backend,
+                self._release,
+                self._reap,
+                _release_capacity,
+            )
+            handle_ref.append(handle)
             self._handles[worker_id] = handle
 
         backend.start()
         return handle
 
+    async def allocate_async(
+        self,
+        context: ExecutionContext,
+        producer: Producer,
+        on_item: OnItem,
+        *,
+        args: Tuple = (),
+        is_async: Optional[bool] = None,
+        overflow: Optional[OverflowPolicy] = None,
+    ) -> WorkerHandle:
+        """Allocate with async admission to the bounded PROCESS lane."""
+        slots = self._process_slots if context is ExecutionContext.PROCESS else None
+        if slots is None:
+            return self.allocate(
+                context,
+                producer,
+                on_item,
+                args=args,
+                is_async=is_async,
+                overflow=overflow,
+            )
+
+        await slots.acquire()
+        if self._stopped:
+            slots.release()
+            raise RuntimeError("worker pool is stopped")
+        released = False
+
+        def release_capacity() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            try:
+                self._provider.event_loop.call_soon_threadsafe(slots.release)
+            except RuntimeError:
+                pass
+
+        try:
+            return self.allocate(
+                context,
+                producer,
+                on_item,
+                args=args,
+                is_async=is_async,
+                overflow=overflow,
+                _release_capacity=release_capacity,
+            )
+        except BaseException:
+            release_capacity()
+            raise
+
     def _release(self, worker_id: int) -> None:
         with self._lock:
             self._handles.pop(worker_id, None)
 
-    def _reap(self, backend: _Backend) -> None:
+    def _reap(
+        self,
+        backend: _Backend,
+        release_capacity: Optional[Callable[[], None]] = None,
+    ) -> None:
         """Hand a stopped backend to the reaper for its blocking join. Never
         blocks the caller. After the pool is fully torn down (reaper joined), a
         late stop finalizes inline so nothing leaks."""
@@ -399,9 +521,9 @@ class WorkerPool:
                 self._ensure_reaper_locked()
                 finalize_inline = False
         if finalize_inline:
-            self._finalize_one(backend)
+            self._finalize_one(backend, release_capacity)
         else:
-            self._reap_queue.put(backend)
+            self._reap_queue.put((backend, release_capacity))
 
     def _ensure_reaper_locked(self) -> None:
         # Caller holds ``self._reaper_lock``.
@@ -413,17 +535,23 @@ class WorkerPool:
 
     def _reaper_loop(self) -> None:
         while True:
-            backend = self._reap_queue.get()
-            if backend is None:  # sentinel: the pool is stopping
+            item = self._reap_queue.get()
+            if item is None:  # sentinel: the pool is stopping
                 return
-            self._finalize_one(backend)
+            self._finalize_one(*item)
 
     @staticmethod
-    def _finalize_one(backend: _Backend) -> None:
+    def _finalize_one(
+        backend: _Backend,
+        release_capacity: Optional[Callable[[], None]] = None,
+    ) -> None:
         try:
             backend.finalize()
         except Exception:  # noqa: BLE001 -- one bad finalize must not wedge the reaper
             _logger.exception("worker finalize failed")
+        finally:
+            if release_capacity is not None:
+                release_capacity()
 
     def stop(self) -> None:
         """Stop every worker and drain the reaper. Idempotent. This is the ONE
