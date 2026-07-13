@@ -228,8 +228,10 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     async def teardown(self) -> None:
         """Final cleanup: stop the drivers, then any extra device teardown."""
+        await super().teardown()
         for driver in self._device_drivers:
             driver.stop()
+        await self.shutdown_camera_mixin()
         self.teardown_camera_mixin()
         await self._stop_connection()
 

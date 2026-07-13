@@ -67,7 +67,14 @@ class CameraHandle(StoppableInterface):
 
         for fut in ready:
             loop = fut.get_loop()
-            loop.call_soon_threadsafe(fut.set_result, data)
+            loop.call_soon_threadsafe(self._resolve_waiter, fut, data)
+
+    @staticmethod
+    def _resolve_waiter(fut: asyncio.Future, data: Optional[FrameT]) -> None:
+        # The waiter may be cancelled after the producer releases ``_lock`` but
+        # before this callback runs on its event loop.
+        if not fut.done():
+            fut.set_result(data)
 
     async def receive_frame(
         self, allow_cache_age: Optional[datetime.timedelta] = None

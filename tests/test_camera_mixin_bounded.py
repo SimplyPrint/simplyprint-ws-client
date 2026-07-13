@@ -1,11 +1,4 @@
-"""Camera demand handlers must be bounded.
-
-These handlers run inline on the connection's dispatch chain: an unbounded
-await here wedges the wire's supervise task -- recv never runs again, the
-websockets keepalive kills the socket, and the transport sits CONNECTED on a
-dead wire (the production keepalive-wedge bug). The mixin therefore bounds
-both waits: camera-handle setup and each frame read.
-"""
+"""The owned camera worker bounds setup and frame waits and survives failures."""
 
 from __future__ import annotations
 
@@ -134,3 +127,86 @@ async def test_dead_camera_worker_counts_as_failed_attempts():
         timeout=2.0,
     )
     assert frame is None
+
+
+@pytest.mark.asyncio
+async def test_stream_demands_coalesce_behind_one_camera_worker():
+    mixin = _bare_mixin()
+    mixin._request_count = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def process(work):
+        calls.append(work.kind)
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+        mixin._request_count -= 1
+        return True
+
+    mixin._process_camera_work = process
+    data = WebcamSnapshotDemandData()
+    for _ in range(3):
+        await mixin.on_webcam_snapshot(data)
+
+    await asyncio.wait_for(entered.wait(), 1.0)
+    assert mixin._camera_work_queue.empty()
+    assert mixin._request_count == 3
+
+    release.set()
+    await asyncio.wait_for(mixin._camera_work_queue.join(), 1.0)
+    assert calls == ["stream", "stream", "stream"]
+    assert mixin._request_count == 0
+    assert mixin._camera_stream_pending is False
+    await mixin.shutdown_camera_mixin()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_does_not_kill_fifo_camera_worker():
+    mixin = _bare_mixin()
+    calls = []
+
+    async def process(work):
+        calls.append(work.data.id)
+        if work.data.id == "bad":
+            raise RuntimeError("upload failed")
+        return True
+
+    mixin._process_camera_work = process
+    await mixin.on_webcam_snapshot(WebcamSnapshotDemandData(id="bad"))
+    await mixin.on_webcam_snapshot(WebcamSnapshotDemandData(id="good"))
+
+    await asyncio.wait_for(mixin._camera_work_queue.join(), 1.0)
+    assert calls == ["bad", "good"]
+    assert mixin._camera_worker_task is not None
+    assert not mixin._camera_worker_task.done()
+    assert mixin._camera_snapshot_backlog == 0
+    await mixin.shutdown_camera_mixin()
+
+
+@pytest.mark.asyncio
+async def test_stream_off_preempts_stream_but_preserves_snapshot():
+    mixin = _bare_mixin()
+    mixin._camera_handle = SimpleNamespace(pause=lambda: None)
+    stream_entered = asyncio.Event()
+    snapshot_finished = asyncio.Event()
+
+    async def process(work):
+        if work.kind == "stream":
+            stream_entered.set()
+            await asyncio.Event().wait()
+        snapshot_finished.set()
+        return True
+
+    mixin._process_camera_work = process
+    stream = WebcamSnapshotDemandData()
+    await mixin.on_webcam_snapshot(stream)
+    await mixin.on_webcam_snapshot(WebcamSnapshotDemandData(id="snapshot"))
+    await asyncio.wait_for(stream_entered.wait(), 1.0)
+
+    await mixin.on_stream_off()
+    await asyncio.wait_for(snapshot_finished.wait(), 1.0)
+    await asyncio.wait_for(mixin._camera_work_queue.join(), 1.0)
+    assert mixin._request_count == 0
+    await mixin.shutdown_camera_mixin()

@@ -76,6 +76,27 @@ async def test_receive_frame_rejects_stale_cached_frame():
     assert await asyncio.wait_for(fut, timeout=1.0) == b"fresh"
 
 
+@pytest.mark.asyncio
+async def test_frame_delivery_tolerates_waiter_cancellation_race():
+    handle = _handle()
+    errors = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        receiver = asyncio.create_task(handle.receive_frame())
+        await asyncio.sleep(0)
+        handle._set_frame(b"racing-frame", time.time())
+        receiver.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await receiver
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert errors == []
+
+
 def _bare_mixin() -> ClientCameraMixin:
     mixin = ClientCameraMixin.__new__(ClientCameraMixin)
     mixin._camera_handle = None

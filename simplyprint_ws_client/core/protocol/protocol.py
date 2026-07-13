@@ -51,12 +51,11 @@ class SimplyPrintProtocol:
     Inbound dispatch is decoupled from the transport's supervise task by one
     FIFO :class:`Courier`: the transport-bus handlers only enqueue, so ``recv``
     (and with it drop detection) stays live no matter how slow or wedged a
-    downstream client handler is. Lifecycle events ride the same queue as
-    messages, so the dispatch order -- and therefore which ``v`` an inbound
-    message observes -- is exactly what inline dispatch produced; a message
-    queued before a ``Disconnected`` still dispatches first, with the pre-bump
-    ``v``. Nothing is flushed on disconnect for the same reason: dropping those
-    messages would *change* semantics, not preserve them.
+    downstream client handler is. Lifecycle events and message routing ride the
+    same queue, so parsing, client selection and version acceptance remain FIFO.
+    Once the target client accepts a message it owns that message's application
+    task; slow handlers no longer hold up this protocol queue. A message queued
+    before a ``Disconnected`` still routes first with the pre-bump ``v``.
     """
 
     #: Queue depth past which a stalled inbound dispatch is reported (once per
@@ -116,7 +115,7 @@ class SimplyPrintProtocol:
             self._stall_reported = True
             self.logger.error(
                 "SimplyPrint inbound dispatch stalled: %d events queued "
-                "(a client handler is not returning)",
+                "(protocol routing is not returning)",
                 courier.pending(),
             )
 
@@ -136,8 +135,12 @@ class SimplyPrintProtocol:
 
     async def _on_disconnected(self, event: Disconnected) -> None:
         self.logger.debug("Emitting SimplyPrintConnectionLostEvent.")
-        await self.event_bus.emit(SimplyPrintConnectionLostEvent(self.v))
-        self.v += 1
+        try:
+            await self.event_bus.emit(SimplyPrintConnectionLostEvent(self.v))
+        finally:
+            # A faulty lifecycle listener must not leave the next connection in
+            # the old protocol epoch.
+            self.v += 1
 
         if event.code is not None and self._suspect.guard_until_bound():
             await self.event_bus.emit(SimplyPrintConnectionSuspectEvent, event.code)
