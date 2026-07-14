@@ -195,6 +195,7 @@ class MultiMaterialSolution(Enum):
     CREALITY_CFS = "creality_cfs"
     ANYCUBIC_ACE_PRO = "anycubic_ace_pro"
     ELEGOO_CANVAS = "elegoo_canvas"
+    QIDI_BOX = "qidi_box"
     SNAPMAKER_U1 = "snapmaker_u1"
     VIRTUAL = "virtual"
     CUSTOM = "custom"
@@ -204,6 +205,7 @@ class MultiMaterialSolution(Enum):
         return self in {
             self.CREALITY_CFS,
             self.ANYCUBIC_ACE_PRO,
+            self.QIDI_BOX,
             self.BAMBU_AMS,
             self.BAMBU_AMS_2_PRO,
             self.BAMBU_AMS_HT,
@@ -219,6 +221,7 @@ class MultiMaterialSolution(Enum):
             self.BAMBU_AMS_LITE: 1,
             self.CREALITY_CFS: 4,
             self.ANYCUBIC_ACE_PRO: 4,
+            self.QIDI_BOX: 4,
         }.get(self)
 
     @property
