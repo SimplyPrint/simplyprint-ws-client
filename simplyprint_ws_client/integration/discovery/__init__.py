@@ -17,6 +17,7 @@ from simplyprint_ws_client.integration.discovery.ssdp import (
     SSDPRequestParser,
 )
 from simplyprint_ws_client.integration.discovery.model import DiscoveredRecord
+from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
 from simplyprint_ws_client.integration.discovery.netif import local_subnets, scan_hosts
 from simplyprint_ws_client.integration.discovery.spec import (
     MDNSSpec,
@@ -56,6 +57,7 @@ from simplyprint_ws_client.integration.discovery.results import (
 __all__ = [
     "DiscoveredDevice",
     "DiscoveredRecord",
+    "DeviceReconciler",
     "SSDPRequest",
     "SSDPRequestParser",
     "local_subnets",

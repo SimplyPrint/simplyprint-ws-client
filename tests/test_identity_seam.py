@@ -6,7 +6,7 @@ neutral test config.
 """
 
 import uuid
-from typing import ClassVar, Optional, Tuple
+from typing import Optional
 from unittest.mock import patch
 
 from simplyprint_ws_client.core.config import PrinterConfig
@@ -14,6 +14,8 @@ from simplyprint_ws_client.integration.discovery.identity import (
     assign_unique_id,
     capture_hardware_id,
 )
+from simplyprint_ws_client.integration.discovery import DiscoveredDevice
+from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
 
 
 class SerialConfig(PrinterConfig):
@@ -22,8 +24,11 @@ class SerialConfig(PrinterConfig):
     serial: Optional[str] = None
     host: Optional[str] = None
 
-    def stable_hardware_id(self) -> Optional[str]:
-        return self.serial
+    def hardware_identity(self) -> Optional[str]:
+        return self.serial or super().hardware_identity()
+
+    def network_addresses(self) -> tuple[str, ...]:
+        return (self.host,) if self.host else ()
 
 
 class UriConfig(PrinterConfig):
@@ -31,11 +36,8 @@ class UriConfig(PrinterConfig):
 
     device_uri: Optional[str] = None
 
-    network_address_fields: ClassVar[Tuple[str, ...]] = (
-        "host",
-        "local_ip",
-        "device_uri",
-    )
+    def network_addresses(self) -> tuple[str, ...]:
+        return (self.device_uri,) if self.device_uri else ()
 
 
 def test_assign_unique_id_mints_a_stable_uuid_when_missing() -> None:
@@ -91,9 +93,8 @@ def test_capture_hardware_id_skips_when_brand_has_a_serial() -> None:
     assert config.mac is None
 
 
-def test_capture_hardware_id_probes_the_config_declared_address_fields() -> None:
-    # The address-field hook: a config with a custom-named address field gets its
-    # MAC resolved from that field, without the seam naming the field itself.
+def test_capture_hardware_id_uses_the_config_address_values() -> None:
+    # The typed address hook returns values, not field names for reflection.
     config = UriConfig.get_new()
     config.device_uri = "10.0.0.9"
 
@@ -105,3 +106,47 @@ def test_capture_hardware_id_probes_the_config_declared_address_fields() -> None
 
     resolve.assert_called_once_with("10.0.0.9")
     assert config.mac == "11:22:33:44:55:66"
+
+
+class _Manager:
+    def __init__(self, *configs) -> None:
+        self._configs = configs
+
+    def get_all(self):
+        return self._configs
+
+
+def test_reconciler_matches_the_first_class_discovered_hardware_id() -> None:
+    config = SerialConfig.get_new()
+    config.serial = "SERIAL-1"
+    config.host = "10.0.0.7"
+    device = DiscoveredDevice(host="10.0.0.99", hardware_id=" serial-1 ", serial=None)
+
+    assert DeviceReconciler(_Manager(config)).matching(device) is config
+
+
+def test_reconciler_uses_direct_address_fallback_for_identityless_config() -> None:
+    config = UriConfig.get_new()
+    config.device_uri = "http://PRINTER.local/"
+    device = DiscoveredDevice(host="printer.local")
+
+    assert DeviceReconciler(_Manager(config)).matching(device) is config
+
+
+def test_reconciler_normalizes_urls_and_unbracketed_ipv6_addresses() -> None:
+    assert (
+        DeviceReconciler.normalize_address("HTTPS://Printer.Local:443/status")
+        == "printer.local"
+    )
+    assert DeviceReconciler.normalize_address("fe80::1") == "fe80::1"
+
+
+def test_reconciler_does_not_replace_stored_identity_with_an_address_match() -> None:
+    config = SerialConfig.get_new()
+    config.serial = "SERIAL-1"
+    config.host = "10.0.0.7"
+
+    assert not DeviceReconciler.same_device(
+        config,
+        DiscoveredDevice(host="10.0.0.7", hardware_id="SERIAL-2"),
+    )

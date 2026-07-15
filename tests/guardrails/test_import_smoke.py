@@ -1,6 +1,7 @@
 """Import-smoke guardrails for the whole library package."""
 
 import importlib
+import pathlib
 import pkgutil
 
 import pytest
@@ -8,6 +9,11 @@ import pytest
 import simplyprint_ws_client
 
 pytestmark = pytest.mark.guardrail
+
+
+def test_package_import_has_no_polyfill_module() -> None:
+    package_root = pathlib.Path(simplyprint_ws_client.__file__).parent
+    assert not (package_root / "_polyfill.py").exists()
 
 
 def _walk_module_names():
@@ -24,7 +30,7 @@ def test_library_modules_import():
         try:
             importlib.import_module(module_name)
         except ModuleNotFoundError as exc:
-            # Heavy optional backends (paho-mqtt, aiomqtt, ...) may be absent in
+            # Heavy optional backends (paho-mqtt, ...) may be absent in
             # the test environment; anything else is a real failure.
             if (
                 exc.name

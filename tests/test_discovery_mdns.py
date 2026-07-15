@@ -171,7 +171,7 @@ async def test_backend_caches_and_emits():
     bus.on(_ProbeEvent, lambda record: received.append(record))
 
     backend = MDNSDiscoveryBackend(_single_stage_spec(), bus)
-    protocol = backend._protocol_factory()
+    protocol = backend.protocol_factory()
     protocol.datagram_received(_ultimaker_response(), ("192.0.2.7", 5353))
     await asyncio.sleep(0)
 
@@ -234,7 +234,7 @@ async def test_two_stage_follow_up_issues_stage2_query_and_maps():
     )
 
     backend = MDNSDiscoveryBackend(spec, EventBus())
-    protocol = backend._protocol_factory()
+    protocol = backend.protocol_factory()
     transport = _FakeTransport()
     protocol.connection_made(transport)
 
@@ -267,7 +267,7 @@ async def test_discovery_service_builds_mdns_backend_and_snapshots():
 
     service = DiscoveryService(mdns_specs=[_single_stage_spec()])
     backend = service._mdns["probe"]
-    protocol = backend._protocol_factory()
+    protocol = backend.protocol_factory()
     protocol.datagram_received(_ultimaker_response(), ("192.0.2.7", 5353))
     await asyncio.sleep(0)
     snapshot = service.snapshot("probe")
@@ -275,17 +275,34 @@ async def test_discovery_service_builds_mdns_backend_and_snapshots():
     assert snapshot[0]["host"] == "192.0.2.7"
 
 
-def test_printer_client_spec_mdns_hook_is_opt_in():
-    from simplyprint_ws_client.integration.spec import PrinterSpec
+def test_integration_spec_mdns_field_is_nullable():
+    from simplyprint_ws_client.core.client import Client
+    from simplyprint_ws_client.core.config import PrinterConfig
+    from simplyprint_ws_client.integration.spec import (
+        IntegrationId,
+        IntegrationSpec,
+        ProductMetadata,
+    )
 
-    assert PrinterSpec.mdns_spec() is None
-    assert PrinterSpec.provides("mdns_spec") is False
+    metadata = ProductMetadata(
+        display_name="Brand",
+        image_url="/brand.png",
+        supported_transports=(),
+        capabilities=(),
+    )
+    base = IntegrationSpec(
+        id=IntegrationId("brandx"),
+        client_factory=Client,
+        config_factory=PrinterConfig,
+        metadata=metadata,
+    )
+    configured = IntegrationSpec(
+        id=IntegrationId("brandy"),
+        client_factory=Client,
+        config_factory=PrinterConfig,
+        metadata=metadata,
+        mdns="a-spec",
+    )
 
-    class _Brand(PrinterSpec):
-        KEY = "brandx"
-
-        @classmethod
-        def mdns_spec(cls):
-            return "a-spec"
-
-    assert _Brand.provides("mdns_spec") is True
+    assert base.mdns is None
+    assert configured.mdns == "a-spec"

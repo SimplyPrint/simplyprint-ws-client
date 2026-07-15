@@ -123,7 +123,7 @@ class SQLiteConfigManager(ConfigManager):
         # Loop over all configs
         for config in configs:
             # If the config is not in the manager
-            if not self.find(pk=config[0], sk=config[1]):
+            if self.by_key(config[0], config[1]) is None:
                 # Remove it from the database
                 self.db.execute(
                     """

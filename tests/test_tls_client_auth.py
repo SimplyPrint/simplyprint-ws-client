@@ -1,8 +1,4 @@
-"""Tests for mutual-TLS client-certificate support.
-
-Covers :func:`~simplyprint_ws_client.wire.paho.client_cert_ssl_context` and
-the aiomqtt guard in :func:`~simplyprint_ws_client.wire.mqtt.connect`.
-"""
+"""Tests for Paho mutual-TLS client-certificate support."""
 
 from __future__ import annotations
 
@@ -10,7 +6,6 @@ import ssl
 import tempfile
 
 import pytest
-import yarl
 
 from simplyprint_ws_client.wire.options import TlsClientAuth
 from simplyprint_ws_client.wire.paho import client_cert_ssl_context
@@ -103,24 +98,3 @@ def test_client_cert_ssl_context_cleans_up_temp_files(
     client_cert_ssl_context(auth)
 
     assert not known_dir.exists()
-
-
-def test_aiomqtt_tls_client_auth_raises() -> None:
-    from simplyprint_ws_client.wire import mqtt
-
-    auth = TlsClientAuth(
-        ca_pem=_TEST_CERT_PEM,
-        cert_pem=_TEST_CERT_PEM,
-        key_pem=_TEST_KEY_PEM,
-    )
-
-    with pytest.raises(ValueError, match="tls_client_auth"):
-        pool = mqtt.build_pool("aiomqtt", None)
-        pool.connect(
-            yarl.URL("mqtts://printer.local:8883"),
-            mqtt.MqttConnectParams(
-                broker=mqtt.MqttBroker("printer.local", 8883),
-                retry=mqtt.RetryPolicy(),
-                tls_client_auth=auth,
-            ),
-        )

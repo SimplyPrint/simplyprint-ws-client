@@ -7,8 +7,11 @@ import logging
 
 import pytest
 
-from simplyprint_ws_client.integration.drivers import DeviceAuthError
-from simplyprint_ws_client.integration.drivers import DevicePoller
+from simplyprint_ws_client.integration.drivers import (
+    DeviceAuthError,
+    DevicePoller,
+    DeviceReachability,
+)
 
 
 class FakeClient:
@@ -21,6 +24,7 @@ class FakeClient:
         self.connected_edges = []
         self.disconnected_edges = []
         self.refreshes = 0
+        self.projections = 0
 
     @property
     def event_loop(self):
@@ -34,6 +38,10 @@ class FakeClient:
 
     async def on_device_disconnected(self, driver, reason=None):
         self.disconnected_edges.append((driver, reason))
+
+    async def project_device_reachability(self, now=None):
+        self.projections += 1
+        return False
 
     async def refresh_device_credentials(self, driver):
         self.refreshes += 1
@@ -63,12 +71,12 @@ async def test_cold_start_silence_fires_the_disconnected_edge_once():
     poller.start()
     try:
         await _wait_for(lambda: client.disconnected_edges)
-        assert poller.is_connected is False
+        assert poller.session.reachability is DeviceReachability.DOWN
         # The edge fires exactly once while silence continues.
         await asyncio.sleep(0.1)
         assert len(client.disconnected_edges) == 1
     finally:
-        poller.stop()
+        await poller.close()
 
 
 @pytest.mark.asyncio
@@ -87,11 +95,11 @@ async def test_contact_fires_connected_then_silence_disconnects():
     poller.start()
     try:
         await _wait_for(lambda: client.connected_edges)
-        assert poller.is_connected is True
+        assert poller.session.reachability is DeviceReachability.UP
         await _wait_for(lambda: client.disconnected_edges)
-        assert poller.is_connected is False
+        assert poller.session.reachability is DeviceReachability.DOWN
     finally:
-        poller.stop()
+        await poller.close()
 
 
 @pytest.mark.asyncio
@@ -107,7 +115,7 @@ async def test_auth_error_runs_single_flight_credential_refresh():
     try:
         await _wait_for(lambda: client.refreshes >= 1)
     finally:
-        poller.stop()
+        await poller.close()
 
 
 @pytest.mark.asyncio
@@ -130,6 +138,6 @@ async def test_hung_poll_counts_as_failure_and_keeps_the_edge_clock():
     poller.start()
     try:
         await _wait_for(lambda: client.disconnected_edges)
-        assert poller.is_connected is False
+        assert poller.session.reachability is DeviceReachability.DOWN
     finally:
-        poller.stop()
+        await poller.close()

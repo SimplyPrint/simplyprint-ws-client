@@ -1,35 +1,24 @@
-"""The one descriptor an integration writes per client type: ``PrinterSpec``.
+"""Immutable integration descriptors.
 
-Every client type an integration ships is described by exactly one
-:class:`PrinterSpec` subclass -- the single source of truth for that type, and
-the *only* descriptor (2.0 merged the old runtime ``PrinterSpec`` and the
-authoring ``PrinterSpec`` into this one class). It carries the runtime
-fields the app hands to ``ClientSettings`` (key, factories, cameras, name), and
-it owns every per-type surface an app projects -- product metadata, the
-background service, discovery specs, guided flows, account capability, periodic
-tasks -- as hooks that default to "this type doesn't back that surface".
+An integration is one :class:`IntegrationSpec` value.  The value contains the
+runtime factories and the optional capabilities that the host projects; there
+is no descriptor subclass, hook discovery, dotted import string, or build step.
 
-The subtlety is laziness. ``KEY`` and ``metadata`` are :class:`~typing.ClassVar`
-literals and the capability hooks are classmethods, so a surface can ask *which*
-client types back it (:meth:`provides`) and read their catalogue facts without
-ever calling :meth:`build` -- the one place a type imports its cameras / runtime.
-Declarative types skip writing ``build`` entirely: point :attr:`client` /
-:attr:`config` / :attr:`cameras` at dotted paths via :func:`lazy` and the default
-``build`` resolves them exactly once, at the same startup boundary.
+Factories that intentionally defer a heavy import are ordinary callables with a
+local import.  This keeps laziness visible at the application composition
+boundary and preserves normal Python identity and static analysis.
 """
 
 from __future__ import annotations
 
-import importlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
-    ClassVar,
-    Generic,
     List,
+    NewType,
     Optional,
     Protocol,
     Tuple,
@@ -40,13 +29,29 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict
 
+from simplyprint_ws_client._compat import StrEnum
+from simplyprint_ws_client.core.client_context import (
+    BackgroundService,
+    ClientContext,
+)
+
+__all__ = [
+    "IntegrationId",
+    "IntegrationTransport",
+    "IntegrationCapability",
+    "IntegrationSpec",
+    "ProductMetadata",
+    "discover_from_service",
+    "model_aware_presentation",
+]
+
 if TYPE_CHECKING:
     from simplyprint_ws_client.core.client import Client
-    from simplyprint_ws_client.core.config import PrinterConfig
-    from simplyprint_ws_client.core.config import ConfigManagerType
+    from simplyprint_ws_client.core.config import ConfigManagerType, PrinterConfig
     from simplyprint_ws_client.integration.accounts import AccountProvider
     from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
     from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+    from simplyprint_ws_client.integration.discovery.service import DiscoveryService
     from simplyprint_ws_client.integration.discovery.spec import (
         MDNSSpec,
         MulticastSpec,
@@ -58,337 +63,178 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.integration.presentation import PrinterPresentation
     from simplyprint_ws_client.integration.tasks import TaskRegistry
 
+
+IntegrationId = NewType("IntegrationId", str)
+
 TAnyClient = TypeVar("TAnyClient", bound="Client")
 TAnyPrinterConfig = TypeVar("TAnyPrinterConfig", bound="PrinterConfig")
-#: What a :class:`LazyRef` resolves to.
-TResolved = TypeVar("TResolved")
 
 
 class ClientFactory(Protocol):
-    def __call__(self, config: TAnyPrinterConfig, *args, **kwargs) -> TAnyClient: ...
+    def __call__(
+        self,
+        config: TAnyPrinterConfig,
+        *,
+        context: ClientContext,
+    ) -> TAnyClient: ...
 
 
 TClientFactory = Union[Type[TAnyClient], ClientFactory]
 TConfigFactory = Union[Type[TAnyPrinterConfig], Callable[..., TAnyPrinterConfig]]
 
-
-class LazyRef(Generic[TResolved]):
-    """A ``"package.module:attr"`` reference resolved on first use, then cached.
-
-    The declarative side of :class:`PrinterSpec`: a spec points its
-    :attr:`~PrinterSpec.client` / :attr:`~PrinterSpec.config` /
-    :attr:`~PrinterSpec.cameras` at dotted paths, and the default ``build``
-    resolves them -- so the catalogue never imports a type's heavy runtime, and
-    the import is paid exactly once, at the same boundary a hand-written
-    ``build`` paid it.
-    """
-
-    def __init__(self, target: str) -> None:
-        if ":" not in target:
-            raise ValueError(f"lazy ref needs 'package.module:attr', got {target!r}")
-        self.target = target
-        self._resolved: Optional[TResolved] = None
-
-    def resolve(self) -> TResolved:
-        if self._resolved is None:
-            module_path, attr = self.target.split(":", 1)
-            value: Any = importlib.import_module(module_path)
-            for part in attr.split("."):
-                value = getattr(value, part)
-            self._resolved = value
-        return self._resolved
-
-    def __repr__(self) -> str:
-        return f"lazy({self.target!r})"
+Discoverer = Callable[["DiscoveryService", float], Awaitable[List["DiscoveredDevice"]]]
+DiscoveryRefiner = Callable[["DiscoveredDevice"], Optional["DiscoveredDevice"]]
+CameraProtocolsFactory = Callable[[], Tuple[Type["BaseCameraProtocol"], ...]]
+BackgroundServiceFactory = Callable[[Any], "BackgroundService"]
+AccountProviderFactory = Callable[["ConfigManagerType"], "AccountProvider"]
+FlowFactory = Callable[[ClientContext], "Flow"]
+TaskRegistrar = Callable[["TaskRegistry"], None]
+PresentationFactory = Callable[["PrinterConfig"], "PrinterPresentation"]
+MqttUrlFactory = Callable[["PrinterConfig", ClientContext], Optional[str]]
 
 
-def lazy(target: str) -> LazyRef[Any]:
-    """Declare a lazily-resolved ``"package.module:attr"`` reference."""
-    return LazyRef(target)
+class LanMqttVerifier(Protocol):
+    def __call__(
+        self,
+        url: str,
+        *,
+        timeout: float,
+        expected_host: Optional[str],
+        context: ClientContext,
+    ) -> Awaitable[Optional[Any]]: ...
 
 
-class BackgroundService(Protocol):
-    """Supervisor-owned service contract: registerable things can be stopped."""
+class IntegrationTransport(StrEnum):
+    """Transport vocabulary exposed by product metadata."""
 
-    def stop(self) -> None: ...
+    HTTP = "http"
+    WEBSOCKET = "websocket"
+    MQTT = "mqtt"
+    FTPS = "ftps"
+
+
+class IntegrationCapability(StrEnum):
+    """Capability vocabulary exposed by product metadata."""
+
+    CAMERA = "camera"
+    FILE_UPLOAD = "file_upload"
+    AMS = "ams"
+    CLOUD_ACCOUNT = "cloud_account"
+    LAN_ACCESS_CODE = "lan_access_code"
 
 
 class ProductMetadata(BaseModel):
-    """Neutral, brand-agnostic product descriptor.
-
-    Values are populated by each client type's spec as plain static
-    strings/tuples; this container itself imports nothing brand-specific.
-    """
+    """Neutral product facts exposed by the integration catalogue."""
 
     model_config = ConfigDict(frozen=True)
 
     display_name: str
     image_url: str
-    supported_transports: tuple[str, ...]
-    capabilities: tuple[str, ...]
+    supported_transports: tuple[IntegrationTransport, ...]
+    capabilities: tuple[IntegrationCapability, ...]
+
+
+def no_camera_protocols() -> Tuple[Type["BaseCameraProtocol"], ...]:
+    """The explicit camera capability for integrations without a camera."""
+
+    return ()
 
 
 @dataclass(frozen=True)
-class PrinterSpec:
-    """One client type's single source of truth -- the only descriptor.
+class IntegrationSpec:
+    """The complete immutable description of one integration.
 
-    Subclasses live next to their client type's code, set the :attr:`KEY` /
-    :attr:`metadata` class literals, point :attr:`client` / :attr:`config` /
-    :attr:`cameras` at dotted paths (or implement :meth:`build` themselves for
-    genuinely custom construction), and override only the capability hooks they
-    back. The hooks below default to "absent"; a surface lists the types that
-    back it via :meth:`provides` and builds none it doesn't need.
+    Optional capabilities are data or callables.  ``None`` means the capability
+    is absent; callers never infer support from subclass overrides.
     """
 
-    key: str
+    id: IntegrationId
     client_factory: TClientFactory
     config_factory: TConfigFactory
+    metadata: ProductMetadata
+
     name: Optional[str] = None
     config_manager_t: Optional["ConfigManagerType"] = None
-    allow_setup: Optional[bool] = None
-    #: Camera protocol classes this client type can drive. Generic (every entry
-    #: is a library ``BaseCameraProtocol``), so an integration declares its
-    #: per-client cameras here instead of in a parallel descriptor.
-    camera_protocols: Tuple[Type["BaseCameraProtocol"], ...] = field(default=())
+    camera_protocols: CameraProtocolsFactory = no_camera_protocols
+
+    background_service_factory: Optional[BackgroundServiceFactory] = None
+    account_provider_factory: Optional[AccountProviderFactory] = None
+
+    multicast: Optional["MulticastSpec"] = None
+    mdns: Optional["MDNSSpec"] = None
+    subnet: Optional["SubnetScanSpec"] = None
+    network_services: Tuple["NetworkServiceSpec", ...] = ()
+    discover: Optional[Discoverer] = None
+
+    add_printer_flow_factory: Optional[FlowFactory] = None
+    account_login_flow_factory: Optional[FlowFactory] = None
+    register_tasks: Optional[TaskRegistrar] = None
+
+    presentation: Optional[PresentationFactory] = None
+    model_catalogue: Optional["ModelCatalogue"] = None
+    discovery_priority: int = 0
+
+    mqtt_url_from_config: Optional[MqttUrlFactory] = None
+    verify_lan_mqtt_url: Optional[LanMqttVerifier] = None
 
     def storage_name(self, app_name: Optional[str], multiple: bool) -> Optional[str]:
         if self.name is not None:
             return self.name
-
         if not multiple:
             return app_name
+        return f"{app_name}-{self.id}" if app_name else str(self.id)
 
-        return f"{app_name}-{self.key}" if app_name else self.key
 
-    #: ``key`` is the per-instance runtime field; :meth:`build` sets it from this.
-    KEY: ClassVar[str]
-    #: Declarative product facts, read off the class without building the heavy
-    #: runtime spec (so the catalogue never imports a brand's cameras/runtime).
-    metadata: ClassVar[ProductMetadata]
-    #: Optional storage name the default ``build`` passes through.
-    NAME: ClassVar[Optional[str]] = None
+def discover_from_service(
+    integration_id: IntegrationId,
+    *,
+    refine: Optional[DiscoveryRefiner] = None,
+) -> Discoverer:
+    """Build the standard discovery projection for one explicit integration id."""
 
-    #: ``lazy("pkg.module:PrinterClass")`` -- the client factory.
-    client: ClassVar[Optional[LazyRef]] = None
-    #: ``lazy("pkg.module:ConfigClass")`` -- the config class.
-    config: ClassVar[Optional[LazyRef]] = None
-    #: ``(lazy("pkg.module:CameraProtocol"), ...)`` -- camera protocol classes.
-    cameras: ClassVar[Tuple[LazyRef, ...]] = ()
+    async def discover(
+        service: "DiscoveryService", timeout: float
+    ) -> List["DiscoveredDevice"]:
+        from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
 
-    @classmethod
-    def build(cls) -> "PrinterSpec":
-        """Construct the runtime spec for this client type.
-
-        The default resolves the declarative :attr:`client` / :attr:`config` /
-        :attr:`cameras` refs (the one place their imports are paid). A type whose
-        construction is genuinely custom overrides this instead and returns
-        ``cls(key=cls.KEY, ...)`` with the runtime fields filled.
-        """
-        if cls.client is None or cls.config is None:
-            raise NotImplementedError(
-                f"{cls.__name__} must point `client = lazy(...)` and "
-                "`config = lazy(...)` at its classes, or override build()."
+        records = await service.scan(str(integration_id), timeout)
+        devices = (
+            DiscoveredDevice(
+                host=record.host,
+                name=record.name,
+                serial=record.serial,
+                hardware_id=record.hardware_id,
+                extra=dict(record.extra),
             )
-        return cls(
-            key=cls.KEY,
-            name=cls.NAME,
-            client_factory=cls.client.resolve(),
-            config_factory=cls.config.resolve(),
-            camera_protocols=tuple(ref.resolve() for ref in cls.cameras),
+            for record in records
         )
+        if refine is None:
+            return list(devices)
+        refined = (refine(device) for device in devices)
+        return [device for device in refined if device is not None]
 
-    @classmethod
-    def background_service(cls, event_loop_provider=None) -> "BackgroundService | None":
-        """A process-wide background service this client type needs (for example a
-        watchdog), or ``None``.
+    return discover
 
-        Constructed once by the app's supervisor at startup and read back by the
-        client factory -- never built in the factory, so two factory calls can't
-        race to create one. Return a ready-to-register service (already started if
-        it needs starting). Read off the *class* (no ``build``).
 
-        ``event_loop_provider`` is the app's loop provider, for services that must
-        deliver work onto that loop.
-        """
-        return None
+def model_aware_presentation(
+    metadata: ProductMetadata,
+    catalogue: Optional["ModelCatalogue"],
+    config: "PrinterConfig",
+    device_type: Optional[str],
+) -> "PrinterPresentation":
+    """Build the common model-aware card without reflective config access."""
 
-    @classmethod
-    def account_provider(cls) -> "Optional[AccountProvider]":
-        """The brand's cloud-account capability, or ``None`` if it has no cloud."""
-        return None
+    from dataclasses import replace
 
-    @classmethod
-    def multicast_spec(cls) -> "Optional[MulticastSpec]":
-        """An always-on SSDP multicast discovery spec, or ``None``."""
-        return None
+    from simplyprint_ws_client.integration.presentation import (
+        default_printer_presentation,
+    )
 
-    @classmethod
-    def mdns_spec(cls) -> "Optional[MDNSSpec]":
-        """An always-on mDNS / DNS-SD discovery spec, or ``None``."""
-        return None
-
-    @classmethod
-    def subnet_spec(cls) -> "Optional[SubnetScanSpec]":
-        """An on-demand active subnet-scan discovery spec, or ``None``."""
-        return None
-
-    @classmethod
-    def network_services(cls) -> "tuple[NetworkServiceSpec, ...]":
-        """Declarative LAN services useful for discovery, onboarding, and debug.
-
-        This is intentionally separate from catalogue ``supported_transports``:
-        those describe product capability, while this describes concrete local
-        network endpoints a diagnostic/scanner may check.
-        """
-        return ()
-
-    @classmethod
-    def discover(
-        cls,
-    ) -> "Optional[Callable[[float], Awaitable[List[DiscoveredDevice]]]]":
-        """An ``async discover(timeout)`` listing devices via the shared discovery
-        service, or ``None`` if this type does not discover over the LAN.
-
-        The default works for every type that declares a discovery spec
-        (multicast / mDNS / subnet): scan the shared service under this type's
-        :attr:`KEY`, map records to neutral
-        :class:`~simplyprint_ws_client.integration.discovery.device.DiscoveredDevice` s,
-        and pass each through :meth:`refine_discovered`. Types with no discovery
-        spec return ``None`` -- so "can this type discover?" is asked as
-        ``spec.discover() is not None``.
-        """
-        if not (
-            cls.provides("multicast_spec")
-            or cls.provides("mdns_spec")
-            or cls.provides("subnet_spec")
-        ):
-            return None
-
-        async def _discover(timeout: float) -> List[DiscoveredDevice]:
-            from simplyprint_ws_client.integration.discovery.active import (
-                active_discovery_service,
-            )
-            from simplyprint_ws_client.integration.discovery.device import (
-                DiscoveredDevice,
-            )
-
-            records = await active_discovery_service().scan(cls.KEY, timeout)
-            devices = (
-                DiscoveredDevice(
-                    host=record.host,
-                    name=record.name,
-                    serial=record.serial,
-                    extra=dict(record.extra),
-                )
-                for record in records
-            )
-            refined = (cls.refine_discovered(device) for device in devices)
-            return [device for device in refined if device is not None]
-
-        return _discover
-
-    @classmethod
-    def refine_discovered(
-        cls, device: "DiscoveredDevice"
-    ) -> "Optional[DiscoveredDevice]":
-        """Polish (or drop, by returning ``None``) one discovered device before it
-        reaches the candidate surface -- probe it, enrich the model name, ... The
-        default keeps it as-is."""
-        return device
-
-    @classmethod
-    def add_printer_flow(cls) -> "Optional[Flow]":
-        """The guided add-printer :class:`Flow`, or ``None``."""
-        return None
-
-    @classmethod
-    def account_login_flow(cls) -> "Optional[Flow]":
-        """The guided account-login :class:`Flow` (cloud brands only), or ``None``."""
-        return None
-
-    @classmethod
-    def register_tasks(cls, task_registry: "TaskRegistry") -> None:
-        """Contribute periodic / on-demand ``TaskSpec`` s to the shared scheduler.
-        No-op for client types with no background tasks."""
-
-    @classmethod
-    def printer_presentation(cls, config: "PrinterConfig") -> "PrinterPresentation":
-        """Public printer-card presentation for one persisted config.
-
-        The default is intentionally boring and metadata-driven. Brands that need
-        to hide secrets, expose editable fields, or resolve model-specific photos
-        override this hook in their own spec -- or, for the common
-        model-image/model-name case only, override :meth:`model_catalogue`
-        instead and let :meth:`model_aware_presentation` do the work.
-        """
-        from simplyprint_ws_client.integration.presentation import (
-            default_printer_presentation,
-        )
-
-        return default_printer_presentation(cls.metadata.image_url)
-
-    @classmethod
-    def model_catalogue(cls) -> "Optional[ModelCatalogue]":
-        """This type's model catalogue -- the four universal operations
-        (label / image / resolve / picker) keyed by the string value stored in
-        a config's ``device_type`` field -- or ``None`` if this type has no
-        per-model identity (single-model, or model-agnostic like a generic
-        RepRapFirmware board).
-
-        Read off the class (no ``build``); surfaces ask
-        ``spec.model_catalogue() is not None`` or ``spec.provides(
-        "model_catalogue")`` before using it. Returning a catalogue is the
-        declarative alternative to overriding :meth:`printer_presentation`
-        just to populate ``model_name`` and ``image_url`` from
-        ``config.device_type`` -- see :meth:`model_aware_presentation`.
-        """
-        return None
-
-    @classmethod
-    def model_aware_presentation(
-        cls, config: "PrinterConfig"
-    ) -> "PrinterPresentation":
-        """Default-by-catalogue presentation: the metadata-driven
-        :meth:`printer_presentation` enriched with ``model_name`` and
-        ``image_url`` resolved from ``config.device_type`` via
-        :meth:`model_catalogue`.
-
-        Brands that need to add secrets / editable fields / a connection
-        summary override :meth:`printer_presentation` and call this as the
-        base (then ``replace`` the result). Brands with no catalogue fall
-        through to the plain metadata-driven default.
-        """
-        from dataclasses import replace
-
-        from simplyprint_ws_client.integration.presentation import (
-            default_printer_presentation,
-        )
-
-        base = default_printer_presentation(cls.metadata.image_url)
-        catalogue = cls.model_catalogue()
-        if catalogue is None:
-            return base
-        value = getattr(config, "device_type", None)
-        if not value or value == catalogue.unknown_value:
-            return base
-        image = catalogue.image_url(value)
-        model_name = catalogue.model_name(value)
-        return replace(
-            base,
-            image_url=image or base.image_url,
-            model_name=model_name,
-        )
-
-    @classmethod
-    def provides(cls, capability: str) -> bool:
-        """True if this type overrides the named capability hook (vs the base
-        no-op) -- a cheap class-level check, so a surface can list the types that
-        back it without building any of them.
-
-        Note ``discover`` has a working default driven by the discovery-spec
-        hooks: ask ``spec.discover() is not None`` instead of
-        ``provides("discover")``.
-        """
-        own = getattr(cls, capability)
-        base = getattr(PrinterSpec, capability)
-        return getattr(own, "__func__", own) is not getattr(base, "__func__", base)
+    base = default_printer_presentation(metadata.image_url, config)
+    if catalogue is None or not device_type or device_type == catalogue.unknown_value:
+        return base
+    return replace(
+        base,
+        image_url=catalogue.image_url(device_type) or base.image_url,
+        model_name=catalogue.model_name(device_type),
+    )

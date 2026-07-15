@@ -1,167 +1,170 @@
-"""The spec registry: every client type an app ships, collected once.
+"""Projection registry for immutable integration descriptors.
 
-An app (or a single-vendor integration) constructs one :class:`SpecRegistry`
-from its :class:`~simplyprint_ws_client.integration.spec.PrinterSpec` classes —
-the single place its types are listed — and every capability surface projects
-off it: live runtime specs, catalogue metadata, flows, discovery, accounts,
-periodic tasks. No type is named in here; the registry only iterates what it
-was given, and each spec's hooks import their modules lazily, so projecting
-never drags in a type's runtime.
+Applications name each shipped integration once by collecting its
+:class:`~simplyprint_ws_client.integration.spec.IntegrationSpec` value here.
+Every runtime surface then projects the corresponding explicit field; there is
+no descriptor construction or hook discovery in the registry.
 """
 
 from __future__ import annotations
 
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-    Type,
-)
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Tuple, Type
 
-from simplyprint_ws_client.integration.spec import PrinterSpec
+from simplyprint_ws_client.integration.spec import IntegrationSpec
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client.integration.accounts import AccountProvider
     from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
+    from simplyprint_ws_client.integration.discovery.spec import (
+        MDNSSpec,
+        MulticastSpec,
+        NetworkServiceSpec,
+        SubnetScanSpec,
+    )
+    from simplyprint_ws_client.core.client_context import ClientContext
     from simplyprint_ws_client.integration.flow import Flow
     from simplyprint_ws_client.integration.spec import ProductMetadata
     from simplyprint_ws_client.integration.tasks import TaskRegistry
 
-__all__ = ["FLOW_FIELDS", "SpecRegistry"]
-
-#: Stable flow ids (the wire/route names) -> the ``PrinterSpec`` hook that
-#: builds them. The id matches the ``Flow.id`` each builder sets.
-FLOW_FIELDS = {
-    "add-printer": "add_printer_flow",
-    "account-login": "account_login_flow",
-}
+__all__ = ["SpecRegistry"]
 
 
 class SpecRegistry:
-    """The collected ``{key: PrinterSpec class}`` map and its projections."""
+    """The ordered ``{integration id: IntegrationSpec}`` map and projections."""
 
-    def __init__(self, specs: Iterable[Type[PrinterSpec]] = ()) -> None:
-        self._types: Dict[str, Type[PrinterSpec]] = {}
-        self._built: Optional[Tuple[PrinterSpec, ...]] = None
-        for spec in specs:
-            self.register(spec)
+    def __init__(self, integrations: Iterable[IntegrationSpec] = ()) -> None:
+        self._integrations: Dict[str, IntegrationSpec] = {}
+        for integration in integrations:
+            self.register(integration)
 
     @classmethod
-    def of(cls, *specs: Type[PrinterSpec]) -> "SpecRegistry":
-        """The explicit constructor an app's one type-naming module calls."""
-        return cls(specs)
+    def of(cls, *integrations: IntegrationSpec) -> "SpecRegistry":
+        return cls(integrations)
 
-    def register(self, spec: Type[PrinterSpec]) -> None:
-        """Add one spec class; duplicate keys are a wiring bug and raise."""
-        key = spec.KEY
-        if key in self._types:
-            raise ValueError(f"duplicate client type key: {key!r}")
-        self._types[key] = spec
+    def register(self, integration: IntegrationSpec) -> None:
+        integration_id = str(integration.id)
+        if integration_id in self._integrations:
+            raise ValueError(f"duplicate integration id: {integration_id!r}")
+        self._integrations[integration_id] = integration
 
-    def types(self) -> Mapping[str, Type[PrinterSpec]]:
-        """The ``{key: spec class}`` map, in registration order."""
-        return dict(self._types)
+    def integrations(self) -> Mapping[str, IntegrationSpec]:
+        return dict(self._integrations)
 
-    def get(self, key: str) -> Optional[Type[PrinterSpec]]:
-        return self._types.get(key)
+    def get(self, integration_id: str) -> IntegrationSpec | None:
+        return self._integrations.get(integration_id)
 
-    def keys(self) -> Tuple[str, ...]:
-        return tuple(self._types)
+    def ids(self) -> Tuple[str, ...]:
+        return tuple(self._integrations)
 
-    def collect(self, capability: str) -> list:
-        """``[spec.cap() for every type that backs cap]`` — the one loop the old
-        per-surface registries each re-wrote."""
-        return [
-            getattr(spec, capability)()
-            for spec in self._types.values()
-            if spec.provides(capability)
-        ]
+    def values(self) -> Tuple[IntegrationSpec, ...]:
+        return tuple(self._integrations.values())
 
-    def collect_map(self, capability: str) -> dict:
-        """Like :meth:`collect`, keyed by client type."""
+    def multicast_specs(self) -> Tuple["MulticastSpec", ...]:
+        return tuple(
+            integration.multicast
+            for integration in self._integrations.values()
+            if integration.multicast is not None
+        )
+
+    def mdns_specs(self) -> Tuple["MDNSSpec", ...]:
+        return tuple(
+            integration.mdns
+            for integration in self._integrations.values()
+            if integration.mdns is not None
+        )
+
+    def subnet_specs(self) -> Tuple["SubnetScanSpec", ...]:
+        return tuple(
+            integration.subnet
+            for integration in self._integrations.values()
+            if integration.subnet is not None
+        )
+
+    def network_services(self) -> Dict[str, Tuple["NetworkServiceSpec", ...]]:
         return {
-            key: getattr(spec, capability)()
-            for key, spec in self._types.items()
-            if spec.provides(capability)
+            integration_id: integration.network_services
+            for integration_id, integration in self._integrations.items()
+            if integration.network_services
         }
 
-    def runtime_specs(self) -> Tuple[PrinterSpec, ...]:
-        """The live client specs, one per type, built once (the lazy boundary)."""
-        if self._built is None:
-            self._built = tuple(spec.build() for spec in self._types.values())
-        return self._built
-
     def metadata(self) -> Dict[str, "ProductMetadata"]:
-        """Catalogue product metadata keyed by client type, without building."""
-        return {key: spec.metadata for key, spec in self._types.items()}
+        return {
+            integration_id: integration.metadata
+            for integration_id, integration in self._integrations.items()
+        }
 
-    @staticmethod
     def camera_protocols(
-        clients: Iterable[PrinterSpec], disabled: bool = False
+        self, disabled: bool = False
     ) -> Tuple[Type["BaseCameraProtocol"], ...]:
         if disabled:
             return ()
         return tuple(
-            protocol for client in clients for protocol in client.camera_protocols
+            protocol
+            for integration in self._integrations.values()
+            for protocol in integration.camera_protocols()
         )
 
     def register_tasks(self, task_registry: "TaskRegistry") -> None:
-        """Let every type contribute its periodic / on-demand tasks once."""
-        for spec in self._types.values():
-            if spec.provides("register_tasks"):
-                spec.register_tasks(task_registry)
+        for integration in self._integrations.values():
+            if integration.register_tasks is not None:
+                integration.register_tasks(task_registry)
 
-    def flow(self, key: str, flow_id: str) -> Optional["Flow"]:
-        """Build ``flow_id`` for type ``key``, or ``None`` if it has no such flow."""
-        spec = self._types.get(key)
-        field = FLOW_FIELDS.get(flow_id)
-        if spec is None or field is None or not spec.provides(field):
+    @staticmethod
+    def _flow_factories(
+        integration: IntegrationSpec,
+    ) -> Tuple[Tuple[str, Callable[["ClientContext"], "Flow"]], ...]:
+        return tuple(
+            (flow_id, factory)
+            for flow_id, factory in (
+                ("add-printer", integration.add_printer_flow_factory),
+                ("account-login", integration.account_login_flow_factory),
+            )
+            if factory is not None
+        )
+
+    def flow(
+        self,
+        integration_id: str,
+        flow_id: str,
+        context: "ClientContext",
+    ) -> "Flow | None":
+        integration = self._integrations.get(integration_id)
+        if integration is None:
             return None
-        return getattr(spec, field)()
+        factory = next(
+            (
+                factory
+                for registered_id, factory in self._flow_factories(integration)
+                if registered_id == flow_id
+            ),
+            None,
+        )
+        return factory(context) if factory is not None else None
 
-    def brand_flows(self, key: str) -> List[str]:
-        """The flow ids type ``key`` exposes (in declaration order)."""
-        spec = self._types.get(key)
-        if spec is None:
+    def brand_flows(self, integration_id: str) -> List[str]:
+        integration = self._integrations.get(integration_id)
+        if integration is None:
             return []
-        return [
-            flow_id for flow_id, field in FLOW_FIELDS.items() if spec.provides(field)
-        ]
+        return [flow_id for flow_id, _ in self._flow_factories(integration)]
 
     def list_flows(self) -> Dict[str, List[str]]:
-        """Every type that exposes at least one flow, mapped to its flow ids."""
-        listing = {key: self.brand_flows(key) for key in self._types}
-        return {key: flows for key, flows in listing.items() if flows}
+        listing = {
+            integration_id: self.brand_flows(integration_id)
+            for integration_id in self._integrations
+        }
+        return {
+            integration_id: flows for integration_id, flows in listing.items() if flows
+        }
 
     def flow_brands(self) -> List[str]:
-        """Client types that expose a guided add-printer flow."""
         return sorted(
-            key
-            for key, spec in self._types.items()
-            if spec.provides("add_printer_flow")
+            integration_id
+            for integration_id, integration in self._integrations.items()
+            if integration.add_printer_flow_factory is not None
         )
 
     def discoverers(self) -> Dict[str, Callable]:
-        """``{key: async discover(timeout)}`` for every type that can list LAN
-        devices (overridden or the spec default — asked as ``discover() is not
-        None``, never ``provides``)."""
-        out: Dict[str, Callable] = {}
-        for key, spec in self._types.items():
-            discover = spec.discover()
-            if discover is not None:
-                out[key] = discover
-        return out
-
-    def account_providers(self) -> Dict[str, Callable[[], "AccountProvider"]]:
-        """Account-capability factories keyed by client type (factories, so
-        listing never builds a provider)."""
         return {
-            key: spec.account_provider
-            for key, spec in self._types.items()
-            if spec.provides("account_provider")
+            integration_id: integration.discover
+            for integration_id, integration in self._integrations.items()
+            if integration.discover is not None
         }

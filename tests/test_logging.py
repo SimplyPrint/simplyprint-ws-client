@@ -79,7 +79,7 @@ def test_routing_per_printer_and_system(tmp_path):
     assert (tmp_path / "p7" / "mqtt.log").read_text().strip().endswith("from mqtt")
     assert (tmp_path / "p7" / "main.log").read_text().strip().endswith("from base")
     assert (tmp_path / "system.log").read_text().strip().endswith("from system")
-    # No per-PrinterSpec file leaked at the root.
+    # No per-integration file leaked at the root.
     assert {p.name for p in tmp_path.glob("*.log")} == {"system.log"}
     handler.close()
 

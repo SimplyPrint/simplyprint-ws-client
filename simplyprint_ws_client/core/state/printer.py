@@ -1,17 +1,7 @@
 """The reactive printer state model tree (:class:`PrinterState` and its parts)."""
 
 import time
-from typing import (
-    Any,
-    ClassVar,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Union,
-    no_type_check,
-)
+from typing import Any, ClassVar, Dict, List, Optional, Set, Union, no_type_check
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -29,10 +19,10 @@ from simplyprint_ws_client.core.state.models import (
 from simplyprint_ws_client.core.state.notifications import NotificationsState
 from simplyprint_ws_client.common.model.reactive import ReactiveModel
 from simplyprint_ws_client.common.model.annotations import Exclusive, Untracked
+from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 from simplyprint_ws_client.core.state.utils import _resize_state_inplace
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.const import VERSION
-from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 from simplyprint_ws_client.core.api.ambient_check import AmbientCheck
 
 
@@ -40,22 +30,14 @@ class TemperatureState(ReactiveModel):
     actual: Optional[float] = None
     target: Optional[float] = None
 
-    def as_rounded(self, k: Literal["actual", "target"]) -> Optional[int]:
-        value: Optional[float] = getattr(self, k)
-
-        if value is None:
-            return None
-
-        return round(value)
-
     def is_heating(self) -> bool:
-        target = self.as_rounded("target")
-        actual = self.as_rounded("actual")
+        target = round(self.target) if self.target is not None else None
+        actual = round(self.actual) if self.actual is not None else None
         return target not in {None, 0} and target != actual
 
     def to_list(self):
-        actual = self.as_rounded("actual")
-        target = self.as_rounded("target")
+        actual = round(self.actual) if self.actual is not None else None
+        target = round(self.target) if self.target is not None else None
 
         return [actual] + ([target] if target is not None else [])
 
@@ -63,9 +45,7 @@ class TemperatureState(ReactiveModel):
         if not isinstance(other, TemperatureState):
             return False
 
-        return self.as_rounded("target") == other.as_rounded(
-            "target"
-        ) and self.as_rounded("actual") == other.as_rounded("actual")
+        return self.to_list() == other.to_list()
 
 
 class AmbientTemperatureState(ReactiveModel):
@@ -286,9 +266,6 @@ class JobInfoState(ReactiveModel, validate_assignment=True):
     filament: Optional[float] = None
     filename: Exclusive[Optional[str]] = None
     delay: Optional[float] = None
-    # Deprecated.
-    # ai: List[int]
-
     # These needs to always trigger a reset.
     started: Exclusive[bool] = False
     finished: Exclusive[bool] = False
@@ -643,13 +620,19 @@ class PrinterState(ReactiveModel):
     def is_heating(self) -> bool:
         return any([h.is_heating() for h in (self.bed, self.chamber, *self.tools)])
 
-    def populate_info_from_physical_machine(self, *skip: str):
-        """Set information about the physical machine the client is running on."""
-        for k, v in PhysicalMachine.get_info().items():
-            if k in skip:
-                continue
-
-            setattr(self.info, k, v)
+    def populate_info_from_physical_machine(self) -> None:
+        """Populate the typed host fields exposed to SimplyPrint."""
+        info = self.info
+        info.python_version = PhysicalMachine.python_version()
+        info.machine = PhysicalMachine.machine()
+        info.os = PhysicalMachine.operating_system()
+        info.mac = PhysicalMachine.mac_address()
+        info.is_ethernet = PhysicalMachine.is_ethernet()
+        info.ssid = PhysicalMachine.ssid()
+        info.hostname = PhysicalMachine.hostname()
+        info.local_ip = PhysicalMachine.local_ip()
+        info.core_count = PhysicalMachine.core_count()
+        info.total_memory = PhysicalMachine.total_memory()
 
     def mark_common_fields_as_changed(self):
         # Mark non-default fields as changed so they will be sent to the client.

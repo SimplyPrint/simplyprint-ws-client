@@ -80,8 +80,8 @@ def run(
         logger.warning("system command failed to start: %s", label, exc_info=True)
         raise
     logger.debug("system command exit: %s rc=%s", label, completed.returncode)
-    _log_output(logger, "stdout", getattr(completed, "stdout", None))
-    _log_output(logger, "stderr", getattr(completed, "stderr", None))
+    _log_output(logger, "stdout", completed.stdout)
+    _log_output(logger, "stderr", completed.stderr)
     return completed
 
 

@@ -24,10 +24,7 @@ from simplyprint_ws_client.integration.discovery.network import (
     diagnostic_status,
     service_diagnostic_check,
 )
-from simplyprint_ws_client.integration.discovery.spec import (
-    NetworkServiceSpec,
-    SubnetScanSpec,
-)
+from simplyprint_ws_client.integration.discovery.spec import SubnetScanSpec
 
 
 class SubnetScanBackend:
@@ -38,23 +35,9 @@ class SubnetScanBackend:
         self.logger = logging.getLogger("discovery")
         self.network_context = network_context or NetworkScanContext()
 
-    def _services(self) -> tuple[NetworkServiceSpec, ...]:
-        if self.spec.services:
-            return self.spec.services
-        if self.spec.port is None:
-            return ()
-        return (
-            NetworkServiceSpec(
-                id="control",
-                transport="tcp",
-                port=self.spec.port,
-                label=f"TCP {self.spec.port}",
-            ),
-        )
-
     async def _host_context(self, host: str) -> HostProbeContext:
         return await self.network_context.host_context(
-            host, self._services(), self.spec.gate_timeout
+            host, self.spec.services, self.spec.gate_timeout
         )
 
     async def _probe(self, host: str, context: HostProbeContext, timeout: float):

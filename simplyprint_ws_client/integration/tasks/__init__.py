@@ -1,8 +1,8 @@
 """Declarative recurring & on-demand tasks.
 
-Declare a task with the :data:`REGISTRY` decorator next to its coroutine; let the
-app's single :class:`SchedulerService` read the registry at startup and own all
-firing. A task reports by publishing to a
+Register task specs into an application-owned :class:`TaskRegistry`, then pass
+that registry to the app's single :class:`SchedulerService`. A task reports by
+publishing to a
 :class:`~simplyprint_ws_client.core.status.registry.StatusRegistry` (see
 :mod:`simplyprint_ws_client.core.status`), so periodic work and the status
 endpoint are decoupled: tasks compute on a schedule, the endpoint serves the
@@ -18,23 +18,24 @@ Example -- a producer codes against this contract::
     import time
     from datetime import timedelta
 
-    from simplyprint_ws_client.integration.tasks import REGISTRY, TaskContext
+    from simplyprint_ws_client.integration.tasks import TaskContext, TaskRegistry
     from simplyprint_ws_client.core.status import StatusEntry, StatusState
 
-    @REGISTRY.periodic(interval=timedelta(hours=1), name="ota.check")
-    async def check_for_update(ctx: TaskContext) -> None:
-        ...  # do the work
-        ctx.status.publish(StatusEntry(
-            section="ota",
-            state=StatusState.OK,
-            detail={"has_update": False},
-            updated_at=time.time(),
-            ttl=3600,
-        ))
+    def register_tasks(registry: TaskRegistry) -> None:
+        @registry.periodic(interval=timedelta(hours=1), name="ota.check")
+        async def check_for_update(ctx: TaskContext) -> None:
+            ...  # do the work
+            ctx.status.publish(StatusEntry(
+                section="ota",
+                state=StatusState.OK,
+                detail={"has_update": False},
+                updated_at=time.time(),
+                ttl=3600,
+            ))
 """
 
 from simplyprint_ws_client.integration.tasks.context import TaskContext
-from simplyprint_ws_client.integration.tasks.registry import REGISTRY, TaskRegistry
+from simplyprint_ws_client.integration.tasks.registry import TaskRegistry
 from simplyprint_ws_client.integration.tasks.scheduler import SchedulerService
 from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
 
@@ -42,7 +43,6 @@ __all__ = [
     "TaskSpec",
     "TaskFn",
     "TaskRegistry",
-    "REGISTRY",
     "TaskContext",
     "SchedulerService",
 ]

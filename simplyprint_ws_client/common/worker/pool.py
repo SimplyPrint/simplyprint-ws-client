@@ -14,8 +14,9 @@ on the consumer loop:
 * **THREAD** -- the producer runs in its own thread (its own loop, if async);
   items ride the courier back onto the consumer loop.
 * **PROCESS** -- the producer runs in a subprocess; payloads ride a zero-copy
-  :class:`SharedSlabChannel`; a reader thread couriers each :class:`SlabLease`
-  onto the loop, where the sink reads it and the slab is recycled.
+  :class:`SharedSlabChannel`. Selector loops watch its pipe directly; other
+  loops use a reader thread. Both feed the same bounded courier, which delivers
+  leases on the loop and then recycles their slabs.
 
 This is the engine the camera pool is rebuilt on; cameras are just one producer.
 """
@@ -46,6 +47,11 @@ _DEFAULT_MAXSIZE = 8
 
 #: How long stop() waits for a backend thread/process before giving up.
 JOIN_TIMEOUT = 2.0
+
+# Ordered through the process courier after its final frame.  Reaping from the
+# reader thread itself can close the courier before the loop has consumed that
+# frame, so normal completion is a delivery event, not an out-of-band callback.
+_PROCESS_DONE = object()
 
 
 def _join_or_warn(target, name: str, logger: logging.Logger) -> None:
@@ -224,6 +230,7 @@ class _ProcessBackend(_Backend):
         self._channel = SharedSlabChannel.create(n_slabs=n_slabs, slab_size=slab_size)
         self._stop = mp.Event()
         self._on_done = on_done
+        self._loop = provider.event_loop
         self._proc = mp.Process(
             target=_process_main,
             args=(producer, args, self._channel.child_args(), self._stop),
@@ -234,21 +241,32 @@ class _ProcessBackend(_Backend):
             provider=provider,
             policy=policy,
             maxsize=maxsize,
+            lossless=lambda item: item is _PROCESS_DONE,
             on_drop=self._recycle,
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_started = False
+        self._loop_readers = False
 
-    def _deliver(self, lease: SlabLease) -> None:
+    def _deliver(self, item: object) -> None:
+        if item is _PROCESS_DONE:
+            self._on_done()
+            return
+        if not isinstance(item, SlabLease):  # pragma: no cover -- internal invariant
+            raise TypeError(f"unexpected process courier item: {type(item)!r}")
+        lease = item
         try:
             self._on_item(lease.to_bytes(), lease.timestamp)
         finally:
             lease.release()
 
     @staticmethod
-    def _recycle(lease: SlabLease) -> None:
-        lease.release()  # a superseded/dropped frame still owns its slab
+    def _recycle(item: object) -> None:
+        if isinstance(item, SlabLease):
+            item.release()  # a superseded/dropped frame still owns its slab
 
     def _read_loop(self) -> None:
+        completion_queued = False
         try:
             while not self._stop.is_set():
                 lease = self._channel.recv(timeout=0.5)
@@ -259,23 +277,97 @@ class _ProcessBackend(_Backend):
                 # immediately instead of leaving its reader thread and process
                 # handle alive until the next camera demand.
                 if not self._proc.is_alive():
+                    completion_queued = self._courier.post(_PROCESS_DONE)
                     return
         finally:
+            # Explicit stop may close the courier before its ordered completion
+            # marker is accepted.  In that case the handle still needs retiring;
+            # normal process exit is retired by _deliver only after prior frames.
+            if not completion_queued:
+                self._on_done()
+
+    def _queue_one_readable(self) -> None:
+        """Queue one readable frame and yield back to the consumer loop."""
+        lease = self._channel.recv(timeout=0)
+        if lease is not None:
+            self._courier.post(lease)
+
+    def _queue_remaining(self) -> None:
+        """Queue the finite tail left by a process that has already exited."""
+        while True:
+            lease = self._channel.recv(timeout=0)
+            if lease is None:
+                return
+            self._courier.post(lease)
+
+    def _process_exited(self) -> None:
+        # Process exit is ordered after its pipe writes. Drain first so a
+        # one-shot producer's final frame is delivered before its handle retires.
+        self._queue_remaining()
+        self._remove_loop_readers()
+        if not self._courier.post(_PROCESS_DONE):
             self._on_done()
+
+    def _install_loop_readers(self) -> bool:
+        """Use native readiness notifications when the target loop supports it.
+
+        ``add_reader`` avoids an extra thread hop and is the reliable Unix path.
+        Proactor and non-local loops fall back to the courier reader thread.
+        """
+        try:
+            if asyncio.get_running_loop() is not self._loop:
+                return False
+        except RuntimeError:
+            return False
+
+        channel_fd = self._channel.reader_fileno()
+        process_fd = self._proc.sentinel
+        try:
+            self._loop.add_reader(channel_fd, self._queue_one_readable)
+        except (AttributeError, NotImplementedError, OSError, ValueError):
+            return False
+        try:
+            self._loop.add_reader(process_fd, self._process_exited)
+        except (AttributeError, NotImplementedError, OSError, ValueError):
+            self._loop.remove_reader(channel_fd)
+            return False
+        self._loop_readers = True
+        return True
+
+    def _remove_loop_readers(self) -> None:
+        if not self._loop_readers:
+            return
+        self._loop_readers = False
+        for descriptor in (self._channel.reader_fileno(), self._proc.sentinel):
+            try:
+                self._loop.remove_reader(descriptor)
+            except (
+                AttributeError,
+                NotImplementedError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):
+                pass
 
     def start(self) -> None:
         self._proc.start()
-        self._reader.start()
+        if not self._install_loop_readers():
+            self._reader_started = True
+            self._reader.start()
 
     def request_stop(self) -> None:
         self._stop.set()
+        self._remove_loop_readers()
 
     def finalize(self) -> None:
+        self._remove_loop_readers()
         self._proc.join(timeout=JOIN_TIMEOUT)
         if self._proc.is_alive():
             self._proc.terminate()
             _join_or_warn(self._proc, "worker process", _logger)
-        _join_or_warn(self._reader, "worker reader thread", _logger)
+        if self._reader_started:
+            _join_or_warn(self._reader, "worker reader thread", _logger)
         # drain=False: recycle any queued leases SYNCHRONOUSLY here (via _recycle,
         # which releases their memoryviews and slabs) before the channel is torn
         # down. The default drain=True would instead schedule delivery onto the
@@ -310,20 +402,33 @@ class WorkerHandle:
             return self._stopped
 
     def _backend_done(self) -> None:
-        self.stop()
+        self._stop(natural_completion=True)
 
     def stop(self) -> None:
         """Stop the worker WITHOUT blocking: signal the producer, hand the
         backend to the pool's reaper for its join, and release the slot. Safe to
         call on the consumer loop -- the up-to-``JOIN_TIMEOUT`` join never runs
         here."""
+        self._stop(natural_completion=False)
+
+    def _stop(self, *, natural_completion: bool) -> None:
         with self._lock:
             if self._stopped:
                 return
             self._stopped = True
+            release_capacity = self._release_capacity
+            if natural_completion:
+                # The PROCESS completion marker is emitted only after its
+                # sentinel is readable. It no longer consumes process capacity,
+                # so release on the consumer loop without waiting for resource
+                # cleanup in the reaper thread.
+                self._release_capacity = None
         try:
             self._backend.request_stop()
-            self._reap(self._backend, self._release_capacity)
+            if natural_completion and release_capacity is not None:
+                release_capacity()
+                release_capacity = None
+            self._reap(self._backend, release_capacity)
         finally:
             self._release(self.id)
 
@@ -484,7 +589,18 @@ class WorkerPool:
                 return
             released = True
             try:
-                self._provider.event_loop.call_soon_threadsafe(slots.release)
+                loop = self._provider.event_loop
+            except RuntimeError:
+                return
+            try:
+                on_consumer_loop = asyncio.get_running_loop() is loop
+            except RuntimeError:
+                on_consumer_loop = False
+            if on_consumer_loop:
+                slots.release()
+                return
+            try:
+                loop.call_soon_threadsafe(slots.release)
             except RuntimeError:
                 pass
 

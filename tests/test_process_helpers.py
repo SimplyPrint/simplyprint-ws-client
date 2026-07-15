@@ -16,9 +16,7 @@ def _patch_windows_subprocess(monkeypatch):
     monkeypatch.setattr(
         process.subprocess, "STARTUPINFO", _FakeStartupInfo, raising=False
     )
-    monkeypatch.setattr(
-        process.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False
-    )
+    monkeypatch.setattr(process.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
     monkeypatch.setattr(
         process.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False
     )

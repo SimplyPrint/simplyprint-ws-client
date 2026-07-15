@@ -1,35 +1,47 @@
-"""The authoring kit: what a vendor subclasses to integrate a printer.
+"""Public authoring components for a printer integration."""
 
-Lazy (PEP 562) like every layer ``__init__`` -- importing the package costs
-nothing until a name is used.
-"""
+from simplyprint_ws_client.core.client_context import ClientContext
+from simplyprint_ws_client.integration.client import AppUpdater, JobEdge, PrinterClient
+from simplyprint_ws_client.integration.drivers import (
+    DeviceAuthError,
+    DeviceDriver,
+    DevicePoller,
+    DeviceReachability,
+    DeviceSession,
+    DeviceSource,
+    LeaseDriver,
+    MqttDriver,
+    WsDriver,
+)
+from simplyprint_ws_client.integration.spec import (
+    IntegrationCapability,
+    IntegrationId,
+    IntegrationSpec,
+    IntegrationTransport,
+    ProductMetadata,
+    discover_from_service,
+    model_aware_presentation,
+)
 
-from __future__ import annotations
-
-import importlib as _importlib
-
-_PUBLIC = {
-    "PrinterClient": ".client",
-    "JobEdge": ".client",
-    "AppUpdater": ".client",
-    "DeviceDriver": ".drivers",
-    "DeviceAuthError": ".drivers",
-    "LeaseDriver": ".drivers",
-    "WsDriver": ".drivers",
-    "MqttDriver": ".drivers",
-    "DevicePoller": ".drivers",
-}
-
-
-def __getattr__(name: str):
-    module_path = _PUBLIC.get(name)
-    if module_path is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = _importlib.import_module(module_path, __name__)
-    value = getattr(module, name)
-    globals()[name] = value
-    return value
-
-
-def __dir__():
-    return sorted(set(globals()) | set(_PUBLIC))
+__all__ = [
+    "AppUpdater",
+    "ClientContext",
+    "DeviceAuthError",
+    "DeviceDriver",
+    "DevicePoller",
+    "DeviceReachability",
+    "DeviceSession",
+    "DeviceSource",
+    "IntegrationCapability",
+    "IntegrationId",
+    "IntegrationSpec",
+    "IntegrationTransport",
+    "JobEdge",
+    "LeaseDriver",
+    "MqttDriver",
+    "PrinterClient",
+    "ProductMetadata",
+    "WsDriver",
+    "discover_from_service",
+    "model_aware_presentation",
+]

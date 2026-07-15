@@ -75,10 +75,9 @@ class SubnetScanSpec(Generic[DiscoveredRecord]):
     """How to discover one brand by actively probing the local subnet(s).
 
     The shared backend enumerates hosts and bounds concurrency; the brand only
-    supplies a ``probe`` coroutine that confirms (and identifies) one host. When
-    ``port`` is set the backend first does a cheap TCP reachability check and only
-    runs ``probe`` on hosts that answer, so the (expensive) brand handshake never
-    touches the hundreds of dead addresses in a subnet.
+    supplies a ``probe`` coroutine that confirms (and identifies) one host.
+    Required ``services`` are checked before the probe, so an expensive brand
+    handshake never touches hosts whose declared endpoints are closed.
     """
 
     brand: str
@@ -86,12 +85,9 @@ class SubnetScanSpec(Generic[DiscoveredRecord]):
     probe: Callable[[str], Awaitable[Optional[DiscoveredRecord]]]
     #: Stable cache key for a probed record (e.g. serial, falling back to host).
     key: Callable[[DiscoveredRecord], str]
-    #: Optional cheap TCP port gate run before ``probe``.
-    port: Optional[int] = None
     concurrency: int = 64
     gate_timeout: float = 0.3
-    #: Declarative services used for discovery/onboarding/debug diagnostics. When
-    #: absent, ``port`` is adapted into one required TCP service for compatibility.
+    #: Declarative services used for discovery/onboarding/debug diagnostics.
     services: tuple[NetworkServiceSpec, ...] = ()
     #: Optional richer probe hook that receives cached port/service facts. Existing
     #: brands can keep the simple ``probe(host)`` hook until they need context.

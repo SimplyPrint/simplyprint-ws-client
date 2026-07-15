@@ -9,21 +9,20 @@ resolving the camera URI -- is identical across every brand; only the
 device-data extraction differs.
 
 This used to be ~80 near-identical lines re-implemented in every integration's
-``printer.py``. It now lives here as :class:`PrinterClient`; a brand subclass
-supplies only what is genuinely device-specific via the hooks at the bottom of
-the class:
+``printer.py``. It now lives here as :class:`PrinterClient`; a brand constructor
+attaches its concrete device drivers, then supplies only what is genuinely
+device-specific via the hooks at the bottom of the class:
 
-* ``device_drivers``        -- declare how the device is reached (links/poller)
 * ``on_device_connected`` / ``on_device_disconnected`` / ``on_device_message``
                             -- the device edges, delivered on the client loop
 * ``poll_device`` / ``refresh_device_credentials``
                             -- the polling cycle and the re-auth seam
-* ``_resolve_camera_uri``   -- the device's current camera URL (or None)
+* ``resolve_camera_uri``    -- the device's current camera URL (or None)
 * ``on_job_start`` / ``on_job_finish`` / ``on_job_progress``
                             -- capture/classify the device's job fields (each
                                receives a :class:`JobEdge` carrying ``raw``)
-* ``_stop_connection``      -- extra device teardown after drivers stop
-* ``_tick_progress``        -- drive a client-side progress shim each tick
+* ``stop_connection``       -- extra device teardown after drivers stop
+* ``tick_progress``         -- drive a client-side progress shim each tick
 
 The subtle part is :meth:`apply_status`: the guard -> edge -> apply pipeline is
 owned here whole, because the *transition semantics* are identical across
@@ -38,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from functools import cached_property
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import (
@@ -46,33 +44,45 @@ from typing import (
     Any,
     ClassVar,
     Coroutine,
-    Dict,
     Generic,
-    Iterable,
     Optional,
     Protocol,
-    Tuple,
     TypeVar,
 )
 
 from typing_extensions import TypeVar as TypeVarWithDefault
 
-from simplyprint_ws_client.core.client import ClientConfigChangedEvent
+from simplyprint_ws_client.core.client import Client, ClientConfigChangedEvent
+from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.core.state import PrinterStatus
+from simplyprint_ws_client.core.state import FileProgressStateEnum, PrinterStatus
 from simplyprint_ws_client.core.protocol.messages import (
+    ApiRestartDemandData,
     CancelDemandData,
+    ConnectedMsg,
+    FileDemandData,
+    FileProgressMsg,
     GcodeDemandData,
     PauseDemandData,
+    PeripheralActionDemandData,
     PluginInstallDemandData,
+    PrinterSettingsMsg,
     ResumeDemandData,
+    ResolveNotificationDemandData,
+    SendLogsDemandData,
+    SetMaterialDataDemandData,
     SkipObjectsDemandData,
+    StartPrintDemandData,
+    StreamOffDemandData,
+    StreamOnDemandData,
     SystemRestartDemandData,
     SystemShutdownDemandData,
     TerminalDemandData,
+    WebcamSnapshotDemandData,
+    WebcamTestDemandData,
 )
-from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
-from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
+from simplyprint_ws_client.core.protocol.models import DemandMsgType, ServerMsgType
+from simplyprint_ws_client.integration.camera.controller import CameraController
 
 if TYPE_CHECKING:
     import logging
@@ -81,40 +91,12 @@ if TYPE_CHECKING:
 
     from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
     from simplyprint_ws_client.integration.drivers import DeviceDriver
+    from simplyprint_ws_client.integration.transfer import FileTransfer
 
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
 #: The brand payload a :class:`JobEdge` carries; defaults to ``object`` so an
 #: unparameterized ``JobEdge`` keeps working for existing subscribers.
 TRaw = TypeVarWithDefault("TRaw", default=object)
-
-#: Host usage is read at most this often, shared across every client, so the
-#: delta-based ``psutil.cpu_percent`` isn't reset by every client every tick.
-_HOST_USAGE_MIN_INTERVAL = 5.0
-_host_usage_snapshot: Dict[str, int] = {}
-_host_usage_read_at: float = 0.0
-
-
-async def _host_usage() -> Dict[str, int]:
-    """Return a process-wide, throttled snapshot of host CPU/memory usage.
-
-    The refresh reads sysfs/proc via ``psutil`` and is offloaded to a worker
-    thread so it never blocks the loop; a fresh-enough snapshot is returned
-    immediately without a thread hop.
-    """
-    global _host_usage_snapshot, _host_usage_read_at
-    now = time.monotonic()
-    if (
-        not _host_usage_snapshot
-        or now - _host_usage_read_at >= _HOST_USAGE_MIN_INTERVAL
-    ):
-        try:
-            _host_usage_snapshot = await asyncio.to_thread(PhysicalMachine.get_usage)
-        except RuntimeError:
-            # Shutdown race: a final tick can land after the loop's executor
-            # closed; the stale (possibly empty) snapshot is the right answer.
-            return _host_usage_snapshot
-        _host_usage_read_at = now
-    return _host_usage_snapshot
 
 
 @dataclass(frozen=True)
@@ -137,8 +119,8 @@ class AppUpdater(Protocol):
 
     Updating the connector is an app-level concern, not a brand one, so the
     library handles the plugin-install demand generically and delegates the
-    actual update here. The integration supplies an implementation (and sets
-    :attr:`PrinterClient.app_updater`); brands never see it.
+    actual update here. The host injects one implementation through
+    :class:`ClientContext`; brands never see it.
     """
 
     #: The connector's plugin name in the SimplyPrint demand. A demand naming a
@@ -150,17 +132,29 @@ class AppUpdater(Protocol):
         ...
 
 
-class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
+class OwnedResource(Protocol):
+    """An async resource retained and closed by a printer client."""
+
+    async def close(self) -> None:
+        """Release all work owned by this resource."""
+        ...
+
+
+TOwnedResource = TypeVar("TOwnedResource", bound=OwnedResource)
+TDeviceDriver = TypeVar("TDeviceDriver", bound="DeviceDriver")
+
+
+class PrinterClient(Client[TConfig], Generic[TConfig]):
     """Common base for device printer clients.
 
     Subclasses own ``__init__`` (device info population, device-client
     construction) and the device-model -> :class:`PrinterState` mapping; they
-    declare how the device is reached via :meth:`device_drivers`. Everything
-    else (lifecycle, status application, camera resolution, host telemetry) is
-    owned here and parameterised through the hooks below.
+    attach each concrete link or poller during construction. Everything else
+    (lifecycle, status application, camera resolution, host telemetry) is owned
+    here and parameterised through the hooks below.
     """
 
-    #: Camera mixin tuning consumed by :meth:`_init_camera`. Subclasses override
+    #: Camera-controller tuning consumed during construction. Subclasses override
     #: the class attribute when their camera wants a different cache window.
     #: How long a continuous camera worker may sit unpolled before it pauses.
     #: Must comfortably exceed the cloud's stream-demand cadence (~15s between
@@ -176,9 +170,14 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     #: be a per-call ``guard_pause=`` flag repeated at every call site).
     hold_pausing: ClassVar[bool] = False
 
-    #: Connector self-updater, wired once by the integration (``None`` = updates
-    #: not wired, so a plugin-install demand is a no-op). See :class:`AppUpdater`.
-    app_updater: ClassVar[Optional[AppUpdater]] = None
+    #: Most devices lose their camera with their control link. Brands whose
+    #: camera remains independently reachable opt out without replacing the
+    #: shared disconnect/status projection.
+    clear_camera_on_unreachable: ClassVar[bool] = True
+
+    #: Maximum time a true link loss may retain a status that protects active
+    #: physical work. Idle devices still project OFFLINE immediately.
+    device_loss_grace: ClassVar[float] = 300.0
 
     # ``active`` is a pure allocation-policy knob ("represent this printer on
     # the SimplyPrint connection"), true for the client's whole membership.
@@ -193,10 +192,97 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     # not); halt on SimplyPrint deallocation; teardown once at final cleanup
     # (see the Client lifecycle docstrings). Drivers run from init to teardown.
 
+    def __init__(
+        self,
+        config: TConfig,
+        *,
+        context: ClientContext,
+    ) -> None:
+        super().__init__(config, context=context)
+        self.app_updater = context.app_updater
+        self.host_telemetry = context.host_telemetry
+        self.camera = CameraController(
+            printer=self.printer,
+            logger=self.logger,
+            event_loop_provider=self,
+            send_stream=self.send,
+            context=context,
+            pause_timeout=self.camera_pause_timeout,
+            max_cache_age=self.camera_max_cache_age,
+        )
+        self._owned_resources: list[OwnedResource] = []
+        self._drivers: list["DeviceDriver"] = []
+        self.file_transfer: Optional["FileTransfer"] = None
+        self._register_printer_handlers()
+
+    def _register_printer_handlers(self) -> None:
+        """Install the author-facing printer routes in one visible table."""
+        on = self.event_bus.on
+        on(ServerMsgType.CONNECTED, self.on_connected)
+        on(ServerMsgType.PRINTER_SETTINGS, self.on_printer_settings)
+        on(DemandMsgType.FILE, self.on_file)
+        on(DemandMsgType.START_PRINT, self.on_start_print)
+        on(DemandMsgType.PAUSE, self.on_pause)
+        on(DemandMsgType.RESUME, self.on_resume)
+        on(DemandMsgType.CANCEL, self.on_cancel)
+        on(DemandMsgType.GCODE, self.on_gcode)
+        on(DemandMsgType.TERMINAL, self.on_terminal)
+        on(DemandMsgType.SKIP_OBJECTS, self.on_skip_objects)
+        on(DemandMsgType.SYSTEM_RESTART, self.on_system_restart)
+        on(DemandMsgType.SYSTEM_SHUTDOWN, self.on_system_shutdown)
+        on(DemandMsgType.API_RESTART, self.on_api_restart)
+        on(DemandMsgType.PLUGIN_INSTALL, self.on_plugin_install)
+        on(DemandMsgType.SEND_LOGS, self.on_send_logs)
+        on(DemandMsgType.PERIPHERAL_ACTION, self.on_peripheral_action)
+        on(DemandMsgType.SET_MATERIAL_DATA, self.on_set_material_data)
+        on(DemandMsgType.RESOLVE_NOTIFICATION, self.on_resolve_notification)
+        on(DemandMsgType.STREAM_ON, self.on_stream_on)
+        on(DemandMsgType.STREAM_OFF, self.on_stream_off)
+        on(DemandMsgType.TEST_WEBCAM, self.on_test_webcam)
+        on(DemandMsgType.WEBCAM_SNAPSHOT, self.on_webcam_snapshot)
+
+    def own(self, resource: TOwnedResource) -> TOwnedResource:
+        """Retain an async resource for reverse-order teardown."""
+        self._owned_resources.append(resource)
+        return resource
+
+    def attach_file_transfer(self, transfer: "FileTransfer") -> None:
+        """Install the one FILE/START lifecycle for this printer."""
+        if self.file_transfer is not None:
+            raise RuntimeError("a file transfer is already attached")
+        self.file_transfer = self.own(transfer)
+
+    def attach_driver(self, driver: TDeviceDriver) -> TDeviceDriver:
+        """Retain one concrete device link or poller for this client."""
+        self._drivers.append(driver)
+        return driver
+
+    @property
+    def drivers(self) -> tuple["DeviceDriver", ...]:
+        """The drivers attached by the concrete printer constructor."""
+        return tuple(self._drivers)
+
+    async def report_job_error(self, job_id: int, message: str) -> None:
+        """Report a superseded FILE operation without exposing ``send``.
+
+        The transfer controller depends on this narrow callback instead of the
+        client's message construction, dispatch flags, or outbound API.
+        """
+        await self.send(
+            FileProgressMsg(
+                data={
+                    "state": FileProgressStateEnum.ERROR,
+                    "job_id": job_id,
+                    "message": message,
+                }
+            ),
+            skip_dispatch=True,
+        )
+
     async def init(self) -> None:
         """Arm the device drivers and keep them tracking the config."""
         self.event_bus.on(ClientConfigChangedEvent, self._on_config_changed_base)
-        for driver in self._device_drivers:
+        for driver in self._drivers:
             driver.start()
 
     def _on_config_changed_base(self) -> None:
@@ -210,7 +296,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     async def _apply_config_change(self) -> None:
         self.update_camera_uri()
-        for driver in self._device_drivers:
+        for driver in self._drivers:
             driver.ensure_current()
 
     async def tick(self, _delta) -> None:
@@ -218,36 +304,28 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         telemetry, the SimplyPrint heartbeat ping (interval-gated, only while
         added), and the driver ensure-started sweep (a driver whose config
         wasn't ready at init retries here for free)."""
-        self._tick_progress()
+        await self.project_device_reachability()
+        self.tick_progress()
         self.printer.ambient_temperature.tick(self.printer)
         await self.update_host_telemetry()
         if self.is_added():
             await self.send_ping()
-        for driver in self._device_drivers:
+        for driver in self._drivers:
             driver.ensure_started()
 
     async def teardown(self) -> None:
-        """Final cleanup: stop the drivers, then any extra device teardown."""
+        """Final cleanup: close owned work, then stop device-side resources."""
+        while self._owned_resources:
+            resource = self._owned_resources.pop()
+            try:
+                await resource.close()
+            except Exception:  # noqa: BLE001 -- close every retained resource
+                self.logger.warning("owned resource close failed", exc_info=True)
         await super().teardown()
-        for driver in self._device_drivers:
-            driver.stop()
-        await self.shutdown_camera_mixin()
-        self.teardown_camera_mixin()
-        await self._stop_connection()
-
-    # -- device drivers: how this client reaches its physical printer --
-
-    def device_drivers(self) -> Iterable["DeviceDriver"]:
-        """Declare how this client reaches its device: zero or more drivers
-        (:class:`~simplyprint_ws_client.integration.drivers.WsDriver` /
-        :class:`~simplyprint_ws_client.integration.drivers.MqttDriver` /
-        :class:`~simplyprint_ws_client.integration.drivers.DevicePoller`).
-        Called once; the base owns when they start/suspend/stop."""
-        return ()
-
-    @cached_property
-    def _device_drivers(self) -> Tuple["DeviceDriver", ...]:
-        return tuple(self.device_drivers())
+        for driver in self._drivers:
+            await driver.close()
+        await self.camera.close()
+        await self.stop_connection()
 
     async def on_device_connected(self, driver: "DeviceDriver") -> None:
         """A driver reached the device: ensure allocation and (re)resolve the
@@ -261,17 +339,69 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     async def on_device_disconnected(
         self, driver: "DeviceDriver", reason: Optional[object] = None
     ) -> None:
-        """A driver lost the device: report it OFFLINE and drop the camera.
+        """Handle the true link edge immediately, without inferring job state.
 
-        The printer stays allocated (``active`` untouched): liveness is status,
-        allocation is membership. The driver keeps reconnecting on its own, so
-        the connected edge restores the status when the device returns.
+        The driver separately projects an unprotected loss (or a protected
+        loss whose bounded deadline expires) through
+        :meth:`on_device_unreachable`.
         """
         self.logger.info(
             "Disconnected from printer%s", f" ({reason})" if reason else ""
         )
+
+    def link_loss_is_protected(self) -> bool:
+        """Whether an immediate OFFLINE would contradict active work."""
+        return (
+            self.printer.is_printing()
+            or self.printer.status == PrinterStatus.DOWNLOADING
+            or self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
+        )
+
+    async def project_device_reachability(self, now: Optional[float] = None) -> bool:
+        """Project all driver sessions into one printer liveness outcome.
+
+        Drivers own observations; this client owns status policy. Any live
+        driver keeps the printer reachable. When all observed paths are down,
+        active print/transfer state is held until the most recent down edge's
+        fixed grace expires. Returns whether OFFLINE was applied now.
+        """
+        from simplyprint_ws_client.integration.drivers import DeviceReachability
+
+        sessions = tuple((driver, driver.session) for driver in self._drivers)
+        if not sessions or any(
+            session.reachability is DeviceReachability.UP for _, session in sessions
+        ):
+            return False
+        if any(
+            session.reachability is DeviceReachability.NEVER_SEEN
+            for _, session in sessions
+        ):
+            return False
+        down = tuple(
+            (driver, session)
+            for driver, session in sessions
+            if session.reachability is DeviceReachability.DOWN
+        )
+        if not down:
+            return False
+
+        protected = self.link_loss_is_protected()
+        if (
+            self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
+            and not self.printer.is_printing()
+        ):
+            self.printer.status = PrinterStatus.DOWNLOADING
+        latest_down = max(session.observed_at for _, session in down)
+        if protected and (time.monotonic() if now is None else now) < (
+            latest_down + self.device_loss_grace
+        ):
+            return False
+        if self.printer.status == PrinterStatus.OFFLINE:
+            return False
         self.printer.status = PrinterStatus.OFFLINE
-        self.clear_camera_uri()
+        if self.clear_camera_on_unreachable:
+            self.clear_camera_uri()
+        return True
 
     async def on_device_message(self, message: object, driver: "DeviceDriver") -> None:
         """One inbound device message (a link's frame payload / an MqttMessage).
@@ -287,12 +417,72 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         ``True`` to have the driver restart with them. Default: cannot refresh."""
         return False
 
-    # Override what your device supports; each default is a no-op (logged at
-    # debug). An override registers exactly once -- autowire resolves one
-    # attribute per name through the MRO -- and may use any tolerated arity.
+    # Override what your device supports. Each route above binds one public,
+    # typed method exactly once; names and annotations never select events.
 
     def _unhandled_demand(self, name: str) -> None:
         self.logger.debug("demand %s received but not implemented", name)
+
+    async def on_connected(self, _msg: ConnectedMsg) -> None:
+        """SimplyPrint accepted this printer connection."""
+
+    async def on_printer_settings(self, _msg: PrinterSettingsMsg) -> None:
+        """React after the core has applied cloud-side printer settings."""
+
+    async def on_stream_on(self, data: Optional[StreamOnDemandData] = None) -> None:
+        """Start the composed camera stream.
+
+        Brands may override to prepare device-side camera power, then call
+        ``await super().on_stream_on(data)``.
+        """
+        await self.camera.stream_on(data)
+
+    async def on_stream_off(self, data: Optional[StreamOffDemandData] = None) -> None:
+        """Pause the composed camera stream and discard stream credit."""
+        await self.camera.stream_off(data)
+
+    async def on_test_webcam(self, data: Optional[WebcamTestDemandData] = None) -> None:
+        """Capture one camera frame for the webcam test demand."""
+        await self.camera.test_webcam(data)
+
+    async def on_webcam_snapshot(
+        self, data: Optional[WebcamSnapshotDemandData] = None
+    ) -> None:
+        """Admit one stream-frame credit or identified snapshot request."""
+        await self.camera.snapshot(data)
+
+    async def on_api_restart(self, _data: ApiRestartDemandData) -> None:
+        self._unhandled_demand("api_restart")
+
+    async def on_send_logs(self, _data: SendLogsDemandData) -> None:
+        self._unhandled_demand("send_logs")
+
+    async def on_peripheral_action(self, _data: PeripheralActionDemandData) -> None:
+        self._unhandled_demand("peripheral_action")
+
+    async def on_set_material_data(self, _data: SetMaterialDataDemandData) -> None:
+        """Apply device-side material changes after core state is updated."""
+
+    async def on_resolve_notification(
+        self, _data: ResolveNotificationDemandData
+    ) -> None:
+        """React after the core resolves/responds to a notification."""
+
+    async def on_file(self, data: FileDemandData) -> None:
+        """Submit a file to the attached transfer lifecycle."""
+        if self.file_transfer is None:
+            self._unhandled_demand("file")
+            return
+        self.file_transfer.submit(data)
+
+    async def on_start_print(
+        self, _data: Optional[StartPrintDemandData] = None
+    ) -> None:
+        """Start the file staged by a prior FILE demand."""
+        if self.file_transfer is None:
+            self._unhandled_demand("start_print")
+            return
+        self.file_transfer.start_staged()
 
     async def on_pause(self, data: PauseDemandData) -> None:
         """SimplyPrint asks the printer to pause the running job."""
@@ -329,7 +519,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         :meth:`on_system_restart` (``PhysicalMachine.shutdown()``)."""
         self._unhandled_demand("system_shutdown")
 
-    async def _stop_connection(self) -> None:
+    async def stop_connection(self) -> None:
         """Extra device teardown after the drivers stop (close an HTTP session,
         send a goodbye). Default no-op."""
 
@@ -345,7 +535,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         """
         return asyncio.run_coroutine_threadsafe(coro, self.event_loop)
 
-    def _tick_progress(self) -> None:
+    def tick_progress(self) -> None:
         """Drive a client-side progress shim each tick. Default no-op; devices
         with a fake-progress shim override to tick it."""
 
@@ -363,7 +553,7 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         """
         if not self._is_same_device(device):
             return False
-        if not self._apply_discovered(device):
+        if not self.update_from_discovery(device):
             return False
         self.event_bus.emit_sync(ClientConfigChangedEvent)
         return True
@@ -371,16 +561,14 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     def _is_same_device(self, device: "DiscoveredDevice") -> bool:
         """True when ``device`` is this client's printer, by hardware identity."""
         from simplyprint_ws_client.integration.discovery.reconcile import (
-            config_hardware_id,
-            device_hardware_id,
+            DeviceReconciler,
         )
 
-        hardware_id = device_hardware_id(device.host, device.serial, device.extra)
-        return hardware_id is not None and hardware_id == config_hardware_id(
-            self.config
+        return DeviceReconciler.same_device(
+            self.config, device, allow_address_match=False
         )
 
-    def _apply_discovered(self, device: "DiscoveredDevice") -> bool:
+    def update_from_discovery(self, device: "DiscoveredDevice") -> bool:
         """Brand hook: update this config's mutable network fields from a
         re-announced ``device`` (already confirmed to be this printer). Return
         whether anything changed. Default no-op for devices without passive
@@ -495,22 +683,14 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
     def on_job_progress(self, edge: JobEdge) -> None:
         """Update in-progress job fields (progress/layer/time). Default no-op."""
 
-    def _init_camera(self, **kwargs) -> None:
-        """Initialise the camera mixin with the device-tuned cache constants."""
-        self.initialize_camera_mixin(
-            pause_timeout=self.camera_pause_timeout,
-            max_cache_age=self.camera_max_cache_age,
-            **kwargs,
-        )
-
-    def _resolve_camera_uri(self) -> Optional["URL"]:
+    def resolve_camera_uri(self) -> Optional["URL"]:
         """Return the device's current camera URI, or ``None`` if unavailable.
         Device hook (the brand's probe); a user-set ``custom_webcam_url`` wins
         before this is even consulted (see :meth:`update_camera_uri`)."""
         return None
 
     def update_camera_uri(self) -> None:
-        """Resolve the camera URI and hand it to the mixin, logging the
+        """Resolve the camera URI and hand it to the controller, logging the
         outcome (and redacting any password) the way every integration did by
         hand.
 
@@ -518,13 +698,13 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
         over the brand's own camera resolution -- every printer supports a
         custom webcam, with zero brand code.
         """
-        custom = getattr(self.config, "custom_webcam_url", None)
+        custom = self.config.custom_webcam_url
         if custom:
             from yarl import URL as _URL
 
             camera_uri = _URL(custom)
         else:
-            camera_uri = self._resolve_camera_uri()
+            camera_uri = self.resolve_camera_uri()
 
         if not camera_uri:
             self.logger.debug("No camera URI available")
@@ -537,12 +717,9 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
             redacted_uri = camera_uri
 
         try:
-            self.camera_uri = camera_uri
-
-            # NB: if/elif rather than match — the library supports Python 3.9.
-            if self.camera_status == "new":
+            if self.camera.set_uri(camera_uri):
                 self.logger.debug("Set camera URI to %s", redacted_uri)
-            elif self.camera_status == "err":
+            else:
                 self.logger.warning("Failed to set camera URI to %s", redacted_uri)
 
         except Exception as e:
@@ -552,13 +729,15 @@ class PrinterClient(ClientCameraMixin[TConfig], Generic[TConfig]):
 
     def clear_camera_uri(self) -> None:
         try:
-            self.camera_uri = None
+            self.camera.set_uri(None)
         except Exception as e:
             self.logger.warning("Failed to clear camera URI", exc_info=e)
 
     async def update_host_telemetry(self) -> None:
         """Populate the host CPU/memory sensors from the machine running the client."""
-        usage = await _host_usage()
+        if self.host_telemetry is None:
+            return
+        usage = await self.host_telemetry()
         self.printer.cpu_info.usage = usage.get("usage")
         self.printer.cpu_info.temp = usage.get("temp")
         self.printer.cpu_info.memory = usage.get("memory")

@@ -16,6 +16,7 @@ import errno
 import logging
 import socket
 import struct
+import sys
 from abc import abstractmethod
 
 from simplyprint_ws_client.events import EventBus
@@ -33,9 +34,9 @@ class MulticastListenerBase(
     """One always-on multicast listener for a single brand spec."""
 
     #: Label used in the listening/stopping log lines.
-    _listen_label = "discovery"
+    listen_label = "discovery"
     #: Label used in the bind-retry warning.
-    _port_label = "discovery"
+    port_label = "discovery"
 
     def __init__(self, spec, event_bus: EventBus) -> None:
         AsyncStoppable.__init__(self)
@@ -53,25 +54,24 @@ class MulticastListenerBase(
         return self.devices.values()
 
     @abstractmethod
-    def _protocol_factory(self) -> asyncio.DatagramProtocol: ...
+    def protocol_factory(self) -> asyncio.DatagramProtocol: ...
 
     @abstractmethod
-    async def _bind(self, sock: socket.socket) -> None:
+    async def bind_socket(self, sock: socket.socket) -> None:
         """Bind the socket (fixed announcement port or ephemeral, per backend)."""
 
     @abstractmethod
-    def _join_group(self, sock: socket.socket) -> None:
+    def join_group(self, sock: socket.socket) -> None:
         """Join the multicast group with the backend's failure policy."""
 
     @abstractmethod
-    async def _run_loop(self, transport: asyncio.DatagramTransport) -> None:
+    async def run_transport(self, transport: asyncio.DatagramTransport) -> None:
         """The backend's long-lived send/wait loop (until stopped)."""
 
     def _make_socket(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        if hasattr(socket, "SO_REUSEADDR"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform != "win32":
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         if self.spec.multicast_ttl is not None:
             sock.setsockopt(
@@ -80,7 +80,7 @@ class MulticastListenerBase(
         sock.setblocking(False)
         return sock
 
-    async def _bind_fixed_port(self, sock: socket.socket) -> None:
+    async def bind_fixed_port(self, sock: socket.socket) -> None:
         """Bind the spec's fixed port, retrying while it is briefly in use
         (e.g. a previous instance still tearing down)."""
         while not self.is_stopped():
@@ -91,14 +91,14 @@ class MulticastListenerBase(
                 if exc.errno == errno.EADDRINUSE:
                     self.logger.warning(
                         "%s port %s in use - retrying in 5s",
-                        self._port_label,
+                        self.port_label,
                         self.spec.port,
                     )
                     await self.wait(5)
                 else:
                     raise
 
-    def _join_group_mreq(self, sock: socket.socket) -> None:
+    def join_multicast_group(self, sock: socket.socket) -> None:
         """Issue the IP_ADD_MEMBERSHIP join (raises ``OSError`` on failure)."""
         group = socket.inet_aton(self.spec.group)
         mreq = struct.pack("4sL", group, socket.INADDR_ANY)
@@ -108,31 +108,46 @@ class MulticastListenerBase(
         self.use_running_loop()
 
         sock = self._make_socket()
-        await self._bind(sock)
-
-        if self.is_stopped():
-            sock.close()
-            return
-
-        self._join_group(sock)
-
-        transport, _ = await self.event_loop.create_datagram_endpoint(
-            self._protocol_factory, sock=sock
-        )
-        self.logger.info(
-            "%s listening for %s on %s:%s",
-            self._listen_label,
-            self.spec.brand,
-            self.spec.group,
-            self.spec.port,
-        )
-
+        transport: asyncio.DatagramTransport | None = None
         try:
-            await self._run_loop(transport)
-        finally:
-            transport.close()
+            await self.bind_socket(sock)
 
-        self.logger.info("%s for %s stopping", self._listen_label, self.spec.brand)
+            if self.is_stopped():
+                return
+
+            self.join_group(sock)
+
+            transport, _ = await self.event_loop.create_datagram_endpoint(
+                self.protocol_factory, sock=sock
+            )
+            self.logger.info(
+                "%s listening for %s on %s:%s",
+                self.listen_label,
+                self.spec.brand,
+                self.spec.group,
+                self.spec.port,
+            )
+            await self.run_transport(transport)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EPERM, 10013}:
+                raise
+            if not self.is_stopped():
+                self.logger.warning(
+                    "%s backend %s disabled: OS denied UDP multicast socket "
+                    "access on port %s; continuing without this listener",
+                    self.listen_label,
+                    self.spec.brand,
+                    self.spec.port,
+                )
+                self.logger.debug("multicast socket access denied", exc_info=True)
+                await self.wait()
+        finally:
+            if transport is None:
+                sock.close()
+            else:
+                transport.close()
+
+        self.logger.info("%s for %s stopping", self.listen_label, self.spec.brand)
 
     def stop(self) -> None:
         if self.is_stopped():

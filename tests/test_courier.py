@@ -331,7 +331,16 @@ async def test_close_without_drain_cancels_active_async_sink():
 
 def test_close_during_concurrent_posts_is_safe():
     loop = asyncio.new_event_loop()
-    loop_thread = threading.Thread(target=loop.run_forever)
+
+    def run_loop():
+        def selector_heartbeat():
+            if loop.is_running():
+                loop.call_later(0.01, selector_heartbeat)
+
+        loop.call_soon(selector_heartbeat)
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
     loop_thread.start()
     try:
         got = []
@@ -362,6 +371,7 @@ def test_close_during_concurrent_posts_is_safe():
     finally:
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(1.0)
+        assert not loop_thread.is_alive()
         loop.close()
 
 

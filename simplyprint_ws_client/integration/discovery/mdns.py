@@ -313,8 +313,8 @@ class MDNSDiscoveryBackend(MulticastListenerBase):
 
     spec: MDNSSpec
 
-    _listen_label = "mdns discovery"
-    _port_label = "mdns"
+    listen_label = "mdns discovery"
+    port_label = "mdns"
 
     def __init__(self, spec: MDNSSpec, event_bus: EventBus) -> None:
         super().__init__(spec, event_bus)
@@ -322,24 +322,24 @@ class MDNSDiscoveryBackend(MulticastListenerBase):
         # entry expires, and the set cannot grow for process lifetime.
         self._queried = ExpiringDict(ttl=DEVICE_TTL)
 
-    def _protocol_factory(self) -> _MDNSProtocol:
+    def protocol_factory(self) -> _MDNSProtocol:
         return _MDNSProtocol(
             self.spec, self.devices, self._emit, self.logger, self._queried
         )
 
-    async def _bind(self, sock: socket.socket) -> None:
+    async def bind_socket(self, sock: socket.socket) -> None:
         # Bind the fixed mDNS port (shared with the system responder via
         # SO_REUSEPORT) so multicast responses and announcements are received;
         # retry briefly while a previous instance tears down.
-        await self._bind_fixed_port(sock)
+        await self.bind_fixed_port(sock)
 
-    def _join_group(self, sock: socket.socket) -> None:
+    def join_group(self, sock: socket.socket) -> None:
         try:
-            self._join_group_mreq(sock)
+            self.join_multicast_group(sock)
         except OSError:
             self.logger.warning("could not join mdns group for %s", self.spec.brand)
 
-    async def _run_loop(self, transport: asyncio.DatagramTransport) -> None:
+    async def run_transport(self, transport: asyncio.DatagramTransport) -> None:
         while not self.is_stopped():
             for name in self.spec.queries:
                 transport.sendto(

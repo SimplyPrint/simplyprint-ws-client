@@ -8,7 +8,7 @@ simplyprint_ws_client.contrib.watchdog	simplyprint_ws_client.common.utils.watchd
 simplyprint_ws_client.contrib.model	simplyprint_ws_client.common.model	module	A
 simplyprint_ws_client.shared.hardware	simplyprint_ws_client.common.hardware	module	A
 simplyprint_ws_client.core.client	simplyprint_ws_client.cloud.client	module	A
-simplyprint_ws_client.core.autowire	simplyprint_ws_client.cloud.autowire	module	A
+simplyprint_ws_client.core.autowire	(deleted — PrinterClient owns an explicit typed protocol route table)	module	A
 simplyprint_ws_client.core.state	simplyprint_ws_client.cloud.state	module	A
 simplyprint_ws_client.core.ws_protocol	simplyprint_ws_client.cloud.protocol	module	A
 simplyprint_ws_client.core.config.config	simplyprint_ws_client.cloud.config	module	A
@@ -38,9 +38,9 @@ simplyprint_ws_client.contrib.connection.state	simplyprint_ws_client.common.wire
 simplyprint_ws_client.contrib.connection.errors	simplyprint_ws_client.common.wire.errors	module	B
 simplyprint_ws_client.contrib.connection.messages	simplyprint_ws_client.common.wire.messages	module	B
 simplyprint_ws_client.contrib.connection.websockets	simplyprint_ws_client.common.wire.websockets	module	B
-simplyprint_ws_client.contrib.connection.aiohttp	simplyprint_ws_client.common.wire.aiohttp	module	B
+simplyprint_ws_client.contrib.connection.aiohttp	(removed — WebSocket front door is fixed to simplyprint_ws_client.wire.websockets.Websockets)	module	B
 simplyprint_ws_client.contrib.connection.paho	simplyprint_ws_client.common.wire.paho	module	B
-simplyprint_ws_client.contrib.connection.aiomqtt	simplyprint_ws_client.common.wire.aiomqtt	module	B
+simplyprint_ws_client.contrib.connection.aiomqtt	(removed — MQTT front door is fixed to simplyprint_ws_client.wire.paho.Paho)	module	B
 simplyprint_ws_client.contrib.connection.connection	simplyprint_ws_client.device.connection.lease	module	B
 simplyprint_ws_client.contrib.connection	simplyprint_ws_client.device.connection	module	B
 simplyprint_ws_client.contrib.transfer	simplyprint_ws_client.device.transfer	module	B
@@ -53,15 +53,22 @@ simplyprint_ws_client.device.connection.websocket.as_message	(removed — use co
 simplyprint_ws_client.device.connection.websocket.frame_of	(removed — use common.wire.messages.ws_message_for_payload)	api	B
 simplyprint_ws_client.device.connection.mqtt.default_topic	(removed — unused)	api	B
 connect(retry=/provider=/keepalive=/wire_keepalive=)	connect(options=ConnectionOptions(...))	api	B
-mqtt.connect impl default "aiomqtt"	mqtt.connect impl default "paho"	behavior	B
+mqtt.connect(impl=...) / websocket.connect(impl=...)	(removed — fixed Paho MQTT / Websockets WS front doors)	api	B
+simplyprint_ws_client.wire.mqtt.MqttImpl	(removed — MQTT front door is fixed to Paho)	type	B
+simplyprint_ws_client.wire.websocket.WsImpl	(removed — WebSocket front door is fixed to Websockets)	type	B
+simplyprint_ws_client.wire.aiomqtt	(removed — use simplyprint_ws_client.wire.paho)	module	B
+simplyprint_ws_client.wire.aiohttp	(removed — use simplyprint_ws_client.wire.websockets)	module	B
+simplyprint_ws_client.integration.drivers.MqttDriver(impl=...)	(removed — MqttDriver always uses Paho)	api	B
 simplyprint_ws_client.cloud.client.DefaultClient	simplyprint_ws_client.cloud.client.Client (merged)	class	C
 simplyprint_ws_client.cloud.client.PhysicalClient	(deleted — populate_info_from_physical_machine stays on PrinterState; system restart/shutdown demands become authoring-base hooks)	class	C
 simplyprint_bambu.core.printer_client.BasePrinterClient	simplyprint_ws_client.integration.client.PrinterClient	promotion	C
-simplyprint_ws_client.integration.client.PrinterClient._connection_event_bus	(deleted — declare device_drivers() instead)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._connection_event_bus	(deleted — attach drivers in the concrete constructor instead)	api	C
 simplyprint_ws_client.integration.client.PrinterClient._connection_event_bindings	(deleted — drivers call the on_device_* hooks)	api	C
 simplyprint_ws_client.integration.client.PrinterClient._wire_connection_events	(deleted)	api	C
-simplyprint_ws_client.integration.client.PrinterClient._start_connection	(deleted — init() starts declared drivers)	api	C
-simplyprint_ws_client.integration.client.PrinterClient._connection_components	(deleted — teardown() stops declared drivers)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._start_connection	(deleted — init() starts constructor-attached drivers)	api	C
+simplyprint_ws_client.integration.client.PrinterClient._connection_components	(deleted — teardown() stops constructor-attached drivers)	api	C
+simplyprint_ws_client.integration.client.PrinterClient.device_drivers	(deleted — call self.attach_driver(...) during concrete client construction)	api	C
+simplyprint_ws_client.integration.model_catalogue.EnumModelCatalogue implicit enum method discovery	pass explicit resolver= and label= callables	api	C
 simplyprint_ws_client.integration.client.PrinterClient.on_connected_to_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_connected	api	C
 simplyprint_ws_client.integration.client.PrinterClient.on_disconnected_from_printer	simplyprint_ws_client.integration.client.PrinterClient.on_device_disconnected	api	C
 simplyprint_ws_client.core.settings.ClientSpec	simplyprint_ws_client.integration.spec.PrinterSpec	class	C
@@ -70,6 +77,12 @@ simplyprint_ws_client.contrib.flow	simplyprint_ws_client.integration.flow	module
 simplyprint_ws_client.contrib.spec	simplyprint_ws_client.integration.spec	module	C
 simplyprint_ws_client.contrib.presentation	simplyprint_ws_client.integration.presentation	module	C
 simplyprint_ws_client.contrib.tasks	simplyprint_ws_client.integration.tasks	module	C
+simplyprint_ws_client.integration.discovery.active	(deleted — Host owns and injects DiscoveryService)	module	C
+simplyprint_ws_client.integration.spec.discover_from_active_service	simplyprint_ws_client.integration.spec.discover_from_service	api	C
+simplyprint_ws_client.integration.spec.FlowFactory(DiscoveryService)	simplyprint_ws_client.integration.spec.FlowFactory(ClientContext)	api	C
+simplyprint_ws_client.integration.spec.IntegrationSpec.account_manager_factory	(removed — account_provider_factory(ConfigManagerType) creates the one Host-owned account service)	field	C
+simplyprint_ws_client.core.registry.SpecRegistry.account_providers	(removed — use the instances owned by Host.account_providers)	method	C
+simplyprint_ws_client.core.app.ClientApp(..., discovery_service=...)	simplyprint_ws_client.core.app.ClientApp(..., discovery_service=..., account_providers=...)	api	C
 simplyprint_ws_client.core.app	simplyprint_ws_client.runtime.app	module	D
 simplyprint_ws_client.core.settings	simplyprint_ws_client.runtime.settings	module	D
 simplyprint_ws_client.core.scheduler	simplyprint_ws_client.runtime.scheduler	module	D
@@ -83,7 +96,7 @@ simplyprint_bambu.core.brand_contract.BrandContract	simplyprint_ws_client.runtim
 simplyprint_ws_client.cloud	simplyprint_ws_client.core	module	review
 simplyprint_ws_client.runtime	simplyprint_ws_client.core	module	review
 simplyprint_ws_client.runtime.debug	simplyprint_ws_client.common.debug	module	review
-simplyprint_ws_client.runtime.cli	simplyprint_ws_client.common.cli	module	review
+simplyprint_ws_client.runtime.cli	(deleted — the host application owns its CLI)	module	review
 simplyprint_ws_client.runtime.manager	simplyprint_ws_client.core.manager	module	review
 simplyprint_ws_client.device.connection	simplyprint_ws_client.common.wire	module	review
 simplyprint_ws_client.common.events	simplyprint_ws_client.events	module	review
@@ -94,11 +107,73 @@ simplyprint_ws_client.integration.link.WsDeviceLink	simplyprint_ws_client.integr
 simplyprint_ws_client.integration.link.MqttDeviceLink	simplyprint_ws_client.integration.drivers.MqttDriver	class	review
 simplyprint_ws_client.integration.{driver,link,poller}	simplyprint_ws_client.integration.drivers	module	review
 conn.paho (logger)	wire.mqtt.paho (logger)	logger	lifecycle-decoupling
-conn.aiomqtt (logger)	wire.mqtt.aiomqtt (logger)	logger	lifecycle-decoupling
+conn.aiomqtt (logger)	(removed with aiomqtt wire backend)	logger	lifecycle-decoupling
 conn.websockets (logger)	wire.ws.websockets (logger)	logger	lifecycle-decoupling
-conn.aiohttp (logger)	wire.ws.aiohttp (logger)	logger	lifecycle-decoupling
+conn.aiohttp (logger)	(removed with aiohttp WebSocket backend)	logger	lifecycle-decoupling
 conn.pool (logger)	wire.pool (logger)	logger	lifecycle-decoupling
 conn.connection (logger)	wire.lease (logger)	logger	lifecycle-decoupling
 conn.reconnect (logger)	wire.reconnect (logger)	logger	lifecycle-decoupling
 conn.keepalive (logger)	wire.keepalive (logger)	logger	lifecycle-decoupling
 simplyprint_ws_client.integration.drivers.DeviceDriver.suspend	(removed -- drivers run init->teardown; halt no longer parks them)	method	lifecycle-decoupling
+simplyprint_ws_client.integration.camera.mixin.ClientCameraMixin	simplyprint_ws_client.integration.camera.controller.CameraController	class	C
+simplyprint_ws_client.integration.client.PrinterClient.camera_uri	simplyprint_ws_client.integration.client.PrinterClient.camera.uri	attribute	C
+simplyprint_ws_client.integration.client.PrinterClient.camera_status	(removed — set camera sources with client.camera.set_uri(uri))	attribute	C
+undocumented simplyprint_ws_client root/integration lazy fallback exports	(removed — import supported authoring names explicitly or use the owning module)	api	C
+simplyprint_ws_client.common.cli / ClientCli	(deleted — the host application owns its CLI; library examples run Host/ClientApp directly)	module	review
+simplyprint_client.core.specs.default_registry	(removed — startup calls build_registry() once and injects the fresh SpecRegistry)	api	C
+simplyprint_client.core.presentation.PrinterPresentationRegistry	(removed — call get_printer_presentation(integration, config))	class	C
+simplyprint_client.web.blueprints.api.serializers.PrinterSerializer(client_type, config)	PrinterSerializer(integration, config, main_url=...)	api	C
+simplyprint_client.web.blueprints.api.serializers.apply_editable(client_type, config, patch)	apply_editable(integration, config, patch)	api	C
+EditableField attribute-name mapping	EditableField.value + EditableField.write(value)	field	C
+EditableField.type string literals	EditableFieldType enum	field	C
+IntervalT string literals	Interval enum	type	C
+Intervals.set(name, value)	direct interval field assignment	api	C
+Config.keys / Config.update_dict_keys	Config.pk / Config.sk explicit identity	api	C
+ConfigManager.find(config or keyword fields)	ConfigManager.by_key(pk, sk)	api	C
+StoppableInterface / Stoppable	(removed — use the concrete SyncStoppable, AsyncStoppable, or ProcessStoppable owner)	class	C
+StoppableThread	(removed — compose SyncStoppable with a Thread owner explicitly)	class	C
+AiRespMsg / ClientMsgType.AI_RESP	(removed — unused protocol message)	api	C
+ListenerLifetimeOnce / ListenerLifetimeForever	ListenerLifetime.ONCE / ListenerLifetime.FOREVER	class	C
+optional camera protocol class-or-None exports	mandatory concrete camera protocol classes	api	C
+set_active_discovery_service / active_discovery_service	Host-owned ClientContext.discovery_service	api	C
+global editable name field	(removed — printer names are synchronized, not locally editable)	api	C
+global editable webcam field	webcam_url_field(config)	api	C
+host_field(attribute-name mapping)	host_field(current_value, writer)	api	C
+default_printer_presentation(image_url)	default_printer_presentation(image_url, config)	api	C
+model_aware_presentation(metadata, catalogue, device_type)	model_aware_presentation(metadata, catalogue, config, device_type)	api	C
+simplyprint_urls(config, ...)	simplyprint_urls(main_url, config, ...)	api	C
+mqtt.DEFAULT_POOLS / websocket.DEFAULT_POOLS	ClientContext.mqtt_pools / ClientContext.websocket_pools	ownership	C
+wire.pools.DefaultPools	wire.pools.PoolRegistry	class	C
+mqtt.build_pool / websocket.build_pool	mqtt.pool_for / websocket.pool_for	api	C
+mqtt.shutdown / websocket.shutdown	await PoolRegistry.close()	api	C
+mqtt.connect(url) / websocket.connect(url)	mqtt.connect(url, pool=pool) / websocket.connect(url, pool=pool)	api	C
+FieldsStep._schema / _resolve_fields / _prompt overrides	FieldsStep(..., schema_transform=...)	api	C
+ChoiceStep._prompt / run prompt post-processing	ChoiceStep(..., footer=...)	api	C
+SimplyPrintURL / SimplyPrintURLCollection / SimplyPrintWsVersion	ClientSettings.endpoints (immutable SimplyPrintEndpoints)	api	C
+SimplyPrintApi static methods	ClientContext.simplyprint_api instance methods	api	C
+ConnectionHint(config=...) implicit websocket lookup	ConnectionHint(websocket_base, config=...)	api	C
+PrinterClient(..., context=None)	PrinterClient(..., context=ClientContext)	api	C
+PrinterClient.app_updater class variable	ClientContext.app_updater	ownership	C
+integration.client module host telemetry cache	ClientContext.host_telemetry (per-ClientApp reader)	ownership	C
+web.events.HUB	AppContext.event_hub	ownership	C
+AppContext.settings / app / discovery / server	derive settings/app/discovery from AppContext.host; Supervisor owns server	ownership	C
+package import of _polyfill	(removed — importing the package never mutates asyncio)	module	C
+asyncio.timeout monkeypatch	direct scheduler timeout import for the supported Python version	api	C
+implicit SSLProtocol patch during import	install_ssl_transport_workaround() at WebSocket open	api	C
+SubnetScanSpec.port compatibility gate	SubnetScanSpec.services with an explicit NetworkServiceSpec	field	C
+Elegoo/Ultimaker model_catalog() and resolver aliases	CATALOGUE methods	api	C
+WebManagementServerSettings.identity_salt	(removed — unused after explicit slot UUID identity)	field	C
+Bambu account access_token / refresh_token record adapter	(removed — persist the typed auth object)	data	C
+SnapmakerPrinter(MoonrakerPrinter)	SnapmakerPrinter(PrinterClient) + owned MoonrakerRuntime	class	C
+MoonrakerDevice / SnapmakerDevice	MoonrakerRuntime(client=..., state=..., parse_state=..., send=...)	class	C
+MoonrakerFiles	MoonrakerRuntime (the generic runtime is the print-file driver)	class	C
+SnapmakerFiles(MoonrakerFiles, *args, **kwargs)	SnapmakerFiles(runtime, device_type)	class	C
+SnapmakerToolStateReducer	project_tool_state(printer, state, nozzle_diameters)	class	C
+SnapmakerConfig(MoonrakerConfig)	SnapmakerConfig(PrinterConfig) with explicit persisted connection fields	class	C
+SnapmakerDeviceModel(MoonrakerDeviceModel)	MoonrakerDeviceModel(KlipperDeviceModel) and SnapmakerDeviceModel(KlipperDeviceModel)	class	C
+simplyprint_client.printers.bambu.lan_probe._verify_lan_mqtt_url_sync	wire.mqtt_probe.probe_mqtt + Bambu result translation	function	C
+simplyprint_client.printers.elegoo.cc2_probe._verify_cc2_sync	wire.mqtt_probe.probe_mqtt + Elegoo result translation	function	C
+verify_lan_credentials(host, serial, access_code)	verify_lan_credentials(host, serial, access_code, pools=ClientContext.mqtt_pools)	api	C
+verify_cc2_credentials(host, access_code)	verify_cc2_credentials(host, access_code, pools=ClientContext.mqtt_pools)	api	C
+IntegrationSpec.verify_lan_mqtt_url(url, timeout=..., expected_host=...)	IntegrationSpec.verify_lan_mqtt_url(url, timeout=..., expected_host=..., context=ClientContext)	api	C
+Supervisor app.stop(); app.run_detached() recovery	RestartCoordinator process relaunch; ClientApp is a one-shot owner	lifecycle	C

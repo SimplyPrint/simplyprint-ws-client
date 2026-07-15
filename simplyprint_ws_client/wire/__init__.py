@@ -11,8 +11,6 @@ compose the same machinery -- nothing in here knows which side it carries.
 from __future__ import annotations
 
 from simplyprint_ws_client.wire import mqtt, websocket
-from simplyprint_ws_client.wire.aiohttp import Aiohttp
-from simplyprint_ws_client.wire.aiomqtt import AioMqtt
 from simplyprint_ws_client.wire.errors import ErrorCode, TransportError
 from simplyprint_ws_client.wire.events import (
     Connected,
@@ -28,10 +26,16 @@ from simplyprint_ws_client.wire.keepalive import (
 )
 from simplyprint_ws_client.wire.lease import Lease, MqttLease, WsLease
 from simplyprint_ws_client.wire.messages import MqttMessage, QoS, WsKind, WsMessage
+from simplyprint_ws_client.wire.mqtt_probe import (
+    MqttProbeOutcome,
+    MqttProbeResult,
+    probe_mqtt,
+)
 from simplyprint_ws_client.wire.options import ConnectionOptions, WireKeepalive
 from simplyprint_ws_client.wire.paho import Paho
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Endpoint, Pool
+from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.reconnect import Reconnecting
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
@@ -51,8 +55,6 @@ __all__ = [
     "mqtt",
     "websocket",
     "ws",
-    "AioMqtt",
-    "Aiohttp",
     "Connected",
     "Connecting",
     "ConnectionKeepalive",
@@ -68,10 +70,13 @@ __all__ = [
     "MessageReceived",
     "MqttLease",
     "MqttMessage",
+    "MqttProbeOutcome",
+    "MqttProbeResult",
     "MqttTransport",
     "NotConnected",
     "Paho",
     "Pool",
+    "PoolRegistry",
     "QoS",
     "Reconnecting",
     "RetryPolicy",
@@ -86,4 +91,5 @@ __all__ = [
     "WsMessage",
     "WsTransport",
     "topic_matches",
+    "probe_mqtt",
 ]

@@ -1,9 +1,11 @@
 from simplyprint_ws_client import (
     Client,
-    PrinterStatus,
     FileProgressStateEnum,
-    JobInfoMsg,
+    PrinterStatus,
+)
+from simplyprint_ws_client.core.protocol.messages import (
     FileProgressMsg,
+    JobInfoMsg,
     StateChangeMsg,
 )
 

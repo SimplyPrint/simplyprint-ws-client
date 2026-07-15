@@ -7,6 +7,7 @@ names the lane); shutdown joins every lane thread so teardown leaks nothing.
 """
 
 import asyncio
+import contextvars
 import threading
 
 import pytest
@@ -19,6 +20,10 @@ from simplyprint_ws_client.common.asyncio.offload import (
 
 def _raise() -> None:
     raise ValueError("boom")
+
+
+def _raise_timeout() -> None:
+    raise asyncio.TimeoutError("work timed out")
 
 
 @pytest.mark.asyncio
@@ -52,6 +57,35 @@ async def test_exceptions_propagate_to_the_loop():
             await off.run_io(_raise)
         with pytest.raises(ValueError, match="boom"):
             await off.run_transfer(_raise)
+        with pytest.raises(asyncio.TimeoutError, match="work timed out"):
+            await off.run_io(_raise_timeout)
+    finally:
+        off.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lanes_preserve_the_calling_context():
+    operation = contextvars.ContextVar("operation", default=None)
+    token = operation.set("active")
+    off = Offload()
+    try:
+        assert await off.run_io(operation.get) == "active"
+        assert await off.run_transfer(operation.get) == "active"
+    finally:
+        off.shutdown()
+        operation.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_executor_completion_uses_loop_owned_wakeups(monkeypatch):
+    loop = asyncio.get_running_loop()
+    off = Offload()
+    try:
+        # Reproduce the supported-runtime failure: the completion handle reaches
+        # ``loop._ready`` but its cross-thread self-pipe byte is lost. The
+        # helper's loop-owned watchdog timer must still process the result.
+        monkeypatch.setattr(loop, "_write_to_self", lambda: None)
+        assert await off.run_io(lambda: 42) == 42
     finally:
         off.shutdown()
 

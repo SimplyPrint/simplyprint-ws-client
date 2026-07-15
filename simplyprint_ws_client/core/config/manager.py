@@ -51,9 +51,12 @@ class ConfigManager(ABC, Generic[TConfig]):
     def by_unique_id(self, unique_id: str) -> Optional[TConfig]:
         return self.find(unique_id=unique_id)
 
-    def find(self, other: Optional[TConfig] = None, **kwargs) -> Optional[TConfig]:
-        kwargs = self.config_t.update_dict_keys(kwargs)
+    def by_key(self, pk: int, sk: str) -> Optional[TConfig]:
+        return next(
+            (config for config in self.get_all() if config.key == (pk, sk)), None
+        )
 
+    def find(self, other: Optional[TConfig] = None, **kwargs) -> Optional[TConfig]:
         for config in self.get_all():
             if config.partial_eq(config=other, **kwargs):
                 return config

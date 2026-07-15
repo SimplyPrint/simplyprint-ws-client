@@ -218,9 +218,7 @@ class MJPEGSnapshotCamera(BaseCameraProtocol):
         if raw_data:
             yield bytes(raw_data)
             return
-        raise CameraProtocolConnectionError(
-            "No image data received from the camera."
-        )
+        raise CameraProtocolConnectionError("No image data received from the camera.")
 
 
 class MJPEGStreamCamera(BaseCameraProtocol):

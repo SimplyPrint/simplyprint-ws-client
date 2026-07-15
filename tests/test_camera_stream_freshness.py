@@ -9,7 +9,7 @@ respawn + connect on top. The contract pinned here:
 - ``CameraHandle.receive_frame`` judges the cache by the *frame's own* arrival
   time (a dead worker must never serve an ancient frame just because polls
   kept coming).
-- The mixin lets a stream request use any cached frame that arrived after the
+- The controller lets a stream request use any cached frame that arrived after the
   last published one (unseen by the server), falling back to ``max_cache_age``
   for the first frame of a session; snapshot events keep ``max_cache_age``.
 """
@@ -20,16 +20,17 @@ import asyncio
 import datetime
 import logging
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
+from simplyprint_ws_client.core.client_context import ClientContext
+from simplyprint_ws_client.integration.camera.controller import CameraController
 from simplyprint_ws_client.integration.camera.handle import CameraHandle
-from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.core.protocol.messages import WebcamSnapshotDemandData
 
 
-class _NoopDriver:
+class _NoopBackend:
     def poll(self):
         pass
 
@@ -44,13 +45,13 @@ class _NoopDriver:
 
 
 def _handle() -> CameraHandle:
-    return CameraHandle(pool=None, camera_id=1, driver=_NoopDriver())
+    return CameraHandle(camera_id=1, backend=_NoopBackend())
 
 
 @pytest.mark.asyncio
 async def test_receive_frame_serves_cached_frame_by_frame_age():
     handle = _handle()
-    handle._set_frame(b"frame-1", time.time() - 0.2)
+    handle.deliver_frame(b"frame-1", time.time() - 0.2)
 
     frame = await asyncio.wait_for(
         handle.receive_frame(allow_cache_age=datetime.timedelta(seconds=1)),
@@ -64,7 +65,7 @@ async def test_receive_frame_rejects_stale_cached_frame():
     """An old frame is not served just because polling was recent -- the
     request blocks for a live frame instead."""
     handle = _handle()
-    handle._set_frame(b"ancient", time.time() - 30.0)
+    handle.deliver_frame(b"ancient", time.time() - 30.0)
 
     fut = asyncio.ensure_future(
         handle.receive_frame(allow_cache_age=datetime.timedelta(seconds=1))
@@ -72,7 +73,7 @@ async def test_receive_frame_rejects_stale_cached_frame():
     await asyncio.sleep(0.05)
     assert not fut.done()
 
-    handle._set_frame(b"fresh", time.time())
+    handle.deliver_frame(b"fresh", time.time())
     assert await asyncio.wait_for(fut, timeout=1.0) == b"fresh"
 
 
@@ -86,7 +87,7 @@ async def test_frame_delivery_tolerates_waiter_cancellation_race():
     try:
         receiver = asyncio.create_task(handle.receive_frame())
         await asyncio.sleep(0)
-        handle._set_frame(b"racing-frame", time.time())
+        handle.deliver_frame(b"racing-frame", time.time())
         receiver.cancel()
         with pytest.raises(asyncio.CancelledError):
             await receiver
@@ -97,38 +98,45 @@ async def test_frame_delivery_tolerates_waiter_cancellation_race():
     assert errors == []
 
 
-def _bare_mixin() -> ClientCameraMixin:
-    mixin = ClientCameraMixin.__new__(ClientCameraMixin)
-    mixin._camera_handle = None
-    mixin._stream_setup = asyncio.Event()
-    mixin._stream_lock = CancelableLock()
-    mixin._request_count = 0
-    mixin._camera_max_cache_age = datetime.timedelta(seconds=1)
-    mixin._camera_logger = logging.getLogger("test.camera")
-    return mixin
+async def _send_stream(_message) -> None:
+    pass
+
+
+def _camera() -> CameraController:
+    return CameraController(
+        printer=SimpleNamespace(
+            config=SimpleNamespace(unique_id="camera-freshness"),
+            webcam_info=SimpleNamespace(connected=False),
+        ),
+        logger=logging.getLogger("test"),
+        event_loop_provider=SimpleNamespace(event_loop=None),
+        send_stream=_send_stream,
+        context=ClientContext(),
+        max_cache_age=datetime.timedelta(seconds=1),
+    )
 
 
 def test_snapshot_event_uses_max_cache_age():
-    mixin = _bare_mixin()
-    mixin._last_stream_frame_at = time.time() - 5.0
+    camera = _camera()
+    camera._last_stream_frame_at = time.time() - 5.0
 
-    allowed = mixin._allowed_cache_age(WebcamSnapshotDemandData(id="abc"))
-    assert allowed == mixin._camera_max_cache_age
+    allowed = camera._allowed_cache_age(WebcamSnapshotDemandData(id="abc"))
+    assert allowed == camera._camera_max_cache_age
 
 
 def test_first_stream_frame_uses_max_cache_age():
-    mixin = _bare_mixin()
-    mixin._last_stream_frame_at = None
+    camera = _camera()
+    camera._last_stream_frame_at = None
 
-    allowed = mixin._allowed_cache_age(WebcamSnapshotDemandData())
-    assert allowed == mixin._camera_max_cache_age
+    allowed = camera._allowed_cache_age(WebcamSnapshotDemandData())
+    assert allowed == camera._camera_max_cache_age
 
 
 def test_stream_frame_accepts_anything_newer_than_last_publish():
-    mixin = _bare_mixin()
-    mixin._last_stream_frame_at = time.time() - 14.0
+    camera = _camera()
+    camera._last_stream_frame_at = time.time() - 14.0
 
-    allowed = mixin._allowed_cache_age(WebcamSnapshotDemandData())
+    allowed = camera._allowed_cache_age(WebcamSnapshotDemandData())
     assert allowed is not None
     # Tolerance covers the test's own runtime; the point is the window tracks
     # the time since the last publish, not a fixed cap.

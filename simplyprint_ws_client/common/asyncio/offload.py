@@ -25,9 +25,12 @@ once on teardown.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Callable, TypeVar
+
+from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_future
 
 __all__ = ["Offload", "install_default_executor"]
 
@@ -90,13 +93,21 @@ class Offload:
 
     async def run_io(self, fn: Callable[..., T], *args: Any) -> T:
         """Run a short blocking syscall on the ``io`` lane; await its result."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._io, partial(fn, *args))
+        return await self._run(self._io, fn, *args)
 
     async def run_transfer(self, fn: Callable[..., T], *args: Any) -> T:
         """Run long-haul blocking work on the ``transfer`` lane; await its result."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._transfer, partial(fn, *args))
+        return await self._run(self._transfer, fn, *args)
+
+    @staticmethod
+    async def _run(executor: ThreadPoolExecutor, fn: Callable[..., T], *args: Any) -> T:
+        context = contextvars.copy_context()
+        future = executor.submit(context.run, partial(fn, *args))
+        try:
+            return await await_concurrent_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
 
     def shutdown(self, wait: bool = True) -> None:
         """Stop both lanes. Idempotent. Cancels queued (not-yet-started) work and,

@@ -5,12 +5,12 @@ from simplyprint_ws_client import PrinterConfig
 
 
 class _HwConfig(PrinterConfig):
-    """A config whose stable hardware id is its serial (test double)."""
+    """A config whose hardware identity is its serial (test double)."""
 
     serial: Optional[str] = None
 
-    def stable_hardware_id(self) -> Optional[str]:
-        return self.serial
+    def hardware_identity(self) -> Optional[str]:
+        return self.serial or super().hardware_identity()
 
 
 def test_config_fields():
@@ -35,7 +35,7 @@ def test_config_fields():
         "public_ip": None,
         "mac": None,
         # Every printer supports a user webcam override (resolved by the base
-        # PrinterClient, edited through the shared WEBCAM_URL_FIELD).
+        # PrinterClient, edited through a config-bound presentation field).
         "custom_webcam_url": None,
     }
 
@@ -84,11 +84,22 @@ def test_config_fields():
     assert not config4.is_empty()
 
 
-def test_stable_hardware_id_default_is_none():
-    """The base hook has no brand hardware id; brands override it. The neutral
-    ``mac`` fallback is applied by the matching seam, not here."""
-    assert PrinterConfig.get_blank().stable_hardware_id() is None
-    assert _HwConfig.get_blank().stable_hardware_id() is None
+def test_hardware_identity_defaults_to_the_neutral_mac_fallback():
+    assert PrinterConfig.get_blank().hardware_identity() is None
+    assert _HwConfig.get_blank().hardware_identity() is None
+    config = PrinterConfig.get_blank()
+    config.mac = "aa:bb:cc:dd:ee:ff"
+    assert config.hardware_identity() == "aa:bb:cc:dd:ee:ff"
+
+
+def test_webcam_url_domain_setter_normalizes_empty_values():
+    config = PrinterConfig.get_blank()
+
+    config.set_webcam_url("http://camera.local/stream")
+    assert config.custom_webcam_url == "http://camera.local/stream"
+
+    config.set_webcam_url("")
+    assert config.custom_webcam_url is None
 
 
 def test_get_new_mints_a_stable_unique_id_uuid():

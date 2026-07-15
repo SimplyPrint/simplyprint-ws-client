@@ -6,8 +6,8 @@ lives: the pool refcount, a lease's ``send`` racing a generation flip, concurren
 subscribe/unsubscribe across leases against one refcounted broker socket, and
 ``stop`` landing mid-open / mid-consume. None of this touches a real broker or
 socket: every wire is an injected fake satisfying the same seam production wires
-do -- a :class:`Reconnecting` subclass driven by queues, an aiomqtt-shaped fake
-client behind :class:`AioMqtt`, a paho-shaped fake behind :class:`Paho`.
+do -- a :class:`Reconnecting` subclass driven by queues, a paho-shaped fake
+behind :class:`Paho`, and a Websockets-shaped fake.
 
 The single asyncio loop does NOT make these tests trivial: every ``await`` is a
 scheduling point where another task can interleave, so the dict mutations, the
@@ -18,8 +18,8 @@ is never torn, the generation is strictly monotonic, no message lands on a wrong
 generation, and the asyncio task count returns to baseline (no leaks, no orphaned
 transports).
 
-paho and aiomqtt are NOT installed; every MQTT test injects a fake client through
-the wire's ``client_factory`` seam, so nothing imports a real wire library.
+paho is not required; every MQTT test injects a fake client through the wire's
+``client_factory`` seam, so nothing imports the real wire library.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopPr
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from simplyprint_ws_client.wire import mqtt as mqtt_door
-from simplyprint_ws_client.wire.aiomqtt import AioMqtt
 from simplyprint_ws_client.wire.lease import MqttLease
 from simplyprint_ws_client.wire.events import (
     Connected,
@@ -583,61 +582,12 @@ async def test_rapid_restart_after_stop_starts_exactly_one_task():
 
 
 # --------------------------------------------------------------------------- #
-# 3. MQTT subscribe/unsubscribe refcount racing across leases + reconnect.
+# MQTT message stand-in shared by the Paho adapter tests below.
 # --------------------------------------------------------------------------- #
 
 
-class GatedAioClient:
-    """An aiomqtt-shaped fake whose subscribe/connect can be gated for racing.
-
-    ``__aenter__`` may block on ``open_gate`` so a test can hold a reconnect
-    mid-open while leases mutate the topic refcount; ``messages`` blocks on an
-    inbox a test feeds (a ``BaseException`` ends the stream == a drop). Each
-    ``subscribe`` / ``unsubscribe`` awaits once so a concurrent (un)subscribe
-    interleaves across the shared refcount table.
-    """
-
-    def __init__(self, open_gate: Optional[asyncio.Event] = None) -> None:
-        self.inbox: asyncio.Queue = asyncio.Queue()
-        self.subscribed: List[str] = []
-        self.unsubscribed: List[str] = []
-        self.published: List[tuple] = []
-        self.open_gate = open_gate
-        self.messages = self
-
-    async def __aenter__(self) -> "GatedAioClient":
-        if self.open_gate is not None:
-            await self.open_gate.wait()
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        return None
-
-    def __aiter__(self) -> "GatedAioClient":
-        return self
-
-    async def __anext__(self) -> Any:
-        item = await self.inbox.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    async def subscribe(self, topic: str) -> None:
-        await asyncio.sleep(0)  # a real await: a concurrent (un)subscribe interleaves
-        self.subscribed.append(topic)
-
-    async def unsubscribe(self, topic: str) -> None:
-        await asyncio.sleep(0)
-        self.unsubscribed.append(topic)
-
-    async def publish(
-        self, topic: str, payload: bytes, qos: int = 0, retain: bool = False
-    ) -> None:
-        self.published.append((topic, payload, qos, retain))
-
-
 class WireMqttMessage:
-    """An aiomqtt message stand-in -- ``AioMqtt`` routes these by ``.topic``."""
+    """A paho message stand-in routed by ``.topic``."""
 
     def __init__(
         self, topic: str, payload: bytes, qos: int = 0, retain: bool = False
@@ -648,330 +598,8 @@ class WireMqttMessage:
         self.retain = retain
 
 
-def mqtt_pool(
-    clients: List[GatedAioClient], *, open_gate: Optional[asyncio.Event] = None
-) -> Pool:
-    """A pool of :class:`AioMqtt` wired to fresh gated fake clients."""
-
-    def factory(url: yarl.URL, logger: logging.Logger) -> GatedAioClient:
-        client = GatedAioClient(open_gate=open_gate)
-        clients.append(client)
-        return client
-
-    def build(url: yarl.URL, params: object) -> AioMqtt:
-        return AioMqtt(
-            url,
-            RetryPolicy(backoff=ConstantBackoff(0)),
-            current_provider(),
-            client_factory=factory,
-            logger=silent_logger(),
-        )
-
-    def key(url: yarl.URL, params: object) -> MqttBroker:
-        return params if isinstance(params, MqttBroker) else MqttBroker.from_url(url)
-
-    return Pool(
-        build=build,
-        key=key,
-        route=mqtt_message_route,
-        lease_class=MqttLease,
-        provider=current_provider(),
-    )
-
-
-@pytest.mark.asyncio
-async def test_subscribe_refcount_survives_concurrent_leases_same_topic():
-    """Many leases subscribe/unsubscribe the SAME topic concurrently.
-
-    The broker socket is refcounted by topic. After equal numbers of subscribe
-    and unsubscribe across leases settle, the refcount table must be empty (no
-    negative count, no stuck positive count), and the broker saw exactly one wire
-    ``subscribe`` and exactly one ``unsubscribe`` for the topic.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    leases = [pool.connect(url, broker) for _ in range(20)]
-    transport = leases[0].transport
-    assert all(lease.transport is transport for lease in leases)
-    await wait_for(lambda: leases[0].connected)
-    assert len(clients) == 1
-    client = clients[0]
-
-    # All 20 leases assert interest in "shared" at once.
-    await asyncio.gather(*(lease.subscribe("shared") for lease in leases))
-    assert transport.subscriptions.get("shared") == 20, transport.subscriptions
-    assert client.subscribed.count("shared") == 1, (
-        f"refcounted topic subscribed {client.subscribed.count('shared')} times "
-        "on the wire (expected exactly 1)"
-    )
-
-    # All 20 drop it at once.
-    await asyncio.gather(*(lease.unsubscribe("shared") for lease in leases))
-    assert "shared" not in transport.subscriptions, transport.subscriptions
-    assert client.unsubscribed.count("shared") == 1, (
-        f"refcounted topic unsubscribed {client.unsubscribed.count('shared')} "
-        "times on the wire (expected exactly 1)"
-    )
-
-    await asyncio.gather(*(lease.close() for lease in leases))
-
-
-@pytest.mark.asyncio
-async def test_interleaved_sub_unsub_never_drives_refcount_negative():
-    """Interleaved sub/unsub churn on one topic keeps the refcount well-formed.
-
-    Each task does subscribe then unsubscribe, with awaits between, so the +1/-1
-    operations interleave across the shared dict. At the end the topic is gone
-    and the *net* wire subscribes equal the net wire unsubscribes -- the refcount
-    was never torn into a negative or orphaned-positive state.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    leases = [pool.connect(url, broker) for _ in range(12)]
-    transport = leases[0].transport
-    await wait_for(lambda: leases[0].connected)
-    client = clients[0]
-
-    async def churn(lease: MqttLease) -> None:
-        for _ in range(6):
-            await lease.subscribe("topic")
-            await asyncio.sleep(0)
-            await lease.unsubscribe("topic")
-            await asyncio.sleep(0)
-
-    await asyncio.gather(*(churn(lease) for lease in leases))
-    await settle()
-
-    assert "topic" not in transport.subscriptions, transport.subscriptions
-    assert all(v > 0 for v in transport.subscriptions.values()), transport.subscriptions
-    # The wire subscribe/unsubscribe pairs must balance: a torn refcount would
-    # leave a dangling subscribe with no matching unsubscribe (or vice versa).
-    assert client.subscribed.count("topic") == client.unsubscribed.count("topic"), (
-        f"wire subs={client.subscribed.count('topic')} != "
-        f"unsubs={client.unsubscribed.count('topic')} -- refcount torn"
-    )
-
-    await asyncio.gather(*(lease.close() for lease in leases))
-
-
-@pytest.mark.asyncio
-async def test_subscribe_during_reconnect_reasserts_exactly_the_live_set():
-    """A topic added while a reconnect is mid-open is re-asserted on the new wire.
-
-    The first client streams a drop; the second client's ``__aenter__`` is gated,
-    so the reconnect is parked mid-open. While parked, a lease subscribes a new
-    topic. When the open is released, the new live client must end up subscribed
-    to exactly the tracked topic set -- nothing lost, nothing duplicated.
-    """
-    clients: List[GatedAioClient] = []
-    open_gate = asyncio.Event()
-    open_gate.set()  # first open proceeds freely
-    pool = mqtt_pool(clients, open_gate=open_gate)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    lease = pool.connect(url, broker)
-    transport = lease.transport
-    await wait_for(lambda: lease.connected)
-    await lease.subscribe("first")
-    await wait_for(lambda: "first" in clients[0].subscribed)
-
-    # Gate the NEXT open, then drop the live wire so a reconnect parks mid-open.
-    open_gate.clear()
-    clients[0].inbox.put_nowait(RuntimeError("drop"))
-    await wait_for(lambda: len(clients) == 2)  # second client built, parked in aenter
-
-    # While the reconnect is parked mid-open, add another topic via a lease.
-    add = asyncio.ensure_future(lease.subscribe("second"))
-    await asyncio.sleep(0)
-
-    # Release the open: the new client re-asserts whatever is tracked now.
-    open_gate.set()
-    await add
-    await wait_for(lambda: lease.connected)
-    await settle()
-
-    new_client = clients[1]
-    # Both tracked topics are live on the new wire, each subscribed exactly once.
-    assert set(new_client.subscribed) == {"first", "second"}, new_client.subscribed
-    assert new_client.subscribed.count("first") == 1, new_client.subscribed
-    assert new_client.subscribed.count("second") == 1, new_client.subscribed
-    assert transport.subscriptions == {"first": 1, "second": 1}, transport.subscriptions
-
-    await lease.close()
-
-
-@pytest.mark.asyncio
-async def test_distinct_leases_subscribe_distinct_topics_concurrently():
-    """Each of N leases subscribes its own topic at once on one shared socket.
-
-    Distinct +1's into the same dict across suspension points must not lose a
-    topic (a lost-update race on the refcount dict). After the storm every topic
-    is present at refcount 1 and was subscribed on the wire exactly once.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    leases = [pool.connect(url, broker) for _ in range(24)]
-    await wait_for(lambda: leases[0].connected)
-    client = clients[0]
-
-    await asyncio.gather(*(lease.subscribe(f"t/{i}") for i, lease in enumerate(leases)))
-
-    expected = {f"t/{i}": 1 for i in range(len(leases))}
-    transport = leases[0].transport
-    assert transport.subscriptions == expected, transport.subscriptions
-    assert sorted(client.subscribed) == sorted(expected), client.subscribed
-
-    await asyncio.gather(*(lease.close() for lease in leases))
-
-
 # --------------------------------------------------------------------------- #
-# 4. Messages on a shared transport never reach the wrong lease/generation.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_message_flood_while_leases_join_and_leave_no_crash():
-    """Messages flow on a shared broker while leases connect/close concurrently.
-
-    A storm of inbound messages races leases joining and leaving the same socket.
-    The fan-out tuple-snapshots its lease set, so a lease closing mid-fan must not
-    crash delivery, and a closed lease must stop receiving. We assert no crash
-    (the loop survives) and that the surviving anchor lease still gets messages.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-    baseline = live_tasks()
-
-    anchor = pool.connect(url, broker)
-    await anchor.subscribe("room/#")
-    await wait_for(lambda: anchor.connected)
-    client = clients[0]
-
-    anchor_got: List[str] = []
-    anchor.event_bus.on(MessageReceived, lambda e: anchor_got.append(e.message.topic))
-
-    async def transient_lease(n: int) -> None:
-        lease = pool.connect(url, broker)
-        await lease.subscribe("room/#")
-        for i in range(5):
-            client.inbox.put_nowait(WireMqttMessage(f"room/{n}-{i}", b"x"))
-            await asyncio.sleep(0)
-        await lease.close()
-
-    async def flood() -> None:
-        for i in range(40):
-            client.inbox.put_nowait(WireMqttMessage(f"room/flood-{i}", b"y"))
-            await asyncio.sleep(0)
-
-    await asyncio.gather(flood(), *(transient_lease(n) for n in range(10)))
-    await settle()
-
-    assert anchor_got, "anchor lease received nothing during the storm"
-    # Every topic the anchor saw matches its subscription (no cross-routing).
-    assert all(t.startswith("room/") for t in anchor_got), anchor_got
-
-    await anchor.close()
-    await settle()
-    assert all(broker != k for k in pool.endpoints), pool.endpoints
-    assert live_tasks() - baseline == set(), "leaked tasks after message storm"
-
-
-@pytest.mark.asyncio
-async def test_closed_lease_stops_receiving_mid_fanout():
-    """A lease closed during message flow receives nothing after it closes.
-
-    Two MQTT leases on one socket subscribe the same wildcard; we close one, then
-    push frames. The closed lease must receive nothing further (its ``feed``
-    short-circuits on ``closed``), while the surviving lease keeps getting frames.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    keep = pool.connect(url, broker)
-    drop = pool.connect(url, broker)
-    assert keep.transport is drop.transport
-    await keep.subscribe("room/#")
-    await drop.subscribe("room/#")
-    await wait_for(lambda: keep.connected)
-    client = clients[0]
-
-    keep_got: List[str] = []
-    drop_got: List[str] = []
-    keep.event_bus.on(MessageReceived, lambda e: keep_got.append(e.message.topic))
-    drop.event_bus.on(MessageReceived, lambda e: drop_got.append(e.message.topic))
-
-    client.inbox.put_nowait(WireMqttMessage("room/before", b"x"))
-    await wait_for(lambda: keep_got and drop_got)
-    assert drop_got == ["room/before"]
-
-    await drop.close()  # release one lease; the socket stays up for 'keep'
-    drop_count_at_close = len(drop_got)
-
-    for i in range(5):
-        client.inbox.put_nowait(WireMqttMessage(f"room/after-{i}", b"y"))
-    await wait_for(lambda: len(keep_got) >= 6)
-
-    assert len(drop_got) == drop_count_at_close, "closed lease still received frames"
-    assert keep_got[1:] == [f"room/after-{i}" for i in range(5)]
-
-    await keep.close()
-
-
-@pytest.mark.asyncio
-async def test_message_never_delivered_with_stale_generation():
-    """Every fanned message carries the generation of the live wire that emitted it.
-
-    Across a drop/reconnect on a shared socket, the generation a lease sees on a
-    ``MessageReceived`` must match the live wire's generation at emit time -- never
-    a stale epoch from the prior connection.
-    """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
-    broker = MqttBroker.from_url(url)
-
-    lease = pool.connect(url, broker)
-    await lease.subscribe("room/#")
-    await wait_for(lambda: lease.connected)
-
-    seen: List[int] = []
-    lease.event_bus.on(MessageReceived, lambda e: seen.append(e.generation))
-
-    transport = lease.transport
-    gen1 = transport.generation
-    clients[0].inbox.put_nowait(WireMqttMessage("room/a", b"1"))
-    await wait_for(lambda: len(seen) == 1)
-    assert seen[0] == gen1
-
-    # Drop and reconnect: a fresh generation.
-    clients[0].inbox.put_nowait(RuntimeError("drop"))
-    await wait_for(lambda: len(clients) == 2 and lease.connected)
-    gen2 = transport.generation
-    assert gen2 > gen1
-
-    clients[1].inbox.put_nowait(WireMqttMessage("room/b", b"2"))
-    await wait_for(lambda: len(seen) == 2)
-    assert seen[1] == gen2, f"message carried stale generation {seen[1]} != {gen2}"
-
-    await lease.close()
-
-
-# --------------------------------------------------------------------------- #
-# 5. send racing close on a pooled lease: no send on a torn-down transport.
+# 3. send racing close on a pooled lease: no send on a torn-down transport.
 # --------------------------------------------------------------------------- #
 
 
@@ -1040,7 +668,7 @@ async def test_send_after_close_raises_not_connected():
 
 
 # --------------------------------------------------------------------------- #
-# 6. WebSocket 1:1 wire: rapid connect<->disconnect; concurrent close; fan-out.
+# 4. WebSocket 1:1 wire: rapid connect<->disconnect; concurrent close; fan-out.
 # --------------------------------------------------------------------------- #
 
 
@@ -1204,7 +832,7 @@ async def test_ws_broadcast_reaches_every_lease_during_join_churn():
 
 
 # --------------------------------------------------------------------------- #
-# 7. paho (sync wire): callbacks fired from a foreign thread race the loop.
+# 5. paho (sync wire): callbacks fired from a foreign thread race the loop.
 # --------------------------------------------------------------------------- #
 
 
@@ -1481,8 +1109,233 @@ async def test_paho_subscribe_refcounted_across_leases_on_shared_socket():
     await settle()
 
 
+@pytest.mark.asyncio
+async def test_paho_pressure_keeps_lossless_edges_and_does_not_starve_loop():
+    """One paho socket stays coherent under pooled callback/backlog pressure.
+
+    This deliberately stalls the transport's async message sink while a foreign
+    paho thread fills its bounded courier.  QoS0 telemetry may shed oldest-first,
+    but QoS1 and lifecycle edges must survive the overflow in FIFO order.  The
+    callback producer handshakes with an asyncio heartbeat between chunks, proving
+    the loop remains schedulable, and a deliberately blocking ``loop_stop`` proves
+    that the last of 128 concurrent lease closes does not park the owner loop.
+    """
+
+    lease_count = 128
+    qos0_count = 1152  # 128 beyond paho's 1024-item bounded telemetry capacity.
+    topic = "pressure/telemetry"
+    loop_thread = threading.get_ident()
+    baseline = live_tasks()
+
+    class PressurePahoClient(FakePahoClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.disconnects = 0
+            self.stop_entered = threading.Event()
+            self.stop_release = threading.Event()
+            self.stop_thread: Optional[int] = None
+
+        def disconnect(self) -> None:
+            self.disconnects += 1
+            super().disconnect()
+
+        def loop_stop(self) -> int:
+            self.stop_thread = threading.get_ident()
+            self.stop_entered.set()
+            if not self.stop_release.wait(5.0):
+                raise AssertionError("test never released the fake paho loop_stop")
+            return super().loop_stop()
+
+    clients: List[PressurePahoClient] = []
+    provider = current_provider()
+
+    def factory(url: yarl.URL, logger: logging.Logger) -> PressurePahoClient:
+        client = PressurePahoClient()
+        clients.append(client)
+        return client
+
+    def build(url: yarl.URL, params: object) -> Paho:
+        return Paho(
+            url,
+            provider=provider,
+            client_factory=factory,
+            logger=silent_logger(),
+        )
+
+    pool = Pool(
+        build=build,
+        key=lambda url, params: (
+            params if isinstance(params, MqttBroker) else MqttBroker.from_url(url)
+        ),
+        route=mqtt_message_route,
+        lease_class=MqttLease,
+        provider=provider,
+    )
+    broker = MqttBroker("broker", 1883)
+    leases = [pool.connect("mqtt://broker/", broker) for _ in range(lease_count)]
+
+    assert len(clients) == 1
+    assert len({id(lease.transport) for lease in leases}) == 1
+    transport = leases[0].transport
+    client = clients[0]
+    assert client.loops_started == 1
+
+    # Keep the telemetry fan-out focused on one observed lease while making the
+    # shared paho transport carry 128 independently refcounted subscriptions.
+    topics = [topic, *(f"pressure/idle/{index}" for index in range(1, lease_count))]
+    observed = leases[0]
+    lifecycle: List[tuple] = []
+    messages: List[tuple] = []
+
+    async def record_lifecycle(event: WireEvent) -> None:
+        await asyncio.sleep(0)
+        lifecycle.append((type(event), event.generation))
+
+    async def record_message(event: MessageReceived) -> None:
+        await asyncio.sleep(0)
+        messages.append((event.message.payload, event.generation, event.lossless))
+
+    observed.event_bus.on(Connecting, record_lifecycle)
+    observed.event_bus.on(Connected, record_lifecycle)
+    observed.event_bus.on(Disconnected, record_lifecycle)
+    observed.event_bus.on(MessageReceived, record_message)
+
+    await asyncio.gather(
+        *(lease.subscribe(subscription) for lease, subscription in zip(leases, topics))
+    )
+    assert len(transport.subscriptions) == lease_count
+
+    from_thread(client.fire_connect)
+    await wait_for(lambda: (Connected, 1) in lifecycle)
+    assert all(lease.connected for lease in leases)
+    assert len(client.subscriptions) == lease_count
+
+    # Hold the first inbound message inside an async transport listener.  The
+    # paho callback itself has already returned on its own thread, so subsequent
+    # callbacks can fill the courier while the app loop remains free to tick.
+    slow_entered = asyncio.Event()
+    slow_release = asyncio.Event()
+
+    async def slow_transport_handler(event: MessageReceived) -> None:
+        if event.message.payload == b"hold-courier":
+            slow_entered.set()
+            await slow_release.wait()
+        await asyncio.sleep(0)
+
+    transport.events.on(MessageReceived, slow_transport_handler, priority=100)
+    first_callback = threading.Thread(
+        target=client.fire_message,
+        args=(WireMqttMessage(topic, b"hold-courier", qos=0),),
+        name="paho-pressure-first-callback",
+        daemon=True,
+    )
+    first_callback.start()
+    await wait_for(slow_entered.is_set)
+    first_callback.join(1.0)
+    assert not first_callback.is_alive()
+
+    heartbeat_ticks = 0
+    heartbeat_stop = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not heartbeat_stop:
+            heartbeat_ticks += 1
+            await asyncio.sleep(0)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    chunk_size = 128
+    checkpoints = [threading.Event() for _ in range(qos0_count // chunk_size)]
+    continuations = [threading.Event() for _ in checkpoints]
+    producer_done = threading.Event()
+    producer_errors: List[str] = []
+
+    def callback_pressure() -> None:
+        for index in range(qos0_count):
+            client.fire_message(WireMqttMessage(topic, f"q0:{index}".encode(), qos=0))
+            if (index + 1) % chunk_size == 0:
+                chunk = index // chunk_size
+                checkpoints[chunk].set()
+                if not continuations[chunk].wait(5.0):
+                    producer_errors.append(f"loop starved at callback chunk {chunk}")
+                    producer_done.set()
+                    return
+
+        # These five lossless items are behind the overflowing QoS0 backlog.
+        client.fire_message(WireMqttMessage(topic, b"qos1-before", qos=1))
+        client.fire_disconnect()
+        client.fire_connect()
+        client.fire_message(WireMqttMessage(topic, b"qos1-after", qos=1))
+        producer_done.set()
+
+    producer = threading.Thread(
+        target=callback_pressure,
+        name="paho-pressure-callbacks",
+        daemon=True,
+    )
+    producer.start()
+
+    for checkpoint, continuation in zip(checkpoints, continuations):
+        await wait_for(checkpoint.is_set)
+        before = heartbeat_ticks
+        await wait_for(lambda: heartbeat_ticks > before)
+        continuation.set()
+
+    await wait_for(producer_done.is_set)
+    producer.join(1.0)
+    assert not producer.is_alive()
+    assert producer_errors == []
+
+    assert transport.courier is not None
+    assert transport.courier.dropped == qos0_count - 1024
+    # 1024 retained QoS0 messages + two QoS1 messages + three recovery edges.
+    assert transport.courier.pending() == 1029
+    assert heartbeat_ticks >= len(checkpoints)
+
+    slow_release.set()
+    await wait_for(lambda: any(payload == b"qos1-after" for payload, _, _ in messages))
+
+    qos1 = [item for item in messages if item[0].startswith(b"qos1-")]
+    assert qos1 == [
+        (b"qos1-before", 1, True),
+        (b"qos1-after", 2, True),
+    ]
+    recovery = [
+        edge
+        for edge in lifecycle
+        if edge in ((Disconnected, 1), (Connecting, 1), (Connected, 2))
+    ]
+    assert recovery == [(Disconnected, 1), (Connecting, 1), (Connected, 2)]
+    assert transport.generation == 2
+    assert len(client.subscriptions) == lease_count * 2
+
+    # All 128 closes race; only the last release may stop the one paho socket.
+    closing = asyncio.gather(*(lease.close() for lease in leases))
+    await wait_for(client.stop_entered.is_set)
+    assert not closing.done()
+    assert client.stop_thread is not None
+    assert client.stop_thread != loop_thread
+    before_stop_wait = heartbeat_ticks
+    await wait_for(lambda: heartbeat_ticks > before_stop_wait)
+    client.stop_release.set()
+    await asyncio.wait_for(closing, 2.0)
+
+    heartbeat_stop = True
+    await heartbeat_task
+    await settle()
+
+    assert all(lease.closed for lease in leases)
+    assert pool.endpoints == {}
+    assert transport.subscriptions == {}
+    assert client.disconnects == 1
+    assert client.loops_started == client.loops_stopped == 1
+    assert len(client.unsubscriptions) == lease_count
+    assert transport.courier is None
+    await wait_for(lambda: live_tasks() - baseline == set())
+
+
 # --------------------------------------------------------------------------- #
-# 8. Front door: ``mqtt.connect`` background initial-subscription tasks.
+# 6. Front door: ``mqtt.connect`` background initial-subscription tasks.
 # --------------------------------------------------------------------------- #
 
 
@@ -1495,8 +1348,8 @@ async def test_front_door_connect_close_race_no_leaked_subscribe_task():
     immediately closing must not leave that background subscribe task orphaned, and
     the shared transport must still stop exactly once.
     """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
+    clients: List[FakePahoClient] = []
+    pool = paho_pool(clients)
     url = yarl.URL("mqtt://broker/?topic=room/a&topic=room/b")
     baseline = live_tasks()
 
@@ -1522,8 +1375,8 @@ async def test_front_door_shared_socket_across_concurrent_connects():
     paths/topics) must lease one shared transport, then releasing all of them
     tears that single transport down exactly once.
     """
-    clients: List[GatedAioClient] = []
-    pool = mqtt_pool(clients)
+    clients: List[FakePahoClient] = []
+    pool = paho_pool(clients)
     baseline = live_tasks()
 
     urls = [
@@ -1536,6 +1389,7 @@ async def test_front_door_shared_socket_across_concurrent_connects():
     # All three resolve to the same broker -> one shared transport instance.
     transports = {id(lease.transport) for lease in leases}
     assert len(transports) == 1, "front-door connects did not share one socket"
+    from_thread(clients[0].fire_connect)
     await wait_for(lambda: leases[0].connected)
     assert len(clients) == 1, f"built {len(clients)} sockets for one broker"
 
@@ -1548,7 +1402,7 @@ async def test_front_door_shared_socket_across_concurrent_connects():
 
 
 # --------------------------------------------------------------------------- #
-# 9. Lease-edge EventBus delivery racing a lease close.
+# 7. Lease-edge EventBus delivery racing a lease close.
 # --------------------------------------------------------------------------- #
 
 

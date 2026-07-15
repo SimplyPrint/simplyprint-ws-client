@@ -1,4 +1,6 @@
-"""Camera machinery (pool, mixin, protocols) + reusable protocol implementations."""
+"""Camera controller, pool machinery and reusable protocol implementations."""
+
+from simplyprint_ws_client.integration.camera.controller import CameraController
 
 from simplyprint_ws_client.integration.camera.mjpeg import (
     MJPEGFrameParser,
@@ -8,6 +10,7 @@ from simplyprint_ws_client.integration.camera.mjpeg import (
 )
 
 __all__ = [
+    "CameraController",
     "MJPEGFrameParser",
     "MJPEGSnapshotCamera",
     "MJPEGStreamCamera",

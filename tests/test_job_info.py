@@ -4,18 +4,16 @@ import pytest
 
 from simplyprint_ws_client import (
     Client,
+    ClientContext,
     PrinterConfig,
-    JobInfoState,
     PrinterState,
-    JobInfoMsg,
 )
+from simplyprint_ws_client.core.protocol.messages import JobInfoMsg
+from simplyprint_ws_client.core.state import JobInfoState
 
 
 def job_state_consistent(state: JobInfoState):
-    return (
-        sum(1 for key in JobInfoState.MUTUALLY_EXCLUSIVE_FIELDS if getattr(state, key))
-        <= 1
-    )
+    return sum((state.started, state.finished, state.cancelled, state.failed)) <= 1
 
 
 def build_job_state_msg(state: PrinterState) -> JobInfoMsg:
@@ -25,7 +23,7 @@ def build_job_state_msg(state: PrinterState) -> JobInfoMsg:
 @pytest.fixture
 def job_client() -> Client:
     """Client fixture specific to job info tests (without id/in_setup setup)."""
-    client = Client(PrinterConfig.get_new())
+    client = Client(PrinterConfig.get_new(), context=ClientContext())
     return client
 
 

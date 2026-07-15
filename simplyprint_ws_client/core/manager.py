@@ -35,6 +35,8 @@ from datetime import timedelta
 from typing import Union, Dict, Mapping
 from typing import final, Optional, Set, cast, Iterable, MutableSet, Hashable
 
+from yarl import URL
+
 from simplyprint_ws_client.core.client import Client
 from simplyprint_ws_client.core.client import ClientState
 from simplyprint_ws_client.core.config import PrinterConfig
@@ -42,6 +44,8 @@ from simplyprint_ws_client.core.protocol.connection import ConnectionHint
 from simplyprint_ws_client.core.protocol.connection import (
     ConnectionMode,
     SimplyPrintConnection,
+    TransportFactory,
+    default_transport_factory,
 )
 from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionIncomingEvent,
@@ -259,28 +263,34 @@ class ClientConnectionManager(
     client_views: Dict[TUniqueId, ClientView]
     views: Set[ClientView]
     logger: logging.Logger
+    transport_factory: TransportFactory
     _next_connection_id: int
 
     def __init__(
         self,
         mode: ConnectionMode,
         client_list: ClientList,
+        websocket_base: URL,
         max_clients_per_connection: Optional[int] = None,
         logger: logging.Logger = logging.getLogger("ws_manager"),
-        **kwargs,
-    ):
-        AsyncStoppable.__init__(self, **kwargs)
-        EventLoopProvider.__init__(self, **kwargs)
+        *,
+        provider: Optional[EventLoopProvider[asyncio.AbstractEventLoop]] = None,
+        transport_factory: TransportFactory = default_transport_factory,
+    ) -> None:
+        AsyncStoppable.__init__(self)
+        EventLoopProvider.__init__(self, provider=provider)
 
         if max_clients_per_connection is not None and max_clients_per_connection < 1:
             raise ValueError("max_clients_per_connection must be a positive integer")
 
         self.mode = mode
         self.client_list = client_list
+        self.websocket_base = websocket_base
         self.max_clients_per_connection = max_clients_per_connection
         self.client_views = {}
         self.views = set()
         self.logger = logger
+        self.transport_factory = transport_factory
         self._next_connection_id = 0
         self._connectivity_report_inflight = False
 
@@ -360,7 +370,10 @@ class ClientConnectionManager(
             loggerName = f"{loggerName}[{connection_id}]"
 
         connection = SimplyPrintConnection(
-            provider=self, logger=logging.getLogger(loggerName)
+            self.websocket_base,
+            provider=self,
+            logger=logging.getLogger(loggerName),
+            transport_factory=self.transport_factory,
         )
         client_view = ClientView(self.mode, connection, self.client_list)
         self.views.add(client_view)
@@ -416,6 +429,7 @@ class ClientConnectionManager(
         is_single = self.mode == ConnectionMode.SINGLE
 
         return ConnectionHint(
+            self.websocket_base,
             mode=self.mode,
             config=client.config if is_single else PrinterConfig.get_blank(),
         )

@@ -1,118 +1,120 @@
-"""SimplyPrint WebSocket client — build a printer integration on top of this library.
+"""Public authoring API for SimplyPrint printer integrations.
 
-The names below are the supported, author-facing public API. In short:
-
-* Subclass :class:`Client` to boil your device into a :class:`PrinterState`, and
-  mark demand/message handlers with :func:`configure`. (The device-side authoring
-  base builds on this.)
-* Declare your client type with a :class:`PrinterSpec`, configure the process via
-  :class:`ClientSettings`, and run it through :class:`ClientApp`.
-
-Deeper modules (``simplyprint_ws_client.core.*``, ``...wire.*``, ``...integration.*``)
-are importable but not part of the stable surface.
-
-Performance: public names are re-exported **lazily** (PEP 562 ``__getattr__``), so
-``import simplyprint_ws_client`` -- or importing a light submodule like
-``simplyprint_ws_client.const`` -- does not eagerly build the whole client
-(aiohttp/websockets, the protocol models, sentry). A heavy module loads only when
-a name it owns is first used. ``_PUBLIC`` is the curated front door
-``from simplyprint_ws_client import *`` exposes; any other public name still
-resolves lazily for backward compatibility.
+Every name exported here is deliberate and statically traceable. Protocol and
+runtime internals remain available from their owning modules; the package root
+does not search modules for undocumented compatibility exports.
 """
 
-from __future__ import annotations
-
-import importlib as _importlib
-from typing import TYPE_CHECKING
-
-from simplyprint_ws_client import _polyfill  # noqa: F401  (cheap; installs runtime polyfills)
-
-# Modules whose public names are re-exported, tried light-first so resolving a
-# config/settings/transport-base name never drags in core.app/aiohttp/sentry.
-_REEXPORT_MODULES = (
-    ".core.config",
-    ".core.settings",
-    ".core.state",
-    ".core.autowire",
-    ".core.protocol.connection",
-    ".core.protocol.models",
-    ".core.protocol.messages",
-    ".core.client",
-    ".core.app",
+from simplyprint_ws_client.core.app import ClientApp
+from simplyprint_ws_client.core.client import (
+    Client,
+    ClientConfigChangedEvent,
+    ClientState,
+    ClientStateChangeEvent,
+    PeripheralDefinitionEntry,
+    PeripheralDefinitions,
+)
+from simplyprint_ws_client.core.client_context import ClientContext
+from simplyprint_ws_client.core.config import (
+    Config,
+    ConfigManager,
+    ConfigManagerType,
+    PrinterConfig,
+)
+from simplyprint_ws_client.core.protocol.connection import ConnectionMode
+from simplyprint_ws_client.core.protocol.messages import (
+    ConnectedMsg,
+    FileDemandData,
+    GcodeDemandData,
+    MaterialDataMsg,
+    MeshDataMsg,
+    MMSMapEntry,
+    ObjectsMsg,
+    PeripheralActionDemandData,
+    PeripheralDefinitionsMsg,
+    PeripheralMsg,
+    PluginInstallDemandData,
+    RefreshPeripheralsDemandData,
+    ResolveNotificationDemandData,
+    SendLogsDemandData,
+    SetMaterialDataDemandData,
+    SkipObjectsDemandData,
+)
+from simplyprint_ws_client.core.protocol.models import PeripheralAction
+from simplyprint_ws_client.core.settings import ClientSettings
+from simplyprint_ws_client.core.state import (
+    FileProgressState,
+    FileProgressStateEnum,
+    MaterialEntry,
+    MaterialLayoutEntry,
+    MultiMaterialSolution,
+    NotificationEventPayload,
+    NotificationEventSeverity,
+    NotificationEventType,
+    NozzleType,
+    PrinterState,
+    PrinterStatus,
+)
+from simplyprint_ws_client.integration.client import PrinterClient
+from simplyprint_ws_client.integration.spec import (
+    IntegrationCapability,
+    IntegrationId,
+    IntegrationSpec,
+    IntegrationTransport,
+    ProductMetadata,
+    discover_from_service,
+    model_aware_presentation,
 )
 
-# The curated, documented public surface. Other public names remain importable
-# (resolved lazily by __getattr__), just not advertised by ``import *``.
-_PUBLIC = (
+__all__ = [
     "Client",
-    "ClientState",
-    "configure",
     "ClientApp",
+    "ClientConfigChangedEvent",
+    "ClientContext",
     "ClientSettings",
-    "PrinterSpec",
-    "ConnectionMode",
-    "PrinterConfig",
+    "ClientState",
+    "ClientStateChangeEvent",
     "Config",
     "ConfigManager",
     "ConfigManagerType",
-    "PrinterState",
-    "PrinterStatus",
+    "ConnectedMsg",
+    "ConnectionMode",
+    "FileDemandData",
+    "FileProgressState",
+    "FileProgressStateEnum",
+    "GcodeDemandData",
+    "IntegrationCapability",
+    "IntegrationId",
+    "IntegrationSpec",
+    "IntegrationTransport",
+    "MaterialDataMsg",
+    "MaterialEntry",
+    "MaterialLayoutEntry",
+    "MeshDataMsg",
+    "MMSMapEntry",
+    "MultiMaterialSolution",
+    "NotificationEventPayload",
+    "NotificationEventSeverity",
+    "NotificationEventType",
+    "NozzleType",
+    "ObjectsMsg",
+    "PeripheralAction",
     "PeripheralActionDemandData",
     "PeripheralDefinitionEntry",
     "PeripheralDefinitions",
     "PeripheralDefinitionsMsg",
     "PeripheralMsg",
-    "RefreshPeripheralsDemandData",
-    "ClientConfigChangedEvent",
-    "ClientStateChangeEvent",
-    "FileDemandData",
     "PluginInstallDemandData",
-    "FileProgressState",
-    "FileProgressStateEnum",
-    "MaterialEntry",
-    "MaterialLayoutEntry",
-    "MultiMaterialSolution",
-    "NozzleType",
-    "NotificationEventSeverity",
-    "ObjectsMsg",
-)
-
-
-def __getattr__(name: str):
-    # ``import *`` reads __all__; serve the curated list lazily (no static __all__
-    # constant, so the re-export hub stays free of "undefined name in __all__").
-    if name == "__all__":
-        return list(_PUBLIC)
-    if name.startswith("__") and name.endswith("__"):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-    for module_path in _REEXPORT_MODULES:
-        module = _importlib.import_module(module_path, __name__)
-        if hasattr(module, name):
-            value = getattr(module, name)
-            globals()[name] = value  # cache: __getattr__ fires once per name
-            return value
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return sorted(set(globals()) | set(_PUBLIC))
-
-
-if TYPE_CHECKING:
-    # Eager re-exports for static analysis / IDEs only (no runtime cost).
-    from simplyprint_ws_client.core.app import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.client import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.config import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.config import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.settings import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.state import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.protocol.connection import ConnectionMode  # noqa: F401
-    from simplyprint_ws_client.core.protocol.messages import *  # noqa: F401,F403
-    from simplyprint_ws_client.core.protocol.models import (  # noqa: F401
-        ClientMsgType,
-        DemandMsgType,
-        DispatchMode,
-        ServerMsgType,
-    )
+    "PrinterClient",
+    "PrinterConfig",
+    "PrinterState",
+    "PrinterStatus",
+    "ProductMetadata",
+    "RefreshPeripheralsDemandData",
+    "ResolveNotificationDemandData",
+    "SendLogsDemandData",
+    "SetMaterialDataDemandData",
+    "SkipObjectsDemandData",
+    "discover_from_service",
+    "model_aware_presentation",
+]

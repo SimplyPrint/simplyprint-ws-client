@@ -1,21 +1,4 @@
-"""The task registry: declare once at import time, wire once at startup.
-
-Every recurring or triggerable task is declared with the
-:meth:`REGISTRY.periodic <TaskRegistry.periodic>` decorator next to the coroutine
-that implements it. The registry is a passive inventory -- it collects
-:class:`~simplyprint_ws_client.integration.tasks.spec.TaskSpec` s and never runs
-anything. At startup the app's single
-:class:`~simplyprint_ws_client.integration.tasks.scheduler.SchedulerService` walks the
-registry and arranges the firing; that service is the *only* code that touches
-the scheduler backend.
-
-This inverts today's pain (``add_job(...)`` calls and interval literals scattered
-through startup code, with brand-specific jobs living inside a shared scheduler):
-a task is declared where it lives -- a brand's task module under
-``printers/<brand>/`` for brand work, an app module for app work -- so the shared
-scheduler never names a brand. The difference between brands is purely *which
-specs get registered*, which is the hook-not-branch rule.
-"""
+"""Task-spec inventory assembled explicitly by an application at startup."""
 
 from __future__ import annotations
 
@@ -28,10 +11,8 @@ from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
 class TaskRegistry:
     """A passive, ordered inventory of :class:`TaskSpec` s.
 
-    Registration happens at import time (a decorator runs when its task module is
-    imported), so the app assembles its full task set simply by importing the
-    task modules it wants -- a brand contributes tasks by being imported, never
-    by editing shared code.
+    Each application owns an instance and passes it to its task registrars and
+    scheduler. Registries therefore cannot leak tasks across hosts or test runs.
     """
 
     def __init__(self) -> None:
@@ -91,10 +72,3 @@ class TaskRegistry:
     def specs(self) -> ValuesView[TaskSpec]:
         """Every registered spec, in registration order."""
         return self._specs.values()
-
-
-#: The process-wide registry. Task modules decorate against this at import time;
-#: the app's SchedulerService reads it once at startup. Registration is global --
-#: it is import-time and stateless, like every task framework -- but runtime
-#: state lives on the wired StatusRegistry, never a global.
-REGISTRY = TaskRegistry()

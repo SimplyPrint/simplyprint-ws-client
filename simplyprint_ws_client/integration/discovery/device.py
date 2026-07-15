@@ -17,15 +17,25 @@ JsonValue = Union[
 class DiscoveredDevice:
     """A device a discovery source turned up on the network.
 
-    Only the network-neutral facts every integration can supply: a reachable
-    ``host`` (IP or hostname) plus an optional human ``name`` and ``serial``.
-    Integration-specific discovery payload (model codes, signed tokens, SSDP
-    headers, a ``mac``) rides in ``extra`` so callers can read it back without this
-    neutral type ever naming vendor fields. The integration decides how to turn
-    these facts into a config's hardware-match id (serial, else MAC).
+    ``hardware_id`` is the neutral immutable identity when discovery knows one
+    (for example a GUID or MAC); ``serial`` remains a common fallback. ``extra``
+    carries presentation/onboarding facts such as model ids and LAN-mode flags,
+    never identity data.
     """
 
     host: str
     name: Optional[str] = None
     serial: Optional[str] = None
+    hardware_id: Optional[str] = None
     extra: Dict[str, object] = field(default_factory=dict)
+
+    def hardware_identity(self) -> Optional[str]:
+        """The immutable device id used for matching, when discovery knows it."""
+        return self.hardware_id or self.serial
+
+    def network_addresses(self) -> tuple[str, ...]:
+        """Reachable addresses advertised by this discovery result."""
+        return (self.host,) if self.host else ()
+
+    def primary_network_address(self) -> Optional[str]:
+        return self.host or None

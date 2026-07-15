@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
+from yarl import URL
 
 from simplyprint_ws_client.core.protocol import connection as conn_mod
 from simplyprint_ws_client.core.protocol.connection import (
@@ -17,6 +18,23 @@ from simplyprint_ws_client.core.protocol.events import (
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from tests._fakes import FakeTransport
+
+_WS = URL("wss://ws.example")
+
+
+def test_default_transport_uses_websocket_control_ping_timeout(monkeypatch):
+    captured = {}
+    transport = object()
+
+    def build(url, retry, provider, **options):
+        captured.update(options)
+        return transport
+
+    monkeypatch.setattr(conn_mod, "Websockets", build)
+
+    assert conn_mod.default_transport_factory(_WS, object(), object()) is transport
+    assert captured["connect_kwargs"]["ping_timeout"] == 30
+    assert "idle_timeout" not in captured
 
 
 def _connection_with_recording_factory():
@@ -33,8 +51,9 @@ def _connection_with_recording_factory():
         return transport
 
     conn = SimplyPrintConnection(
+        _WS,
         transport_factory=factory,
-        hint=ConnectionHint(mode=ConnectionMode.SINGLE),
+        hint=ConnectionHint(_WS, mode=ConnectionMode.SINGLE),
     )
     conn.use_running_loop()
     return conn, built

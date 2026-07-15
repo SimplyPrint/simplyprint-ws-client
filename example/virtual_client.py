@@ -8,19 +8,20 @@ from typing import Optional
 from yarl import URL
 
 from simplyprint_ws_client import (
-    Client,
+    ConnectedMsg,
+    ClientContext,
     FileDemandData,
     FileProgressStateEnum,
     GcodeDemandData,
     MeshDataMsg,
     PrinterConfig,
+    PrinterClient,
     PrinterStatus,
 )
 from simplyprint_ws_client.integration.camera.base import (
     BaseCameraProtocol,
     CameraProtocolPollingMode,
 )
-from simplyprint_ws_client.integration.camera.mixin import ClientCameraMixin
 
 
 def expt_smooth(target, actual, alpha, dt) -> float:
@@ -69,13 +70,17 @@ class VirtualCamera(BaseCameraProtocol):
             yield _random_test_image()
 
 
-class VirtualClient(ClientCameraMixin[VirtualConfig]):
+class VirtualClient(PrinterClient[VirtualConfig]):
     job_progress_alpha: float = 2.0
     pending_job: Optional[FileDemandData] = None
 
-    def __init__(self, *args, **kwargs):
-        Client.__init__(self, *args, **kwargs)
-        self.initialize_camera_mixin(**kwargs)
+    def __init__(
+        self,
+        config: VirtualConfig,
+        *,
+        context: ClientContext,
+    ) -> None:
+        super().__init__(config, context=context)
 
         self.printer.firmware.machine_name = "Creality K2"
         self.printer.firmware.name = "Creality K2"
@@ -85,14 +90,12 @@ class VirtualClient(ClientCameraMixin[VirtualConfig]):
         self.printer.info.api = "Bambu"
         self.printer.tool_count = 1
 
-        self.camera_uri = URL("virtual://localhost")
-        self.printer.webcam_info.connected = True
+        self.camera.set_uri(URL("virtual://localhost"))
 
         self.printer.material0.color = "#BC0900"
         self.printer.material0.type = "PETG"
 
-    async def on_connected(self):
-        _ = self
+    async def on_connected(self, _msg: ConnectedMsg) -> None:
         self.logger.info("Yay i am connected :) :) :)")
 
     async def on_gcode(self, data: GcodeDemandData):

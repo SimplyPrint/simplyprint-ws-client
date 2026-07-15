@@ -1,9 +1,4 @@
-"""Version-compatibility imports.
-
-Import the names from here instead of relying on :mod:`_polyfill`'s historic
-stdlib monkeypatching - an explicit import survives static analysis and works
-no matter which module is imported first.
-"""
+"""Explicit imports for standard-library features absent on older Python."""
 
 import sys
 

@@ -23,6 +23,7 @@ importing this module never drags the dependency in.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import ssl
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
 import yarl
 
 from simplyprint_ws_client.events import EventBus
+from simplyprint_ws_client.common.asyncio.concurrent import run_in_thread
 from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 
@@ -330,7 +332,11 @@ class Paho(MqttTransport):
                 self.logger.debug("paho %s disconnect failed", self.url, exc_info=True)
             try:
                 # loop_stop joins paho's network thread - keep it off the loop.
-                await self.provider.event_loop.run_in_executor(None, client.loop_stop)
+                # ``stop`` may run after the delivery loop has stopped. Use a
+                # short-lived executor instead of that dead loop (or the
+                # caller's default executor, whose shutdown can race a lost
+                # cross-thread selector wake-up).
+                await run_in_thread(client.loop_stop, thread_name="paho-stop")
             except Exception:  # noqa: BLE001
                 self.logger.debug("paho %s loop_stop failed", self.url, exc_info=True)
         if self.courier is not None:
@@ -366,7 +372,7 @@ class Paho(MqttTransport):
         if message.qos.value > 0:
             # Bound the ack wait: an unacked QoS>0 publish on a dropped link
             # must not park an executor thread forever.
-            await self.provider.event_loop.run_in_executor(
+            await asyncio.get_running_loop().run_in_executor(
                 None, lambda: info.wait_for_publish(PUBLISH_ACK_TIMEOUT)
             )
             if not info.is_published():
@@ -495,7 +501,10 @@ class Paho(MqttTransport):
 
     def record_connect_failure(self, error: TransportError) -> None:
         self.connect_failures += 1
-        if self.connect_failures < self.connect_failure_limit:
+        report_after = (
+            1 if isinstance(error, FatalError) else self.connect_failure_limit
+        )
+        if self.connect_failures < report_after:
             self.logger.debug(
                 "paho %s connect failed (%s/%s): %s",
                 self.url,
@@ -556,7 +565,4 @@ def paho_reason_code(reason_code: PahoReasonCode) -> Optional[ErrorCode]:
         return None
     if isinstance(reason_code, int):
         return reason_code
-    try:
-        return int(reason_code)
-    except (TypeError, ValueError):
-        return str(reason_code)
+    return reason_code.value

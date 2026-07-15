@@ -3,21 +3,25 @@
 from simplyprint_ws_client.integration.presentation.base import (
     EditableField,
     EditableFieldOption,
-    NAME_FIELD,
-    WEBCAM_URL_FIELD,
+    EditableFieldType,
+    EditableValue,
+    EditableWriter,
     PrinterPresentation,
     default_printer_presentation,
     host_field,
     public_secret,
+    webcam_url_field,
 )
 
 __all__ = [
     "EditableField",
     "EditableFieldOption",
-    "NAME_FIELD",
-    "WEBCAM_URL_FIELD",
+    "EditableFieldType",
+    "EditableValue",
+    "EditableWriter",
     "PrinterPresentation",
     "default_printer_presentation",
     "host_field",
     "public_secret",
+    "webcam_url_field",
 ]

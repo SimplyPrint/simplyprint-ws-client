@@ -121,19 +121,6 @@ wheels = [
 ]
 
 [[package]]
-name = "aiomqtt"
-version = "2.5.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "paho-mqtt" },
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/70/44/cfc58272783a11729462dc6df5adbfeabd084f840f609054ac772ae98c19/aiomqtt-2.5.1.tar.gz", hash = "sha256:25a0a47d157e8f158d2da1110ea4786c0615518751e94f7b04976c977a8ff20d", size = 86641, upload-time = "2026-03-05T18:28:56.421Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/9e/5089fa596220bf0dc73deeb23db27904e4b3504986caf08571f6f5cb84a8/aiomqtt-2.5.1-py3-none-any.whl", hash = "sha256:fd58c3593160e4d475d90ce911cdfc4239cd64de96b0ba22edf6c86bd7afa278", size = 16051, upload-time = "2026-03-05T18:28:55.14Z" },
-]
-
-[[package]]
 name = "aiosignal"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1419,8 +1406,6 @@ dependencies = [
     { name = "aiohttp" },
     { name = "apscheduler" },
     { name = "async-timeout", marker = "python_full_version < '3.11'" },
-    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "dnspython", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "dnspython", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "email-validator" },
@@ -1436,9 +1421,6 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
-aiomqtt = [
-    { name = "aiomqtt" },
-]
 dev = [
     { name = "mkdocs" },
     { name = "mkdocs-material" },
@@ -1461,8 +1443,6 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.12.15,<4" },
     { name = "apscheduler", specifier = ">=3.11,<4" },
     { name = "async-timeout", marker = "python_full_version < '3.11'" },
-    { name = "click", marker = "python_full_version < '3.10'", specifier = "==8.1.8" },
-    { name = "click", marker = "python_full_version >= '3.10'", specifier = ">=8.2.1,<9" },
     { name = "dnspython", specifier = ">=2.6,<3" },
     { name = "email-validator", specifier = ">=2.0.0" },
     { name = "netifaces-plus", specifier = "==0.12.4" },
@@ -1477,7 +1457,6 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-aiomqtt = [{ name = "aiomqtt", specifier = ">=2.0.0" }]
 dev = [
     { name = "mkdocs", specifier = ">=1.6.1" },
     { name = "mkdocs-material", specifier = ">=9.6.18" },

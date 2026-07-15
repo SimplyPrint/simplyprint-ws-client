@@ -1,6 +1,7 @@
 import uuid
 
-from simplyprint_ws_client import Client, NotificationEventSeverity, NotificationMsg
+from simplyprint_ws_client import Client, NotificationEventSeverity
+from simplyprint_ws_client.core.protocol.messages import NotificationMsg
 from simplyprint_ws_client.core.state import NotificationEventPayload
 from tests.test_intervals import TimeControlledIntervals
 

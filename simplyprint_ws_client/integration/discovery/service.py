@@ -1,6 +1,6 @@
-"""The single, process-wide owner of LAN discovery.
+"""The Host-owned LAN discovery service.
 
-One injected :class:`DiscoveryService` holds every brand's discovery backend and
+One explicitly injected :class:`DiscoveryService` holds every brand's discovery backend and
 a shared event bus. The always-on multicast backends run on a single harness
 thread + loop owned by a :class:`DiscoveryServiceHost` (not a thread each);
 printer clients subscribe to ``event_bus`` for live device updates and onboarding

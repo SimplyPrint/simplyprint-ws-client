@@ -193,10 +193,6 @@ class SharedSlabChannel:
         # channel has its own, independent of the parent's.
         self._send_lock = threading.Lock()
 
-    # ------------------------------------------------------------------ #
-    # Construction / handoff.
-    # ------------------------------------------------------------------ #
-
     @classmethod
     def create(
         cls, n_slabs: int = _DEFAULT_SLABS, slab_size: int = _DEFAULT_SLAB_SIZE
@@ -249,9 +245,11 @@ class SharedSlabChannel:
     def dropped(self) -> int:
         return self._dropped
 
-    # ------------------------------------------------------------------ #
-    # Worker side.
-    # ------------------------------------------------------------------ #
+    def reader_fileno(self) -> int:
+        """Return the parent metadata pipe descriptor for event-loop readers."""
+        if self._parent_conn is None:
+            raise RuntimeError("reader_fileno is available on the parent side only")
+        return self._parent_conn.fileno()
 
     def send(self, producer_id: int, data: Optional[Any], timestamp: float) -> bool:
         """Hand a payload to the parent. ``False`` if it was dropped (slabs full).
@@ -301,10 +299,6 @@ class SharedSlabChannel:
                     return i
         return None
 
-    # ------------------------------------------------------------------ #
-    # Parent side.
-    # ------------------------------------------------------------------ #
-
     def recv(self, timeout: Optional[float] = None) -> Optional[SlabLease]:
         """Block for the next frame and return a :class:`SlabLease`.
 
@@ -345,10 +339,6 @@ class SharedSlabChannel:
     def _free_slab(self, idx: int) -> None:
         with self._states.get_lock():
             self._states[idx] = _FREE
-
-    # ------------------------------------------------------------------ #
-    # Teardown.
-    # ------------------------------------------------------------------ #
 
     def close(self) -> None:
         """Release this end. The owner also unlinks the shared segment.

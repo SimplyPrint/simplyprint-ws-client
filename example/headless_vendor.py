@@ -2,15 +2,15 @@
 
 This file is the 2.0 acceptance proof: with ONLY ``simplyprint_ws_client``
 installed, a vendor ships one module containing a config, a printer client, a
-declarative spec, and a guided add-printer flow -- then runs discovery, drives
+    declarative integration value, and a guided add-printer flow -- then runs discovery, drives
 the flow programmatically (no web layer), persists the printer through the one
 identity seam, and runs the fleet::
 
     .venv/bin/python -m example.headless_vendor
 
 The simulated device polls instead of pushing (the ``DevicePoller`` seam); a
-push device would declare a ``WsDriver``/``MqttDriver`` in
-``device_drivers()`` instead and override ``on_device_message``. Set
+push device would attach a ``WsDriver``/``MqttDriver`` in its constructor
+instead and override ``on_device_message``. Set
 ``SPWS_DEMO_SECONDS`` to auto-stop (the demo default is 5; ``0`` blocks forever
 like a real vendor ``main()`` would).
 """
@@ -22,12 +22,23 @@ import os
 import random
 from typing import Optional
 
-from simplyprint_ws_client import ClientSettings, PrinterConfig, PrinterStatus
+from simplyprint_ws_client import (
+    ClientContext,
+    ClientSettings,
+    PrinterConfig,
+    PrinterStatus,
+)
 from simplyprint_ws_client.integration.discovery.spec import SubnetScanSpec
 from simplyprint_ws_client.integration import DevicePoller, PrinterClient
 from simplyprint_ws_client.integration.flow import FlowError, FlowState, run_flow
 from simplyprint_ws_client.integration.flow.recipes import standard_add_printer_flow
-from simplyprint_ws_client.integration.spec import PrinterSpec, ProductMetadata, lazy
+from simplyprint_ws_client.integration.spec import (
+    IntegrationId,
+    IntegrationTransport,
+    IntegrationSpec,
+    ProductMetadata,
+    discover_from_service,
+)
 from simplyprint_ws_client.core.host import Host
 from simplyprint_ws_client.core.registry import SpecRegistry
 
@@ -38,7 +49,7 @@ class VendorConfig(PrinterConfig):
     host: Optional[str] = None
     serial: Optional[str] = None
 
-    def stable_hardware_id(self) -> Optional[str]:
+    def hardware_identity(self) -> Optional[str]:
         # The hardware-match id discovery correlates on (never the slot id).
         return self.serial
 
@@ -47,10 +58,18 @@ class VendorConfig(PrinterConfig):
 
 
 class VendorPrinter(PrinterClient[VendorConfig]):
-    def device_drivers(self):
+    def __init__(
+        self,
+        config: VendorConfig,
+        *,
+        context: ClientContext,
+    ) -> None:
+        super().__init__(config, context=context)
         # A real vendor polls its device's HTTP API here; the simulation just
         # synthesizes readings, so every poll is a "sign of life".
-        return (DevicePoller(self, interval=1.0, offline_after=10.0),)
+        self.driver = self.attach_driver(
+            DevicePoller(self, interval=1.0, offline_after=10.0)
+        )
 
     async def setup_device(self) -> None:  # called from your own init() if needed
         pass
@@ -79,7 +98,7 @@ def _make_config(state: FlowState) -> VendorConfig:
     return config
 
 
-def build_add_printer_flow():
+def build_add_printer_flow(_context):
     return standard_add_printer_flow(
         title="Add a Vendor printer",
         make_config=_make_config,
@@ -89,33 +108,29 @@ def build_add_printer_flow():
     )
 
 
-# 4. The spec: the one declarative descriptor.
+# 4. The integration: one immutable value with explicit capabilities.
 
 
 async def _probe(host: str):
     return None  # a real probe confirms (and identifies) one reachable host
 
 
-class VendorSpec(PrinterSpec):
-    KEY = "vendor"
-    metadata = ProductMetadata(
+VENDOR_ID = IntegrationId("vendor")
+VENDOR = IntegrationSpec(
+    id=VENDOR_ID,
+    name="vendor",
+    client_factory=VendorPrinter,
+    config_factory=VendorConfig,
+    metadata=ProductMetadata(
         display_name="Vendor",
         image_url="/img/vendor.png",
-        supported_transports=("http",),
+        supported_transports=(IntegrationTransport.HTTP,),
         capabilities=(),
-    )
-    client = lazy("example.headless_vendor:VendorPrinter")
-    config = lazy("example.headless_vendor:VendorConfig")
-
-    @classmethod
-    def subnet_spec(cls):
-        # Declaring any discovery spec gives this type the DEFAULT discover():
-        # scan the shared service under KEY -> neutral DiscoveredDevices.
-        return SubnetScanSpec(brand=cls.KEY, probe=_probe, key=lambda r: r.host)
-
-    @classmethod
-    def add_printer_flow(cls):
-        return build_add_printer_flow()
+    ),
+    subnet=SubnetScanSpec(brand="vendor", probe=_probe, key=lambda r: r.host),
+    discover=discover_from_service(VENDOR_ID),
+    add_printer_flow_factory=build_add_printer_flow,
+)
 
 
 # 5. The headless main(): registry -> host -> discover -> flow -> add -> run.
@@ -142,7 +157,7 @@ async def onboard(host: Host) -> None:
 
 
 def main() -> None:
-    registry = SpecRegistry.of(VendorSpec)
+    registry = SpecRegistry.of(VENDOR)
     # A real vendor persists configs: config_manager_t=ConfigManagerType.JSON.
     host = Host(registry, ClientSettings(name="vendor-demo"))
 
@@ -166,10 +181,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # ``python -m example.headless_vendor`` imports this file as ``__main__``,
-    # while the spec's lazy refs import it under its canonical name -- two
-    # module objects, two VendorConfig classes. Delegate to the canonical one
-    # so every constructed object shares one class identity.
-    from example.headless_vendor import main as _main
-
-    _main()
+    main()

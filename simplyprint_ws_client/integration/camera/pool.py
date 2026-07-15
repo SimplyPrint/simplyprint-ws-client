@@ -18,13 +18,6 @@ from simplyprint_ws_client.integration.camera.base import (
     CameraProtocolInvalidState,
     CameraProtocolPollingMode,
 )
-from simplyprint_ws_client.integration.camera.commands import (
-    DeleteCamera,
-    PollCamera,
-    Request,
-    StartCamera,
-    StopCamera,
-)
 from simplyprint_ws_client.integration.camera.handle import CameraHandle
 from simplyprint_ws_client.common.asyncio.coalescing_task import CoalescingTask
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
@@ -215,7 +208,7 @@ class CameraWorkerBackend:
         def on_item(payload, timestamp, _generation: int = generation) -> None:
             # Drop frames from a worker that has since been retired.
             if _generation == self._generation:
-                self._handle._set_frame(payload, timestamp)
+                self._handle.deliver_frame(payload, timestamp)
 
         return await self._worker_pool.allocate_async(
             self._context,
@@ -242,11 +235,10 @@ class CameraPool(ProcessStoppable, Synchronized):
     def __init__(
         self,
         *,
-        event_loop_provider=None,
+        event_loop_provider: Optional[EventLoopProvider] = None,
         process_workers: int = 0,
-        **kwargs,
-    ):
-        ProcessStoppable.__init__(self, **kwargs)
+    ) -> None:
+        ProcessStoppable.__init__(self)
         Synchronized.__init__(self)
 
         self.protocols = []
@@ -260,19 +252,6 @@ class CameraPool(ProcessStoppable, Synchronized):
             max_process_workers=self.process_workers,
         )
         self._id_counter = 0
-
-    def submit_request(self, req: Request):
-        handle = self.allocations.get(req.id)
-        if handle is None or handle._driver is None:
-            return
-        if isinstance(req, PollCamera):
-            handle._driver.poll()
-        elif isinstance(req, StartCamera):
-            handle._driver.start()
-        elif isinstance(req, StopCamera):
-            handle._driver.pause()
-        elif isinstance(req, DeleteCamera):
-            handle._driver.stop()
 
     def _release(self, camera_id: int) -> None:
         with self:
@@ -312,15 +291,17 @@ class CameraPool(ProcessStoppable, Synchronized):
 
         context = self._route(type(protocol))
         camera_id = self._new_id()
-        handle = CameraHandle(self, camera_id)
-        handle._driver = CameraWorkerBackend(
-            self._workers,
-            context,
-            protocol,
-            handle,
-            self._release,
-            self._provider,
-            pause_timeout,
+        handle = CameraHandle(camera_id)
+        handle.attach_backend(
+            CameraWorkerBackend(
+                self._workers,
+                context,
+                protocol,
+                handle,
+                self._release,
+                self._provider,
+                pause_timeout,
+            )
         )
         with self:
             self.allocations[camera_id] = handle
@@ -333,8 +314,7 @@ class CameraPool(ProcessStoppable, Synchronized):
             self.allocations.clear()
         for handle in handles:
             try:
-                if handle._driver is not None:
-                    handle._driver.stop()
+                handle.backend.stop()
             except Exception:  # noqa: BLE001
                 pass
         self._workers.stop()

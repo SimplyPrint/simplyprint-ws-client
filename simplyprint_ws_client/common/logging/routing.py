@@ -73,7 +73,7 @@ class RoutingHandler(logging.Handler):
         super().__init__()
         self._config = config
         self._rules = config.compiled_rules()  # ordered; catch-all system rule last
-        self._handlers: Dict[str, logging.Handler] = {}
+        self._handlers: Dict[str, logging.handlers.RotatingFileHandler] = {}
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -86,7 +86,9 @@ class RoutingHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-    def _handler_for(self, record: logging.LogRecord) -> logging.Handler:
+    def _handler_for(
+        self, record: logging.LogRecord
+    ) -> logging.handlers.RotatingFileHandler:
         scope, stem, formatter_kind = self._route(record.name)
         root = self._config.resolve_log_dir()
         if scope == self._config.system_scope:
@@ -148,7 +150,7 @@ class RoutingHandler(logging.Handler):
         # same stream.
         handler.acquire()
         try:
-            stream = getattr(handler, "stream", None)
+            stream = handler.stream
             if stream is not None:
                 stream.seek(0)
                 stream.truncate()

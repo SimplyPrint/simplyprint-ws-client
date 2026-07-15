@@ -42,6 +42,7 @@ __all__ = [
     "RefreshMaterialDataDemandData",
     "RefreshPeripheralsDemandData",
     "PeripheralActionDemandData",
+    "PeripheralAction",
     "MMSMapEntry",
     "SkipObjectsDemandData",
     "ResolveNotificationDemandData",
@@ -76,7 +77,6 @@ __all__ = [
     "ConnectionMsg",
     "StateChangeMsg",
     "JobInfoMsg",
-    "AiRespMsg",
     "PrinterErrorMsg",
     "ShutdownMsg",
     "StreamMsg",
@@ -129,9 +129,11 @@ from simplyprint_ws_client.core.protocol.models import (
     ClientMsgType,
     DemandMsgType,
     DispatchMode,
+    PeripheralAction,
 )
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import (
+    Interval,
     Intervals,
     PrinterSettings,
     FileProgressStateEnum,
@@ -413,11 +415,11 @@ class RefreshPeripheralsDemandData(BaseModel):
 class PeripheralActionDemandData(BaseModel):
     demand: Literal[DemandMsgType.PERIPHERAL_ACTION] = DemandMsgType.PERIPHERAL_ACTION
     id: str
-    a: str
+    a: PeripheralAction
     v: Optional[Any] = None
 
     @property
-    def action(self) -> str:
+    def action(self) -> PeripheralAction:
         return self.a
 
     @property
@@ -674,8 +676,10 @@ class WebcamStatusMsg(ClientMsg[Literal[ClientMsgType.WEBCAM_STATUS]]):
 class WebcamMsg(ClientMsg[Literal[ClientMsgType.WEBCAM]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        for key in state.webcam_settings.model_changed_fields:
-            yield key, getattr(state.webcam_settings, key)
+        yield from state.webcam_settings.model_dump(
+            include=state.webcam_settings.model_changed_fields,
+            mode="python",
+        ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.webcam_settings.model_reset_changed()
@@ -694,16 +698,21 @@ class FirmwareMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE]]):
         Construct a dict "fw" with all fields prefixed with firmware,
         except for name which is just supposed to be firmware.
         """
-        yield (
-            "fw",
-            (
-                {
-                    (f"firmware_{key}" if key != "name" else "firmware"): value
-                    for key in state.firmware.__class__.model_fields
-                    if (value := getattr(state.firmware, key)) is not None
-                }
-            ),
-        )
+        firmware = state.firmware
+        data = {
+            key: value
+            for key, value in (
+                ("firmware", firmware.name),
+                ("firmware_name_raw", firmware.name_raw),
+                ("firmware_machine", firmware.machine),
+                ("firmware_machine_name", firmware.machine_name),
+                ("firmware_version", firmware.version),
+                ("firmware_date", firmware.date),
+                ("firmware_link", firmware.link),
+            )
+            if value is not None
+        }
+        yield "fw", data
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.firmware.model_reset_changed()
@@ -712,8 +721,10 @@ class FirmwareMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE]]):
 class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        for key in state.firmware_warning.model_changed_fields:
-            yield key, getattr(state.firmware_warning, key)
+        yield from state.firmware_warning.model_dump(
+            include=state.firmware_warning.model_changed_fields,
+            mode="python",
+        ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.firmware_warning.model_reset_changed()
@@ -770,11 +781,10 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
             return DispatchMode.DISPATCH
 
         # For normal temperature changes, report more often if we are heating up or down.
-        # TODO: StrEnum
-        interval_t: Literal["temps_target", "temps"] = (
-            "temps_target" if state.is_heating() else "temps"
+        interval = (
+            Interval.TEMPERATURE_TARGET if state.is_heating() else Interval.TEMPERATURE
         )
-        return state.intervals.dispatch_mode(interval_t)
+        return state.intervals.dispatch_mode(interval)
 
 
 class AmbientTemperatureMsg(ClientMsg[Literal[ClientMsgType.AMBIENT]]):
@@ -811,9 +821,11 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
         if state.current_job_id is not None:
             yield "job_id", state.current_job_id
 
-        for key in state.job_info.model_changed_fields:
-            value = getattr(state.job_info, key)
-
+        changed = state.job_info.model_dump(
+            include=state.job_info.model_changed_fields,
+            mode="python",
+        )
+        for key, value in changed.items():
             # Progress is a float, but for simplicity we'll round it here.
             # TODO: For diff checking it might be smart to keep it as an int always.
             if key == "progress" and value is not None:
@@ -831,9 +843,9 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         # When an ended field has been changed to true, we can clear the current job id.
-        ended_fields = JobInfoState.MUTUALLY_EXCLUSIVE_FIELDS - {"started"}
-        if state.job_info.model_has_changes(*ended_fields) and any(
-            getattr(state.job_info, f) for f in ended_fields
+        ended_fields = {"cancelled", "failed", "finished"}
+        if state.job_info.model_has_changes(*ended_fields) and (
+            state.job_info.cancelled or state.job_info.failed or state.job_info.finished
         ):
             state.current_job_id = None
 
@@ -846,11 +858,7 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
         ):
             return DispatchMode.DISPATCH
 
-        return state.intervals.dispatch_mode("job")
-
-
-# Deprecated.
-class AiRespMsg(ClientMsg[Literal[ClientMsgType.AI_RESP]]): ...
+        return state.intervals.dispatch_mode(Interval.JOB)
 
 
 class PrinterErrorMsg(ClientMsg[Literal[ClientMsgType.PRINTER_ERROR]]): ...
@@ -864,12 +872,12 @@ class StreamMsg(ClientMsg[Literal[ClientMsgType.STREAM]]):
         super().__init__(data={"base": base64jpg})
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode("webcam")
+        return state.intervals.dispatch_mode(Interval.WEBCAM)
 
 
 class PingMsg(ClientMsg[Literal[ClientMsgType.PING]]):
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode("ping")
+        return state.intervals.dispatch_mode(Interval.PING)
 
 
 class LatencyMsg(ClientMsg[Literal[ClientMsgType.LATENCY]]):
@@ -928,14 +936,16 @@ class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
 class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
-        for key in state.cpu_info.model_changed_fields:
-            yield key, getattr(state.cpu_info, key)
+        yield from state.cpu_info.model_dump(
+            include=state.cpu_info.model_changed_fields,
+            mode="python",
+        ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.cpu_info.model_reset_changed()
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode("cpu")
+        return state.intervals.dispatch_mode(Interval.CPU)
 
 
 class MeshDataMsg(ClientMsg[Literal[ClientMsgType.MESH_DATA]]): ...
@@ -1029,10 +1039,14 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
             if not peripheral.model_has_changed:
                 continue
 
+            changed = peripheral.model_changed_fields
             data = {}
-            for field_name, alias in (("value", "v"), ("available", "a"), ("updated", "u")):
-                if field_name in peripheral.model_changed_fields:
-                    data[alias] = getattr(peripheral, field_name)
+            if "value" in changed:
+                data["v"] = peripheral.value
+            if "available" in changed:
+                data["a"] = peripheral.available
+            if "updated" in changed:
+                data["u"] = peripheral.updated
 
             yield (
                 peripheral.id,
@@ -1046,7 +1060,7 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
             peripheral.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode("peripheral")
+        return state.intervals.dispatch_mode(Interval.PERIPHERAL)
 
 
 class PeripheralDefinitionsMsg(
@@ -1094,7 +1108,7 @@ class NotificationMsg(ClientMsg[Literal[ClientMsgType.NOTIFICATION]]):
         yield "events", events
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode("notification")
+        return state.intervals.dispatch_mode(Interval.NOTIFICATION)
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         for event_id, notification in list(state.notifications.notifications.items()):

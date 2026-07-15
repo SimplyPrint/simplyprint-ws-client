@@ -7,46 +7,39 @@ in a web handler:
   and the backend handle. Assigned once and never re-keyed, so it survives an IP
   change *and* a physical-printer swap.
 * a stable *hardware* id for matching a re-discovered device back to its slot --
-  the brand's ``stable_hardware_id`` (serial / board id / guid) or, when the brand
-  exposes none, the device's MAC resolved from the LAN and stored in
-  ``config.mac``. This is what discovery correlates on; it never becomes the
-  ``unique_id``.
+  returned directly by ``config.hardware_identity()`` (serial / board id / guid /
+  MAC). This is what discovery correlates on; it never becomes the ``unique_id``.
 
-Which config fields may carry the device's address is the config class's
-business: :attr:`~simplyprint_ws_client.core.config.PrinterConfig.network_address_fields`.
+Each config returns its address values through
+:meth:`~simplyprint_ws_client.core.config.PrinterConfig.network_addresses`.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Optional
-
-
-def _config_host(config) -> Optional[str]:
-    for field in type(config).network_address_fields:
-        value = getattr(config, field, None)
-        if value:
-            return str(value)
-    return None
 
 
 def capture_hardware_id(config) -> None:
     """Capture a stable hardware id for matching when the brand exposes none.
 
-    Brands with a serial/guid already answer ``stable_hardware_id``; for the rest
+    Brands with a serial/guid already answer ``hardware_identity``; for the rest
     (a bare subnet-scanned printer) resolve the device's MAC from its address and
     store it in ``config.mac``, so a re-discovery on a new IP still finds this
     slot. A no-op once a hardware id (brand id or a previously-captured MAC) is
     present.
     """
-    if config.stable_hardware_id() or getattr(config, "mac", None):
+    from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
+
+    if DeviceReconciler.normalize_identity(config.hardware_identity()) is not None:
         return
-    host = _config_host(config)
-    if not host:
+    address = config.primary_network_address()
+    if not address:
         return
     from simplyprint_ws_client.integration.discovery.mac import resolve_mac
 
-    config.mac = resolve_mac(host)
+    host = DeviceReconciler.normalize_address(address)
+    if host is not None:
+        config.mac = resolve_mac(host)
 
 
 def assign_unique_id(config) -> str:

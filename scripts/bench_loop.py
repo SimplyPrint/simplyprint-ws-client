@@ -52,7 +52,6 @@ import json
 import socket
 import sys
 import tempfile
-import threading
 import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
@@ -217,7 +216,7 @@ async def camera_stop_inline(
     context: ExecutionContext, count: int, interval_s: float, block_s: float
 ) -> LoopMetric:
     """Stop N wedged workers SYNCHRONOUSLY on the loop -- exactly what the
-    camera_uri setter does today. Joins add up serially."""
+    camera controller URI setter does today. Joins add up serially."""
     provider = EventLoopProvider(loop=asyncio.get_running_loop())
     pool = WorkerPool(event_loop_provider=provider)
     handles = _allocate_wedged_workers(pool, context, count, block_s)
@@ -472,12 +471,8 @@ async def run_benchmarks(args: argparse.Namespace) -> List[LoopMetric]:
         )
 
     # Scenario 2: config flush storm.
-    metrics.append(
-        await config_flush_inline(args.flushes, args.configs, interval_s)
-    )
-    metrics.append(
-        await config_flush_coalesced(args.flushes, args.configs, interval_s)
-    )
+    metrics.append(await config_flush_inline(args.flushes, args.configs, interval_s))
+    metrics.append(await config_flush_coalesced(args.flushes, args.configs, interval_s))
 
     # Scenario 3: blocking connect.
     metrics.append(await blocking_connect_inline(args.connect_timeout, interval_s))

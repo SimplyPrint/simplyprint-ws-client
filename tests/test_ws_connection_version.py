@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from yarl import URL
 
 from simplyprint_ws_client.core.protocol import connection as conn_mod
 from simplyprint_ws_client.core.protocol.connection import (
@@ -32,6 +33,8 @@ from simplyprint_ws_client.core.protocol.messages import (
 )
 
 from tests._fakes import FakeTransport
+
+_WS = URL("wss://ws.example")
 
 
 @pytest_asyncio.fixture
@@ -52,8 +55,9 @@ async def connection(fake_transport):
         return fake_transport
 
     conn = SimplyPrintConnection(
+        _WS,
         transport_factory=factory,
-        hint=ConnectionHint(mode=ConnectionMode.SINGLE),
+        hint=ConnectionHint(_WS, mode=ConnectionMode.SINGLE),
     )
 
     # Provide the running event loop to the connection
@@ -160,7 +164,9 @@ async def test_incoming_message_tagged_with_correct_version(connection):
 @pytest.mark.asyncio
 async def test_version_consistency_across_events():
     """Test that version is consistent when events are emitted."""
-    conn = SimplyPrintConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+    conn = SimplyPrintConnection(
+        _WS, hint=ConnectionHint(_WS, mode=ConnectionMode.SINGLE)
+    )
     events_captured = []
 
     async def capture_established(event: SimplyPrintConnectionEstablishedEvent):
@@ -188,8 +194,12 @@ async def test_version_consistency_across_events():
 @pytest.mark.asyncio
 async def test_version_isolation_between_connections():
     """Test that versions are independent between different connection instances."""
-    conn1 = SimplyPrintConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
-    conn2 = SimplyPrintConnection(hint=ConnectionHint(mode=ConnectionMode.SINGLE))
+    conn1 = SimplyPrintConnection(
+        _WS, hint=ConnectionHint(_WS, mode=ConnectionMode.SINGLE)
+    )
+    conn2 = SimplyPrintConnection(
+        _WS, hint=ConnectionHint(_WS, mode=ConnectionMode.SINGLE)
+    )
 
     assert conn1.v == 0
     assert conn2.v == 0

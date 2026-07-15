@@ -2,12 +2,7 @@
 
 Unlike the fake-injected unit suites, this file stands up a real in-process
 WebSocket server on ``127.0.0.1`` (the ``websockets`` library's ``serve``) and
-drives BOTH installed async wire families against it over a genuine TCP socket:
-
-* the ``websockets``-backed :class:`Websockets` transport, and
-* the ``aiohttp``-backed :class:`Aiohttp` transport.
-
-Both speak the standard WebSocket protocol, so one server serves both clients.
+drives the production :class:`Websockets` transport over a genuine TCP socket.
 Each real-socket scenario proves the full reliability story end to end: connect
 and ``ready()`` -> ``True``, a server push surfacing as :class:`MessageReceived`,
 a send the server echoes back, a server-forced drop that the supervised reconnect
@@ -18,8 +13,8 @@ It also drives the public ``ws.connect`` front door end to end (front door ->
 :class:`Pool` -> framed lease) over the same real server, including pooled
 socket-sharing across two leases on one endpoint.
 
-``paho`` / ``aiomqtt`` are not installed, so MQTT is not exercised here; the
-fake-injected MQTT path lives in the sibling unit suites.
+MQTT is not exercised here; the fake-injected Paho path lives in the sibling
+unit suites.
 """
 
 from __future__ import annotations
@@ -35,7 +30,6 @@ import yarl
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 
 from simplyprint_ws_client.wire import websocket as ws
-from simplyprint_ws_client.wire.aiohttp import Aiohttp
 from simplyprint_ws_client.wire.lease import WsLease
 from simplyprint_ws_client.wire.options import ConnectionOptions
 from simplyprint_ws_client.wire.events import (
@@ -46,6 +40,7 @@ from simplyprint_ws_client.wire.events import (
 )
 from simplyprint_ws_client.wire.messages import QoS
 from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import WsTransport
 from simplyprint_ws_client.wire.websocket import (
@@ -217,7 +212,7 @@ def fast_policy() -> RetryPolicy:
 
 
 # --------------------------------------------------------------------------- #
-# Build the two installed wire transports against a real server URL.
+# Build the production wire transport against a real server URL.
 # --------------------------------------------------------------------------- #
 
 
@@ -225,13 +220,8 @@ def make_websockets(url: yarl.URL, policy: Optional[RetryPolicy] = None) -> Webs
     return Websockets(url, policy or fast_policy())
 
 
-def make_aiohttp(url: yarl.URL, policy: Optional[RetryPolicy] = None) -> Aiohttp:
-    return Aiohttp(url, policy or fast_policy())
-
-
 WIRES = [
     pytest.param(make_websockets, id="websockets"),
-    pytest.param(make_aiohttp, id="aiohttp"),
 ]
 
 
@@ -245,7 +235,7 @@ async def running(transport: WsTransport) -> AsyncIterator[WsTransport]:
 
 
 # --------------------------------------------------------------------------- #
-# Real-socket transport scenarios -- run for BOTH installed wire families.
+# Real-socket transport scenarios.
 # --------------------------------------------------------------------------- #
 
 
@@ -488,15 +478,13 @@ async def test_idempotent_start_keeps_single_connection(
 
 @contextlib.asynccontextmanager
 async def front_door(
-    url: yarl.URL, *, impl: str, retry: Optional[RetryPolicy] = None
+    url: yarl.URL, *, retry: Optional[RetryPolicy] = None
 ) -> AsyncIterator[WsLease]:
     """A ws.connect lease on its own pool, torn down cleanly after the test."""
     # Force a brand-new pool so suites do not share live sockets across tests.
-    ws.DEFAULT_POOLS.pools.pop(impl, None)
-    pool = ws.build_pool(impl, None)
+    pool = ws.pool_for(PoolRegistry())
     conn = ws.connect(
         url,
-        impl=impl,
         options=ConnectionOptions(retry=retry or fast_policy()),
         pool=pool,
     )
@@ -509,10 +497,9 @@ async def front_door(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_ready_true(impl, server: LoopbackServer) -> None:
+async def test_front_door_ready_true(server: LoopbackServer) -> None:
     """ws.connect -> ready() resolves True over a real socket."""
-    async with front_door(server.url, impl=impl) as conn:
+    async with front_door(server.url) as conn:
         assert await conn.ready(timeout=3.0) is True
         assert conn.connected
         assert conn.state is ConnectionState.CONNECTED
@@ -520,14 +507,13 @@ async def test_front_door_ready_true(impl, server: LoopbackServer) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_server_push_is_framed(
-    impl, push_server: LoopbackServer
+    push_server: LoopbackServer,
 ) -> None:
     """A raw server frame is delivered to the lease as a framed WsMessage."""
     received: List[WsMessage] = []
 
-    async with front_door(push_server.url, impl=impl) as conn:
+    async with front_door(push_server.url) as conn:
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
 
@@ -541,14 +527,13 @@ async def test_front_door_server_push_is_framed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_binary_push_is_framed_bytes(
-    impl, push_server: LoopbackServer
+    push_server: LoopbackServer,
 ) -> None:
     """A binary server frame is framed as a BINARY WsMessage carrying bytes."""
     received: List[WsMessage] = []
 
-    async with front_door(push_server.url, impl=impl) as conn:
+    async with front_door(push_server.url) as conn:
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
 
@@ -562,12 +547,11 @@ async def test_front_door_binary_push_is_framed_bytes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_send_str_and_wsmessage(impl, server: LoopbackServer) -> None:
+async def test_front_door_send_str_and_wsmessage(server: LoopbackServer) -> None:
     """A bare str and a WsMessage both go out and are echoed back, framed."""
     received: List[WsMessage] = []
 
-    async with front_door(server.url, impl=impl) as conn:
+    async with front_door(server.url) as conn:
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
 
@@ -576,12 +560,14 @@ async def test_front_door_send_str_and_wsmessage(impl, server: LoopbackServer) -
         await conn.send(WsMessage.binary(b"rawbytes"))
 
         await wait_until(
-            lambda: {
-                m.payload
-                for m in received
-                if isinstance(m, WsMessage) and isinstance(m.payload, str)
-            }
-            >= {"echo:bare-str", "echo:wrapped"}
+            lambda: (
+                {
+                    m.payload
+                    for m in received
+                    if isinstance(m, WsMessage) and isinstance(m.payload, str)
+                }
+                >= {"echo:bare-str", "echo:wrapped"}
+            )
         )
         await wait_until(
             lambda: any(
@@ -595,13 +581,12 @@ async def test_front_door_send_str_and_wsmessage(impl, server: LoopbackServer) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_forced_drop_resume(impl, server: LoopbackServer) -> None:
+async def test_front_door_forced_drop_resume(server: LoopbackServer) -> None:
     """The front-door lease survives a server drop: gen+1, then sends again."""
     lifecycle_connected: List[int] = []
     received: List[WsMessage] = []
 
-    async with front_door(server.url, impl=impl) as conn:
+    async with front_door(server.url) as conn:
         conn.event_bus.on(Connected, lambda e: lifecycle_connected.append(e.generation))
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
@@ -622,16 +607,14 @@ async def test_front_door_forced_drop_resume(impl, server: LoopbackServer) -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_pool_shares_one_socket(impl, server: LoopbackServer) -> None:
+async def test_front_door_pool_shares_one_socket(server: LoopbackServer) -> None:
     """Two leases on one endpoint URL share a single real socket."""
-    ws.DEFAULT_POOLS.pools.pop(impl, None)
-    pool = ws.build_pool(impl, None)
+    pool = ws.pool_for(PoolRegistry())
     first = ws.connect(
-        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+        server.url, options=ConnectionOptions(retry=fast_policy()), pool=pool
     )
     second = ws.connect(
-        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+        server.url, options=ConnectionOptions(retry=fast_policy()), pool=pool
     )
     try:
         assert await first.ready(timeout=3.0)
@@ -647,18 +630,16 @@ async def test_front_door_pool_shares_one_socket(impl, server: LoopbackServer) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_last_close_tears_socket_down(
-    impl, server: LoopbackServer
+    server: LoopbackServer,
 ) -> None:
     """The last lease to close stops the shared transport and drops the socket."""
-    ws.DEFAULT_POOLS.pools.pop(impl, None)
-    pool = ws.build_pool(impl, None)
+    pool = ws.pool_for(PoolRegistry())
     first = ws.connect(
-        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+        server.url, options=ConnectionOptions(retry=fast_policy()), pool=pool
     )
     second = ws.connect(
-        server.url, impl=impl, options=ConnectionOptions(retry=fast_policy()), pool=pool
+        server.url, options=ConnectionOptions(retry=fast_policy()), pool=pool
     )
     try:
         assert await first.ready(timeout=3.0)
@@ -684,9 +665,8 @@ async def test_front_door_last_close_tears_socket_down(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_async_handler_drain_ordered(
-    impl, push_server: LoopbackServer
+    push_server: LoopbackServer,
 ) -> None:
     """An async lease handler drains pushes FIFO, in arrival order, serialized."""
     order: List[str] = []
@@ -700,7 +680,7 @@ async def test_front_door_async_handler_drain_ordered(
         order.append(event.message.payload)
         running_now.pop()
 
-    async with front_door(push_server.url, impl=impl) as conn:
+    async with front_door(push_server.url) as conn:
         conn.event_bus.on(MessageReceived, handler)
         assert await conn.ready(timeout=3.0)
 
@@ -713,12 +693,11 @@ async def test_front_door_async_handler_drain_ordered(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_ready_already_connected_returns_fast(
-    impl, server: LoopbackServer
+    server: LoopbackServer,
 ) -> None:
     """ready() on an already-connected lease resolves True immediately."""
-    async with front_door(server.url, impl=impl) as conn:
+    async with front_door(server.url) as conn:
         assert await conn.ready(timeout=3.0)
         # Second call: already connected, returns at once.
         assert await conn.ready(timeout=0.001) is True
@@ -727,66 +706,9 @@ async def test_front_door_ready_already_connected_returns_fast(
 @pytest.mark.asyncio
 async def test_front_door_rejects_non_ws_scheme() -> None:
     """ws.connect refuses a non ws/wss URL before touching the network."""
+    pool = ws.pool_for(PoolRegistry())
     with pytest.raises(ValueError):
-        ws.connect(yarl.URL("http://127.0.0.1:1/"))
-
-
-@pytest.mark.asyncio
-async def test_front_door_rejects_unknown_impl() -> None:
-    """ws.connect refuses an impl it does not ship."""
-    with pytest.raises(ValueError):
-        ws.connect(yarl.URL("ws://127.0.0.1:1/"), impl="nonsense")
-
-
-# --------------------------------------------------------------------------- #
-# Cross-impl: a single server serves websockets AND aiohttp leases at once.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_both_impls_against_one_server(server: LoopbackServer) -> None:
-    """The same real server serves a websockets lease and an aiohttp lease."""
-    ws.DEFAULT_POOLS.pools.pop("websockets", None)
-    ws.DEFAULT_POOLS.pools.pop("aiohttp", None)
-    pool_ws = ws.build_pool("websockets", None)
-    pool_aio = ws.build_pool("aiohttp", None)
-
-    a = ws.connect(
-        server.url,
-        impl="websockets",
-        options=ConnectionOptions(retry=fast_policy()),
-        pool=pool_ws,
-    )
-    b = ws.connect(
-        server.url,
-        impl="aiohttp",
-        options=ConnectionOptions(retry=fast_policy()),
-        pool=pool_aio,
-    )
-
-    got_a: List[WsMessage] = []
-    got_b: List[WsMessage] = []
-    a.event_bus.on(MessageReceived, lambda e: got_a.append(e.message))
-    b.event_bus.on(MessageReceived, lambda e: got_b.append(e.message))
-
-    try:
-        assert await a.ready(timeout=3.0)
-        assert await b.ready(timeout=3.0)
-
-        await a.send("from-a")
-        await b.send("from-b")
-
-        await wait_until(
-            lambda: any(m.payload == "echo:from-a" for m in got_a)
-            and any(m.payload == "echo:from-b" for m in got_b)
-        )
-        # Distinct sockets: two separate accepts on the same server.
-        await wait_until(lambda: server.accept_count >= 2)
-    finally:
-        await a.close()
-        await b.close()
-        pool_ws.stop()
-        pool_aio.stop()
+        ws.connect(yarl.URL("http://127.0.0.1:1/"), pool=pool)
 
 
 # --------------------------------------------------------------------------- #
@@ -795,22 +717,18 @@ async def test_both_impls_against_one_server(server: LoopbackServer) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
 async def test_front_door_two_leases_both_receive_broadcast(
-    impl, push_server: LoopbackServer
+    push_server: LoopbackServer,
 ) -> None:
     """A 1:1 WS broadcasts every inbound frame to EVERY lease on the endpoint."""
-    ws.DEFAULT_POOLS.pools.pop(impl, None)
-    pool = ws.build_pool(impl, None)
+    pool = ws.pool_for(PoolRegistry())
     first = ws.connect(
         push_server.url,
-        impl=impl,
         options=ConnectionOptions(retry=fast_policy()),
         pool=pool,
     )
     second = ws.connect(
         push_server.url,
-        impl=impl,
         options=ConnectionOptions(retry=fast_policy()),
         pool=pool,
     )
@@ -874,8 +792,7 @@ async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_ready_timeout_false_while_still_retrying(impl) -> None:
+async def test_front_door_ready_timeout_false_while_still_retrying() -> None:
     """ready(timeout) returns False (not None, no raise) on a slow endpoint.
 
     The endpoint never comes up but the policy keeps retrying forever; ready()
@@ -890,7 +807,7 @@ async def test_front_door_ready_timeout_false_while_still_retrying(impl) -> None
 
     url = yarl.URL(f"ws://127.0.0.1:{dead_port}/")
     forever = RetryPolicy(backoff=ConstantBackoff(0.05))  # retry forever
-    async with front_door(url, impl=impl, retry=forever) as conn:
+    async with front_door(url, retry=forever) as conn:
         result = await conn.ready(timeout=0.3)
         assert result is False
         # Still supervising (never gave up): a later connect could still succeed.
@@ -903,7 +820,7 @@ async def test_server_ping_is_not_delivered_as_message(make) -> None:
     """A server-initiated WebSocket ping must not surface as a MessageReceived.
 
     The wire's recv must skip control frames (ping/pong) -- only real data frames
-    become messages. Both libraries answer a ping with a pong transparently.
+    become messages. The library answers a ping with a pong transparently.
     """
     from websockets.asyncio.server import serve
 
@@ -1023,8 +940,7 @@ async def test_stop_while_connecting_is_clean(make) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_front_door_ready_false_on_give_up(impl) -> None:
+async def test_front_door_ready_false_on_give_up() -> None:
     """The full ws.connect path resolves ready() False on a permanent give-up."""
     import socket
 
@@ -1035,7 +951,7 @@ async def test_front_door_ready_false_on_give_up(impl) -> None:
 
     url = yarl.URL(f"ws://127.0.0.1:{dead_port}/")
     bounded = RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=2)
-    async with front_door(url, impl=impl, retry=bounded) as conn:
+    async with front_door(url, retry=bounded) as conn:
         assert await conn.ready(timeout=5.0) is False
         assert not conn.transport.supervising()
         assert conn.state is ConnectionState.DISCONNECTED
@@ -1067,11 +983,10 @@ async def test_lifecycle_event_sequence_across_drop(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("impl", ["websockets", "aiohttp"])
-async def test_at_most_once_outbound_still_sends(impl, server: LoopbackServer) -> None:
+async def test_at_most_once_outbound_still_sends(server: LoopbackServer) -> None:
     """An AT_MOST_ONCE outbound WsMessage still goes out (QoS gates inbound only)."""
     received: List[WsMessage] = []
-    async with front_door(server.url, impl=impl) as conn:
+    async with front_door(server.url) as conn:
         conn.event_bus.on(MessageReceived, lambda e: received.append(e.message))
         assert await conn.ready(timeout=3.0)
         await conn.send(WsMessage.text("amo", qos=QoS.AT_MOST_ONCE))
@@ -1145,14 +1060,14 @@ async def test_messages_after_reconnect_carry_new_generation_only(
 
 
 def test_importing_conn_package_loads_no_wire_library() -> None:
-    """Importing contrib.connection must not eager-load websockets/aiohttp/paho/aiomqtt."""
+    """Importing the wire package must not load websockets or paho."""
     import subprocess
     import sys
 
     code = (
         "import sys\n"
         "import simplyprint_ws_client.wire as conn\n"
-        "leaked = [m for m in ('websockets', 'aiohttp', 'paho', 'aiomqtt')\n"
+        "leaked = [m for m in ('websockets', 'paho')\n"
         "          if m in sys.modules]\n"
         "assert not leaked, leaked\n"
         "print('clean')\n"

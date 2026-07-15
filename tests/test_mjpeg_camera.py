@@ -77,9 +77,7 @@ async def test_snapshot_camera_extracts_multipart_frame_with_case_sensitive_boun
 
     frames = [
         frame
-        async for frame in MJPEGSnapshotCamera(
-            URL("mjpeg://printer/snapshot")
-        ).read()
+        async for frame in MJPEGSnapshotCamera(URL("mjpeg://printer/snapshot")).read()
     ]
 
     assert frames == [JPEG_ONE]

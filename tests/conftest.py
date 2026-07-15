@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from simplyprint_ws_client import Client, PrinterConfig
+from simplyprint_ws_client import Client, ClientContext, PrinterConfig
 
 
 @pytest.fixture
 def client() -> Client:
     """Create a configured Client instance for testing."""
-    client = Client(PrinterConfig.get_new())
+    client = Client(PrinterConfig.get_new(), context=ClientContext())
     client.config.id = 1
     client.config.in_setup = False
     return client

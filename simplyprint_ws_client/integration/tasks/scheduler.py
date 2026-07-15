@@ -1,9 +1,9 @@
 """The one place that drives a scheduler backend: :class:`SchedulerService`.
 
-Reads the :data:`~simplyprint_ws_client.integration.tasks.registry.REGISTRY` once at
-startup and arranges every task's firing on APScheduler (3.x; the v4 ``add_job``
--> ``add_schedule`` rename is confined to this file). It is also the single entry
-point for the two firing paths a task supports:
+Receives an application-owned task registry at startup and arranges every task's
+firing on APScheduler (3.x; the v4 ``add_job`` -> ``add_schedule`` rename is
+confined to this file). It is also the single entry point for the two firing
+paths a task supports:
 
 * **scheduled** -- interval / cron specs fire on a timer, with the spec's
   ``max_instances`` / ``coalesce`` / ``misfire_grace_time`` taken straight through
@@ -41,9 +41,10 @@ from simplyprint_ws_client.core.status.registry import (
     StatusRegistry,
     StatusState,
 )
+from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_future
 from simplyprint_ws_client.common.asyncio.offload import install_default_executor
 from simplyprint_ws_client.integration.tasks.context import TaskContext
-from simplyprint_ws_client.integration.tasks.registry import REGISTRY, TaskRegistry
+from simplyprint_ws_client.integration.tasks.registry import TaskRegistry
 from simplyprint_ws_client.integration.tasks.spec import TaskSpec
 
 logger = logging.getLogger("simplyprint.tasks")
@@ -57,6 +58,10 @@ TASKS_SECTION = "tasks"
 # apart so they don't all land at once.
 _STARTUP_DELAY = timedelta(seconds=10)
 _STARTUP_STAGGER = timedelta(minutes=1)
+# Keep the dedicated selector's timeout bounded. The ordinary self-pipe remains
+# the zero-latency cross-thread wake path; this timer only backs it up on
+# supported runtimes where that notification can be lost.
+_CROSS_THREAD_WAKE_BACKSTOP_SECONDS = 0.01
 
 
 class SchedulerService:
@@ -65,13 +70,14 @@ class SchedulerService:
     def __init__(
         self,
         status: StatusRegistry,
-        registry: TaskRegistry = REGISTRY,
+        registry: TaskRegistry,
     ) -> None:
         self._status = status
         self._registry = registry
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._scheduler: Optional[Any] = None  # apscheduler AsyncIOScheduler
+        self._wake_backstop: Optional[asyncio.TimerHandle] = None
         self._ready = threading.Event()
         self._started = False
         # Single-flight: the in-flight run per (task name, key). Only ever touched
@@ -143,10 +149,14 @@ class SchedulerService:
         self._schedule_all()
         self._scheduler.add_listener(self._on_job_error, EVENT_JOB_ERROR)
         self._scheduler.start()
+        self._arm_wake_backstop()
         self._ready.set()
         try:
             self._loop.run_forever()
         finally:
+            if self._wake_backstop is not None:
+                self._wake_backstop.cancel()
+                self._wake_backstop = None
             pending = [
                 task for task in asyncio.all_tasks(self._loop) if not task.done()
             ]
@@ -160,6 +170,22 @@ class SchedulerService:
             self._loop = None
             self._scheduler = None
             self._ready.clear()
+
+    def _arm_wake_backstop(self) -> None:
+        """Bound selector sleep without replacing its normal self-pipe wake."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        def rearm() -> None:
+            if self._loop is loop and not loop.is_closed():
+                self._wake_backstop = loop.call_later(
+                    _CROSS_THREAD_WAKE_BACKSTOP_SECONDS, rearm
+                )
+
+        self._wake_backstop = loop.call_later(
+            _CROSS_THREAD_WAKE_BACKSTOP_SECONDS, rearm
+        )
 
     def _schedule_all(self) -> None:
         assert self._scheduler is not None
@@ -211,7 +237,7 @@ class SchedulerService:
             raise RuntimeError("SchedulerService is not started")
         spec = self._registry.get(name)
         fut = asyncio.run_coroutine_threadsafe(self._run(spec, key=key), self._loop)
-        return await asyncio.wrap_future(fut)
+        return await await_concurrent_future(fut)
 
     def fire(self, name: str, *, key: str = "") -> "concurrent.futures.Future":
         """Fire-and-forget ``name`` from synchronous code -- the sync sibling of

@@ -1,664 +1,753 @@
-"""The file-transfer + prepare-to-print lifecycle, as one business object.
+"""One print-preparation lifecycle composed with one printer file driver.
 
-Every LAN-upload integration runs the same play when a print file arrives:
-
-1. cancel any in-flight transfer, claim the job
-   (``_set_active_job_for_prepare``),
-2. ``begin_prepare`` -> download from the SP CDN (0-50%),
-3. transform the file for this printer, upload it (50-100%),
-4. either stash it (no auto-start) or send the start command and arm a grace
-   timer (``mark_transfer_complete``),
-5. watch the firmware: land ``READY`` once it actually starts, ``ERROR`` if it
-   rejects the start or the grace window expires.
-
-This used to be ~200 near-identical lines in each brand's ``files.py``. It now
-lives here as :class:`FileTransfer`; a brand subclass supplies only what is
-genuinely brand-specific via the hooks at the bottom of the class:
-
-* ``_upload``           -- push the local file to the printer (FTP / HTTP / ...)
-* ``_send_start``       -- the brand's "start this file" command(s)
-* ``_firmware_outcome`` -- read a state push and decide started / failed / pending
-* and a handful of optional hooks (file transform, existing-file lookup,
-  device-error text, in-firmware download progress).
-
-The firmware-ACK gate is the subtle part and is deliberately delegated whole to
-``_firmware_outcome`` because it differs by model: some firmwares discriminate a
-fresh attempt by a task id; others (whose print id is always empty) key off a
-genuine state transition.
+``FileTransfer`` owns admission, cancellation, source download, upload retry,
+staging, firmware-confirmation timeouts and teardown. Integrations implement
+``PrintFileDriver`` and explicitly project device reports back through
+``started()``, ``rejected()`` and ``progress()``. Neither side reaches through
+the other with lifecycle hooks.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
+import contextvars
+import logging
 import threading
 import time
-from abc import ABC, abstractmethod
-from enum import Enum, auto
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Optional, Tuple
+from typing import Awaitable, Callable, final, Optional, Tuple
 
-from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
 from simplyprint_ws_client.common.utils.slugify import slugify
 from simplyprint_ws_client.common.utils.temp import (
     app_cache_path,
     cache_temporary_directory,
 )
-from simplyprint_ws_client.core.files.file_download import FileDownload
+from simplyprint_ws_client.core.protocol.messages import (
+    FileDemandData,
+)
+from simplyprint_ws_client.core.state import FileProgressState, FileProgressStateEnum
+from simplyprint_ws_client.integration.transfer.download import (
+    FileDownloadError,
+    download_file,
+)
 
-from simplyprint_ws_client.integration.transfer.checksum import file_md5
+ProgressCallback = Callable[[float], None]
+JobErrorReporter = Callable[[int, str], Awaitable[None]]
 
-if TYPE_CHECKING:
-    from simplyprint_ws_client.integration.client import PrinterClient
-
-#: Seconds to wait, after the file reached the printer and the start command was
-#: sent, for the firmware to broadcast a started print state.
 DEFAULT_GRACE_SECONDS = 60.0
-PREEMPTION_GRACE_SECONDS = 0.05
-DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_MAX_UPLOAD_ATTEMPTS = 4
 DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_WATCHDOG_INTERVAL_SECONDS = 5.0
 
-#: Prepared (dest, demand, md5) ready to print once a start is requested.
-PreparedPrint = Tuple[PurePosixPath, FileDemandData, str]
+
+class PreparationKind(Enum):
+    """The physical route a FILE demand takes to the printer."""
+
+    UPLOAD = "upload"
+    UPLOAD_AND_START = "upload_and_start"
+    URL = "url"
 
 
-class _TransferCancelled(Exception):
-    """Cooperative cancellation raised from synchronous progress callbacks."""
+class StartDisposition(Enum):
+    """How an accepted start operation reaches its terminal state."""
+
+    COMPLETE = "complete"
+    AWAIT_DEVICE = "await_device"
 
 
-class _TransferFailed(Exception):
-    def __init__(self, user_message: str, reason: str) -> None:
+@dataclass(frozen=True)
+class UploadedFile:
+    """A driver-owned file now addressable by a printer start command."""
+
+    path: PurePosixPath
+    md5: Optional[str] = None
+
+
+class FileOperationError(Exception):
+    """A permanent, user-reportable print-file operation failure."""
+
+    def __init__(self, user_message: str, reason: Optional[str] = None) -> None:
         super().__init__(user_message)
         self.user_message = user_message
-        self.reason = reason
+        self.reason = reason or user_message
 
 
-class FirmwareStartOutcome(Enum):
-    """What a firmware state push tells us about a print we're awaiting."""
-
-    PENDING = auto()  #: nothing conclusive yet
-    STARTED = auto()  #: the print is actually running
-    FAILED = auto()  #: the printer rejected / aborted the start
+class RetryableFileError(FileOperationError):
+    """An upload failed before acceptance and may safely be attempted again."""
 
 
-class FileTransfer(ABC):
-    """Owns the file-transfer + prepare lifecycle for one printer.
+class UnsupportedFileOperation(FileOperationError):
+    """The selected printer route is not implemented by this driver."""
 
-    A brand instantiates this with its high-level client and wires its own
-    print-update / connect / disconnect events to :meth:`on_print_changed` and
-    :meth:`on_connection_changed`.
+    def __init__(self, operation: str) -> None:
+        super().__init__(
+            f"This printer does not support {operation}",
+            f"unsupported print-file operation: {operation}",
+        )
+
+
+class PrintFileDriver:
+    """Printer-specific print-file operations, without lifecycle ownership.
+
+    A driver method either returns after the device transport accepted the
+    operation or raises. Device-side completion is expressed by the returned
+    :class:`StartDisposition`; later reports are projected explicitly into the
+    composed :class:`FileTransfer` by the owning printer.
     """
 
-    #: Default transfer-type label recorded while a prepare is in flight.
-    transfer_type: str = "file"
-    #: Whether READY waits for the firmware to confirm the started print (the
-    #: full await-firmware gate). Brands whose device API gives no usable
-    #: confirmation (download -> upload -> done shapes) set this False and
-    #: ``mark_transfer_complete`` lands READY immediately.
-    await_firmware_start: bool = True
-    #: Fallback message when a start is rejected with no specific device error.
-    reject_message: str = "Print start was rejected by the printer"
-    #: Grace window for the firmware to confirm a started print.
-    grace_seconds: float = DEFAULT_GRACE_SECONDS
-    #: Retry budget for the whole download/prepare/upload operation.
-    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
-    #: Maximum time without real download/upload/firmware progress before ERROR.
-    no_progress_timeout_seconds: float = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS
+    max_upload_attempts: int = DEFAULT_MAX_UPLOAD_ATTEMPTS
     retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
+
+    def route(self, _data: FileDemandData) -> PreparationKind:
+        return PreparationKind.UPLOAD
+
+    async def upload(
+        self,
+        data: FileDemandData,
+        source: Path,
+        progress: ProgressCallback,
+    ) -> UploadedFile:
+        raise UnsupportedFileOperation("local file upload")
+
+    async def start_uploaded(
+        self, data: FileDemandData, uploaded: UploadedFile
+    ) -> StartDisposition:
+        raise UnsupportedFileOperation("starting a stored file")
+
+    async def upload_and_start(
+        self,
+        data: FileDemandData,
+        source: Path,
+        progress: ProgressCallback,
+    ) -> StartDisposition:
+        raise UnsupportedFileOperation("atomic upload and start")
+
+    async def start_url(
+        self, data: FileDemandData, progress: ProgressCallback
+    ) -> StartDisposition:
+        raise UnsupportedFileOperation("starting a file by URL")
+
+    async def cancel_start(self) -> None:
+        """Best-effort cancellation after a device-confirmation timeout."""
+
+    async def close(self) -> None:
+        """Close resources owned by the driver."""
+
+
+@dataclass(frozen=True)
+class _StagedPrint:
+    uploaded: UploadedFile
+    data: FileDemandData
+
+
+@dataclass
+class _TransferLifecycle:
+    route: PreparationKind
+    data: FileDemandData
+    staged_start: bool = False
+    task: Optional[asyncio.Task] = field(default=None, repr=False)
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
+    terminal: Optional[FileProgressStateEnum] = None
+    activity_at: Optional[float] = None
+    awaiting_since: Optional[float] = None
+    start_in_flight: bool = False
+    watchdog: Optional[asyncio.Task] = field(default=None, repr=False)
+
+    @property
+    def job_id(self) -> Optional[int]:
+        return self.data.job_id
+
+    @property
+    def is_preparing(self) -> bool:
+        return self.activity_at is not None
+
+
+_executing_lifecycle: contextvars.ContextVar[Optional[_TransferLifecycle]] = (
+    contextvars.ContextVar("file_transfer_lifecycle", default=None)
+)
+
+
+@final
+class FileTransfer:
+    """Final controller for one printer's FILE and staged START operations."""
+
+    grace_seconds: float = DEFAULT_GRACE_SECONDS
+    no_progress_timeout_seconds: float = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS
     watchdog_interval_seconds: float = DEFAULT_WATCHDOG_INTERVAL_SECONDS
 
-    def __init__(self, client: "PrinterClient") -> None:
-        self.client = client
-        self.next_to_print: Optional[PreparedPrint] = None
-
-        # The three hooks run on the app loop and must be async (offloading their
-        # blocking parts via _offload). Warn loudly if an out-of-tree brand still
-        # overrides one synchronously rather than silently re-blocking the loop.
-        cls = type(self)
-        for name, hook in (
-            ("_pre_ensure", cls._pre_ensure),
-            ("_locate_existing", cls._locate_existing),
-            ("_prepare_local_file", cls._prepare_local_file),
-        ):
-            if not inspect.iscoroutinefunction(hook):
-                client.logger.warning(
-                    "%s.%s must be async def (it runs on the app loop); a sync "
-                    "override blocks it -- offload via self._offload",
-                    cls.__name__,
-                    name,
-                )
-
-        # Prepare lifecycle. None transfer_type => no prepare in flight.
-        # awaiting_since flips from None to a monotonic timestamp at
-        # mark_transfer_complete (arming the grace window).
-        self._prepare_transfer_type: Optional[str] = None
-        self._prepare_awaiting_since: Optional[float] = None
-
-        # The transfer runs as an asyncio.Task on the client's own event loop; a
-        # new dispatch preempts the one in flight (cooperative cancel + await).
-        # The canceller stays a threading.Event -- it is only ever polled via
-        # is_set() at the cooperative checkpoints, never awaited.
-        self._download_task_lock = asyncio.Lock()
-        self._download_lock = asyncio.Lock()
-        self._download_task: Optional["asyncio.Task"] = None
-        self._download_canceller = threading.Event()
-        # Strong ref to the scheduled task until it registers itself as
-        # _download_task (asyncio only weakly references tasks).
-        self._download_dispatch: Optional[object] = None
-
-        self._prepare_activity_at: Optional[float] = None
-        self._prepare_watchdog: Optional[asyncio.Task] = None
+    def __init__(
+        self,
+        driver: PrintFileDriver,
+        progress: FileProgressState,
+        logger: logging.Logger,
+        report_job_error: Optional[JobErrorReporter] = None,
+        *,
+        cache_root: Optional[Path] = None,
+        downloader: Callable[
+            [FileDemandData, Path, ProgressCallback], Awaitable[Path]
+        ] = download_file,
+    ) -> None:
+        self.driver = driver
+        self._progress_state = progress
+        self._logger = logger
+        self._report_job_error_callback = report_job_error
+        self._cache_root = cache_root
+        self._downloader = downloader
+        self._staged: Optional[_StagedPrint] = None
+        self._sent_start_filename: Optional[str] = None
+        self._previous_print_filename: Optional[str] = None
+        self._lifecycle: Optional[_TransferLifecycle] = None
 
     @property
     def is_preparing_to_print(self) -> bool:
-        return self._prepare_transfer_type is not None
+        lifecycle = self._lifecycle
+        return lifecycle is not None and lifecycle.is_preparing
 
     @property
-    def current_download_type(self) -> Optional[str]:
-        return self._prepare_transfer_type
+    def awaiting_device_start(self) -> bool:
+        lifecycle = self._lifecycle
+        return lifecycle is not None and lifecycle.awaiting_since is not None
 
     @property
-    def _is_awaiting_firmware_start(self) -> bool:
-        return self._prepare_awaiting_since is not None
+    def cancelled(self) -> bool:
+        lifecycle = _executing_lifecycle.get()
+        return lifecycle is not None and (
+            lifecycle.cancelled.is_set() or self._lifecycle is not lifecycle
+        )
 
-    def begin_prepare(self, transfer_type: Optional[str] = None) -> None:
-        if self.is_preparing_to_print:
-            return
-        transfer_type = transfer_type or self.transfer_type
-        self.client.logger.debug(f"Begin print prepare ({transfer_type})")
-        self._prepare_transfer_type = transfer_type
-        self._prepare_awaiting_since = None
-        self._touch_prepare_activity()
-        self._schedule_prepare_watchdog()
-        self._on_begin_prepare()
-        self.client.printer.file_progress.message = None
-        self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
+    def record_start_sent(self, filename: str) -> None:
+        """Remember the accepted start identity for the next device job edge."""
+        self._sent_start_filename = filename
 
-    def mark_transfer_complete(self) -> None:
-        """File reached the printer and the start command was sent; arm the
-        grace timer. State stays DOWNLOADING -- READY is only set once the
-        firmware actually starts, so a concurrent ``fail_prepare`` is never
-        clobbered. With :attr:`await_firmware_start` False there is no gate to
-        arm: READY lands now."""
-        if not self.is_preparing_to_print or self._is_awaiting_firmware_start:
-            return
-        if not self.await_firmware_start:
-            self._mark_ready("no firmware gate")
-            return
-        self._prepare_awaiting_since = time.monotonic()
-        self._touch_prepare_activity()
-        self.client.printer.file_progress.percent = 100
-
-    def end_prepare(self, reason: str = "done") -> None:
-        if not self.is_preparing_to_print:
-            return
-        self.client.logger.debug(f"End print prepare ({reason})")
-        self._prepare_transfer_type = None
-        self._prepare_awaiting_since = None
-        self._prepare_activity_at = None
-        self._cancel_prepare_watchdog()
-        self._on_end_prepare()
-
-    def fail_prepare(self, message: str, reason: str) -> None:
-        self.client.printer.file_progress.state = FileProgressStateEnum.ERROR
-        self.client.printer.file_progress.message = message
-        self.client.logger.warning(f"Print prepare aborted: {reason} - {message}")
-        self.end_prepare(reason)
-
-    def _mark_ready(self, reason: str) -> None:
-        self.client.printer.file_progress.percent = 100
-        self.client.printer.file_progress.state = FileProgressStateEnum.READY
-        self.end_prepare(reason)
-
-    def ensure_file_and_start_task(self, data: FileDemandData) -> None:
-        """Schedule the prepare-and-start on the client's event loop, returning
-        immediately. A new call preempts any transfer still in flight (see
-        :meth:`ensure_file_and_start`)."""
-        coro = self.ensure_file_and_start(data)
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-
-        # The client's own loop. EventLoopProvider.event_loop always exists but
-        # raises when no loop is set -- that "no loop" case is client_loop = None.
-        try:
-            client_loop = self.client.event_loop
-        except RuntimeError:
-            client_loop = None
-
-        if running_loop is not None and (
-            client_loop is None or running_loop is client_loop
-        ):
-            task = running_loop.create_task(coro)
-            self._download_dispatch = task
-            task.add_done_callback(self._on_dispatch_done)
-            return
-
-        if client_loop is not None:
-            # Cross-thread: marshal onto the client's loop. This is exactly what
-            # PrinterClient.submit_to_loop does (run_coroutine_threadsafe).
-            self._download_dispatch = asyncio.run_coroutine_threadsafe(
-                coro, client_loop
+    def observe_job_start(
+        self,
+        device_filename: Optional[str],
+        *,
+        reprint_if_filename_missing: bool = False,
+    ) -> Tuple[Optional[str], bool]:
+        """Resolve a device job edge against the last accepted start command."""
+        sent = self._sent_start_filename
+        filename = sent or device_filename
+        previous = self._previous_print_filename
+        reprint = (
+            sent is None
+            and previous is not None
+            and (
+                (not device_filename and reprint_if_filename_missing)
+                or (
+                    bool(device_filename)
+                    and PurePosixPath(device_filename).name
+                    == PurePosixPath(previous).name
+                )
             )
-        else:
-            coro.close()
-            raise RuntimeError("No running client event loop for file transfer")
+        )
+        self._previous_print_filename = sent
+        self._sent_start_filename = None
+        return filename, reprint
 
-    def _on_dispatch_done(self, task: "asyncio.Task") -> None:
-        """Surface a dispatch that died before it could register itself as the
-        active download task, and drop the strong reference."""
-        if self._download_dispatch is task:
-            self._download_dispatch = None
+    def submit(self, data: FileDemandData) -> bool:
+        """Accept and schedule a FILE demand on the current event loop."""
+        try:
+            normalized = self._normalize_request(data)
+            route = self.driver.route(normalized)
+        except FileOperationError as error:
+            self._report_start_error(error.user_message)
+            return False
+        except Exception as error:
+            self._report_start_error(f"Failed to prepare file: {error}")
+            return False
+        return self._submit(normalized, route, self._prepare)
+
+    def start_staged(self) -> bool:
+        """Accept START for the most recently staged uploaded file."""
+        if self._lifecycle is not None:
+            return False
+        staged = self._staged
+        if staged is None:
+            self._report_start_error("No file is ready to start")
+            return False
+        return self._submit(
+            staged.data,
+            PreparationKind.UPLOAD,
+            self._start_prepared,
+            staged_start=True,
+        )
+
+    def _submit(
+        self,
+        data: FileDemandData,
+        route: PreparationKind,
+        runner: Callable[[FileDemandData], Awaitable[None]],
+        *,
+        staged_start: bool = False,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        previous = self._lifecycle
+        if (
+            data.job_id is not None
+            and previous is not None
+            and previous.job_id == data.job_id
+        ):
+            self._logger.info("Ignoring duplicate file demand for job %s", data.job_id)
+            return False
+
+        # A newly accepted FILE supersedes both in-flight work and any older
+        # staged upload.  Invalidate synchronously at admission so a failure
+        # in the new operation can never expose the stale file to START.
+        if not staged_start:
+            self._staged = None
+
+        if previous is not None:
+            previous.cancelled.set()
+            if previous.task is not None and not previous.task.done():
+                previous.task.cancel()
+            if previous.watchdog is not None and not previous.watchdog.done():
+                previous.watchdog.cancel()
+
+        lifecycle = _TransferLifecycle(
+            route=route,
+            data=data,
+            staged_start=staged_start,
+        )
+        self._lifecycle = lifecycle
+        self._progress_state.message = None
+        self._progress_state.percent = 0
+        self._progress_state.state = FileProgressStateEnum.DOWNLOADING
+        lifecycle.task = loop.create_task(
+            self._run_lifecycle(lifecycle, previous, runner)
+        )
+        lifecycle.task.add_done_callback(
+            lambda task, current=lifecycle: self._on_lifecycle_done(current, task)
+        )
+        return True
+
+    async def _run_lifecycle(
+        self,
+        lifecycle: _TransferLifecycle,
+        previous: Optional[_TransferLifecycle],
+        runner: Callable[[FileDemandData], Awaitable[None]],
+    ) -> None:
+        token = _executing_lifecycle.set(lifecycle)
+        data = lifecycle.data
+        try:
+            if previous is not None and previous.task is not None:
+                await asyncio.gather(previous.task, return_exceptions=True)
+            if self._lifecycle is not lifecycle:
+                return
+
+            if previous is not None:
+                self._end_lifecycle(previous, "superseded")
+                if (
+                    previous.terminal is None
+                    and previous.job_id is not None
+                    and previous.job_id != lifecycle.job_id
+                ):
+                    await self._report_job_error(
+                        previous.job_id,
+                        "File preparation was replaced by a newer job",
+                    )
+                    previous.terminal = FileProgressStateEnum.ERROR
+            if self._lifecycle is not lifecycle:
+                return
+
+            self._begin_lifecycle(lifecycle)
+            await runner(data)
+        except asyncio.CancelledError:
+            if self._lifecycle is lifecycle and not lifecycle.cancelled.is_set():
+                self._fail("File transfer was cancelled", "task cancelled")
+            raise
+        except FileOperationError as error:
+            if self._lifecycle is lifecycle:
+                self._logger.warning(
+                    'Preparing file "%s" failed', data.file_name, exc_info=error
+                )
+                self._fail(error.user_message, error.reason)
+        except Exception as error:
+            if self._lifecycle is lifecycle:
+                self._logger.warning(
+                    'Preparing file "%s" failed', data.file_name, exc_info=error
+                )
+                action = "start print" if lifecycle.staged_start else "prepare file"
+                self._fail(f"Failed to {action}: {error}", f"exception: {error}")
+        finally:
+            _executing_lifecycle.reset(token)
+            if self._lifecycle is lifecycle and not lifecycle.is_preparing:
+                self._lifecycle = None
+
+    def _on_lifecycle_done(
+        self, lifecycle: _TransferLifecycle, task: asyncio.Task
+    ) -> None:
+        if self._lifecycle is lifecycle and not lifecycle.is_preparing:
+            self._lifecycle = None
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
-            self.client.logger.warning(
-                "file transfer dispatch failed",
-                exc_info=(type(error), error, error.__traceback__),
+            self._logger.error("File operation failed", exc_info=error)
+
+    async def wait(self) -> None:
+        """Wait until the active operation coroutine returns."""
+        lifecycle = self._lifecycle
+        if lifecycle is not None and lifecycle.task is not None:
+            await asyncio.gather(lifecycle.task, return_exceptions=True)
+
+    async def close(self) -> None:
+        """Cancel owned work, then close the composed driver."""
+        lifecycle, self._lifecycle = self._lifecycle, None
+        if lifecycle is not None:
+            lifecycle.cancelled.set()
+        tasks = [
+            task
+            for task in (
+                lifecycle.task if lifecycle is not None else None,
+                lifecycle.watchdog if lifecycle is not None else None,
             )
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if lifecycle is not None:
+            self._end_lifecycle(lifecycle, "closed")
+        self._staged = None
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.driver.close()
 
-    async def ensure_file_and_start(self, data: FileDemandData) -> None:
-        """Ensure the SP file is on the printer and, if auto-start is set,
-        start it. A new call cancels any transfer still in flight."""
-        # Take over as the active download task, signalling any in-flight
-        # transfer to cancel, then await it. Because the transfer runs as a task
-        # on this loop, awaiting the previous one suspends only this coroutine
-        # (the previous task cooperates via the canceller and bows out) -- the
-        # loop keeps running. The set -> await -> clear ordering mirrors the old
-        # set -> join -> clear: set under the lock, await the previous task,
-        # clear after.
-        async with self._download_task_lock:
-            prev = self._download_task
-            if prev is not None:
-                self._download_canceller.set()
-            self._download_task = asyncio.current_task()
+    async def _prepare(self, data: FileDemandData) -> None:
+        lifecycle = self._executing()
+        route = lifecycle.route
 
-        if prev is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(prev), timeout=PREEMPTION_GRACE_SECONDS
+        if route is PreparationKind.URL:
+            if not data.auto_start:
+                raise FileOperationError(
+                    "This printer cannot store a URL file without starting it",
+                    "URL route is start-only",
                 )
-            except asyncio.TimeoutError:
-                prev.cancel()
-                try:
-                    await prev
-                except asyncio.CancelledError:
-                    pass
-            except asyncio.CancelledError:
-                pass
+            await self._dispatch_start(
+                data.file_name or "print-file",
+                self.driver.start_url(data, self._device_progress),
+            )
+            return
 
-        self._download_canceller.clear()
+        if route is PreparationKind.UPLOAD_AND_START and not data.auto_start:
+            raise FileOperationError(
+                "This printer cannot store a file without starting it",
+                "device upload endpoint starts the print",
+            )
 
-        try:
-            async with self._download_lock:
-                self._set_active_job_for_prepare(data.job_id, data.action_token)
-
-                try:
-                    self.begin_prepare()
-                    result = await self.ensure_file(data)
-
-                    if not result:
-                        self.end_prepare("ensure_file returned no result")
-                        return
-
-                    if self._download_canceller.is_set():
-                        self.client.logger.info("Download was cancelled")
-                        self.end_prepare("download cancelled")
-                        return
-
-                    if not self.is_preparing_to_print:
-                        return
-
-                    dest, md5checksum = result
-
-                    if not data.auto_start:
-                        self.next_to_print = (dest, data, md5checksum)
-                        self.client.printer.file_progress.percent = 100
-                        self.client.printer.file_progress.state = (
-                            FileProgressStateEnum.READY
-                        )
-                        self.end_prepare("file ready (no auto_start)")
-                        return
-
-                    # Hand off to firmware; on_print_changed ends the prepare once
-                    # the firmware reports a started (READY) or failed (ERROR) state.
-                    await self.start_print(dest, data, md5checksum)
-                    if not self.is_preparing_to_print:
-                        return
-                    self.mark_transfer_complete()
-
-                except asyncio.CancelledError:
-                    if self._download_canceller.is_set():
-                        self.client.logger.info("Download was cancelled")
-                        self.end_prepare("download cancelled")
-                    else:
-                        self.fail_prepare(
-                            "File transfer was cancelled", "task cancelled"
-                        )
-                    raise
-                except _TransferFailed as e:
-                    self.client.logger.warning(
-                        f'Ensure file for "{data.file_name}" failed', exc_info=e
-                    )
-                    self.fail_prepare(e.user_message, e.reason)
-                except Exception as e:
-                    self.client.logger.warning(
-                        f'Ensure file for "{data.file_name}" failed', exc_info=e
-                    )
-                    self.fail_prepare(
-                        f"Failed to download file: {e}",
-                        f"exception: {e}",
-                    )
-        finally:
-            async with self._download_task_lock:
-                if self._download_task is asyncio.current_task():
-                    self._download_task = None
-
-    async def ensure_file(
-        self, data: FileDemandData
-    ) -> Optional[Tuple[PurePosixPath, str]]:
-        if not data.file_name:
-            self.client.logger.error("No file name provided")
-            return None
-
-        # Slugify the file name (this is the one we compare with).
-        data.file_name = slugify(data.file_name)
-
-        await self._pre_ensure()
-
-        existing = await self._locate_existing(data)
-        if existing is not None:
-            return existing
-
-        if self._download_canceller.is_set():
-            self.client.logger.info("Download was cancelled")
-            return None
-
-        return await self.download_file_and_upload(data)
-
-    async def download_file_and_upload(
-        self, data: FileDemandData
-    ) -> Optional[Tuple[PurePosixPath, str]]:
-        # Download is the first half of the progress bar; upload the second.
-        downloader = FileDownload(self.client)
-        last_error: Optional[Exception] = None
-        total_attempts = self.retry_attempts + 1
-
-        for attempt in range(1, total_attempts + 1):
-            phase = "download"
-            try:
-                with cache_temporary_directory(
-                    "sp-transfer-", root=app_cache_path("transfers")
-                ) as local_folder:
-                    local_dest = Path(local_folder) / data.file_name
-                    local_dest = await downloader.download_as_file(
-                        data, local_dest, self._download_progress
-                    )
-
-                    phase = "prepare"
-                    local_dest = await self._prepare_local_file(data, local_dest)
-
-                    phase = "upload"
-                    dest = (
-                        await self._upload(local_dest, self._upload_progress)
-                    ).relative_to("/")
-                    phase = "checksum"
-                    # Hash the final (post-transform) file, off-loop, so a large
-                    # gcode can't stall the firmware-ACK grace window.
-                    return dest, await file_md5(local_dest)
-            except _TransferCancelled:
-                self.client.logger.info("Upload was cancelled")
-                return None
-            except Exception as e:
-                last_error = e
-                if self._download_canceller.is_set():
-                    self.client.logger.info("Transfer was cancelled")
-                    return None
-
-                if self._has_prepare_stalled():
-                    raise _TransferFailed(
-                        f"No file transfer progress for {int(self.no_progress_timeout_seconds)}s",
-                        "transfer stalled",
-                    ) from e
-
-                if attempt >= total_attempts:
-                    raise _TransferFailed(
-                        self._transfer_error_message(e, phase),
-                        f"transfer failed after {attempt} attempts: {e}",
-                    ) from e
-
-                self._mark_transfer_retrying(e, attempt, total_attempts)
-                await asyncio.sleep(self.retry_backoff_seconds)
-
-        if last_error is not None:
-            raise _TransferFailed(
-                self._transfer_error_message(last_error, "transfer"),
-                f"transfer failed after {total_attempts} attempts: {last_error}",
-            ) from last_error
-        return None
-
-    def _transfer_error_message(self, error: Exception, phase: str) -> str:
-        if phase == "upload":
-            return self._upload_error_message(error)
-        return f"Failed to {phase} file: {error}"
-
-    def _download_progress(self, progress: float) -> float:
-        self._touch_prepare_activity()
-        return progress // 2
-
-    def _upload_progress(self, progress: float) -> None:
-        self._touch_prepare_activity()
-        self.client.printer.file_progress.percent = min((progress // 2) + 50, 100)
-        if self._download_canceller.is_set():
-            raise _TransferCancelled("Upload cancelled")
-
-    def _mark_transfer_retrying(
-        self, error: Exception, attempt: int, total_attempts: int
-    ) -> None:
-        self.client.logger.warning(
-            "File transfer attempt %s/%s failed; retrying",
-            attempt,
-            total_attempts,
-            exc_info=error,
-        )
-        self.client.printer.file_progress.message = None
-        self.client.printer.file_progress.percent = 0
-        self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
-
-    async def start_print(
-        self,
-        path: Optional[PurePosixPath] = None,
-        data: Optional[FileDemandData] = None,
-        md5checksum: Optional[str] = None,
-    ) -> None:
-        """Start a print from a previously-prepared file. With no ``path`` the
-        stashed ``next_to_print`` is used (the no-auto-start path)."""
-        if path is None:
-            if self.next_to_print is None:
-                self.client.logger.error("No path or data provided to start_print")
+        async with self._source_file(data) as source:
+            if route is PreparationKind.UPLOAD_AND_START:
+                await self._dispatch_start(
+                    data.file_name or source.name,
+                    self.driver.upload_and_start(data, source, self._upload_progress),
+                )
                 return
-            path, data, md5checksum = self.next_to_print
-            self.next_to_print = None
-
-        if path is None or data is None:
-            self.client.logger.error("No path or data provided to start_print")
+            uploaded = await self._upload_with_retry(data, source)
+        if not data.auto_start:
+            self._staged = _StagedPrint(uploaded=uploaded, data=data)
+            self._mark_ready("file ready (no auto_start)")
             return
 
-        await self._send_start(path, data, md5checksum)
-
-    def on_print_changed(self, changes) -> None:
-        """Drive the prepare terminal from a firmware state push.
-
-        Per the backend invariant, file_progress lands in exactly one terminal
-        per prepare: READY (the print actually started) or ERROR (rejected, or
-        the grace timer expired). The started/failed discrimination is wholly
-        delegated to the brand via :meth:`_firmware_outcome`.
-        """
-        if not self.is_preparing_to_print:
-            return
-
-        if changes:
-            self._touch_prepare_activity()
-
-        outcome = self._firmware_outcome(changes)
-        if outcome is FirmwareStartOutcome.STARTED:
-            self._mark_ready("firmware started")
-            return
-        if outcome is FirmwareStartOutcome.FAILED:
-            self.fail_prepare(
-                self._device_error_message() or self.reject_message,
-                "firmware reported failure",
-            )
-            return
-
-        # In-firmware download progress (printers that pull from the CDN
-        # themselves); no-op otherwise.
-        self._on_progress_tick(changes)
-
-        if (
-            self._is_awaiting_firmware_start
-            and time.monotonic() - self._prepare_awaiting_since > self.grace_seconds
-        ):
-            self.fail_prepare(
-                self._device_error_message()
-                or f"Print did not start within {int(self.grace_seconds)}s",
-                "grace expired",
-            )
-            return
-
-        self._fail_if_prepare_stalled()
-
-    def _on_client_connect_change(self, *_args, **_kwargs) -> None:
-        if not self.is_preparing_to_print:
-            return
-
-        self.client.logger.warning(
-            "Printer connection changed during file transfer; keeping transfer pending"
+        await self._dispatch_start(
+            uploaded.path.name,
+            self.driver.start_uploaded(data, uploaded),
         )
-        self.client.printer.file_progress.message = None
-        self.client.printer.file_progress.percent = 0
-        self.client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
-        if self._is_awaiting_firmware_start:
-            self._prepare_awaiting_since = time.monotonic()
 
-    def _touch_prepare_activity(self) -> None:
-        self._prepare_activity_at = time.monotonic()
+    async def _start_prepared(self, data: FileDemandData) -> None:
+        staged = self._staged
+        if staged is None or staged.data is not data:
+            raise FileOperationError("No file is ready to start", "staged file missing")
+        await self._dispatch_start(
+            staged.uploaded.path.name,
+            self.driver.start_uploaded(data, staged.uploaded),
+        )
+        # Clear only after the driver accepted the START operation.
+        self._staged = None
 
-    def _has_prepare_stalled(self) -> bool:
-        if self._prepare_activity_at is None:
+    async def _dispatch_start(
+        self, filename: str, operation: Awaitable[StartDisposition]
+    ) -> None:
+        lifecycle = self._executing()
+        lifecycle.start_in_flight = True
+        self.record_start_sent(filename)
+        try:
+            disposition = await operation
+        except BaseException:
+            if self._sent_start_filename == filename:
+                self._sent_start_filename = None
+            lifecycle.start_in_flight = False
+            raise
+        lifecycle.start_in_flight = False
+
+        # A device edge may have completed this operation while its command
+        # coroutine was still returning (Moonraker's response/event race).
+        if self._lifecycle is not lifecycle or not lifecycle.is_preparing:
+            return
+        if disposition is StartDisposition.COMPLETE:
+            self._mark_ready("device accepted start")
+            return
+        if disposition is StartDisposition.AWAIT_DEVICE:
+            lifecycle.awaiting_since = lifecycle.activity_at = time.monotonic()
+            self._progress_state.percent = 100
+            return
+        raise FileOperationError(
+            "Printer returned an invalid start result",
+            f"invalid start disposition: {disposition!r}",
+        )
+
+    @asynccontextmanager
+    async def _source_file(self, data: FileDemandData):
+        root = self._cache_root or app_cache_path("transfers")
+        with cache_temporary_directory("sp-transfer-", root=root) as local_folder:
+            destination = Path(local_folder) / (data.file_name or "print-file")
+            try:
+                await self._downloader(data, destination, self._download_progress)
+            except _TransferCancelled:
+                raise asyncio.CancelledError
+            except FileDownloadError as error:
+                raise FileOperationError(
+                    str(error), f"download failed: {error}"
+                ) from error
+            except Exception as error:
+                if self.cancelled:
+                    raise asyncio.CancelledError
+                raise FileOperationError(
+                    f"Failed to download file: {error}", f"download failed: {error}"
+                ) from error
+            self._progress_state.percent = 50
+            self._touch_activity()
+            yield destination
+
+    async def _upload_with_retry(
+        self, data: FileDemandData, source: Path
+    ) -> UploadedFile:
+        attempts = max(1, int(self.driver.max_upload_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                uploaded = await self.driver.upload(data, source, self._upload_progress)
+                path = uploaded.path
+                if path.is_absolute():
+                    path = path.relative_to("/")
+                return replace(uploaded, path=path)
+            except _TransferCancelled:
+                raise asyncio.CancelledError
+            except RetryableFileError as error:
+                if self.cancelled:
+                    raise asyncio.CancelledError
+                if self._has_stalled():
+                    raise FileOperationError(
+                        "No file transfer progress for "
+                        f"{int(self.no_progress_timeout_seconds)}s",
+                        "transfer stalled",
+                    ) from error
+                if attempt >= attempts:
+                    raise FileOperationError(
+                        error.user_message,
+                        f"upload failed after {attempt} attempts: {error.reason}",
+                    ) from error
+                self._logger.warning(
+                    "File upload attempt %s/%s failed; retrying",
+                    attempt,
+                    attempts,
+                    exc_info=error,
+                )
+                self._progress_state.message = None
+                self._progress_state.percent = 50
+                self._progress_state.state = FileProgressStateEnum.DOWNLOADING
+                await asyncio.sleep(self.driver.retry_backoff_seconds)
+        raise AssertionError("upload attempt loop exhausted")
+
+    def started(self) -> bool:
+        """Project a genuine device-start edge into the active operation."""
+        lifecycle = self._lifecycle
+        if (
+            lifecycle is None
+            or not lifecycle.is_preparing
+            or not (lifecycle.start_in_flight or lifecycle.awaiting_since is not None)
+        ):
             return False
-        return (
-            time.monotonic() - self._prepare_activity_at
+        self._touch_activity()
+        self._mark_ready("device started")
+        return True
+
+    def rejected(self, message: str, reason: str = "device rejected start") -> bool:
+        """Project a genuine device rejection into the active operation."""
+        lifecycle = self._lifecycle
+        if (
+            lifecycle is None
+            or not lifecycle.is_preparing
+            or not (lifecycle.start_in_flight or lifecycle.awaiting_since is not None)
+        ):
+            return False
+        self._fail(message, reason)
+        return True
+
+    def progress(self, percent: float) -> bool:
+        """Project printer-side URL preparation progress."""
+        if not self.is_preparing_to_print:
+            return False
+        self._device_progress(percent)
+        return True
+
+    def _normalize_request(self, data: FileDemandData) -> FileDemandData:
+        if not data.file_name:
+            raise FileOperationError("No file name provided", "missing file_name")
+        normalized_name = slugify(data.file_name)
+        if not normalized_name:
+            raise FileOperationError("Invalid file name", "slugified filename is empty")
+        return data.model_copy(update={"file_name": normalized_name})
+
+    def _executing(self) -> _TransferLifecycle:
+        lifecycle = _executing_lifecycle.get()
+        if lifecycle is None or self._lifecycle is not lifecycle:
+            raise asyncio.CancelledError
+        return lifecycle
+
+    def _begin_lifecycle(self, lifecycle: _TransferLifecycle) -> None:
+        lifecycle.activity_at = time.monotonic()
+        lifecycle.awaiting_since = None
+        self._logger.debug("Begin print prepare (%s)", lifecycle.route.value)
+        self._progress_state.message = None
+        self._progress_state.state = FileProgressStateEnum.DOWNLOADING
+        self._schedule_watchdog(lifecycle)
+
+    def _end_lifecycle(self, lifecycle: _TransferLifecycle, reason: str) -> None:
+        if not lifecycle.is_preparing:
+            return
+        self._logger.debug("End print prepare (%s)", reason)
+        lifecycle.activity_at = None
+        lifecycle.awaiting_since = None
+        lifecycle.start_in_flight = False
+        watchdog, lifecycle.watchdog = lifecycle.watchdog, None
+        if watchdog is not None:
+            watchdog.cancel()
+
+    def _mark_ready(self, reason: str) -> None:
+        lifecycle = self._active_for_context()
+        if lifecycle is None:
+            return
+        lifecycle.terminal = FileProgressStateEnum.READY
+        self._progress_state.state = FileProgressStateEnum.READY
+        self._progress_state.percent = 100
+        self._end_lifecycle(lifecycle, reason)
+
+    def _fail(self, message: str, reason: str) -> None:
+        lifecycle = self._active_for_context()
+        if lifecycle is None:
+            return
+        if lifecycle.start_in_flight or lifecycle.awaiting_since is not None:
+            self._sent_start_filename = None
+        lifecycle.terminal = FileProgressStateEnum.ERROR
+        self._progress_state.state = FileProgressStateEnum.ERROR
+        self._progress_state.message = message
+        self._logger.warning("Print prepare aborted: %s - %s", reason, message)
+        self._end_lifecycle(lifecycle, reason)
+        lifecycle.cancelled.set()
+        task = lifecycle.task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _active_for_context(self) -> Optional[_TransferLifecycle]:
+        executing = _executing_lifecycle.get()
+        if executing is not None and self._lifecycle is not executing:
+            return None
+        lifecycle = self._lifecycle
+        if lifecycle is None or not lifecycle.is_preparing:
+            return None
+        return lifecycle
+
+    def _download_progress(self, percent: float) -> None:
+        if self.cancelled:
+            raise _TransferCancelled("download cancelled")
+        self._touch_activity()
+        self._progress_state.percent = min(max(percent, 0.0) / 2.0, 50.0)
+
+    def _upload_progress(self, percent: float) -> None:
+        if self.cancelled:
+            raise _TransferCancelled("upload cancelled")
+        self._touch_activity()
+        self._progress_state.percent = min(max(percent, 0.0) / 2.0 + 50.0, 100.0)
+
+    def _device_progress(self, percent: float) -> None:
+        self._touch_activity()
+        self._progress_state.percent = min(max(percent, 0.0), 100.0)
+
+    def _touch_activity(self) -> None:
+        lifecycle = self._lifecycle
+        if lifecycle is not None and lifecycle.is_preparing:
+            lifecycle.activity_at = time.monotonic()
+
+    def _has_stalled(self) -> bool:
+        lifecycle = self._lifecycle
+        return bool(
+            lifecycle is not None
+            and lifecycle.activity_at is not None
+            and time.monotonic() - lifecycle.activity_at
             > self.no_progress_timeout_seconds
         )
 
-    def _fail_if_prepare_stalled(self) -> bool:
-        if not self.is_preparing_to_print or not self._has_prepare_stalled():
-            return False
-        self.fail_prepare(
-            f"No file transfer progress for {int(self.no_progress_timeout_seconds)}s",
-            "transfer stalled",
-        )
-        return True
+    def _schedule_watchdog(self, lifecycle: _TransferLifecycle) -> None:
+        if lifecycle.watchdog is None or lifecycle.watchdog.done():
+            lifecycle.watchdog = asyncio.get_running_loop().create_task(
+                self._watchdog_loop(lifecycle)
+            )
 
-    def _schedule_prepare_watchdog(self) -> None:
-        if self._prepare_watchdog is not None and not self._prepare_watchdog.done():
-            return
+    async def _watchdog_loop(self, lifecycle: _TransferLifecycle) -> None:
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._prepare_watchdog = loop.create_task(self._prepare_watchdog_loop())
-
-    def _cancel_prepare_watchdog(self) -> None:
-        if self._prepare_watchdog is None:
-            return
-        self._prepare_watchdog.cancel()
-        self._prepare_watchdog = None
-
-    async def _prepare_watchdog_loop(self) -> None:
-        try:
-            while self.is_preparing_to_print:
+            while self._lifecycle is lifecycle and lifecycle.is_preparing:
                 await asyncio.sleep(self.watchdog_interval_seconds)
-                if self._fail_if_prepare_stalled():
+                if self._lifecycle is not lifecycle:
+                    return
+                if (
+                    lifecycle.awaiting_since is not None
+                    and time.monotonic() - lifecycle.awaiting_since > self.grace_seconds
+                ):
+                    try:
+                        await self.driver.cancel_start()
+                    except Exception:
+                        self._logger.warning(
+                            "Failed to cancel timed-out printer start", exc_info=True
+                        )
+                    self._fail(
+                        f"Print did not start within {int(self.grace_seconds)}s",
+                        "grace expired",
+                    )
+                    return
+                if self._has_stalled():
+                    self._fail(
+                        "No file transfer progress for "
+                        f"{int(self.no_progress_timeout_seconds)}s",
+                        "transfer stalled",
+                    )
                     return
         except asyncio.CancelledError:
             pass
 
-    @abstractmethod
-    async def _upload(
-        self, local_path: Path, on_progress: Callable[[float], None]
-    ) -> PurePosixPath:
-        """Push ``local_path`` to the printer; return its remote path."""
+    def _report_start_error(self, message: str) -> None:
+        self._progress_state.state = FileProgressStateEnum.ERROR
+        self._progress_state.message = message
 
-    async def _send_start(
-        self, path: PurePosixPath, data: FileDemandData, md5checksum: Optional[str]
-    ) -> None:
-        """Issue the brand command(s) that start printing ``path``. Default:
-        nothing to send (the upload itself is the handoff)."""
+    async def _report_job_error(self, job_id: int, message: str) -> None:
+        if self._report_job_error_callback is None:
+            return
+        await self._report_job_error_callback(job_id, message)
 
-    def _firmware_outcome(self, changes) -> FirmwareStartOutcome:
-        """Classify a firmware state push while a prepare is in flight.
-        Default: nothing conclusive (pair with ``await_firmware_start = False``
-        unless the grace timeout alone is the desired gate)."""
-        return FirmwareStartOutcome.PENDING
 
-    async def _offload(self, fn: Callable, *args):
-        """Run a brand's blocking hook work off the loop, on the transfer lane.
+class _TransferCancelled(Exception):
+    pass
 
-        The single seam a brand uses to push synchronous FTP/HTTP/zip work off
-        the app loop. ``Client.offload`` is the app's lanes; it is ``None`` only
-        for a client built outside an app (unit tests), where a plain thread is
-        the right fallback. Args are positional; bind keywords with a closure."""
-        offload = self.client.offload
-        if offload is not None:
-            return await offload.run_transfer(fn, *args)
-        return await asyncio.to_thread(fn, *args)
 
-    async def _prepare_local_file(self, data: FileDemandData, local_path: Path) -> Path:
-        """Transform the downloaded file for this printer (e.g. wrap as 3mf).
-        Async: a brand offloads its blocking transform via :meth:`_offload`."""
-        return local_path
-
-    async def _locate_existing(
-        self, data: FileDemandData
-    ) -> Optional[Tuple[PurePosixPath, str]]:
-        """Return an already-present remote file to skip re-upload, else None.
-        Async: a brand offloads its blocking lookup via :meth:`_offload`."""
-        return None
-
-    async def _pre_ensure(self) -> None:
-        """Run before locating/downloading (e.g. reset the FTP connection).
-        Async: a brand offloads its blocking reset via :meth:`_offload`."""
-
-    def _on_progress_tick(self, changes) -> None:
-        """React to in-firmware transfer progress (brands that download CDN-side)."""
-
-    def _device_error_message(self) -> Optional[str]:
-        """A specific user-facing message when the firmware reports an error."""
-        return None
-
-    def _upload_error_message(self, error: Exception) -> str:
-        return f"Last error: {error}"
-
-    def _on_begin_prepare(self) -> None:
-        """Brand bookkeeping at prepare start (e.g. capture baseline task_id)."""
-
-    def _on_end_prepare(self) -> None:
-        """Brand bookkeeping at prepare end."""
-
-    def _set_active_job_for_prepare(
-        self, job_id: Optional[int], action_token: Optional[str]
-    ) -> None:
-        """Mark ``job_id`` as the printer's active job at prepare start.
-
-        Records which job is now "the active job" (so later pause/cancel/resume
-        target the right one) and resets the bed-cleared flag.
-        """
-        self.client.printer.current_job_id = job_id
-        self.client.printer.file_action_token = action_token
-        self.client.printer.have_cleared_bed = False
+__all__ = [
+    "FileOperationError",
+    "FileTransfer",
+    "PreparationKind",
+    "PrintFileDriver",
+    "RetryableFileError",
+    "StartDisposition",
+    "UnsupportedFileOperation",
+    "UploadedFile",
+]

@@ -2,32 +2,30 @@ import asyncio
 import datetime
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import List, Optional, Protocol
 
 from simplyprint_ws_client.integration.camera.base import FrameT
-from simplyprint_ws_client.integration.camera.commands import (
-    PollCamera,
-    StartCamera,
-    StopCamera,
-    DeleteCamera,
-)
-from simplyprint_ws_client.common.utils.stoppable import StoppableInterface
-
-if TYPE_CHECKING:
-    from simplyprint_ws_client.integration.camera.pool import CameraPool
 
 
-class CameraHandle(StoppableInterface):
+class CameraBackend(Protocol):
+    def poll(self) -> None: ...
+
+    def start(self) -> None: ...
+
+    def pause(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class CameraHandle:
     """A client's view of one camera, independent of where it runs.
 
-    Frames arrive via :meth:`_set_frame` -- from the PROCESS pool's response
+    Frames arrive via :meth:`deliver_frame` -- from the worker pool's response
     reader, or from an inline/thread :mod:`.backends` driver -- and the same
     ``receive_frame`` / ``start`` / ``pause`` / ``stop`` surface drives whichever
-    backend this handle was created with. When ``driver`` is set the commands go
-    to that backend; otherwise they go to the worker ``pool``.
+    backend this handle was created with.
     """
 
-    pool: "CameraPool"
     id: int
 
     _waiters: List[asyncio.Future]
@@ -39,16 +37,30 @@ class CameraHandle(StoppableInterface):
     never about how recently somebody polled."""
 
     def __init__(
-        self, pool: "CameraPool", camera_id: int, driver: Optional[Any] = None
-    ):
-        self.pool = pool
+        self,
+        camera_id: int,
+        backend: Optional[CameraBackend] = None,
+    ) -> None:
         self.id = camera_id
-        self._driver = driver
+        self._backend: Optional[CameraBackend] = None
+        if backend is not None:
+            self.attach_backend(backend)
         self._frame_time_window = []
         self._waiters = []
         self._lock = threading.Lock()
 
-    def _set_frame(self, data: Optional[FrameT], timestamp: float) -> None:
+    @property
+    def backend(self) -> CameraBackend:
+        if self._backend is None:
+            raise RuntimeError("camera backend is not attached")
+        return self._backend
+
+    def attach_backend(self, backend: CameraBackend) -> None:
+        if self._backend is not None:
+            raise RuntimeError("camera backend is already attached")
+        self._backend = backend
+
+    def deliver_frame(self, data: Optional[FrameT], timestamp: float) -> None:
         """Deliver one frame to this handle. Called from one producer at a time
         (the PROCESS response reader, an inline loop task, or a thread courier)."""
         ready = []
@@ -114,16 +126,10 @@ class CameraHandle(StoppableInterface):
             raise
 
     def start(self):
-        if self._driver is not None:
-            self._driver.start()
-        else:
-            self.pool.submit_request(StartCamera(self.id))
+        self.backend.start()
 
     def pause(self):
-        if self._driver is not None:
-            self._driver.pause()
-        else:
-            self.pool.submit_request(StopCamera(self.id))
+        self.backend.pause()
 
     @property
     def fps(self) -> float:
@@ -141,21 +147,7 @@ class CameraHandle(StoppableInterface):
         return num_intervals / elapsed_time
 
     def _poll(self):
-        if self._driver is not None:
-            self._driver.poll()
-        else:
-            self.pool.submit_request(PollCamera(self.id))
-
-    # Stoppable methods
-
-    def is_stopped(self) -> bool:
-        raise NotImplementedError()
+        self.backend.poll()
 
     def stop(self) -> None:
-        if self._driver is not None:
-            self._driver.stop()
-        else:
-            self.pool.submit_request(DeleteCamera(self.id))
-
-    def clear(self) -> None:
-        raise NotImplementedError()
+        self.backend.stop()

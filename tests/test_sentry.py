@@ -66,7 +66,9 @@ def test_initialize_sentry_skips_in_development(monkeypatch):
     monkeypatch.setattr(sentry_sdk, "init", lambda *a, **k: calls.append((a, k)))
 
     Sentry.initialize_sentry(
-        ClientSettings(sentry_dsn="https://example@o0.ingest.sentry.io/1", development=True)
+        ClientSettings(
+            sentry_dsn="https://example@o0.ingest.sentry.io/1", development=True
+        )
     )
 
     assert calls == []  # dev/source runs never report

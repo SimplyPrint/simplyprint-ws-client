@@ -2,16 +2,35 @@
 
 The shape a ``/printers`` API returns for one printer is identical across
 integrations -- an image, a connection summary, badges, secrets, and a set of
-user-editable fields. Only *which* fields are editable and how they map onto a
-brand's config differs, so an :class:`EditableField` carries the one place a
-brand attribute name lives (the generic serializer/PATCH never names it). The
-integration's own registry projects each client type's spec into one
+user-editable fields. Each :class:`EditableField` is built for one concrete
+config and carries a current value plus the domain operation that writes it.
+The generic serializer/PATCH path therefore needs no knowledge of config model
+internals. The integration projects its spec into one
 :class:`PrinterPresentation`; this module stays brand-neutral.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable
+
+from simplyprint_ws_client._compat import StrEnum
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.core.config import PrinterConfig
+
+EditableValue = str | int | float | bool | None
+EditableWriter = Callable[[EditableValue], None]
+
+
+class EditableFieldType(StrEnum):
+    STRING = "string"
+    URL = "url"
+    EMAIL = "email"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    SELECT = "select"
+    TEXTAREA = "textarea"
 
 
 @dataclass(frozen=True)
@@ -24,18 +43,19 @@ class EditableFieldOption:
 
 @dataclass(frozen=True)
 class EditableField:
-    """A user-editable printer setting, mapping a neutral API key to the brand's
-    own config attribute. This is the ONLY place brand attribute names for
-    editable settings live, so the generic serializer/PATCH never name them.
+    """One config-bound user-editable printer setting.
 
     Carries the full spec the client needs to render the control (label, type,
     validation, options for selects) -- the API surface is a contract, not a
-    pseudo-custom-fields hack."""
+    pseudo-custom-fields hack. ``value`` is the snapshot rendered by this
+    presentation and ``write`` is the explicit domain operation used by PATCH.
+    """
 
-    key: str  # neutral API key, e.g. "name", "webcam_url"
-    config_attr: str  # brand config attribute, e.g. "name", "custom_webcam_url"
+    key: str  # neutral API key, e.g. "host", "webcam_url"
     label: str
-    type: str = "string"  # one of: string|url|email|number|boolean|select|textarea
+    value: EditableValue
+    write: EditableWriter
+    type: EditableFieldType = EditableFieldType.STRING
     required: bool = False
     placeholder: str | None = None
     description: str | None = None
@@ -50,46 +70,37 @@ class EditableField:
     advanced: bool = False
 
 
-#: Every config has a friendly `name`.
-NAME_FIELD = EditableField(
-    key="name",
-    config_attr="name",
-    label="Name",
-    placeholder="My printer",
-    description="Shown across the dashboard and on SimplyPrint.",
-    max_length=64,
-)
+def webcam_url_field(config: "PrinterConfig") -> EditableField:
+    """Build the universal webcam override field for one concrete config."""
 
-#: Every config supports a user-supplied webcam URL (the base PrinterConfig
-#: declares ``custom_webcam_url`` and the base client resolves it ahead of the
-#: brand's own camera probe), so the field ships here once instead of being
-#: re-declared per brand.
-WEBCAM_URL_FIELD = EditableField(
-    key="webcam_url",
-    config_attr="custom_webcam_url",
-    label="Webcam URL",
-    type="url",
-    placeholder="http://192.168.1.42:8080/?action=stream",
-    description="Leave blank to use the printer's own camera.",
-    advanced=True,
-)
+    return EditableField(
+        key="webcam_url",
+        label="Webcam URL",
+        value=config.custom_webcam_url,
+        write=config.set_webcam_url,
+        type=EditableFieldType.URL,
+        placeholder="http://192.168.1.42:8080/?action=stream",
+        description="Leave blank to use the printer's own camera.",
+        advanced=True,
+    )
 
 
 def host_field(
-    config_attr: str = "host",
+    value: str | None,
+    write: EditableWriter,
     *,
     label: str = "IP address",
     placeholder: str = "192.168.1.42",
     description: str = "The printer's address on your network. "
     "Changing it reconnects the printer.",
 ) -> EditableField:
-    """The editable device-address field, mapped to the brand's own config
-    attribute (``host``, ``local_ip``, ``duet_uri``, ...). One neutral ``host``
-    key, so the UI and PATCH contract never name a brand attribute."""
+    """Build a config-bound device-address field under the neutral ``host`` key."""
+
     return EditableField(
         key="host",
-        config_attr=config_attr,
         label=label,
+        value=value,
+        write=write,
         placeholder=placeholder,
         description=description,
     )
@@ -103,7 +114,7 @@ class PrinterPresentation:
     badges: list[dict] = field(default_factory=list)
     secrets: list[dict] = field(default_factory=list)
     private_fields: tuple[str, ...] = ()
-    editable_fields: tuple[EditableField, ...] = (NAME_FIELD, WEBCAM_URL_FIELD)
+    editable_fields: tuple[EditableField, ...] = ()
 
 
 def _as_text(value, default: str = "") -> str:
@@ -121,5 +132,10 @@ def public_secret(key: str, label: str, value) -> dict | None:
     return {"key": key, "label": label, "value": value}
 
 
-def default_printer_presentation(image_url: str) -> PrinterPresentation:
-    return PrinterPresentation(image_url=image_url)
+def default_printer_presentation(
+    image_url: str, config: "PrinterConfig"
+) -> PrinterPresentation:
+    return PrinterPresentation(
+        image_url=image_url,
+        editable_fields=(webcam_url_field(config),),
+    )

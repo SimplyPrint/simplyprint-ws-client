@@ -47,6 +47,10 @@ def _cooperative_producer(emit, is_stopped):
         time.sleep(0.01)
 
 
+def _oneshot_producer(emit, is_stopped):
+    emit(b"final", 42.0)
+
+
 async def _async_producer(emit, is_stopped, count, size):
     """An async producer (INLINE / THREAD)."""
     for i in range(count):
@@ -153,6 +157,57 @@ async def test_process_producer_delivers_zero_copy_frames():
         pool.stop()
 
     assert got[:8] == [_frame(i, 1024) for i in range(8)]
+
+
+@pytest.mark.asyncio
+async def test_process_delivers_frame_when_producer_exits_immediately():
+    """An immediately exiting producer must not reap its channel first."""
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop))
+    delivered = loop.create_future()
+
+    def on_item(data, timestamp):
+        delivered.set_result((bytes(data), timestamp))
+
+    handle = pool.allocate(
+        ExecutionContext.PROCESS,
+        _oneshot_producer,
+        on_item,
+        overflow=OverflowPolicy.UNBOUNDED,
+    )
+    try:
+        assert await asyncio.wait_for(delivered, 2.0) == (b"final", 42.0)
+    finally:
+        handle.stop()
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_bounded_process_lane_reopens_after_oneshot_exit():
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(
+        event_loop_provider=EventLoopProvider(loop=loop), max_process_workers=1
+    )
+
+    async def run_once():
+        delivered = loop.create_future()
+        handle = await pool.allocate_async(
+            ExecutionContext.PROCESS,
+            _oneshot_producer,
+            lambda data, timestamp: delivered.set_result((bytes(data), timestamp)),
+            overflow=OverflowPolicy.UNBOUNDED,
+        )
+        return handle, await delivered
+
+    first, first_frame = await run_once()
+    try:
+        second, second_frame = await asyncio.wait_for(run_once(), 2.0)
+        assert first_frame == second_frame == (b"final", 42.0)
+    finally:
+        first.stop()
+        if "second" in locals():
+            second.stop()
+        pool.stop()
 
 
 @pytest.mark.asyncio

@@ -1,22 +1,29 @@
-"""Reusable file-transfer building blocks (prepare lifecycle).
+"""File preparation shared by printer integrations."""
 
-The headline :class:`FileTransfer` owns the whole prepare -> download ->
-transform -> upload -> await-firmware lifecycle and exposes brand hooks; a brand
-subclasses it. Active-job bookkeeping at prepare start is now owned by
-:class:`FileTransfer` as ``_set_active_job_for_prepare``. Leaf primitives an
-integration's file handler also composes live here too.
-"""
-
-from simplyprint_ws_client.integration.transfer.download import download_to_file
+from simplyprint_ws_client.integration.transfer.download import (
+    FileDownloadError,
+    download_file,
+)
 from simplyprint_ws_client.integration.transfer.file_transfer import (
+    FileOperationError,
     FileTransfer,
-    FirmwareStartOutcome,
-    PreparedPrint,
+    PreparationKind,
+    PrintFileDriver,
+    RetryableFileError,
+    StartDisposition,
+    UnsupportedFileOperation,
+    UploadedFile,
 )
 
 __all__ = [
+    "FileDownloadError",
+    "FileOperationError",
     "FileTransfer",
-    "FirmwareStartOutcome",
-    "PreparedPrint",
-    "download_to_file",
+    "PreparationKind",
+    "PrintFileDriver",
+    "RetryableFileError",
+    "StartDisposition",
+    "UnsupportedFileOperation",
+    "UploadedFile",
+    "download_file",
 ]

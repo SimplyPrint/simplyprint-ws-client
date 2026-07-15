@@ -2,21 +2,30 @@ __all__ = ["Scheduler"]
 
 import asyncio
 import logging
+import sys
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 
 from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.manager import (
     ClientConnectionManager,
     ClientList,
 )
+from simplyprint_ws_client.core.protocol.connection import (
+    TransportFactory,
+    default_transport_factory,
+)
 from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.common.asyncio.async_task_scope import AsyncTaskScope
 from simplyprint_ws_client.common.asyncio.continuous_task import ContinuousTask
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.asyncio.utils import cond_notify_all, cond_wait
 from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
+
+if sys.version_info >= (3, 11):
+    from asyncio import timeout as tick_timeout
+else:
+    from async_timeout import timeout as tick_timeout
 
 #: Per-client budget for one ``tick``; a slow client is cut off so it cannot
 #: stall the shared scheduling loop.
@@ -31,7 +40,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         client_list: ClientList
         manager: ClientConnectionManager
         logger: logging.Logger
-        _cond: asyncio.Condition
+        _wake_event: asyncio.Event
         _tasks: Dict[str, ContinuousTask]
         _to_delete: Set[str]
         _schedule_task: ContinuousTask
@@ -41,45 +50,48 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
     client_list: ClientList
     manager: ClientConnectionManager
     logger: logging.Logger
-    _cond: asyncio.Condition
+    _wake_event: asyncio.Event
     _tasks: Dict[str, ContinuousTask]
     _last_ticked: Dict[str, datetime]
+    _tick_timeout_reported: Set[str]
     _tick_rate_delta: timedelta
     _to_delete: Set[str]
     _schedule_task: ContinuousTask
-    _pending_signals: Set[asyncio.Future]
     _signal_lock: threading.Lock
+    _signal_scheduled: bool
 
     def __init__(
         self,
         client_list: ClientList,
         settings: ClientSettings,
         logger: logging.Logger = logging.getLogger("Scheduler"),
-        **kwargs,
-    ):
-        AsyncStoppable.__init__(self, **kwargs)
-        EventLoopProvider.__init__(self, **kwargs)
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        transport_factory: TransportFactory = default_transport_factory,
+    ) -> None:
+        AsyncStoppable.__init__(self)
+        EventLoopProvider.__init__(self, loop=loop)
 
         self.settings = settings
         self.client_list = client_list
         self.manager = ClientConnectionManager(
             self.settings.mode,
             self.client_list,
+            self.settings.endpoints.websocket_url,
             max_clients_per_connection=self.settings.max_clients_per_connection,
             provider=self,
+            transport_factory=transport_factory,
         )
         self.logger = logger
-        self._cond = asyncio.Condition()
+        self._wake_event = asyncio.Event()
         self._tasks = {}
         self._last_ticked = {}
+        self._tick_timeout_reported = set()
         self._tick_rate_delta = timedelta(seconds=self.settings.tick_rate)
         self._to_delete = set()
         self._schedule_task = ContinuousTask(self._schedule_loop, provider=self)
-        self._pending_signals = set()
         self._signal_lock = threading.Lock()
-        #: How many loop tasks currently sit in ``cond_wait`` - our own counter
-        #: instead of peeking at asyncio.Condition's private ``_waiters``.
-        self._cond_waiters = 0
+        self._signal_scheduled = False
         #: Keeps in-flight client teardown tasks alive (asyncio holds tasks
         #: weakly) and reports their failures.
         self._teardown_tasks = set()
@@ -111,42 +123,41 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         self.client_list.remove(client)
         self._tasks.pop(client.unique_id, None)
         self._last_ticked.pop(client.unique_id, None)
+        self._tick_timeout_reported.discard(client.unique_id)
         self._to_delete.discard(client.unique_id)
         self.signal()
 
     def signal(self):
+        """Latch one scheduling wake-up onto the app loop.
+
+        An ``asyncio.Condition`` notification is edge-triggered and disappears
+        when no coroutine is waiting. Client submission can land in the narrow
+        gap between a scheduling pass and waiter registration, so the old
+        waiter-count fast path delayed that client until the periodic tick.
+        ``asyncio.Event`` retains the wake-up until the loop consumes it.
+        """
         with self._signal_lock:
-            # Optimization: No one to wake.
-            if self._cond_waiters == 0:
+            if self._signal_scheduled:
                 return
+            self._signal_scheduled = True
 
-            # Optimization: No need to signal if there are pending signals.
-            if len(self._pending_signals) > 0:
-                return
-
-            if not self.event_loop_is_running():
-                return
-
-            fut = asyncio.run_coroutine_threadsafe(
-                cond_notify_all(self._cond), self.event_loop
-            )
-            fut.add_done_callback(self._discard_pending_signal)
-            self._pending_signals.add(fut)
-
-    def _discard_pending_signal(self, fut) -> None:
-        # Runs on the loop thread; take the same lock signal() holds.
-        with self._signal_lock:
-            self._pending_signals.discard(fut)
-
-    async def _cond_wait(self):
-        """``cond_wait`` with the waiter accounted for ``signal()``'s fast path."""
-        with self._signal_lock:
-            self._cond_waiters += 1
         try:
-            await cond_wait(self._cond)
-        finally:
+            # Queuing on a not-yet-running loop is intentional: app.add() may
+            # race run_detached() startup, and this callback then becomes the
+            # retained first wake-up as soon as the loop begins.
+            self.event_loop.call_soon_threadsafe(self._deliver_signal)
+        except RuntimeError:
             with self._signal_lock:
-                self._cond_waiters -= 1
+                self._signal_scheduled = False
+
+    def _deliver_signal(self) -> None:
+        with self._signal_lock:
+            self._signal_scheduled = False
+        self._wake_event.set()
+
+    async def _wait_for_signal(self) -> None:
+        await self._wake_event.wait()
+        self._wake_event.clear()
 
     def _should_schedule_client(self, client: Client, when: datetime):
         # Always schedule clients that still need their once-per-lifetime init.
@@ -197,8 +208,17 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 self._last_ticked[client.unique_id] = now
 
                 try:
-                    async with asyncio.timeout(TICK_TIMEOUT_SECONDS):
+                    async with tick_timeout(TICK_TIMEOUT_SECONDS):
                         await client.tick(delta_tick)
+                    self._tick_timeout_reported.discard(client.unique_id)
+                except asyncio.TimeoutError as e:
+                    # A stalled device or ping can time out on every scheduler
+                    # slice. Report one compact warning per failure streak;
+                    # a successful tick rearms it. Repeated tracebacks for the
+                    # same transient outage obscure the actual reconnect edge.
+                    if client.unique_id not in self._tick_timeout_reported:
+                        client.logger.warning("Client tick timed out: %s", e)
+                        self._tick_timeout_reported.add(client.unique_id)
                 except Exception as e:
                     # A slow or failing tick must not stall the allocation
                     # state machine below: tick runs first (device side), but
@@ -347,7 +367,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                     # Wait until either a change is made to the state or a timeout occurs.
                     conditions = [
                         task_scope.create_task(self.wait(self.settings.tick_rate)),
-                        task_scope.create_task(self._cond_wait()),
+                        task_scope.create_task(self._wait_for_signal()),
                     ]
 
                     await asyncio.wait(conditions, return_when=asyncio.FIRST_COMPLETED)

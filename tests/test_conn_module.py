@@ -6,8 +6,7 @@ touched. The fakes satisfy the same seams production wires do:
 * a tiny :class:`FakeTransport` for pool refcounting and lease delivery;
 * a :class:`Reconnecting` subclass driven by a queue for the supervised
   reconnect loop;
-* a fake aiomqtt client (``.messages`` / ``.subscribe`` / ``.publish``) injected
-  into :class:`AioMqtt` for MQTT multi-topic routing;
+* a fake paho client injected into :class:`Paho` for MQTT multi-topic routing;
 * a fake ``websockets`` socket injected into :class:`Websockets` for WS broadcast.
 
 These pin the library contract: one shared transport per endpoint, the
@@ -25,6 +24,7 @@ import yarl
 
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.core.client_context import ClientContext
 
 from simplyprint_ws_client.wire import (
     Lease,
@@ -43,8 +43,10 @@ from simplyprint_ws_client.wire.keepalive import (
     KeepaliveTimeout,
 )
 from simplyprint_ws_client.wire.messages import QoS
+from simplyprint_ws_client.wire.options import ConnectionOptions, WireKeepalive
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.reconnect import Reconnecting
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
@@ -56,12 +58,12 @@ from simplyprint_ws_client.wire.transport import (
 
 from simplyprint_ws_client.wire import mqtt
 from simplyprint_ws_client.wire import websocket as ws
-from simplyprint_ws_client.wire.aiomqtt import AioMqtt
 from simplyprint_ws_client.wire.mqtt import (
     MqttBroker,
     MqttMessage,
     mqtt_message_route,
 )
+from simplyprint_ws_client.wire.paho import Paho
 from simplyprint_ws_client.wire.websocket import WsMessage
 from simplyprint_ws_client.wire.websockets import Websockets
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
@@ -753,45 +755,72 @@ async def test_lease_transport_awaits_live_connection():
 # --------------------------------------------------------------------------- #
 
 
-class FakeAioMqttClient:
-    """An aiomqtt-shaped fake: ``async with`` once, ``.messages`` is an async
-    iterator a test feeds, plus ``.subscribe`` / ``.unsubscribe`` / ``.publish``."""
+class FakePahoClient:
+    """A paho-shaped fake driven synchronously by the tests."""
 
     def __init__(self) -> None:
-        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.on_pre_connect = None
+        self.on_connect = None
+        self.on_connect_fail = None
+        self.on_message = None
+        self.on_disconnect = None
+        self.connected = False
         self.subscribed: List[str] = []
         self.unsubscribed: List[str] = []
         self.published: List[tuple] = []
-        self.messages = self  # ``client.messages.__aiter__()``
+        self.connect_calls: List[tuple] = []
 
-    async def __aenter__(self) -> "FakeAioMqttClient":
-        return self
+    def username_pw_set(self, *_args, **_kwargs) -> None:
+        pass
 
-    async def __aexit__(self, *exc) -> None:
-        return None
+    def connect_async(self, host, port, keepalive) -> None:
+        self.connect_calls.append((host, port, keepalive))
 
-    def __aiter__(self) -> "FakeAioMqttClient":
-        return self
+    def loop_start(self) -> int:
+        return 0
 
-    async def __anext__(self) -> Any:
-        item = await self.inbox.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
+    def loop_stop(self) -> int:
+        return 0
 
-    async def subscribe(self, topic: str) -> None:
+    def disconnect(self) -> None:
+        self.connected = False
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def subscribe(self, topic: str) -> None:
         self.subscribed.append(topic)
 
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         self.unsubscribed.append(topic)
 
-    async def publish(self, topic, payload, qos=0, retain=False) -> None:
+    def publish(self, topic, payload, qos=0, retain=False):
         self.published.append((topic, payload, qos, retain))
+
+        class Info:
+            rc = 0
+
+            @staticmethod
+            def wait_for_publish(timeout=None) -> None:
+                pass
+
+            @staticmethod
+            def is_published() -> bool:
+                return True
+
+        return Info()
+
+    def fire_connect(self) -> None:
+        self.on_pre_connect(self, None)
+        self.connected = True
+        self.on_connect(self, None, {}, 0, None)
+
+    def fire_message(self, message: object) -> None:
+        self.on_message(self, None, message)
 
 
 class WireMqttMessage:
-    """An aiomqtt message stand-in -- ``AioMqtt`` forwards these wire-shaped and
-    routes them by ``.topic``."""
+    """A paho message stand-in routed by ``.topic``."""
 
     def __init__(self, topic: str, payload: bytes, qos: int = 0, retain: bool = False):
         self.topic = topic
@@ -800,20 +829,19 @@ class WireMqttMessage:
         self.retain = retain
 
 
-def build_mqtt_pool(clients: List[FakeAioMqttClient]) -> Pool:
-    """A pool of :class:`AioMqtt` wired to fresh fake clients, keyed by broker
+def build_mqtt_pool(clients: List[FakePahoClient]) -> Pool:
+    """A pool of :class:`Paho` wired to fresh fake clients, keyed by broker
     endpoint, handing out :class:`MqttLease` leases."""
 
     def factory(url, logger):
-        client = FakeAioMqttClient()
+        client = FakePahoClient()
         clients.append(client)
         return client
 
     def build(url: yarl.URL, params: object):
-        return AioMqtt(
+        return Paho(
             url,
-            RetryPolicy(backoff=ConstantBackoff(0)),
-            current_provider(),
+            provider=current_provider(),
             client_factory=factory,
         )
 
@@ -831,7 +859,7 @@ def build_mqtt_pool(clients: List[FakeAioMqttClient]) -> Pool:
 
 @pytest.mark.asyncio
 async def test_mqtt_multi_topic_on_one_connection():
-    clients: List[FakeAioMqttClient] = []
+    clients: List[FakePahoClient] = []
     pool = build_mqtt_pool(clients)
     url = yarl.URL("mqtt://broker/")
 
@@ -841,13 +869,14 @@ async def test_mqtt_multi_topic_on_one_connection():
 
     await lease.subscribe("a")
     await lease.subscribe("b")
+    clients[0].fire_connect()
     await wait_for(lambda: lease.connected)
     assert len(clients) == 1  # one shared socket
     client = clients[0]
 
-    client.inbox.put_nowait(WireMqttMessage("a", b"1"))
-    client.inbox.put_nowait(WireMqttMessage("b", b"2"))
-    client.inbox.put_nowait(WireMqttMessage("c", b"3"))  # not subscribed
+    client.fire_message(WireMqttMessage("a", b"1"))
+    client.fire_message(WireMqttMessage("b", b"2"))
+    client.fire_message(WireMqttMessage("c", b"3"))  # not subscribed
 
     await wait_for(lambda: len(got) >= 2)
     await asyncio.sleep(0.02)  # give a stray 'c' a chance to (wrongly) arrive
@@ -858,7 +887,7 @@ async def test_mqtt_multi_topic_on_one_connection():
 
 @pytest.mark.asyncio
 async def test_mqtt_two_leases_each_get_only_their_topic():
-    clients: List[FakeAioMqttClient] = []
+    clients: List[FakePahoClient] = []
     pool = build_mqtt_pool(clients)
     url = yarl.URL("mqtt://broker/")
     broker = MqttBroker.from_url(url)
@@ -874,12 +903,13 @@ async def test_mqtt_two_leases_each_get_only_their_topic():
 
     await first.subscribe("alpha")
     await second.subscribe("beta")
+    clients[0].fire_connect()
     await wait_for(lambda: first.connected)
-    assert len(clients) == 1  # one aiomqtt client built for the shared socket
+    assert len(clients) == 1  # one paho client built for the shared socket
 
     client = clients[0]
-    client.inbox.put_nowait(WireMqttMessage("alpha", b"a"))
-    client.inbox.put_nowait(WireMqttMessage("beta", b"b"))
+    client.fire_message(WireMqttMessage("alpha", b"a"))
+    client.fire_message(WireMqttMessage("beta", b"b"))
 
     await wait_for(lambda: got_first and got_second)
     await asyncio.sleep(0.02)
@@ -892,7 +922,7 @@ async def test_mqtt_two_leases_each_get_only_their_topic():
 
 @pytest.mark.asyncio
 async def test_mqtt_wildcard_subscription_routes():
-    clients: List[FakeAioMqttClient] = []
+    clients: List[FakePahoClient] = []
     pool = build_mqtt_pool(clients)
     url = yarl.URL("mqtt://broker/")
     lease = pool.connect(url, MqttBroker.from_url(url))
@@ -900,11 +930,12 @@ async def test_mqtt_wildcard_subscription_routes():
     lease.event_bus.on(MessageReceived, lambda e: got.append(e.message.topic))
 
     await lease.subscribe("device/#")
+    clients[0].fire_connect()
     await wait_for(lambda: lease.connected)
     client = clients[0]
-    client.inbox.put_nowait(WireMqttMessage("device/temp", b"1"))
-    client.inbox.put_nowait(WireMqttMessage("device", b"2"))
-    client.inbox.put_nowait(WireMqttMessage("other", b"3"))
+    client.fire_message(WireMqttMessage("device/temp", b"1"))
+    client.fire_message(WireMqttMessage("device", b"2"))
+    client.fire_message(WireMqttMessage("other", b"3"))
 
     await wait_for(lambda: len(got) >= 2)
     await asyncio.sleep(0.02)
@@ -940,6 +971,35 @@ class FakeWsSocket:
 
     async def close(self) -> None:
         self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_open_explicitly_installs_ssl_transport_fix(monkeypatch):
+    installed = 0
+    socket = FakeWsSocket()
+
+    def install() -> None:
+        nonlocal installed
+        installed += 1
+
+    async def connect_factory(url: str, **kwargs) -> FakeWsSocket:
+        return socket
+
+    monkeypatch.setattr(
+        "simplyprint_ws_client.wire.websockets.install_ssl_transport_workaround",
+        install,
+    )
+    transport = Websockets(
+        yarl.URL("wss://host/path"),
+        provider=current_provider(),
+        connect_factory=connect_factory,
+    )
+
+    await transport.open()
+
+    assert installed == 1
+    assert transport.socket is socket
+    await transport.aclose()
 
 
 def build_ws_pool(sockets: List[FakeWsSocket]) -> Pool:
@@ -1079,7 +1139,7 @@ async def test_lease_event_bus_does_not_drop_message_bursts():
 
 @pytest.mark.asyncio
 async def test_mqtt_connect_returns_lease_and_applies_url_topics():
-    clients: List[FakeAioMqttClient] = []
+    clients: List[FakePahoClient] = []
     pool = build_mqtt_pool(clients)
     url = yarl.URL("mqtt://broker/?topic=foo/%23")  # foo/# url-encoded
 
@@ -1090,13 +1150,14 @@ async def test_mqtt_connect_returns_lease_and_applies_url_topics():
     # The URL's ?topic= is recorded on the lease synchronously for routing,
     # and asserted on the shared socket once it comes up.
     assert "foo/#" in lease.topics
+    clients[0].fire_connect()
     await wait_for(lambda: lease.connected)
     await wait_for(lambda: "foo/#" in clients[0].subscribed)
 
     got: List[str] = []
     lease.event_bus.on(MessageReceived, lambda e: got.append(e.message.topic))
-    clients[0].inbox.put_nowait(WireMqttMessage("foo/bar", b"x"))
-    clients[0].inbox.put_nowait(WireMqttMessage("nope", b"y"))
+    clients[0].fire_message(WireMqttMessage("foo/bar", b"x"))
+    clients[0].fire_message(WireMqttMessage("nope", b"y"))
     await wait_for(lambda: got == ["foo/bar"])  # wildcard routes, 'nope' filtered
 
     await lease.close()
@@ -1104,11 +1165,12 @@ async def test_mqtt_connect_returns_lease_and_applies_url_topics():
 
 @pytest.mark.asyncio
 async def test_mqtt_connect_bare_bytes_uses_default_topic():
-    clients: List[FakeAioMqttClient] = []
+    clients: List[FakePahoClient] = []
     pool = build_mqtt_pool(clients)
     url = yarl.URL("mqtt://broker/?topic=cmd")
 
     lease = mqtt.connect(url, pool=pool)
+    clients[0].fire_connect()
     await wait_for(lambda: lease.connected)
 
     await lease.send(b"payload")  # bare bytes -> wrapped onto the URL's first topic
@@ -1122,8 +1184,85 @@ async def test_mqtt_connect_bare_bytes_uses_default_topic():
 
 @pytest.mark.asyncio
 async def test_mqtt_connect_rejects_url_without_host():
+    pool = build_mqtt_pool([])
     with pytest.raises(ValueError):
-        mqtt.connect(yarl.URL("mqtt:///?topic=x"))
+        mqtt.connect(yarl.URL("mqtt:///?topic=x"), pool=pool)
+
+
+@pytest.mark.asyncio
+async def test_context_registries_do_not_share_mqtt_transports(monkeypatch):
+    clients: List[FakePahoClient] = []
+
+    def factory(url, logger, **_kwargs):
+        client = FakePahoClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+    first = ClientContext()
+    second = ClientContext()
+    first_pool = mqtt.pool_for(first.mqtt_pools, current_provider())
+    second_pool = mqtt.pool_for(second.mqtt_pools, current_provider())
+    first_lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=first_pool)
+    second_lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=second_pool)
+
+    assert isinstance(first_lease.transport, Paho)
+    assert isinstance(second_lease.transport, Paho)
+    assert first_lease.transport is not second_lease.transport
+    assert len(clients) == 2
+
+    await first_lease.close()
+    await second_lease.close()
+
+
+@pytest.mark.asyncio
+async def test_mqtt_defaults_preserve_paho_native_reconnect_window(monkeypatch):
+    captured = {}
+    client = FakePahoClient()
+
+    def factory(_url, _logger, **kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+    pool = mqtt.pool_for(
+        PoolRegistry(),
+        current_provider(),
+        WireKeepalive(interval=20),
+    )
+    lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=pool)
+
+    assert client.connect_calls == [("broker", 1883, 20)]
+    # No caller override means default_paho_client selects its native 1..5s
+    # reconnect bounds. Materializing RetryPolicy() here used to change that to
+    # a fixed 5s delay.
+    assert captured["retry"] is None
+
+    await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_mqtt_explicit_retry_policy_reaches_paho_factory(monkeypatch):
+    captured = {}
+    client = FakePahoClient()
+    retry = RetryPolicy(backoff=ConstantBackoff(7), max_attempts=4)
+
+    def factory(_url, _logger, **kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+    pool = mqtt.pool_for(PoolRegistry(), current_provider())
+    lease = mqtt.connect(
+        yarl.URL("mqtt://broker/"),
+        pool=pool,
+        options=ConnectionOptions(retry=retry),
+    )
+
+    assert captured["retry"] is retry
+    assert lease.transport.connect_failure_limit == 4
+
+    await lease.close()
 
 
 @pytest.mark.asyncio
@@ -1147,8 +1286,9 @@ async def test_ws_connect_returns_ws_lease():
 
 @pytest.mark.asyncio
 async def test_ws_connect_rejects_non_ws_scheme():
+    pool = build_ws_pool([])
     with pytest.raises(ValueError):
-        ws.connect(yarl.URL("http://host/socket"))
+        ws.connect(yarl.URL("http://host/socket"), pool=pool)
 
 
 @pytest.mark.asyncio
@@ -1168,17 +1308,18 @@ async def test_front_doors_share_one_transport_per_endpoint():
 async def test_ws_front_door_passes_open_timeout_to_the_transport():
     """ConnectionOptions.open_timeout reaches the transport the pool builds;
     omitted means the transport keeps its own default."""
-    from simplyprint_ws_client.wire.websocket import build_pool
+    from simplyprint_ws_client.wire.websocket import pool_for
 
-    pool = build_pool("websockets", None, current_provider())
+    pool = pool_for(PoolRegistry(), current_provider())
     lease = pool.connect(
         yarl.URL("ws://host/x"),
         ws.WsConnectParams(RetryPolicy(), None, 12.5),
     )
+    assert isinstance(lease.transport, Websockets)
     assert lease.transport.open_timeout == 12.5
     await lease.close()
 
-    pool = build_pool("websockets", None, current_provider())
+    pool = pool_for(PoolRegistry(), current_provider())
     lease = pool.connect(
         yarl.URL("ws://host/y"),
         ws.WsConnectParams(RetryPolicy(), None, None),

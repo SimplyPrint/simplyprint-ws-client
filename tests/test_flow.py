@@ -495,6 +495,66 @@ async def test_fields_step_validates_with_pydantic_schema():
     assert done.value == "::1"
 
 
+@pytest.mark.asyncio
+async def test_fields_step_transforms_model_schema_before_deriving_fields():
+    """A state-aware schema projection can hide or require model fields without
+    a bespoke Step subclass; the projected schema drives both rendering and the
+    recoverable required-field check."""
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class SetupInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        host: str = Field(title="Host")
+        access_code: Optional[str] = Field(default=None, title="Access code")
+
+    def project_schema(state, schema):
+        properties = schema["properties"]
+        if state.get("needs_code"):
+            schema["required"] = [*schema.get("required", []), "access_code"]
+            properties["access_code"]["ui"]["guide"] = ["find-code"]
+        else:
+            properties.pop("access_code")
+        return schema
+
+    flow = Flow(
+        id="projected-form",
+        title="Projected form",
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    FieldsStep(
+                        "setup",
+                        label="Set up",
+                        input_model=SetupInput,
+                        schema_transform=project_schema,
+                    )
+                ],
+            )
+        ],
+        finish=lambda state: state,
+    )
+
+    simple = await advance_flow(flow, {"needs_code": False})
+    assert isinstance(simple, Prompt)
+    assert [field.key for field in simple.prompt.fields] == ["host"]
+    assert "access_code" not in simple.prompt.input_schema["properties"]
+
+    secured = await advance_flow(flow, {"needs_code": True})
+    assert isinstance(secured, Prompt)
+    assert [field.key for field in secured.prompt.fields] == ["host", "access_code"]
+    assert secured.prompt.fields[1].required is True
+    assert secured.prompt.input_schema["properties"]["access_code"]["ui"]["guide"] == [
+        "find-code"
+    ]
+
+    rejected = await advance_flow(flow, secured.state, {"host": "printer.local"})
+    assert isinstance(rejected, Failed)
+    assert "access_code" in rejected.message
+
+
 def test_model_input_schema_stamps_field_order_for_renderers():
     from pydantic import BaseModel, ConfigDict, Field
 
@@ -1140,6 +1200,41 @@ async def test_step_footer_renders_below_and_curates_by_state():
     step = await advance_flow(flow, {"device_type": "x1"})
     assert step.prompt.content == ["Enter the IP below."]
     assert step.prompt.footer == ["Guide for x1"]
+
+
+@pytest.mark.asyncio
+async def test_choice_step_footer_curates_by_state_and_survives_rejection():
+    """Choice screens use the same state-aware footer composition as forms."""
+    from simplyprint_ws_client.integration.flow import Choice, ChoiceStep
+
+    flow = Flow(
+        id="choice-footer",
+        title="Choice footer",
+        phases=[
+            Phase(
+                "main",
+                "Main",
+                steps=[
+                    ChoiceStep(
+                        "mode",
+                        label="Connect",
+                        options=[Choice("lan", "LAN")],
+                        footer=lambda state: [f"Guide for {state['model']}"],
+                    )
+                ],
+            )
+        ],
+        finish=lambda state: state["mode"],
+    )
+
+    prompt = await advance_flow(flow, {"model": "X1"})
+    assert isinstance(prompt, Prompt)
+    assert prompt.prompt.footer == ["Guide for X1"]
+
+    rejected = await advance_flow(flow, prompt.state, {"mode": "unsupported"})
+    assert isinstance(rejected, Failed)
+    assert rejected.prompt is not None
+    assert rejected.prompt.footer == ["Guide for X1"]
 
 
 @pytest.mark.asyncio

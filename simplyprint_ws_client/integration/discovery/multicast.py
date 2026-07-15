@@ -109,33 +109,33 @@ class MulticastDiscoveryBackend(MulticastListenerBase):
 
     spec: MulticastSpec
 
-    def _protocol_factory(self) -> _MulticastProtocol:
+    def protocol_factory(self) -> _MulticastProtocol:
         return _MulticastProtocol(self.spec, self.devices, self._emit, self.logger)
 
-    async def _bind(self, sock: socket.socket) -> None:
+    async def bind_socket(self, sock: socket.socket) -> None:
         # Active specs search from an ephemeral port; passive specs bind the fixed
         # announcement port and retry while it is briefly in use.
         if self.spec.is_active:
             sock.bind(("", 0))
             return
 
-        await self._bind_fixed_port(sock)
+        await self.bind_fixed_port(sock)
 
-    def _join_group(self, sock: socket.socket) -> None:
+    def join_group(self, sock: socket.socket) -> None:
         if self.spec.is_active:
             # An active spec still works via unicast search responses if the join
             # fails (e.g. no multicast route); don't let that kill the listener.
             try:
-                self._join_group_mreq(sock)
+                self.join_multicast_group(sock)
             except OSError:
                 self.logger.warning(
                     "could not join multicast group for %s - passive announcements disabled",
                     self.spec.brand,
                 )
         else:
-            self._join_group_mreq(sock)
+            self.join_multicast_group(sock)
 
-    async def _run_loop(self, transport: asyncio.DatagramTransport) -> None:
+    async def run_transport(self, transport: asyncio.DatagramTransport) -> None:
         if self.spec.is_active:
             while not self.is_stopped():
                 transport.sendto(

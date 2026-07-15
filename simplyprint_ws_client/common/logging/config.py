@@ -101,7 +101,7 @@ class LoggingConfig:
 
         return APP_DIRS.user_log_path
 
-    def make_file_handler(self, path: Path) -> logging.Handler:
+    def make_file_handler(self, path: Path) -> logging.handlers.RotatingFileHandler:
         return logging.handlers.RotatingFileHandler(
             path,
             maxBytes=self.max_bytes,

@@ -4,8 +4,8 @@ restart() must actually bounce: the old lease is closed and awaited (handlers
 detached, refcount released) BEFORE the new lease is built, a same-URL restart
 additionally trips the shared Reconnecting wire (siblings may keep it leased),
 concurrent restarts coalesce, and a stop() racing the sequence wins. Persistent
-start() failures must surface: after N consecutive failed sweeps the printer is
-reported offline once, with the failure as the reason.
+start() failures must surface after a bounded interval: the printer is reported
+offline once, with the failure as the reason.
 """
 
 from __future__ import annotations
@@ -13,12 +13,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 import yarl
 
 from simplyprint_ws_client.events import EventBus
-from simplyprint_ws_client.integration.drivers import LeaseDriver
+from simplyprint_ws_client.integration.drivers import (
+    DeviceReachability,
+    LeaseDriver,
+)
+from simplyprint_ws_client.wire.errors import FatalError
 from simplyprint_ws_client.wire.events import Disconnected
 from simplyprint_ws_client.wire.reconnect import Reconnecting
 
@@ -29,7 +34,9 @@ class FakeClient:
     def __init__(self, loop) -> None:
         self._loop = loop
         self.logger = logging.getLogger("test.lease.driver")
+        self.connected_edges: List[object] = []
         self.disconnected_edges: List[object] = []
+        self.projections = 0
 
     @property
     def event_loop(self):
@@ -38,11 +45,15 @@ class FakeClient:
     def submit_to_loop(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    async def on_device_connected(self, driver) -> None:  # pragma: no cover
-        pass
+    async def on_device_connected(self, driver) -> None:
+        self.connected_edges.append(driver)
 
     async def on_device_disconnected(self, driver, reason=None) -> None:
         self.disconnected_edges.append(reason)
+
+    async def project_device_reachability(self, now=None) -> bool:
+        self.projections += 1
+        return False
 
     def clear_camera_uri(self) -> None:  # pragma: no cover - unused
         pass
@@ -85,6 +96,10 @@ class FakeLease:
         self._journal = journal
         self.close_gate: Optional[asyncio.Event] = None
 
+    @property
+    def generation(self) -> int:
+        return self.transport.generation
+
     async def close(self) -> None:
         if self.close_gate is not None:
             await self.close_gate.wait()
@@ -109,7 +124,7 @@ class FakeLeaseDriver(LeaseDriver):
         self.built: List[FakeLease] = []
         self.transport_for_next = None
 
-    def _connect(self, url, options) -> FakeLease:
+    def acquire_lease(self, url, options) -> FakeLease:
         transport = self.transport_for_next or TrippableTransport()
         lease = FakeLease(yarl.URL(str(url)), transport, self.journal)
         self.built.append(lease)
@@ -155,8 +170,22 @@ async def test_old_lease_events_never_reach_handlers_after_restart():
 
     # The old lease's bus was cleared by its close -- a stale Disconnected
     # cannot clobber the fresh link.
+    before = list(driver.client.disconnected_edges)
     await old.event_bus.emit(Disconnected(1))
-    assert driver.client.disconnected_edges == []
+    assert driver.client.disconnected_edges == before
+
+
+@pytest.mark.asyncio
+async def test_fatal_wire_disconnect_requests_credential_refresh():
+    driver = _driver()
+    driver.start()
+    lease = driver.lease
+    driver.request_credential_refresh = MagicMock()
+
+    await lease.event_bus.emit(Disconnected(lease.generation, code=FatalError("auth")))
+
+    assert driver.session.reachability is DeviceReachability.DOWN
+    driver.request_credential_refresh.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -229,28 +258,33 @@ async def test_persistent_start_failures_flip_the_offline_edge_once():
         return "ws://host/a"
 
     driver = FakeLeaseDriver(client, url)
-    driver.START_FAILURE_EDGE_AFTER = 3
+    driver.START_FAILURE_OFFLINE_AFTER = 0.01
 
-    for _ in range(5):
+    driver.start()
+    await asyncio.sleep(0.02)
+    for _ in range(4):
         driver.start()
     await _settle(lambda: client.disconnected_edges)
 
     assert len(client.disconnected_edges) == 1  # edge fired exactly once
     assert "host not set" in str(client.disconnected_edges[0])
-    assert driver.consecutive_start_failures == 5
-    assert "host not set" in driver.last_start_error
+    assert driver.session.reachability is DeviceReachability.DOWN
+    assert "host not set" in str(driver.session.reason)
 
-    # Recovery resets the counter, the error, and re-arms the edge.
+    # A real recovery starts a new reachable generation and re-arms the edge.
     boom.clear()
     driver.start()
     assert driver.lease is not None
-    assert driver.consecutive_start_failures == 0
-    assert driver.last_start_error is None
+    await driver.set_reachability(DeviceReachability.UP)
+    assert driver.session.reachability is DeviceReachability.UP
+    assert driver.session.generation == 1
 
     # A later outage fires a fresh edge.
     driver.stop()
     boom.append("gone again")
-    for _ in range(3):
-        driver.start()
+    driver.start()
+    await asyncio.sleep(0.02)
+    driver.start()
     await _settle(lambda: len(client.disconnected_edges) == 2)
     assert "gone again" in str(client.disconnected_edges[1])
+    assert driver.session.reachability is DeviceReachability.DOWN

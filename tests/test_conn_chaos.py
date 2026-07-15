@@ -3,7 +3,7 @@
 These hammer :class:`~simplyprint_ws_client.wire.reconnect.Reconnecting`
 through a single controllable fake wire (``ChaosWire``) whose four hooks --
 ``open`` / ``recv`` / ``write`` / ``aclose`` -- a test scripts call-by-call. No
-real socket, broker, or wire library is touched; ``paho`` and ``aiomqtt`` are not
+real socket, broker, or wire library is touched; ``paho`` is not
 imported at all. The fake is the only thing under test's control: every retry,
 drop, skipped frame, and teardown failure is injected through it.
 

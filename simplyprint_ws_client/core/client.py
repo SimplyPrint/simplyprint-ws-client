@@ -3,7 +3,6 @@ __all__ = [
     "ClientConfigChangedEvent",
     "ClientStateChangeEvent",
     "ClientState",
-    "configure",
     "PeripheralDefinitionEntry",
     "PeripheralDefinitions",
 ]
@@ -11,41 +10,30 @@ __all__ = [
 import asyncio
 import logging
 import weakref
-from abc import ABC
 from datetime import timedelta, datetime
 from enum import IntEnum
 from typing import (
     TYPE_CHECKING,
-    Any,
     Dict,
     Generic,
+    Iterable,
     Literal,
     NamedTuple,
     Optional,
     TypeVar,
     Union,
     cast,
-    get_args,
-    get_origin,
 )
-
-from pydantic import BaseModel
-
-if TYPE_CHECKING:
-    from simplyprint_ws_client.common.asyncio.offload import Offload
 
 try:
     from typing import NotRequired, TypedDict, Unpack
 except ImportError:
     from typing_extensions import NotRequired, TypedDict, Unpack
 
-from simplyprint_ws_client.core.autowire import (
-    configure,
-    autowire,
-    AutowireClientMeta,
-)
 from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.state import (
+    Interval,
     PrinterState,
     NotificationEvent,
     NotificationEventKwargs,
@@ -66,13 +54,17 @@ from simplyprint_ws_client.core.protocol.messages import (
     MultiPrinterRemovedMsg,
     MultiPrinterAddedMsg,
     PingMsg,
+    PongMsg,
     PrinterSettingsMsg,
+    StreamReceivedMsg,
     IntervalChangeMsg,
     CompleteSetupMsg,
     NewTokenMsg,
     ErrorMsg,
     ConnectedMsg,
     FileDemandData,
+    RefreshMaterialDataDemandData,
+    RefreshPeripheralsDemandData,
     WebcamSnapshotDemandData,
     ClientMsg,
     ServerMsgKind,
@@ -106,8 +98,11 @@ from simplyprint_ws_client.events import EventBus, Event
 from simplyprint_ws_client.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.logging import printer_logger
-from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApi
+from simplyprint_ws_client.common.model.reactive import ReactiveModel
 from simplyprint_ws_client.common.utils.backoff import Backoff, ExponentialBackoff
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.common.asyncio.offload import Offload
 
 
 class ClientState(IntEnum):
@@ -153,89 +148,102 @@ PeripheralDefinitions = Dict[str, PeripheralDefinitionEntry]
 
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
 
-# Map message producers
 
-_CLIENT_MSG_PRODUCERS = {
-    MachineDataMsg: ["info"],
-    WebcamStatusMsg: ["webcam_info.connected"],
-    WebcamMsg: ["webcam_settings"],
-    FirmwareMsg: ["firmware"],
-    FirmwareWarningMsg: ["firmware_warning"],
-    ToolMsg: ["tools.*.active_material"],
-    TemperatureMsg: ["bed.temperature", "chamber.temperature", "tools.*.temperature"],
-    AmbientTemperatureMsg: ["ambient_temperature.ambient"],
-    StateChangeMsg: ["status"],
-    JobInfoMsg: ["job_info"],
-    LatencyMsg: ["latency.pong"],
-    FileProgressMsg: ["file_progress"],
-    FilamentSensorMsg: ["filament_sensor"],
-    PowerControllerMsg: ["psu_info"],
-    CpuInfoMsg: ["cpu_info"],
-    MaterialDataMsg: [
-        "tools.*.materials",
-        "tools.*.size",
-        "tools.*.type",
-        "tools.*.volume_type",
-        "bed.type",
-        "mms_layout",
-    ],
-    NotificationMsg: [
-        "notifications.notifications",
-    ],
-    PeripheralMsg: ["peripherals.entries"],
-}
-
-_CLIENT_MSG_MAP = {k: v for v, keys in _CLIENT_MSG_PRODUCERS.items() for k in keys}
+def _field_version(
+    model: ReactiveModel,
+    field: str,
+    nested: Iterable[ReactiveModel] = (),
+) -> int | None:
+    """Latest change for one explicit state branch."""
+    versions = []
+    if field in model.model_self_changed_fields:
+        versions.append(model.model_self_changed_fields[field])
+    for child in nested:
+        if changes := child.model_recursive_changeset:
+            versions.append(max(changes.values()))
+    return max(versions) if versions else None
 
 
-def _producer_path_is_valid(path: str) -> bool:
-    """Whether a producer's dotted path still matches the PrinterState models."""
-    annotation: Any = PrinterState
-
-    for part in path.split("."):
-        # Unwrap Optional[...] around models/containers.
-        if get_origin(annotation) is Union:
-            args = [a for a in get_args(annotation) if a is not type(None)]
-            if len(args) == 1:
-                annotation = args[0]
-
-        if part == "*":
-            if get_origin(annotation) not in (list, tuple):
-                return False
-            annotation = get_args(annotation)[0]
-            continue
-
-        if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
-            return False
-
-        field = annotation.model_fields.get(part)
-        if field is None:
-            return False
-        annotation = field.annotation
-
-    return True
-
-
-_invalid_producer_paths = [
-    path
-    for paths in _CLIENT_MSG_PRODUCERS.values()
-    for path in paths
-    if not _producer_path_is_valid(path)
-]
-if _invalid_producer_paths:
-    # Fail at import: a renamed state field would otherwise silently stop its
-    # message from ever being sent.
-    raise RuntimeError(
-        f"_CLIENT_MSG_PRODUCERS paths no longer match PrinterState: "
-        f"{_invalid_producer_paths}"
+def _message_changes(
+    state: PrinterState,
+) -> Iterable[tuple[type[ClientMsg], Iterable[int | None]]]:
+    """Messages affected by the concrete branches of this state tree."""
+    yield MachineDataMsg, (_field_version(state, "info", (state.info,)),)
+    yield WebcamStatusMsg, (_field_version(state.webcam_info, "connected"),)
+    yield (
+        WebcamMsg,
+        (_field_version(state, "webcam_settings", (state.webcam_settings,)),),
+    )
+    yield FirmwareMsg, (_field_version(state, "firmware", (state.firmware,)),)
+    yield (
+        FirmwareWarningMsg,
+        (_field_version(state, "firmware_warning", (state.firmware_warning,)),),
+    )
+    yield ToolMsg, (_field_version(tool, "active_material") for tool in state.tools)
+    yield (
+        TemperatureMsg,
+        (
+            _field_version(state.bed, "temperature", (state.bed.temperature,)),
+            _field_version(state.chamber, "temperature", (state.chamber.temperature,)),
+            *(
+                _field_version(tool, "temperature", (tool.temperature,))
+                for tool in state.tools
+            ),
+        ),
+    )
+    yield AmbientTemperatureMsg, (_field_version(state.ambient_temperature, "ambient"),)
+    yield StateChangeMsg, (_field_version(state, "status"),)
+    yield JobInfoMsg, (_field_version(state, "job_info", (state.job_info,)),)
+    yield LatencyMsg, (_field_version(state.latency, "pong"),)
+    yield (
+        FileProgressMsg,
+        (_field_version(state, "file_progress", (state.file_progress,)),),
+    )
+    yield (
+        FilamentSensorMsg,
+        (_field_version(state, "filament_sensor", (state.filament_sensor,)),),
+    )
+    yield PowerControllerMsg, (_field_version(state, "psu_info", (state.psu_info,)),)
+    yield CpuInfoMsg, (_field_version(state, "cpu_info", (state.cpu_info,)),)
+    yield (
+        MaterialDataMsg,
+        (
+            *(
+                _field_version(tool, "materials", tool.materials)
+                for tool in state.tools
+            ),
+            *(_field_version(tool, "size") for tool in state.tools),
+            *(_field_version(tool, "type") for tool in state.tools),
+            *(_field_version(tool, "volume_type") for tool in state.tools),
+            _field_version(state.bed, "type"),
+            _field_version(state, "mms_layout", state.mms_layout),
+        ),
+    )
+    yield (
+        NotificationMsg,
+        (
+            _field_version(
+                state.notifications,
+                "notifications",
+                state.notifications.notifications.values(),
+            ),
+        ),
+    )
+    yield (
+        PeripheralMsg,
+        (
+            _field_version(
+                state.peripherals,
+                "entries",
+                state.peripherals.entries.values(),
+            ),
+        ),
     )
 
 
 class Client(
-    ABC,
     Generic[TConfig],
     EventLoopProvider[asyncio.AbstractEventLoop],
-    metaclass=AutowireClientMeta,
 ):
     """One printer's agent speaking the SimplyPrint cloud protocol — a scheduling unit.
 
@@ -260,50 +268,92 @@ class Client(
         _pending_action_log_ts: Timestamp of the last pending action log, so to limit log spam
     """
 
-    v: int = -1
-    msg_id: int = -1
-    last_msg_id: int = -1
     printer: PrinterState
     event_bus: EventBus
     logger: logging.Logger
 
     _state: VersionedState
-    _should_be_allocated: bool = True
-
-    #: Whether the scheduler has run :meth:`init` for this instance. Set once
-    #: when the client enters scheduling; never reset (init is once per
-    #: lifetime -- recovery/retry paths belong in :meth:`tick`).
-    initialized: bool = False
-
     _pending_action_backoff: Backoff
-    _pending_action_delay: timedelta = timedelta.min
-    _pending_action_ts: datetime = datetime.min
-    _pending_action_log_ts: datetime = datetime.min
 
     #: The app's bounded blocking-work lanes, injected by ``ClientApp`` at
     #: construction. ``None`` outside the app (e.g. in unit tests); callers that
     #: offload must tolerate its absence (``FileTransfer`` falls back to a thread).
-    offload: "Optional[Offload]" = None
+    offload: "Optional[Offload]"
 
     def __init__(
         self,
         config: TConfig,
         *,
-        event_loop_provider: Optional[EventLoopProvider] = None,
-        offload: "Optional[Offload]" = None,
-        **kwargs,
-    ):
-        ABC.__init__(self)
+        context: ClientContext,
+    ) -> None:
         Generic.__init__(self)
-        EventLoopProvider.__init__(self, provider=event_loop_provider)
-        self.offload = offload
+        self.context = context
+        EventLoopProvider.__init__(
+            self,
+            provider=context.event_loop_provider,
+        )
+        self.v = -1
+        self.msg_id = -1
+        self.last_msg_id = -1
+        self._should_be_allocated = True
+        self.initialized = False
+        self.offload = context.offload
+        self.simplyprint_api = context.simplyprint_api
         self._state = VersionedState(-1, ClientState.CONNECTING)
         self._pending_action_backoff = ExponentialBackoff(10, 600, 3600)
+        self._pending_action_delay = timedelta.min
+        self._pending_action_ts = datetime.min
+        self._pending_action_log_ts = datetime.min
         self.event_bus = EventBus(event_loop_provider=self)
         self.printer = PrinterState(config=config)
         self.printer.provide_context(weakref.ref(self))
         self.logger = printer_logger(self.unique_id)
-        autowire(self)
+        self._register_core_handlers()
+
+    def _register_core_handlers(self) -> None:
+        """Install the protocol state machine's fixed routes.
+
+        This table is intentionally explicit: event selection, ordering, and
+        handler arity are visible here and cannot change because a method was
+        renamed or received a different annotation.
+        """
+        on = self.event_bus.on
+        on(SimplyPrintConnectionIncomingEvent, self._on_connection_incoming)
+        on(SimplyPrintConnectionEstablishedEvent, self._on_connection_established)
+        on(SimplyPrintConnectionLostEvent, self._on_connection_lost)
+        on(ServerMsgType.ADD_CONNECTION, self._on_multi_printer_added, priority=1)
+        on(
+            ServerMsgType.REMOVE_CONNECTION,
+            self._on_multi_printer_removed,
+            priority=1,
+        )
+        on(ServerMsgType.CONNECTED, self._on_connected_state, priority=2)
+        on(ServerMsgType.ERROR, self._on_error, priority=1)
+        on(ServerMsgType.NEW_TOKEN, self._on_new_token, priority=1)
+        on(ServerMsgType.CONNECTED, self._on_connected_data, priority=1)
+        on(ServerMsgType.COMPLETE_SETUP, self._on_setup_complete, priority=1)
+        on(ServerMsgType.INTERVAL_CHANGE, self._on_interval_change, priority=1)
+        on(ServerMsgType.PONG, self._on_pong, priority=1)
+        on(ServerMsgType.PRINTER_SETTINGS, self._on_printer_settings, priority=1)
+        on(ServerMsgType.STREAM_RECEIVED, self._on_stream_received, priority=1)
+        on(DemandMsgType.WEBCAM_SNAPSHOT, self._on_webcam_snapshot, priority=1)
+        on(DemandMsgType.FILE, self._on_file_demand, priority=1)
+        on(DemandMsgType.SET_MATERIAL_DATA, self._apply_material_data, priority=1)
+        on(
+            DemandMsgType.REFRESH_MATERIAL_DATA,
+            self.on_refresh_material_data,
+            priority=1,
+        )
+        on(
+            DemandMsgType.REFRESH_PERIPHERALS,
+            self.on_refresh_peripherals,
+            priority=1,
+        )
+        on(
+            DemandMsgType.RESOLVE_NOTIFICATION,
+            self._on_resolve_notification,
+            priority=1,
+        )
 
     @property
     def unique_id(self) -> Union[str, int]:
@@ -415,23 +465,12 @@ class Client(
         """Consume and return the list of pending messages."""
         self.last_msg_id = self.msg_id
 
-        changes = self.printer.model_recursive_changeset
         msg_kinds = {}
 
         # Build a unique map of message kinds together with their highest version.
-        for k, v in changes.items():
-            if k not in _CLIENT_MSG_MAP:
-                continue
-
-            msg_kind = _CLIENT_MSG_MAP.get(k)
-            current = msg_kinds.get(msg_kind)
-
-            if current is None:
-                msg_kinds[msg_kind] = (v, v)
-                continue
-
-            lowest, highest = current
-            msg_kinds[msg_kind] = (min(lowest, v), max(highest, v))
+        for msg_kind, candidates in _message_changes(self.printer):
+            if versions := tuple(v for v in candidates if v is not None):
+                msg_kinds[msg_kind] = (min(versions), max(versions))
 
         is_pending = self.printer.config.is_pending()
 
@@ -463,7 +502,6 @@ class Client(
 
     # internal methods
 
-    @configure(SimplyPrintConnectionIncomingEvent)
     async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
         if self.v > v:
             self.logger.warning("Dropped incoming message %s with v: %d.", msg, v)
@@ -492,14 +530,12 @@ class Client(
         # makes the application's total task count unbounded.
         await self.event_bus.emit(event, *args)
 
-    @configure(SimplyPrintConnectionEstablishedEvent)
     def _on_connection_established(self, event: SimplyPrintConnectionEstablishedEvent):
         self.v = event.v
 
         if self.state == ClientState.CONNECTING:
             self.state = ClientState.NOT_CONNECTED
 
-    @configure(SimplyPrintConnectionLostEvent)
     def _on_connection_lost(self, event: SimplyPrintConnectionLostEvent):
         if self.v > event.v:
             return
@@ -512,7 +548,6 @@ class Client(
 
     # important functional event handling
 
-    @configure(ServerMsgType.ADD_CONNECTION, priority=1)
     async def _on_multi_printer_added(self, msg: MultiPrinterAddedMsg):
         if not msg.data.status:
             self.logger.debug("Failed to add connection. %s", msg)
@@ -526,14 +561,12 @@ class Client(
         self.state = ClientState.CONNECTED
         self.signal()
 
-    @configure(ServerMsgType.REMOVE_CONNECTION, priority=1)
     async def _on_multi_printer_removed(self, msg: MultiPrinterRemovedMsg):
         self.logger.debug("Connection removed. %s", msg)
         self.state = ClientState.NOT_CONNECTED
         self.signal()
 
-    @configure(ServerMsgType.CONNECTED, priority=2)
-    async def _on_connected_state(self):
+    async def _on_connected_state(self, _msg: ConnectedMsg):
         self.printer.mark_common_fields_as_changed()
         self.state = ClientState.CONNECTED
         self.signal()
@@ -589,7 +622,7 @@ class Client(
         return self.printer.file_action_token
 
     async def send_ping(self) -> None:
-        if not self.printer.intervals.is_ready("ping"):
+        if not self.printer.intervals.is_ready(Interval.PING):
             return
 
         self.printer.latency.ping_now()
@@ -600,7 +633,9 @@ class Client(
             return
 
         try:
-            await SimplyPrintApi.clear_bed(
+            if self.simplyprint_api is None:
+                raise RuntimeError("SimplyPrint API is not configured")
+            await self.simplyprint_api.clear_bed(
                 self.config.id, self.file_action_token, success, rating
             )
             self.printer.have_cleared_bed = True
@@ -609,7 +644,9 @@ class Client(
 
     async def start_next_print(self):
         try:
-            await SimplyPrintApi.start_next_print(
+            if self.simplyprint_api is None:
+                raise RuntimeError("SimplyPrint API is not configured")
+            await self.simplyprint_api.start_next_print(
                 self.config.id, self.file_action_token
             )
         except Exception as e:
@@ -634,11 +671,9 @@ class Client(
 
     # Default event handling.
 
-    @configure(ServerMsgType.ERROR, priority=1)
     def _on_error(self, msg: ErrorMsg):
         self.logger.warning("Server reported an error: %s", msg.data)
 
-    @configure(ServerMsgType.NEW_TOKEN, priority=1)
     async def _on_new_token(self, msg: NewTokenMsg):
         self.config.token = msg.data.token
         self.config.short_id = msg.data.short_id
@@ -646,7 +681,6 @@ class Client(
 
         await self.event_bus.emit(ClientConfigChangedEvent)
 
-    @configure(ServerMsgType.CONNECTED, priority=1)
     async def _on_connected_data(self, msg: ConnectedMsg):
         if msg.data is None:
             # A bare `connected` frame carries nothing to apply; the
@@ -664,7 +698,6 @@ class Client(
 
         await self.event_bus.emit(ClientConfigChangedEvent)
 
-    @configure(ServerMsgType.COMPLETE_SETUP, priority=1)
     async def _on_setup_complete(self, msg: CompleteSetupMsg):
         try:
             self.printer.mark_common_fields_as_changed()
@@ -674,35 +707,28 @@ class Client(
         except Exception as e:
             self.logger.exception("Failed to complete setup: %s", e)
 
-    @configure(ServerMsgType.INTERVAL_CHANGE, priority=1)
     def _on_interval_change(self, msg: IntervalChangeMsg):
         self.printer.intervals.update(msg.data)
 
-    @configure(ServerMsgType.PONG, priority=1)
-    def _on_pong(self):
+    def _on_pong(self, _msg: PongMsg):
         self.printer.latency.pong_now()
 
-    @configure(ServerMsgType.PRINTER_SETTINGS, priority=1)
     def _on_printer_settings(self, msg: PrinterSettingsMsg):
         self.printer.settings = msg.data
 
-    @configure(ServerMsgType.STREAM_RECEIVED, priority=1)
-    def _on_stream_received(self): ...
+    def _on_stream_received(self, _msg: StreamReceivedMsg) -> None: ...
 
-    @configure(DemandMsgType.WEBCAM_SNAPSHOT, priority=1)
     def _on_webcam_snapshot(self, data: WebcamSnapshotDemandData):
         if data.timer is not None:
             self.printer.intervals.webcam = data.timer
 
-    @configure(DemandMsgType.FILE, priority=1)
     def _on_file_demand(self, data: FileDemandData):
         """Store file action_token for later use."""
         self.printer.current_job_id = data.job_id
         self.printer.file_action_token = data.action_token
         self.printer.have_cleared_bed = False
 
-    @configure(DemandMsgType.SET_MATERIAL_DATA, priority=1)
-    def _on_set_material_data(self, data: SetMaterialDataDemandData):
+    def _apply_material_data(self, data: SetMaterialDataDemandData) -> None:
         for material in data.materials:
             entry = self.printer.material(material.nozzle, material.ext)
 
@@ -712,14 +738,16 @@ class Client(
             entry.model_update(material)
             entry.model_reset_changed()
 
-    @configure(DemandMsgType.REFRESH_MATERIAL_DATA, priority=1)
-    async def _on_refresh_material_data(self):
+    async def on_refresh_material_data(
+        self, _data: Optional[RefreshMaterialDataDemandData] = None
+    ) -> None:
         await self.send(
             MaterialDataMsg(data=dict(MaterialDataMsg.build_refresh(self.printer)))
         )
 
-    @configure(DemandMsgType.REFRESH_PERIPHERALS, priority=1)
-    async def _on_refresh_peripherals(self):
+    async def on_refresh_peripherals(
+        self, _data: Optional[RefreshPeripheralsDemandData] = None
+    ) -> None:
         definitions = self.get_current_peripheral_definitions()
 
         if definitions is None:
@@ -727,7 +755,6 @@ class Client(
 
         await self.send(PeripheralDefinitionsMsg(data=definitions), skip_dispatch=True)
 
-    @configure(DemandMsgType.RESOLVE_NOTIFICATION, priority=1)
     async def _on_resolve_notification(self, data: ResolveNotificationDemandData):
         event = self.printer.notifications.notifications.get(data.event_id)
 

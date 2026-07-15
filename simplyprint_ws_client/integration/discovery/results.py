@@ -25,6 +25,7 @@ from simplyprint_ws_client.integration.discovery.device import (
     DiscoveredDevice,
     JsonValue,
 )
+from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 
 DiscoveryExtra = Dict[str, JsonValue]
@@ -46,13 +47,7 @@ def _normalise_host(value: Optional[str]) -> str:
     """A host string normalised for identity comparison (same rule the web
     layer's reconciler applies): case, scheme and trailing slashes are
     cosmetic, so ``HTTP://Printer.local/`` and ``printer.local`` are one box."""
-    if value is None:
-        return ""
-    value = str(value).strip().lower()
-    for prefix in ("https://", "http://"):
-        if value.startswith(prefix):
-            value = value[len(prefix) :]
-    return value.rstrip("/")
+    return DeviceReconciler.normalize_address(value) or ""
 
 
 @dataclass(frozen=True)
@@ -68,7 +63,17 @@ class DiscoveryResult:
     host: str
     name: Optional[str] = None
     serial: Optional[str] = None
+    hardware_id: Optional[str] = None
     extra: DiscoveryExtra = field(default_factory=dict)
+
+    def hardware_identity(self) -> Optional[str]:
+        return self.hardware_id or self.serial
+
+    def network_addresses(self) -> tuple[str, ...]:
+        return (self.host,) if self.host else ()
+
+    def primary_network_address(self) -> Optional[str]:
+        return self.host or None
 
 
 class DiscoveryResultsStore:
@@ -145,14 +150,15 @@ class DiscoveryResultsStore:
         # here: the serial entry is authoritative, and a host-only sighting of
         # an already-known box refreshes that entry instead of duplicating it.
         host = _normalise_host(device.host)
-        if device.serial:
+        hardware_id = DeviceReconciler.normalize_identity(device.hardware_identity())
+        if hardware_id:
             # A host-only sighting of the same box may already be stored under
             # its host key; the serial-keyed entry supersedes it.
             try:
                 del self._results[(brand, host)]
             except KeyError:
                 pass
-            key = (brand, device.serial)
+            key = (brand, hardware_id)
         else:
             for existing_key in self._results.keys():
                 if existing_key[0] != brand:
@@ -169,5 +175,6 @@ class DiscoveryResultsStore:
             host=device.host,
             name=device.name,
             serial=device.serial,
+            hardware_id=device.hardware_id,
             extra=dict(device.extra),
         )

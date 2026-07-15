@@ -205,6 +205,11 @@ class Pool(Generic[T]):
         self.endpoints: Dict[Hashable, Endpoint[T]] = {}
         #: Held only for refcount/dict bookkeeping -- never across I/O.
         self.lock = threading.Lock()
+        #: ``stop`` is terminal for this pool instance. A registry drops a
+        #: stopped pool and builds a fresh one for a later lifecycle; retaining
+        #: this bit prevents a caller that raced registry shutdown from creating
+        #: an endpoint in an already-detached, no-longer-owned pool.
+        self._stopped = False
 
     def connect(self, url: Union[str, yarl.URL], params: object = None) -> "Lease[T]":
         """Lease the shared transport for ``url`` + ``params``.
@@ -221,6 +226,8 @@ class Pool(Generic[T]):
         started: Optional[T] = None
 
         with self.lock:
+            if self._stopped:
+                raise RuntimeError("cannot connect through a stopped pool")
             endpoint = self.endpoints.get(endpoint_key)
             if endpoint is None:
                 transport = self.build(parsed, params)
@@ -233,14 +240,16 @@ class Pool(Generic[T]):
                 self, shared, parsed, endpoint_key, provider=self.provider
             )
             endpoint.add_lease(lease)
-
-        if started is not None:
-            started.start()
-        elif not shared.supervising():
-            # A fresh lease on an endpoint whose transport permanently gave up
-            # (bounded retry policy exhausted) re-arms supervision -- start()
-            # resets the give-up and is a no-op on a live wire.
-            shared.start()
+            # ``start`` is a fire-and-forget, non-blocking contract. Keep it in
+            # the bookkeeping critical section so terminal ``stop`` cannot
+            # collect the transport and then have this connect resume by
+            # starting the now-orphaned wire.
+            if started is not None:
+                started.start()
+            elif not shared.supervising():
+                # A fresh lease on an endpoint whose transport permanently gave
+                # up (bounded retry policy exhausted) re-arms supervision.
+                shared.start()
         return lease
 
     def release(self, lease: "Lease[T]") -> Optional[T]:
@@ -261,13 +270,15 @@ class Pool(Generic[T]):
             return endpoint.transport
 
     def stop(self) -> List[T]:
-        """Detach every endpoint, clear the pool, and return the live transports.
+        """Permanently stop this pool and return its live transports.
 
         Releasing a lease after this finds no endpoint, so nobody is left to
         stop the sockets - the caller must await (or schedule) each returned
-        transport's async ``stop``.
+        transport's async ``stop``. A later lifecycle builds a fresh pool rather
+        than reconnecting through this detached instance.
         """
         with self.lock:
+            self._stopped = True
             endpoints = list(self.endpoints.values())
             for endpoint in endpoints:
                 endpoint.detach()

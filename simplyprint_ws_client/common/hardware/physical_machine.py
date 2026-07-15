@@ -1,9 +1,11 @@
+import asyncio
 import functools
 import os
 import platform
 import re
 import socket
-from typing import Optional
+import time
+from typing import Awaitable, Callable, Mapping, Optional
 
 import netifaces
 import psutil
@@ -93,27 +95,16 @@ class PhysicalMachine:
             "flags": 0,
         }
 
-    @classmethod
-    def get_info(cls):
-        return {
-            "python_version": cls.python_version(),
-            "machine": cls.machine(),
-            "os": platform.system(),
-            "mac": cls.mac_address(),
-            "is_ethernet": cls.is_ethernet(),
-            "ssid": cls.ssid(),
-            "hostname": cls.hostname(),
-            "local_ip": cls.local_ip(),
-            "core_count": cls.core_count(),
-            "total_memory": cls.total_memory(),
-        }
-
     @staticmethod
     def python_version() -> str:
         """
         Returns the Python version.
         """
         return platform.python_version()
+
+    @staticmethod
+    def operating_system() -> str:
+        return platform.system()
 
     @staticmethod
     @callonce
@@ -317,3 +308,30 @@ class PhysicalMachine:
                 ["shutdown", "/s", "/t", "1"],
                 action="shut down Windows host",
             )
+
+
+def make_host_telemetry_reader(
+    *,
+    min_interval: float = 5.0,
+    read_usage: Callable[[], Mapping[str, int | None]] = PhysicalMachine.get_usage,
+    clock: Callable[[], float] = time.monotonic,
+) -> Callable[[], Awaitable[Mapping[str, int | None]]]:
+    """Build one app-owned, throttled asynchronous host-usage reader."""
+
+    snapshot: Mapping[str, int | None] = {}
+    read_at = 0.0
+
+    async def read() -> Mapping[str, int | None]:
+        nonlocal snapshot, read_at
+        now = clock()
+        if not snapshot or now - read_at >= min_interval:
+            try:
+                snapshot = await asyncio.to_thread(read_usage)
+            except RuntimeError:
+                # A final tick may race executor shutdown; the last app-owned
+                # snapshot (possibly empty) is the only safe result.
+                return snapshot
+            read_at = now
+        return snapshot
+
+    return read

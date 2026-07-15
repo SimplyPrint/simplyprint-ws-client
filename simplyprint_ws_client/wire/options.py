@@ -34,10 +34,9 @@ class TlsClientAuth:
 class WireKeepalive:
     """Transport-native ping/keepalive knobs.
 
-    The front door maps these to the selected wire implementation: paho MQTT's
-    CONNECT keepalive, websockets' ``ping_interval`` / ``ping_timeout``, aiohttp's
-    heartbeat, etc. Unsupported values are ignored by transports that cannot use
-    them.
+    The front doors map these to paho MQTT's CONNECT keepalive and websockets'
+    ``ping_interval`` / ``ping_timeout``. Unsupported values are ignored by
+    transports that cannot use them.
     """
 
     interval: Optional[float] = None
@@ -56,7 +55,7 @@ class ConnectionOptions:
     because printer fleets routinely present self-signed certificates, but an
     explicit, opt-in knob. ``tls_client_auth`` supplies mutual-TLS credentials
     issued by the printer at pairing time; when set it takes precedence over
-    ``verify_tls`` (paho only - aiomqtt raises ValueError). ``logger`` names where
+    ``verify_tls``. ``logger`` names where
     the transport's lifecycle log lines land; the device drivers default it to the
     printer's own child logger so wire events end up in that printer's log files.
     Endpoints are pooled, so the logger of the FIRST lease that builds a transport
@@ -70,6 +69,5 @@ class ConnectionOptions:
     verify_tls: bool = False
     tls_client_auth: Optional[TlsClientAuth] = None
     logger: Optional["logging.Logger"] = None
-    #: Bound on one connect attempt for the supervised async transports
-    #: (``None`` = the transport's own default; paho owns its own timeouts).
+    #: Bound on one WebSocket connect attempt (paho owns its own timeouts).
     open_timeout: Optional[float] = None

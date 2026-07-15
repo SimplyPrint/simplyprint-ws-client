@@ -1,6 +1,7 @@
 """Test active_material per tool -> ToolMsg flow."""
 
-from simplyprint_ws_client import Client, ToolMsg
+from simplyprint_ws_client import Client
+from simplyprint_ws_client.core.protocol.messages import ToolMsg
 
 
 def test_active_material_change(client: Client):

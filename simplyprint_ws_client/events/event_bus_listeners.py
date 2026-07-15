@@ -1,7 +1,6 @@
 import asyncio
 import functools
 import heapq
-import inspect
 from enum import Enum
 from typing import (
     Callable,
@@ -9,8 +8,6 @@ from typing import (
     Union,
     Tuple,
     Optional,
-    get_args,
-    get_type_hints,
     Iterable,
     Iterator,
 )
@@ -19,8 +16,6 @@ try:
     from typing import Unpack, NotRequired, TypedDict
 except ImportError:
     from typing_extensions import Unpack, NotRequired, TypedDict
-
-from simplyprint_ws_client.events.emitter import Emitter
 
 
 class ListenerUniqueness(Enum):
@@ -35,43 +30,15 @@ class ListenerUniqueness(Enum):
     EXCLUSIVE_WITH_ERROR = 3
 
 
-class ListenerLifetime:
-    """Listener lifetime options as a tagged-union (room for value-based
-    lifetimes such as max-calls in the future).
-
-    Variants are distinguished by type (consumers ``isinstance`` on them);
-    instances of *different* variants never compare equal.
-    """
-
-    __slots__ = ()
-
-    def __eq__(self, other: object) -> bool:
-        return type(self) is type(other)
-
-    def __hash__(self) -> int:
-        return hash(type(self))
-
-
-class ListenerLifetimeOnce(ListenerLifetime):
-    """An event listener that is removed after being called once."""
-
-    __slots__ = ()
-
-
-class ListenerLifetimeForever(ListenerLifetime):
-    """A normal event listener that is never removed."""
-
-    __slots__ = ()
+class ListenerLifetime(Enum):
+    FOREVER = 0
+    ONCE = 1
 
 
 class EventBusListenerOptions(TypedDict):
     lifetime: NotRequired[ListenerLifetime]
     priority: NotRequired[int]
     unique: NotRequired[ListenerUniqueness]
-
-
-class EventBusListenersOptions(EventBusListenerOptions, TypedDict):
-    generic: NotRequired[bool]
 
 
 def _is_async(handler: Callable) -> bool:
@@ -82,13 +49,12 @@ def _is_async(handler: Callable) -> bool:
 
 
 class EventBusListener:
-    __slots__ = ("lifetime", "priority", "handler", "is_async", "forward_emitter")
+    __slots__ = ("lifetime", "priority", "handler", "is_async")
 
     lifetime: ListenerLifetime
     priority: int
     handler: Callable
     is_async: bool
-    forward_emitter: Optional[str]
 
     async def __call__(self, *args, **kwargs):
         if not self.is_async:
@@ -103,35 +69,6 @@ class EventBusListener:
         self.priority = priority
         self.handler = handler
         self.is_async = _is_async(handler)
-        self.forward_emitter = None
-
-        # If the function takes a named argument with the type Emitter, store
-        # that kwarg name. Not every callable has an inspectable signature.
-        try:
-            signature = inspect.signature(handler)
-        except (TypeError, ValueError):
-            return
-
-        # Under PEP 563 (`from __future__ import annotations`) the raw
-        # annotations are strings; resolve them so the type check still works.
-        try:
-            hints = get_type_hints(handler)
-        except Exception:
-            hints = {}
-
-        for name, parameter in signature.parameters.items():
-            annotation = hints.get(name, parameter.annotation)
-
-            # Check if the annotation is a type or a type hint. And whether it is a subclass of Emitter.
-            if not any(
-                issubclass(cls, Emitter)
-                for cls in get_args(annotation) + (annotation,)
-                if isinstance(cls, type)
-            ):
-                continue
-
-            self.forward_emitter = name
-            break
 
     def __lt__(self, other: "EventBusListener") -> bool:
         return self.priority < other.priority
@@ -146,14 +83,10 @@ class EventBusListener:
         return hash(self.handler)
 
     def __repr__(self):
-        if isinstance(self.handler, functools.partial):
-            name = self.handler.func.__name__
-        elif hasattr(self.handler, "__name__"):
-            name = self.handler.__name__
-        else:
-            name = "Unknown"
-
-        return f"EventListener(handler={name}, priority={self.priority}, is_async={self.is_async})"
+        return (
+            f"EventListener(handler={self.handler!r}, priority={self.priority}, "
+            f"is_async={self.is_async})"
+        )
 
 
 class EventBusListeners(Iterable[EventBusListener]):
@@ -175,7 +108,7 @@ class EventBusListeners(Iterable[EventBusListener]):
     ) -> None:
         unique = kwargs.get("unique", ListenerUniqueness.NONE)
         priority = kwargs.get("priority", 0)
-        lifetime = kwargs.get("lifetime", ListenerLifetimeForever(**{}))
+        lifetime = kwargs.get("lifetime", ListenerLifetime.FOREVER)
 
         # Handle replacement strategy.
         if (
@@ -219,7 +152,7 @@ class EventBusListeners(Iterable[EventBusListener]):
         """Iterate over listeners in priority order."""
         for listener in self.ordered():
             # Only allow once shot listener to be consumed once.
-            if isinstance(listener.lifetime, ListenerLifetimeOnce):
+            if listener.lifetime is ListenerLifetime.ONCE:
                 self.remove(listener)
 
             yield listener
@@ -242,8 +175,7 @@ class EventBusListeners(Iterable[EventBusListener]):
         """Return the cached listeners if direct dispatch can preserve semantics."""
         if self._fast_emit is None:
             self._fast_emit = all(
-                not isinstance(listener.lifetime, ListenerLifetimeOnce)
-                and listener.forward_emitter is None
+                listener.lifetime is not ListenerLifetime.ONCE
                 for _, listener in self.listeners
             )
         if not self._fast_emit:

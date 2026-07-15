@@ -1,17 +1,18 @@
-"""Process-wide default pools, shared by the connect front doors.
+"""An owner-scoped registry of transport pools.
 
-Each front door keeps one :class:`DefaultPools` registry: one
-:class:`~simplyprint_ws_client.wire.pool.Pool` per
-``(impl, loop, wire-keepalive)`` identity, created on first use and torn down by
-the front door's ``shutdown()``. A caller that passes its own ``pool`` never
-touches these.
+Applications retain one registry per wire protocol and inject those registries
+through :class:`~simplyprint_ws_client.core.client_context.ClientContext`.
+Nothing in the wire front doors owns process state.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Dict, Generic, Hashable, Optional, Set, TypeVar
+import concurrent.futures
+import threading
+from typing import Callable, Generic, Hashable, Optional, TypeVar
 
+from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_future
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.wire.options import WireKeepalive
 from simplyprint_ws_client.wire.pool import Pool
@@ -19,86 +20,129 @@ from simplyprint_ws_client.wire.transport import Transport
 
 T = TypeVar("T", bound=Transport)
 
-#: Keeps scheduled transport-stop tasks alive until they finish (asyncio holds
-#: tasks weakly; an unreferenced stop task could be collected mid-teardown).
-_STOP_TASKS: Set["asyncio.Task"] = set()
-
 
 def pool_identity(
-    impl: str,
     provider: Optional[EventLoopProvider],
     wire_keepalive: Optional[WireKeepalive],
 ) -> Hashable:
-    """The hashable identity a default pool is shared by."""
-    if provider is None and wire_keepalive is None:
-        return impl
+    """The hashable identity an owner shares a pool by."""
     provider_key: object = None
     if provider is not None:
         try:
             provider_key = id(provider.event_loop)
         except RuntimeError:
             provider_key = id(provider)
-    return impl, provider_key, wire_keepalive
+    return provider_key, wire_keepalive
 
 
-class DefaultPools(Generic[T]):
-    """One front door's default-pool cache, keyed by :func:`pool_identity`."""
+class PoolRegistry(Generic[T]):
+    """One owner's pool cache, keyed by :func:`pool_identity`."""
 
     def __init__(self) -> None:
-        self.pools: Dict[Hashable, Pool[T]] = {}
+        self._pools: dict[Hashable, Pool[T]] = {}
+        self._lock = threading.Lock()
+        # The first close installs this permanent lifecycle barrier; concurrent
+        # and later closes join it. ``concurrent.futures.Future`` is deliberately
+        # loop-neutral because callers can live on different application threads.
+        self._close_future: Optional[concurrent.futures.Future[None]] = None
 
     def get(
         self,
-        impl: str,
         provider: Optional[EventLoopProvider],
         wire_keepalive: Optional[WireKeepalive],
         build: Callable[[], Pool[T]],
     ) -> Pool[T]:
         """The pool for this identity, building (and caching) it on first use."""
-        key = pool_identity(impl, provider, wire_keepalive)
-        existing = self.pools.get(key)
-        if existing is not None:
-            return existing
-        built = build()
-        self.pools[key] = built
-        return built
+        key = pool_identity(provider, wire_keepalive)
+        with self._lock:
+            if self._close_future is not None:
+                raise RuntimeError("cannot acquire from a closed pool registry")
+            existing = self._pools.get(key)
+            if existing is not None:
+                return existing
+            # Pool construction is synchronous bookkeeping only. Keeping it in
+            # the critical section prevents duplicate pools for one identity.
+            built = build()
+            self._pools[key] = built
+            return built
 
-    def shutdown(self) -> None:
-        """Tear down every cached pool and stop its live transports. Idempotent.
+    async def close(self) -> None:
+        """Permanently close every cached pool and await its live transports.
 
         A lease released after this finds no endpoint to stop the socket
-        through, so each transport's async ``stop`` is scheduled here, on the
-        transport's own loop (awaitable from that loop, threadsafe from any
-        other).
+        through. Each pool is detached and its transports are awaited on that
+        pool's own loop, even when another owner loop initiates shutdown. New
+        acquisitions are rejected once close begins; repeated closes join the
+        same terminal operation.
         """
-        pools = list(self.pools.values())
-        self.pools.clear()
-        for pool in pools:
-            for transport in pool.stop():
-                _schedule_transport_stop(transport)
+        with self._lock:
+            close_future = self._close_future
+            if close_future is None:
+                close_future = concurrent.futures.Future()
+                self._close_future = close_future
+                pools = list(self._pools.values())
+                self._pools.clear()
+                leader = True
+            else:
+                pools = []
+                leader = False
+
+        if not leader:
+            await await_concurrent_future(close_future)
+            return
+
+        close_task = asyncio.create_task(_close_pools(pools))
+        cancellation: Optional[asyncio.CancelledError] = None
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as error:
+                # Registry teardown owns live socket/thread handles. Finish it
+                # before honoring caller cancellation so clearing the cache can
+                # never orphan those handles.
+                cancellation = error
+            except BaseException:
+                # The completed task's result below records the same failure on
+                # the loop-neutral close future for every joining caller.
+                pass
+
+        try:
+            close_task.result()
+        except BaseException as error:
+            close_future.set_exception(error)
+            raise
+        close_future.set_result(None)
+        if cancellation is not None:
+            raise cancellation
 
 
-def _schedule_transport_stop(transport: Transport) -> None:
-    """Run ``transport.stop()`` on the transport's loop from any thread."""
-    coro = transport.stop()
+async def _close_pool_on_owner_loop(pool: Pool[T]) -> None:
+    """Detach ``pool`` and stop its transports on the loop that owns them."""
 
-    try:
-        loop = transport.provider.event_loop
-    except (AttributeError, RuntimeError):
-        loop = None
-
-    if loop is None or loop.is_closed():
-        coro.close()
+    owner_loop = pool.provider.event_loop
+    running_loop = asyncio.get_running_loop()
+    if owner_loop is running_loop or not owner_loop.is_running():
+        # A stopped loop has no concurrent event dispatch. This direct path is
+        # also what unit-test transports without a detached owner use.
+        await _close_pool(pool)
         return
 
+    close_coro = _close_pool(pool)
     try:
-        running = asyncio.get_running_loop()
+        submitted = asyncio.run_coroutine_threadsafe(close_coro, owner_loop)
     except RuntimeError:
-        running = None
+        # The owner can finish between ``is_running`` and submission. It can no
+        # longer race event dispatch, so close directly on the surviving loop.
+        close_coro.close()
+        await _close_pool(pool)
+        return
+    await await_concurrent_future(submitted)
 
-    if running is loop:
-        task = loop.create_task(coro)
-        _STOP_TASKS.add(task)
-        task.add_done_callback(_STOP_TASKS.discard)
-    else:
-        asyncio.run_coroutine_threadsafe(coro, loop)
+
+async def _close_pools(pools: list[Pool[T]]) -> None:
+    await asyncio.gather(*(_close_pool_on_owner_loop(pool) for pool in pools))
+
+
+async def _close_pool(pool: Pool[T]) -> None:
+    transports = pool.stop()
+    await asyncio.gather(*(transport.stop() for transport in transports))

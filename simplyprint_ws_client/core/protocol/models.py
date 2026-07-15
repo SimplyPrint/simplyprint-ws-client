@@ -1,6 +1,7 @@
 __all__ = [
     "ServerMsgType",
     "DemandMsgType",
+    "PeripheralAction",
     "ClientMsgType",
     "DispatchMode",
 ]
@@ -64,6 +65,14 @@ class DemandMsgType(StrEnum):
     PERIPHERAL_ACTION = "peripheral_action"
 
 
+class PeripheralAction(StrEnum):
+    """Supported operations for a writable peripheral."""
+
+    ON = "on"
+    OFF = "off"
+    SET = "set"
+
+
 class ClientMsgType(StrEnum):
     ADD_CONNECTION = "add_connection"
     REMOVE_CONNECTION = "remove_connection"
@@ -98,7 +107,6 @@ class ClientMsgType(StrEnum):
     INSTALLED_PLUGINS = "installed_plugins"
     SOFTWARE_UPDATES = "software_updates"
     FIRMWARE_WARNING = "firmware_warning"
-    AI_RESP = "ai_resp"
     LOGS_SENT = "logs_sent"
     FILAMENT_SENSOR = "filament_sensor"
     MATERIAL_DATA = "material_data"

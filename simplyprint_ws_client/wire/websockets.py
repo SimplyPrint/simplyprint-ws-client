@@ -30,6 +30,9 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Union
 import yarl
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.asyncio.ssl_transport import (
+    install_ssl_transport_workaround,
+)
 
 from simplyprint_ws_client.wire.messages import (
     WsMessage,
@@ -106,6 +109,7 @@ class Websockets(WsTransport, Reconnecting):
 
     async def open(self) -> None:
         """Open the live connection. A failure raises and triggers a retry."""
+        install_ssl_transport_workaround()
         factory = self.connect_factory or default_websockets_connect()
         try:
             self.socket = await factory(str(self.url), **self.connect_kwargs)

@@ -2,7 +2,7 @@
 
 This is the structural inverse of the benchmark's measured 6,011 ms stall. A
 camera worker whose read is wedged (a hung stream) used to make the synchronous
-``camera_uri`` setter join the worker on the loop -- up to ~2s per THREAD worker,
+camera-controller URI setter join the worker on the loop -- up to ~2s per THREAD worker,
 ~6s per PROCESS worker, and additive across cameras. With the WorkerPool reaper,
 ``handle.stop()`` only signals + enqueues; the join happens off the loop. A
 heartbeat proves the loop keeps beating while a wedged worker is stopped.
@@ -56,7 +56,7 @@ async def test_camera_handle_stop_does_not_block_the_loop():
 
     async with LoopHeartbeat(interval=0.01) as hb:
         start = time.perf_counter()
-        handle.stop()  # the camera_uri=None path
+        handle.stop()  # the CameraController.uri=None path
         elapsed = time.perf_counter() - start
 
     assert elapsed < 0.2  # stop returned at once (no on-loop join)

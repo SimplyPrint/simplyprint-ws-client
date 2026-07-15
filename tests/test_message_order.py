@@ -1,9 +1,8 @@
 from simplyprint_ws_client import (
     Client,
     PrinterStatus,
-    JobInfoMsg,
-    StateChangeMsg,
 )
+from simplyprint_ws_client.core.protocol.messages import JobInfoMsg, StateChangeMsg
 
 
 def test_message_order_simple(client: Client):

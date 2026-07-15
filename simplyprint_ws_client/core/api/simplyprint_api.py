@@ -1,13 +1,13 @@
 import base64
 import contextlib
 import json
-from typing import Optional, Union
+from typing import Optional, Union, final
 
 import aiohttp
 from aiohttp import ClientTimeout
 from yarl import URL
 
-from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
+from simplyprint_ws_client.core.api.url_builder import SimplyPrintEndpoints
 from simplyprint_ws_client.const import VERSION
 
 
@@ -27,13 +27,22 @@ def _company_id_from_token(action_token: str) -> int:
     return payload["company"]
 
 
+@final
 class SimplyPrintApi:
-    @staticmethod
+    """HTTP operations scoped to one app's immutable endpoints."""
+
+    def __init__(self, endpoints: SimplyPrintEndpoints) -> None:
+        self.endpoints = endpoints
+        self.api_url = endpoints.api_url
+
     async def post_snapshot(
-        snapshot_id: str, image_data: bytes, endpoint: Union[str, URL, None] = None
+        self,
+        snapshot_id: str,
+        image_data: bytes,
+        endpoint: Union[str, URL, None] = None,
     ):
         if endpoint is None:
-            endpoint = SimplyPrintURL().api_url / "jobs" / "ReceiveSnapshot"
+            endpoint = self.api_url / "jobs" / "ReceiveSnapshot"
 
         data = {
             "id": snapshot_id,
@@ -54,8 +63,8 @@ class SimplyPrintApi:
                         f"Failed to post snapshot: {await response.text()}"
                     )
 
-    @staticmethod
     async def post_logs(
+        self,
         printer_id: int,
         token: str,
         main_log_file: Optional[str] = None,
@@ -65,9 +74,7 @@ class SimplyPrintApi:
         # Request /printers/ReceiveLogs with the token as post data
         # And each of the files as multipart/form-data
 
-        endpoint = (
-            SimplyPrintURL().api_url / "printers" / "ReceiveLogs" % {"pid": printer_id}
-        )
+        endpoint = self.api_url / "printers" / "ReceiveLogs" % {"pid": printer_id}
 
         data = {
             "token": token,
@@ -101,8 +108,8 @@ class SimplyPrintApi:
 
                     return await response.json()
 
-    @staticmethod
     async def clear_bed(
+        self,
         printer_id: int,
         action_token: str,
         success: bool,
@@ -113,7 +120,7 @@ class SimplyPrintApi:
         }
 
         endpoint = (
-            SimplyPrintURL().api_url
+            self.api_url
             / str(_company_id_from_token(action_token))
             / "printers"
             / "actions"
@@ -140,8 +147,7 @@ class SimplyPrintApi:
 
                 return await response.json()
 
-    @staticmethod
-    async def start_next_print(printer_id: int, action_token: str):
+    async def start_next_print(self, printer_id: int, action_token: str):
         headers = {
             "X-Action-Token": action_token,
         }
@@ -152,7 +158,7 @@ class SimplyPrintApi:
         }
 
         endpoint = (
-            SimplyPrintURL().api_url
+            self.api_url
             / str(_company_id_from_token(action_token))
             / "printers"
             / "actions"

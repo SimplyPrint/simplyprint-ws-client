@@ -1,11 +1,16 @@
 import asyncio
 import logging
+from dataclasses import fields
 
 import pytest
 
 from simplyprint_ws_client.integration.discovery.network import DiagnosticReason
 from simplyprint_ws_client.integration.discovery.spec import SubnetScanSpec
 from simplyprint_ws_client.integration.discovery.subnet import SubnetScanBackend
+
+
+def test_subnet_gate_has_one_explicit_service_contract() -> None:
+    assert "port" not in {field.name for field in fields(SubnetScanSpec)}
 
 
 async def _slow_probe(host: str):

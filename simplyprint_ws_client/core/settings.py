@@ -1,28 +1,30 @@
-__all__ = ["ClientSettings"]
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Type
 
-from dataclasses import dataclass
-from typing import Optional, Type, List, Sequence
-
+from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
+from simplyprint_ws_client.core.api.url_builder import (
+    SimplyPrintBackend,
+    SimplyPrintEndpoints,
+    resolve_backend_endpoints,
+)
 from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
-from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
 from simplyprint_ws_client.integration.camera.base import BaseCameraProtocol
-from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
-from simplyprint_ws_client.integration.spec import (
-    PrinterSpec,
-    TClientFactory,
-    TConfigFactory,
-)
+from simplyprint_ws_client.integration.spec import IntegrationSpec
+
+__all__ = ["ClientSettings"]
 
 
 @dataclass
 class ClientSettings:
-    client_factory: Optional[TClientFactory] = None
-    config_factory: Optional[TConfigFactory] = None
+    """Process settings and the exact integrations hosted by the process."""
+
+    integrations: Optional[Sequence[IntegrationSpec]] = None
     name: Optional[str] = "printers"
     version: Optional[str] = "0.1"
     mode: ConnectionMode = ConnectionMode.SINGLE
     backend: Optional[SimplyPrintBackend] = None
+    endpoints: SimplyPrintEndpoints = field(init=False)
     event_loop_backend: EventLoopBackend = EventLoopBackend.ASYNCIO
     development: bool = False
     config_manager_t: ConfigManagerType = ConfigManagerType.MEMORY
@@ -32,59 +34,39 @@ class ClientSettings:
     sentry_dsn: Optional[str] = None
     camera_workers: Optional[int] = None
     camera_protocols: Optional[List[Type[BaseCameraProtocol]]] = None
-    client_specs: Optional[Sequence[PrinterSpec]] = None
 
-    def resolved_client_specs(self) -> tuple[PrinterSpec, ...]:
-        if self.client_specs is not None:
-            specs = tuple(self.client_specs)
+    def __post_init__(self) -> None:
+        self.backend, self.endpoints = resolve_backend_endpoints(self.backend)
 
-            if not specs:
-                raise ValueError("At least one client spec must be configured.")
+    def resolved_integrations(self) -> tuple[IntegrationSpec, ...]:
+        integrations = tuple(self.integrations or ())
+        if not integrations:
+            raise ValueError("At least one integration must be configured.")
 
-            keys = {spec.key for spec in specs}
+        ids = {str(integration.id) for integration in integrations}
+        if len(ids) != len(integrations):
+            raise ValueError("Integration ids must be unique.")
+        return integrations
 
-            if len(keys) != len(specs):
-                raise ValueError("Client spec keys must be unique.")
-
-            return specs
-
-        if self.client_factory is None or self.config_factory is None:
+    def get_integration(self, integration_id: Optional[str] = None) -> IntegrationSpec:
+        integrations = self.resolved_integrations()
+        if integration_id is None:
+            if len(integrations) == 1:
+                return integrations[0]
             raise ValueError(
-                "Either client_specs or both client_factory/config_factory must be set."
+                "Integration id is required when multiple integrations exist."
             )
 
-        return (
-            PrinterSpec(
-                key="default",
-                client_factory=self.client_factory,
-                config_factory=self.config_factory,
-                name=self.name,
-                config_manager_t=self.config_manager_t,
-                allow_setup=self.allow_setup,
-            ),
-        )
+        for integration in integrations:
+            if integration.id == integration_id:
+                return integration
+        raise KeyError(f"Unknown integration: {integration_id}")
 
-    def get_client_spec(self, key: Optional[str] = None) -> PrinterSpec:
-        specs = self.resolved_client_specs()
-
-        if key is None:
-            if len(specs) == 1:
-                return specs[0]
-
-            raise ValueError("Client spec key is required when multiple specs exist.")
-
-        for spec in specs:
-            if spec.key == key:
-                return spec
-
-        raise KeyError(f"Unknown client spec: {key}")
-
-    def new_config_manager(self, key: Optional[str] = None):
-        spec = self.get_client_spec(key)
-        specs = self.resolved_client_specs()
-        manager_t = spec.config_manager_t or self.config_manager_t
-
+    def new_config_manager(self, integration_id: Optional[str] = None):
+        integration = self.get_integration(integration_id)
+        integrations = self.resolved_integrations()
+        manager_t = integration.config_manager_t or self.config_manager_t
         return manager_t(
-            name=spec.storage_name(self.name, multiple=len(specs) > 1),
-            config_t=spec.config_factory,
+            name=integration.storage_name(self.name, multiple=len(integrations) > 1),
+            config_t=integration.config_factory,
         )

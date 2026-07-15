@@ -1,22 +1,18 @@
-"""The MQTT front door: ``mqtt.connect(url)`` -> a pooled, self-healing lease.
+"""The MQTT front door: an explicit pool -> a self-healing lease.
 
 This is the protocol-specific face a printer client meets. It owns the wire
 message shape (:class:`MqttMessage`), the broker-endpoint identity it pools by
-(:class:`MqttBroker`), and the one-liner :func:`connect` that parses a broker URL,
-shares one socket per endpoint through a :class:`~simplyprint_ws_client.wire.pool.Pool`,
+(:class:`MqttBroker`), and :func:`connect`, which parses a broker URL and
+shares one socket per endpoint through its caller-owned
+:class:`~simplyprint_ws_client.wire.pool.Pool`,
 and hands back a lease already carrying the URL's initial subscriptions.
 
-The two concrete broker wires live in their own modules and are imported here, not
-re-implemented: the sync :class:`~simplyprint_ws_client.wire.paho.Paho`
-(its own network thread, self-healing, events couriered onto the loop -- the
-default, and what production runs) and the async
-:class:`~simplyprint_ws_client.wire.aiomqtt.AioMqtt` (one ``async with``
-client per attempt, on the shared reconnect loop). Both speak the exact
-:class:`~simplyprint_ws_client.wire.transport.MqttTransport` contract, so a
-consumer that only listens cannot tell which it got, and both import their wire
-library lazily so importing this module needs neither installed.
+The concrete broker wire is :class:`~simplyprint_ws_client.wire.paho.Paho`: its
+network thread owns reconnects and events are couriered onto the client loop.
+The dependency is imported lazily, so importing this module does not require
+``paho-mqtt`` to be installed.
 
-Everything beyond ``url``/``impl``/``pool`` is carried by one
+Everything beyond ``url``/``pool`` is carried by one
 :class:`~simplyprint_ws_client.wire.options.ConnectionOptions`.
 """
 
@@ -24,15 +20,11 @@ from __future__ import annotations
 
 import logging
 
-from typing import List, Literal, NamedTuple, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Union
 
 import yarl
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.wire.aiomqtt import (
-    AioMqtt,
-    default_aiomqtt_client,
-)
 from simplyprint_ws_client.wire.messages import MqttMessage
 from simplyprint_ws_client.wire.paho import Paho, default_paho_client
 from simplyprint_ws_client.wire.policy import RetryPolicy
@@ -44,25 +36,18 @@ from simplyprint_ws_client.wire.options import (
     WireKeepalive,
 )
 from simplyprint_ws_client.wire.pool import Pool
-from simplyprint_ws_client.wire.pools import DefaultPools
+from simplyprint_ws_client.wire.pools import PoolRegistry
 
 __all__ = [
     "MqttMessage",
     "MqttBroker",
-    "MqttImpl",
     "MqttLease",
     "connect",
-    "shutdown",
+    "pool_for",
 ]
 
 #: yarl knows default ports for ws/wss but not mqtt/mqtts; supply them.
 DEFAULT_PORTS = {"mqtt": 1883, "mqtts": 8883}
-
-#: The name of a shipped broker wire. ``paho`` is the default.
-MqttImpl = Literal["paho", "aiomqtt"]
-
-#: The two shipped broker wires, by name. ``paho`` is the default.
-SUPPORTED_IMPLS: Tuple[MqttImpl, ...] = ("paho", "aiomqtt")
 
 
 class MqttBroker(NamedTuple):
@@ -105,13 +90,12 @@ class MqttConnectParams(NamedTuple):
     """
 
     broker: MqttBroker
-    retry: RetryPolicy
+    #: ``None`` preserves paho's native 1..5 second reconnect window. An
+    #: explicit policy is mapped onto paho's reconnect bounds by the factory.
+    retry: Optional[RetryPolicy]
     verify_tls: bool = False
     tls_client_auth: Optional[TlsClientAuth] = None
     logger: Optional["logging.Logger"] = None
-    #: Bound on one connect attempt for the supervised async impls
-    #: (``None`` = the transport's own default; paho owns its own timeouts).
-    open_timeout: Optional[float] = None
 
 
 def initial_topics(url: yarl.URL) -> List[str]:
@@ -119,71 +103,45 @@ def initial_topics(url: yarl.URL) -> List[str]:
     return list(url.query.getall("topic", []))
 
 
-def build_pool(
-    impl: MqttImpl,
-    pool: Optional[Pool[MqttTransport]],
+def pool_for(
+    registry: PoolRegistry[MqttTransport],
     provider: Optional[EventLoopProvider] = None,
     wire_keepalive: Optional[WireKeepalive] = None,
 ) -> Pool[MqttTransport]:
-    """The :class:`Pool` to lease from -- the caller's, or a default for ``impl``.
+    """Return this owner's Paho pool for a loop/keepalive identity.
 
-    A default pool shares one wire per :class:`MqttBroker` and hands out
-    :class:`MqttLease` leases. ``paho`` builds the sync network-thread
-    :class:`~simplyprint_ws_client.wire.paho.Paho`; ``aiomqtt`` the async
-    reconnecting :class:`~simplyprint_ws_client.wire.aiomqtt.AioMqtt`.
+    The pool shares one wire per :class:`MqttBroker` and hands out
+    :class:`MqttLease` leases backed by the sync network-thread
+    :class:`~simplyprint_ws_client.wire.paho.Paho`.
     Per-connect retry/TLS settings ride in the
     :class:`MqttConnectParams` each ``connect`` passes, never in this closure -
     the pool is cached, so a closure would freeze the first caller's options.
     """
-    if pool is not None:
-        return pool
-
     mqtt_keepalive = _mqtt_keepalive_seconds(wire_keepalive)
 
     def make_transport(url: yarl.URL, params: object) -> MqttTransport:
         if isinstance(params, MqttConnectParams):
             retry, verify_tls, logger = params.retry, params.verify_tls, params.logger
             tls_client_auth = params.tls_client_auth
-            open_timeout = params.open_timeout
         else:
-            retry, verify_tls, logger = RetryPolicy(), False, None
+            retry, verify_tls, logger = None, False, None
             tls_client_auth = None
-            open_timeout = None
-        if impl == "paho":
-            return Paho(
-                url,
-                provider=provider,
-                keepalive=mqtt_keepalive or 60,
-                client_factory=lambda u, logger: default_paho_client(
-                    u,
-                    logger,
-                    verify_tls=verify_tls,
-                    tls_client_auth=tls_client_auth,
-                    retry=retry,
-                ),
-                logger=logger,
-            )
-        if impl == "aiomqtt":
-            if tls_client_auth is not None:
-                raise ValueError(
-                    "mqtt.connect: tls_client_auth requires impl='paho'; "
-                    "aiomqtt does not support mutual-TLS client certificates"
-                )
-            # ``None`` means "the transport's own default", not "unbounded".
-            timeout_kwargs = (
-                {} if open_timeout is None else {"open_timeout": open_timeout}
-            )
-            return AioMqtt(
-                url,
-                retry,
-                provider,
-                client_factory=lambda u, logger: default_aiomqtt_client(
-                    u, logger, keepalive=mqtt_keepalive, verify_tls=verify_tls
-                ),
-                logger=logger,
-                **timeout_kwargs,
-            )
-        raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
+        return Paho(
+            url,
+            provider=provider,
+            keepalive=mqtt_keepalive or 60,
+            connect_failure_limit=(
+                retry.max_attempts if retry is not None and retry.max_attempts else 3
+            ),
+            client_factory=lambda u, logger: default_paho_client(
+                u,
+                logger,
+                verify_tls=verify_tls,
+                tls_client_auth=tls_client_auth,
+                retry=retry,
+            ),
+            logger=logger,
+        )
 
     def endpoint_key(url: yarl.URL, params: object) -> MqttBroker:
         if isinstance(params, MqttConnectParams):
@@ -201,50 +159,37 @@ def build_pool(
             provider=provider,
         )
 
-    return DEFAULT_POOLS.get(impl, provider, wire_keepalive, make_pool)
-
-
-#: One default pool per ``impl``, created on first use and torn down by
-#: :func:`shutdown`. A caller that passes its own ``pool`` never touches these.
-DEFAULT_POOLS: DefaultPools[MqttTransport] = DefaultPools()
+    return registry.get(provider, wire_keepalive, make_pool)
 
 
 def connect(
     url: Union[str, yarl.URL],
     *,
-    impl: MqttImpl = "paho",
-    pool: Optional[Pool[MqttTransport]] = None,
+    pool: Pool[MqttTransport],
     options: Optional[ConnectionOptions] = None,
 ) -> MqttLease:
     """Lease a pooled, self-healing MQTT connection to ``url``.
 
     Synchronous and fire-and-forget: it parses the broker out of ``url``, leases
-    the shared transport (building a default per-``impl`` :class:`Pool` keyed by
-    broker endpoint when ``pool`` is omitted), applies the URL's ``?topic=``
-    subscriptions, and returns at once. Readiness/failure arrive as events on the
-    lease's ``event_bus``; ``await conn.ready()`` waits for the first connect.
+    the shared transport from the caller-owned :class:`Pool`, applies the URL's
+    ``?topic=`` subscriptions, and returns at once. Readiness/failure arrive as
+    events on the lease's ``event_bus``; ``await conn.ready()`` waits for the
+    first connect.
 
-    ``impl`` selects the broker wire (``"paho"`` default, or ``"aiomqtt"``);
-    everything else (retry policy, loop provider, wire/app keepalive) rides in
-    ``options``. Raises :class:`ValueError` on a URL with no host or an unknown
-    ``impl``.
+    Retry policy, loop provider, and wire/app keepalive ride in ``options``.
+    Raises :class:`ValueError` on a URL with no host.
     """
     url = yarl.URL(url) if isinstance(url, str) else url
-    if impl not in SUPPORTED_IMPLS:
-        raise ValueError(f"mqtt.connect: unknown impl {impl!r} (use 'paho'/'aiomqtt')")
     options = options or ConnectionOptions()
     broker = MqttBroker.from_url(url)
-    pool = build_pool(impl, pool, options.provider, options.wire_keepalive)
-
     lease = pool.connect(
         url,
         MqttConnectParams(
             broker=broker,
-            retry=options.retry or RetryPolicy(),
+            retry=options.retry,
             verify_tls=options.verify_tls,
             tls_client_auth=options.tls_client_auth,
             logger=options.logger,
-            open_timeout=options.open_timeout,
         ),
     )
     if not isinstance(lease, MqttLease):
@@ -274,8 +219,3 @@ def _mqtt_keepalive_seconds(wire_keepalive: Optional[WireKeepalive]) -> Optional
 def mqtt_message_route(message: MqttMessage) -> str:
     """Route an inbound MQTT message by its topic."""
     return message.topic
-
-
-def shutdown() -> None:
-    """Tear down every default pool of this front door. Idempotent."""
-    DEFAULT_POOLS.shutdown()

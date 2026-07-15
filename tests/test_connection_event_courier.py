@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from yarl import URL
 
 from types import SimpleNamespace
 
@@ -21,10 +22,12 @@ from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionLostEvent,
 )
 
+_WS = URL("wss://ws.example")
+
 
 @pytest.mark.asyncio
 async def test_transport_events_emit_protocol_events_in_order():
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     payload = '{"type":"pong"}'
     order = []
 
@@ -51,7 +54,7 @@ async def test_transport_events_emit_protocol_events_in_order():
 
 @pytest.mark.asyncio
 async def test_protocol_event_emission_does_not_drop_bursts():
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     payload = '{"type":"pong"}'
     got = []
 
@@ -90,7 +93,7 @@ async def _drain(predicate, timeout: float = 2.0) -> None:
 async def test_transport_bus_events_dispatch_in_order_without_loss():
     """Connected, a 500-message burst, and Disconnected ride one FIFO courier:
     exact order, zero drops, and every message observes the pre-bump ``v``."""
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     conn.use_running_loop()
     transport = _fake_transport()
     conn.protocol.attach(transport)
@@ -125,7 +128,7 @@ async def test_transport_bus_events_dispatch_in_order_without_loss():
 async def test_wedged_client_handler_does_not_block_the_transport_bus():
     """The original production bug: a handler that never returns must not stop
     the transport's emit from returning (recv/drop-detection liveness)."""
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     conn.use_running_loop()
     transport = _fake_transport()
     conn.protocol.attach(transport)
@@ -156,7 +159,7 @@ async def test_wedged_client_handler_does_not_block_the_transport_bus():
 @pytest.mark.asyncio
 async def test_stalled_dispatch_logs_the_watchdog_error(caplog):
     """Past the depth threshold the stall is surfaced once per attach epoch."""
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     conn.use_running_loop()
     transport = _fake_transport()
     conn.protocol.attach(transport)
@@ -183,7 +186,7 @@ async def test_stalled_dispatch_logs_the_watchdog_error(caplog):
 
 @pytest.mark.asyncio
 async def test_detach_drops_queued_events_and_stops_dispatch():
-    conn = SimplyPrintConnection()
+    conn = SimplyPrintConnection(_WS)
     conn.use_running_loop()
     transport = _fake_transport()
     conn.protocol.attach(transport)

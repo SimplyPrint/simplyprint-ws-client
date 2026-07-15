@@ -8,10 +8,11 @@ is the async/ETag-aware surface callers should prefer.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from pathlib import Path
 from typing import Optional
+
+from simplyprint_ws_client.common.asyncio.concurrent import run_in_thread
 
 
 def fast_md5sum(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -31,7 +32,7 @@ async def file_md5(path: Path) -> str:
     The whole read+hash runs on a worker thread, so a large file never blocks
     the loop and the file is never slurped into memory.
     """
-    return await asyncio.to_thread(fast_md5sum, path)
+    return await run_in_thread(fast_md5sum, path, thread_name="file-md5")
 
 
 def parse_s3_etag(etag: Optional[str]) -> Optional[str]:

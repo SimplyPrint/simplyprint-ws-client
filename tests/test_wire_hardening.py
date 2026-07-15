@@ -29,7 +29,7 @@ from simplyprint_ws_client.wire.mqtt import MqttBroker
 from simplyprint_ws_client.wire.paho import retry_delay_bounds
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Pool
-from simplyprint_ws_client.wire.pools import DefaultPools
+from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
     MqttTransport,
@@ -130,18 +130,18 @@ async def test_pool_stop_returns_live_transports():
 
 
 @pytest.mark.asyncio
-async def test_default_pools_shutdown_stops_transports():
+async def test_pool_registry_close_stops_transports():
     transports: List[FakeBrokerTransport] = []
-    pools: DefaultPools = DefaultPools()
-    pool = pools.get("fake", None, None, lambda: make_broker_pool(transports))
+    pools: PoolRegistry = PoolRegistry()
+    pool = pools.get(None, None, lambda: make_broker_pool(transports))
     pool.connect(yarl.URL("mqtt://host"))
 
-    pools.shutdown()
-    await asyncio.sleep(0)
+    await pools.close()
 
     # Previously the transports were orphaned (never stopped) on shutdown.
     assert [t.stops for t in transports] == [1]
-    assert pools.pools == {}
+    with pytest.raises(RuntimeError, match="closed pool registry"):
+        pools.get(None, None, lambda: make_broker_pool(transports))
 
 
 # --- lease close is exception-safe and settles waiters ---------------------------

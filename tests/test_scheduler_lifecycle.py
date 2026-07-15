@@ -8,12 +8,14 @@ liveness -- so a client that enters scheduling inactive (or goes inactive)
 must keep running init/tick, or it can never recover.
 """
 
+import asyncio
 import logging
 from datetime import timedelta
 
 import pytest
 
 from simplyprint_ws_client.core.client import Client
+from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.manager import ClientList
 from simplyprint_ws_client.core.scheduler import Scheduler
@@ -21,8 +23,13 @@ from simplyprint_ws_client.core.settings import ClientSettings
 
 
 class _RecordingClient(Client[PrinterConfig]):
-    def __init__(self, config, **kwargs):
-        super().__init__(config, **kwargs)
+    def __init__(
+        self,
+        config: PrinterConfig,
+        *,
+        context: ClientContext,
+    ) -> None:
+        super().__init__(config, context=context)
         self.init_calls = 0
         self.tick_calls = 0
         self.halt_calls = 0
@@ -61,7 +68,7 @@ class _FakeManager:
 def scheduler():
     # SINGLE mode keeps ensure_added/ensure_removed free of protocol sends, so
     # _schedule_client can be driven directly with no connection behind it.
-    settings = ClientSettings(Client, PrinterConfig, camera_workers=None)
+    settings = ClientSettings(camera_workers=None)
     scheduler = Scheduler(client_list=ClientList(), settings=settings)
     scheduler.manager = _FakeManager()
     return scheduler
@@ -71,7 +78,19 @@ def scheduler():
 def client():
     config = PrinterConfig.get_new()
     config.id = 1
-    return _RecordingClient(config)
+    return _RecordingClient(config, context=ClientContext())
+
+
+@pytest.mark.asyncio
+async def test_signal_is_retained_before_scheduler_waiter_exists(scheduler):
+    scheduler.use_running_loop()
+
+    # Submission can land after a scheduling pass but before its waiter starts.
+    # The wake-up is level-triggered, so that edge must still be waiting for it.
+    scheduler.signal()
+    await asyncio.wait_for(scheduler._wait_for_signal(), timeout=0.1)
+
+    assert not scheduler._wake_event.is_set()
 
 
 @pytest.mark.asyncio

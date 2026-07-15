@@ -24,7 +24,6 @@ from simplyprint_ws_client.wire.transport import WsTransport
 from simplyprint_ws_client.wire.websockets import Websockets
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.core.api.url_builder import SimplyPrintURL
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
 
@@ -35,21 +34,21 @@ class ConnectionMode(Enum):
 
 
 class ConnectionHint:
-    mode: ConnectionMode = ConnectionMode.SINGLE
-    config: PrinterConfig = PrinterConfig.get_blank()
-
     def __init__(
         self,
+        websocket_base: URL,
         mode: Optional[ConnectionMode] = None,
         config: Optional[PrinterConfig] = None,
-    ):
-        self.mode = mode or self.mode
-        self.config = config or self.config
+    ) -> None:
+        self.websocket_base = websocket_base
+        self.mode = mode or ConnectionMode.SINGLE
+        self.config = config or PrinterConfig.get_blank()
 
     @property
     def ws_url(self) -> URL:
         return (
-            SimplyPrintURL().ws_url
+            self.websocket_base
+            / "0.2"
             / self.mode.value
             / str(self.config.id)
             / str(self.config.token)
@@ -101,16 +100,21 @@ class SimplyPrintConnection(
 
     def __init__(
         self,
+        websocket_base: URL,
         transport_factory: TransportFactory = default_transport_factory,
         hint: Optional[ConnectionHint] = None,
         logger: logging.Logger = logging.getLogger("ws"),
-        **kwargs,
-    ):
-        AsyncStoppable.__init__(self, **kwargs)
-        EventLoopProvider.__init__(self, **kwargs)
+        *,
+        provider: Optional[EventLoopProvider[asyncio.AbstractEventLoop]] = None,
+    ) -> None:
+        AsyncStoppable.__init__(self)
+        EventLoopProvider.__init__(self, provider=provider)
 
+        if hint is not None and hint.websocket_base != websocket_base:
+            raise ValueError("connection hint websocket base does not match")
+        self.websocket_base = websocket_base
         self.transport_factory = transport_factory
-        self.hint = hint or ConnectionHint()
+        self.hint = hint or ConnectionHint(websocket_base)
         self.logger = logger
         self.transport: Optional[WsTransport] = None
         self.protocol = SimplyPrintProtocol(self, logger)
@@ -167,6 +171,8 @@ class SimplyPrintConnection(
         await self.protocol.send(msg, v)
 
     async def connect(self, hint: Optional[ConnectionHint] = None):
+        if hint is not None and hint.websocket_base != self.websocket_base:
+            raise ValueError("connection hint websocket base does not match")
         self.hint = hint or self.hint
 
         if self.is_stopped():

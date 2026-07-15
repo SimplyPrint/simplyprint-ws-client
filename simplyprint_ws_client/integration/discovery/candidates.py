@@ -9,9 +9,10 @@ pass over the merged list:
 2. **Collapse duplicates.** Candidates sharing ``(type, hardware identity)``
    collapse to one card; when a LAN and a cloud candidate are the same printer
    the LAN one wins (it carries the host the wizard needs).
-3. **Fail open.** A candidate with no resolvable hardware identity is never
-   dropped or collapsed -- we never hide a printer we can't positively prove is
-   already added or a duplicate.
+3. **Fail open between candidates.** A candidate with no resolvable hardware
+   identity is never collapsed with another sighting. It can still be removed
+   when the shared matcher proves that an identityless stored config owns its
+   network address.
 
 Identity is computed by :mod:`reconcile`, the one hardware-identity owner, so the
 already-configured filter and add-time de-duplication share a single rule.
@@ -24,10 +25,8 @@ from __future__ import annotations
 
 from typing import Mapping, Optional
 
-from simplyprint_ws_client.integration.discovery.reconcile import (
-    DeviceReconciler,
-    device_hardware_id,
-)
+from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
 
 
 def _lan_candidate(result) -> dict:
@@ -44,6 +43,7 @@ def _lan_candidate(result) -> dict:
         "type": result.type,
         "host": result.host,
         "serial": result.serial,
+        "hardware_id": result.hardware_id,
         "name": result.name,
         "model": str(model) if model else "",
         "device_type": str(device_type) if device_type else None,
@@ -62,6 +62,7 @@ def _cloud_candidate(provider: str, uid: str, device) -> dict:
         "type": provider,
         "host": None,
         "serial": device.serial,
+        "hardware_id": device.serial,
         "name": device.name,
         "model": device.model,
         "model_image_url": device.model_image_url,
@@ -90,9 +91,11 @@ async def _cloud_candidates(account_providers: Mapping[str, object]) -> "list[di
     return out
 
 
-def _hardware_id(candidate: dict) -> Optional[str]:
-    return device_hardware_id(
-        candidate.get("host"), candidate.get("serial"), candidate.get("extra")
+def _candidate_device(candidate: dict) -> DiscoveredDevice:
+    return DiscoveredDevice(
+        host=candidate.get("host") or "",
+        serial=candidate.get("serial"),
+        hardware_id=candidate.get("hardware_id"),
     )
 
 
@@ -101,8 +104,8 @@ def _dedupe(client_app, candidates: "list[dict]") -> "list[dict]":
 
     LAN candidates are considered before cloud ones so a LAN/cloud collision keeps
     the LAN card (it carries the host the wizard needs). A candidate with no
-    hardware identity is kept verbatim -- never matched against a config, never
-    folded into another card.
+    hardware identity is never folded into another candidate; the reconciler may
+    still match it to an identityless stored config by address.
     """
     ordered = [c for c in candidates if c["source"] == "lan"]
     ordered += [c for c in candidates if c["source"] != "lan"]
@@ -110,16 +113,15 @@ def _dedupe(client_app, candidates: "list[dict]") -> "list[dict]":
     out: "list[dict]" = []
     seen: "set[tuple[str, str]]" = set()
     for candidate in ordered:
-        hardware_id = _hardware_id(candidate)
-        if hardware_id is None:
-            out.append(candidate)  # fail open: unidentifiable, never hidden
-            continue
-
-        manager = client_app.get_config_manager(client_key=candidate["type"])
-        if DeviceReconciler(manager).matching(
-            hardware_id=hardware_id, host=candidate.get("host")
-        ):
+        device = _candidate_device(candidate)
+        manager = client_app.get_config_manager(integration_id=candidate["type"])
+        if DeviceReconciler(manager).matching(device):
             continue  # already a stored printer
+
+        hardware_id = DeviceReconciler.resolved_hardware_identity(device)
+        if hardware_id is None:
+            out.append(candidate)  # fail open: never candidate-collapsed
+            continue
 
         key = (candidate["type"], hardware_id)
         if key in seen:

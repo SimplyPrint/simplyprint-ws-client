@@ -1,9 +1,11 @@
 import asyncio
 
 import pytest
+from yarl import URL
 
 import simplyprint_ws_client.core.manager as connection_manager_module
 from simplyprint_ws_client.core.client import Client, ClientState
+from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.manager import (
     ClientConnectionManager,
@@ -18,6 +20,8 @@ from simplyprint_ws_client.core.protocol.events import (
 )
 from simplyprint_ws_client.core.protocol.messages import PingMsg
 from simplyprint_ws_client.events import EventBus
+
+_WS = URL("wss://ws.example")
 
 
 class _DummyConnection:
@@ -66,7 +70,9 @@ class _DummyView:
 
 def _client_list(count: int):
     client_list = ClientList()
-    clients = [Client(PrinterConfig.get_new()) for _ in range(count)]
+    clients = [
+        Client(PrinterConfig.get_new(), context=ClientContext()) for _ in range(count)
+    ]
 
     for client in clients:
         client_list.add(client)
@@ -86,11 +92,11 @@ def _fake_connections(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_deallocate_waits_for_connection_lost_handlers():
-    client = Client(PrinterConfig.get_new())
+    client = Client(PrinterConfig.get_new(), context=ClientContext())
     client.v = 3
     client.state = ClientState.CONNECTED
 
-    manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList())
+    manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList(), _WS)
     connection = _DummyConnection()
     manager.client_views[client.unique_id] = _DummyView(client, connection)
 
@@ -120,11 +126,11 @@ async def test_deallocate_waits_for_connection_lost_handlers():
 
 @pytest.mark.asyncio
 async def test_deallocate_does_not_leave_late_connection_lost_event():
-    client = Client(PrinterConfig.get_new())
+    client = Client(PrinterConfig.get_new(), context=ClientContext())
     client.v = 5
     client.state = ClientState.CONNECTED
 
-    manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList())
+    manager = ClientConnectionManager(ConnectionMode.SINGLE, ClientList(), _WS)
     manager.client_views[client.unique_id] = _DummyView(client, _DummyConnection())
 
     async def slow_listener(_event: SimplyPrintConnectionLostEvent):
@@ -148,6 +154,7 @@ def test_manager_rejects_invalid_max_clients_per_connection():
         ClientConnectionManager(
             ConnectionMode.MULTI,
             ClientList(),
+            _WS,
             max_clients_per_connection=0,
         )
 
@@ -156,7 +163,7 @@ def test_manager_rejects_invalid_max_clients_per_connection():
 async def test_multi_mode_without_capacity_reuses_one_view(monkeypatch):
     connections = _fake_connections(monkeypatch)
     client_list, clients = _client_list(3)
-    manager = ClientConnectionManager(ConnectionMode.MULTI, client_list)
+    manager = ClientConnectionManager(ConnectionMode.MULTI, client_list, _WS)
 
     for client in clients:
         await manager.allocate(client)
@@ -173,6 +180,7 @@ async def test_multi_mode_capacity_spreads_clients_across_views(monkeypatch):
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
+        _WS,
         max_clients_per_connection=2,
     )
 
@@ -197,6 +205,7 @@ async def test_deallocate_removes_empty_view(monkeypatch):
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
+        _WS,
         max_clients_per_connection=1,
     )
 
@@ -222,6 +231,7 @@ async def test_multi_mode_reuses_partially_free_view(monkeypatch):
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
+        _WS,
         max_clients_per_connection=2,
     )
 
@@ -245,6 +255,7 @@ async def test_multi_mode_outgoing_messages_use_assigned_connection(monkeypatch)
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
+        _WS,
         max_clients_per_connection=1,
     )
 
@@ -279,6 +290,7 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
+        _WS,
         max_clients_per_connection=1,
     )
 
@@ -313,9 +325,9 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
 @pytest.mark.asyncio
 async def test_emit_all_uses_snapshot_when_view_is_mutated():
     client_list = ClientList()
-    c1 = Client(PrinterConfig.get_new())
-    c2 = Client(PrinterConfig.get_new())
-    c3 = Client(PrinterConfig.get_new())
+    c1 = Client(PrinterConfig.get_new(), context=ClientContext())
+    c2 = Client(PrinterConfig.get_new(), context=ClientContext())
+    c3 = Client(PrinterConfig.get_new(), context=ClientContext())
     client_list.add(c1)
     client_list.add(c2)
     client_list.add(c3)
@@ -350,8 +362,8 @@ async def test_emit_all_uses_snapshot_when_view_is_mutated():
 @pytest.mark.asyncio
 async def test_emit_all_ignores_stale_client_ids():
     client_list = ClientList()
-    c1 = Client(PrinterConfig.get_new())
-    c2 = Client(PrinterConfig.get_new())
+    c1 = Client(PrinterConfig.get_new(), context=ClientContext())
+    c2 = Client(PrinterConfig.get_new(), context=ClientContext())
     client_list.add(c1)
     client_list.add(c2)
 

@@ -5,83 +5,109 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Literal, TypeVar
+from enum import Enum
+from typing import Awaitable, Callable, Optional, final
 
 from yarl import URL
 
 from simplyprint_ws_client.integration.camera.handle import CameraHandle
 from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
-from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApi
-from simplyprint_ws_client.core.client import Client
-from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.protocol.messages import (
+    StreamOffDemandData,
+    StreamOnDemandData,
+    WebcamTestDemandData,
     WebcamSnapshotDemandData,
     StreamMsg,
 )
+from simplyprint_ws_client.core.state import Interval, PrinterState
 
-_T = TypeVar("_T", bound=PrinterConfig)
+StreamSender = Callable[[StreamMsg], Awaitable[None]]
+
+
+class _CameraWorkKind(Enum):
+    STREAM = "stream"
+    SNAPSHOT = "snapshot"
+    TEST = "test"
 
 
 @dataclass
 class _CameraWork:
-    kind: Literal["stream", "snapshot", "test"]
+    kind: _CameraWorkKind
     data: WebcamSnapshotDemandData
     done: Optional[asyncio.Future] = None
 
 
-class ClientCameraMixin(Client[_T]):
+@final
+class CameraController:
+    """Final owner of one printer's camera handle and demand-work lane.
+
+    Protocol routing stays on :class:`PrinterClient`; this component owns only
+    camera state, bounded work admission, frame delivery and teardown.
+    """
+
     #: Queue entries, not tasks. Stream demand is coalesced to one entry, while
     #: ID'd snapshots remain individual up to this hard memory bound.
     _CAMERA_QUEUE_MAXSIZE = 20
-    _camera_pool: Optional[CameraPool] = None
-    _camera_uri: Optional[URL] = None
-    _camera_handle: Optional[CameraHandle] = None
-    _camera_status: Literal["ok", "new", "err"] = "ok"
-    _camera_max_cache_age: Optional[datetime.timedelta] = None
-    _camera_pause_timeout: Optional[int] = None
-    _camera_debug: bool = False
-    _camera_logger: logging.Logger = logging.getLogger(__name__)
+    _camera_pool: Optional[CameraPool]
+    _camera_uri: Optional[URL]
+    _camera_handle: Optional[CameraHandle]
+    _camera_max_cache_age: Optional[datetime.timedelta]
+    _camera_pause_timeout: Optional[int]
+    _camera_debug: bool
+    _camera_logger: logging.Logger
     _stream_lock: CancelableLock
     _stream_setup: asyncio.Event
-    _request_count: int = 0
+    _request_count: int
     #: ``time.time()`` of the last published stream frame. A cached frame that
     #: arrived after this is *unseen* by the server and can be served with zero
     #: latency instead of blocking until the camera produces its next frame.
-    _last_stream_frame_at: Optional[float] = None
+    _last_stream_frame_at: Optional[float]
     _camera_work_queue: asyncio.Queue
-    _camera_worker_task: Optional[asyncio.Task] = None
-    _camera_active_task: Optional[asyncio.Task] = None
-    _camera_active_kind: Optional[Literal["stream", "snapshot", "test"]] = None
-    _camera_stream_pending: bool = False
-    _camera_snapshot_backlog: int = 0
-    _camera_backlog_reported: bool = False
-    _camera_closing: bool = False
-    _camera_stream_cancel_requested: bool = False
+    _camera_worker_task: Optional[asyncio.Task]
+    _camera_active_task: Optional[asyncio.Task]
+    _camera_active_kind: Optional[_CameraWorkKind]
+    _camera_stream_pending: bool
+    _camera_snapshot_backlog: int
+    _camera_backlog_reported: bool
+    _camera_closing: bool
+    _camera_stream_cancel_requested: bool
 
-    def initialize_camera_mixin(
+    def __init__(
         self,
-        camera_pool: Optional[CameraPool] = None,
+        *,
+        printer: PrinterState,
+        logger: logging.Logger,
+        event_loop_provider: EventLoopProvider,
+        send_stream: StreamSender,
+        context: ClientContext,
         pause_timeout: Optional[int] = None,
         max_cache_age: Optional[datetime.timedelta] = None,
-        camera_debug: Optional[bool] = None,
-        **_kwargs,
-    ):
-        self._camera_pool = camera_pool
+        debug: Optional[bool] = None,
+    ) -> None:
+        self._printer = printer
+        self._event_loop_provider = event_loop_provider
+        self._send_stream = send_stream
+        self._camera_pool = context.camera_pool
+        self._simplyprint_api = context.simplyprint_api
+        self._camera_uri = None
+        self._camera_handle = None
         self._stream_lock = CancelableLock()
         self._stream_setup = asyncio.Event()
         self._camera_pause_timeout = pause_timeout
         self._camera_max_cache_age = max_cache_age
         self._camera_debug = (
-            "SIMPLYPRINT_DEBUG_CAMERA" in os.environ
-            if camera_debug is None
-            else camera_debug
+            "SIMPLYPRINT_DEBUG_CAMERA" in os.environ if debug is None else debug
         )
-        self._camera_logger = self.logger.getChild("camera")
+        self._camera_logger = logger.getChild("camera")
         self._camera_logger.setLevel(
             logging.DEBUG if self._camera_debug else logging.INFO
         )
         self._camera_work_queue = asyncio.Queue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
+        self._request_count = 0
+        self._last_stream_frame_at = None
         self._camera_worker_task = None
         self._camera_active_task = None
         self._camera_active_kind = None
@@ -92,18 +118,12 @@ class ClientCameraMixin(Client[_T]):
         self._camera_stream_cancel_requested = False
 
     @property
-    def camera_status(self) -> Literal["ok", "new", "err"]:
-        """Get the camera status."""
-        return self._camera_status
-
-    @property
-    def camera_uri(self) -> Optional[URL]:
+    def uri(self) -> Optional[URL]:
         """Get the camera URI."""
         return self._camera_uri
 
-    @camera_uri.setter
-    def camera_uri(self, uri: Optional[URL] = None):
-        """Returns whether it has changed the camera URI"""
+    def set_uri(self, uri: Optional[URL]) -> bool:
+        """Replace or clear the camera source; return whether it was accepted."""
         if uri is None:
             if self._camera_handle:
                 self._camera_handle.stop()
@@ -111,34 +131,27 @@ class ClientCameraMixin(Client[_T]):
                     f"Cleared previous camera handle ID {self._camera_handle.id}."
                 )
                 self._camera_handle = None
-                self.event_loop.call_soon_threadsafe(self._stream_setup.clear)
+                self._event_loop_provider.event_loop.call_soon_threadsafe(
+                    self._stream_setup.clear
+                )
             self._camera_uri = None
-            self._camera_status = "ok"
             self._last_stream_frame_at = None
-            try:
-                self.printer.webcam_info.connected = False
-            except AttributeError:
-                pass
-            return
+            self._printer.webcam_info.connected = False
+            return True
 
         if self._camera_pool is None:
-            self._camera_status = "err"
             self._camera_logger.debug(
                 f"Dropped camera URI {uri} because no camera pool is available."
             )
-            try:
-                self.printer.webcam_info.connected = False
-            except AttributeError:
-                pass
-            return
+            self._printer.webcam_info.connected = False
+            return False
 
         # If the camera URI is the same, don't recreate the camera.
         if self._camera_uri == uri and self._camera_handle:
-            self._camera_status = "ok"
             self._camera_logger.debug(
                 f"Camera URI {uri} is the same as the current one, not changing."
             )
-            return
+            return True
 
         self._camera_uri = uri
 
@@ -149,54 +162,55 @@ class ClientCameraMixin(Client[_T]):
                 f"Cleared previous camera handle ID {self._camera_handle.id}."
             )
             self._camera_handle = None
-            self.event_loop.call_soon_threadsafe(self._stream_setup.clear)
+            self._event_loop_provider.event_loop.call_soon_threadsafe(
+                self._stream_setup.clear
+            )
 
         # Create a new camera handle
         if self._camera_uri and self._camera_pool:
             self._camera_handle = self._camera_pool.create(
                 self._camera_uri, pause_timeout=self._camera_pause_timeout
             )
-            self.event_loop.call_soon_threadsafe(self._stream_setup.set)
+            self._event_loop_provider.event_loop.call_soon_threadsafe(
+                self._stream_setup.set
+            )
 
         # Check if we left off with a request that needs to be sent.
         if self._request_count > 0:
             asyncio.run_coroutine_threadsafe(
-                self._resume_webcam_stream(), loop=self.event_loop
+                self._resume_webcam_stream(),
+                loop=self._event_loop_provider.event_loop,
             )
 
         # Mark the webcam as connected if it's not already.
-        if not self.printer.webcam_info.connected:
-            self.printer.webcam_info.connected = True
+        if not self._printer.webcam_info.connected:
+            self._printer.webcam_info.connected = True
 
-        self._camera_status = "new"
         self._camera_logger.debug(
-            f"Set new camera URI to {uri} with handle ID {self._camera_handle.id if self._camera_handle else 'N/A'}, status is now {self._camera_status}."
+            f"Set new camera URI to {uri} with handle ID {self._camera_handle.id if self._camera_handle else 'N/A'}."
         )
+        return True
 
-    def teardown_camera_mixin(self) -> None:
-        """Release the camera handle. Called from the client's ``teardown`` -
-        explicit ownership, never ``__del__`` (a finalizer would re-enter the
-        event loop during GC)."""
-        self.camera_uri = None
-
-    async def shutdown_camera_mixin(self) -> None:
-        """Cancel and await the camera dispatch worker before releasing it."""
+    async def close(self) -> None:
+        """Cancel owned work, then release the camera handle."""
         self._camera_closing = True
-        active = getattr(self, "_camera_active_task", None)
-        worker = getattr(self, "_camera_worker_task", None)
+        active = self._camera_active_task
+        worker = self._camera_worker_task
         if active is not None:
             active.cancel()
         if worker is not None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
 
-        queue = getattr(self, "_camera_work_queue", None)
-        if queue is not None:
-            while not queue.empty():
-                work = queue.get_nowait()
-                if work.done is not None and not work.done.done():
-                    work.done.cancel()
-                queue.task_done()
+        while not self._camera_work_queue.empty():
+            work = self._camera_work_queue.get_nowait()
+            if work.done is not None and not work.done.done():
+                work.done.cancel()
+            self._camera_work_queue.task_done()
+
+        # Explicit ownership, never ``__del__``: a finalizer would re-enter the
+        # event loop during garbage collection.
+        self.set_uri(None)
 
     #: How long a demand waits for a camera handle to be configured before
     #: giving up. Camera work is detached from connection dispatch, but it is
@@ -220,11 +234,11 @@ class ClientCameraMixin(Client[_T]):
             return False
         return self._camera_handle is not None
 
-    async def on_stream_on(self):
+    async def stream_on(self, _data: Optional[StreamOnDemandData] = None) -> None:
         if await self._wait_for_camera():
             self._camera_handle.start()
 
-    async def on_stream_off(self):
+    async def stream_off(self, _data: Optional[StreamOffDemandData] = None) -> None:
         if await self._wait_for_camera():
             self._camera_handle.pause()
         self._stream_lock.cancel()
@@ -233,18 +247,18 @@ class ClientCameraMixin(Client[_T]):
         # A stream read/upload is expendable once streaming is disabled. ID'd
         # snapshots and webcam tests remain lossless and are never preempted.
         if (
-            getattr(self, "_camera_active_kind", None) == "stream"
-            and getattr(self, "_camera_active_task", None) is not None
+            self._camera_active_kind is _CameraWorkKind.STREAM
+            and self._camera_active_task is not None
         ):
             self._camera_stream_cancel_requested = True
             self._camera_active_task.cancel()
 
-    async def on_test_webcam(self):
+    async def test_webcam(self, _data: Optional[WebcamTestDemandData] = None) -> None:
         self._ensure_camera_worker()
         done = asyncio.get_running_loop().create_future()
         try:
             self._camera_work_queue.put_nowait(
-                _CameraWork("test", WebcamSnapshotDemandData(), done)
+                _CameraWork(_CameraWorkKind.TEST, WebcamSnapshotDemandData(), done)
             )
         except asyncio.QueueFull:
             raise RuntimeError("Camera work queue is full") from None
@@ -253,12 +267,10 @@ class ClientCameraMixin(Client[_T]):
     #: Frame-read attempts per snapshot request before giving up.
     _SNAPSHOT_MAX_ATTEMPTS = 5
 
-    async def on_webcam_snapshot(
+    async def snapshot(
         self,
         data: Optional[WebcamSnapshotDemandData] = None,
-        attempt=0,
-        retry_timeout=5,
-    ):
+    ) -> None:
         data = data or WebcamSnapshotDemandData()
         self._ensure_camera_worker()
 
@@ -271,7 +283,7 @@ class ClientCameraMixin(Client[_T]):
             return
         else:
             # ID'd snapshots are individually meaningful and must not shed.
-            kind = "snapshot"
+            kind = _CameraWorkKind.SNAPSHOT
             self._camera_snapshot_backlog += 1
             if (
                 self._camera_snapshot_backlog >= 20
@@ -286,9 +298,7 @@ class ClientCameraMixin(Client[_T]):
         try:
             self._camera_work_queue.put_nowait(_CameraWork(kind, data))
         except asyncio.QueueFull:
-            self._camera_snapshot_backlog = max(
-                0, self._camera_snapshot_backlog - 1
-            )
+            self._camera_snapshot_backlog = max(0, self._camera_snapshot_backlog - 1)
             self._camera_logger.warning(
                 "Dropped camera snapshot %s because the %d-entry queue is full.",
                 data.id,
@@ -305,7 +315,7 @@ class ClientCameraMixin(Client[_T]):
             return
         try:
             self._camera_work_queue.put_nowait(
-                _CameraWork("stream", WebcamSnapshotDemandData())
+                _CameraWork(_CameraWorkKind.STREAM, WebcamSnapshotDemandData())
             )
         except asyncio.QueueFull:
             # Credits remain in _request_count, so a later completed snapshot or
@@ -315,25 +325,12 @@ class ClientCameraMixin(Client[_T]):
 
     def _ensure_camera_worker(self) -> None:
         """Lazily create the one owner of frame reads and uploads."""
-        if not hasattr(self, "_camera_work_queue"):
-            self._camera_work_queue = asyncio.Queue(
-                maxsize=self._CAMERA_QUEUE_MAXSIZE
-            )
-            self._camera_worker_task = None
-            self._camera_active_task = None
-            self._camera_active_kind = None
-            self._camera_stream_pending = False
-            self._camera_snapshot_backlog = 0
-            self._camera_backlog_reported = False
-            self._camera_closing = False
-            self._camera_stream_cancel_requested = False
-
         if self._camera_closing:
             return
         if self._camera_worker_task is None or self._camera_worker_task.done():
             self._camera_worker_task = asyncio.get_running_loop().create_task(
                 self._camera_worker(),
-                name=f"sp-camera:{getattr(self, 'unique_id', 'unknown')}",
+                name=f"sp-camera:{self._printer.config.unique_id}",
             )
 
     async def _camera_worker(self) -> None:
@@ -344,13 +341,13 @@ class ClientCameraMixin(Client[_T]):
             error = None
             worker_cancelled = False
             try:
-                if work.kind == "stream" and self._request_count <= 0:
+                if work.kind is _CameraWorkKind.STREAM and self._request_count <= 0:
                     continue
 
                 self._camera_active_kind = work.kind
                 self._camera_active_task = asyncio.get_running_loop().create_task(
                     self._process_camera_work(work),
-                    name=f"sp-camera-frame:{work.kind}",
+                    name=f"sp-camera-frame:{work.kind.value}",
                 )
                 try:
                     result = await self._camera_active_task
@@ -359,7 +356,7 @@ class ClientCameraMixin(Client[_T]):
                     # to consume. Any other cancellation belongs to the owner
                     # task (teardown/loop shutdown) and must propagate.
                     if not (
-                        work.kind == "stream"
+                        work.kind is _CameraWorkKind.STREAM
                         and self._camera_stream_cancel_requested
                         and not self._camera_closing
                     ):
@@ -370,14 +367,14 @@ class ClientCameraMixin(Client[_T]):
             except Exception as exc:  # keep one failed upload from killing owner
                 error = exc
                 self._camera_logger.warning(
-                    "Camera %s request failed", work.kind, exc_info=True
+                    "Camera %s request failed", work.kind.value, exc_info=True
                 )
             finally:
                 self._camera_active_task = None
                 self._camera_active_kind = None
                 self._camera_stream_cancel_requested = False
 
-                if work.kind == "snapshot":
+                if work.kind is _CameraWorkKind.SNAPSHOT:
                     self._camera_snapshot_backlog = max(
                         0, self._camera_snapshot_backlog - 1
                     )
@@ -386,7 +383,7 @@ class ClientCameraMixin(Client[_T]):
                         and self._camera_snapshot_backlog < 10
                     ):
                         self._camera_backlog_reported = False
-                elif work.kind == "stream":
+                elif work.kind is _CameraWorkKind.STREAM:
                     if not result and self._request_count > 0:
                         self._request_count -= 1
                     self._camera_stream_pending = False
@@ -402,7 +399,7 @@ class ClientCameraMixin(Client[_T]):
                         work.done.set_result(result)
                 self._camera_work_queue.task_done()
                 if (
-                    work.kind != "stream"
+                    work.kind is not _CameraWorkKind.STREAM
                     and self._request_count > 0
                     and not self._camera_closing
                 ):
@@ -488,19 +485,23 @@ class ClientCameraMixin(Client[_T]):
         """Deliver one frame; True when the stream should keep going."""
         # Capture snapshot events and send them to the API
         if data.id is not None:
-            await SimplyPrintApi.post_snapshot(data.id, frame, endpoint=data.endpoint)
+            if self._simplyprint_api is None:
+                raise RuntimeError("SimplyPrint API is not configured")
+            await self._simplyprint_api.post_snapshot(
+                data.id, frame, endpoint=data.endpoint
+            )
             self._camera_logger.debug(f"Posted snapshot to API with id {data.id}")
             return False
 
         # Mark the webcam as connected if it's not already.
-        if not self.printer.webcam_info.connected:
-            self.printer.webcam_info.connected = True
+        if not self._printer.webcam_info.connected:
+            self._printer.webcam_info.connected = True
 
         async with self._stream_lock:
             # Prevent racing between receiving frames and sending them.
-            await self.printer.intervals.wait_for("webcam")
+            await self._printer.intervals.wait_for(Interval.WEBCAM)
             b64frame = base64.b64encode(frame).decode("utf-8")
-            await self.send(StreamMsg(b64frame))
+            await self._send_stream(StreamMsg(b64frame))
             self._last_stream_frame_at = time.time()
 
             if self._request_count > 0:

@@ -64,9 +64,7 @@ class BaseCameraProtocol(ABC, Iterable[FrameT], AsyncIterable[FrameT]):
     uri: URL
     """Configuration URI for the camera protocol, and the only input we have access to."""
 
-    def __init__(self, uri: URL, *args, **kwargs):
-        _ = args
-        _ = kwargs
+    def __init__(self, uri: URL) -> None:
         self.uri = uri
 
     @staticmethod

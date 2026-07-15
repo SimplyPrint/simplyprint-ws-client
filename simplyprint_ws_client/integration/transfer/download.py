@@ -1,115 +1,116 @@
-"""Progress-reporting HTTP downloads to file-like objects."""
+"""Pure HTTP source-file download used by the print preparation controller."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
-from typing import BinaryIO, Optional
+from pathlib import Path
+from ssl import SSLError
+from typing import Callable, Optional
 
 import aiohttp
+from aiohttp import ClientError
 
-from simplyprint_ws_client import FileProgressState, FileProgressStateEnum
+from simplyprint_ws_client.core.protocol.messages import FileDemandData
 
 
-async def download_to_file(
+class FileDownloadError(Exception):
+    """The requested source could not be downloaded and validated."""
+
+
+DEFAULT_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(
+    total=None,
+    connect=120,
+    sock_connect=120,
+    # Operation-level stall detection belongs to FileTransfer's watchdog.
+    sock_read=None,
+)
+
+
+async def download_file(
+    data: FileDemandData,
+    destination: Path,
+    progress: Callable[[float], None],
     *,
-    url: str,
-    file: BinaryIO,
-    file_progress: FileProgressState,
-    logger: logging.Logger,
-    file_name: Optional[str] = None,
-    file_size: Optional[int] = None,
-    progress_end: float = 50.0,
-    chunk_size: int = 8192,
-    session=None,
-) -> int:
-    """Download ``url`` into ``file`` while updating ``file_progress``.
+    timeout: Optional[aiohttp.ClientTimeout] = None,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Path:
+    """Download one validated source artifact into ``destination``.
 
-    ``session`` is injectable for tests or callers that already own an
-    ``aiohttp.ClientSession``. The function owns all file writes/flush/rewind and
-    leaves the handle positioned at the beginning on success.
+    The primary CDN URL and fallback URL are attempted in that order. Each
+    attempt owns/truncates the destination, so a partially delivered primary
+    can never be concatenated with its fallback. This function has no client or
+    printer-state dependency; callers own progress and terminal reporting.
     """
 
+    urls = tuple(dict.fromkeys(url for url in (data.cdn_url, data.url) if url))
+    if not urls:
+        raise FileDownloadError("No file URL provided")
+
     if session is None:
-        async with aiohttp.ClientSession() as owned_session:
-            return await _download_to_file_with_session(
-                url=url,
-                file=file,
-                file_progress=file_progress,
-                logger=logger,
-                file_name=file_name,
-                file_size=file_size,
-                progress_end=progress_end,
-                chunk_size=chunk_size,
-                session=owned_session,
+        async with aiohttp.ClientSession(
+            timeout=timeout or DEFAULT_DOWNLOAD_TIMEOUT
+        ) as owned_session:
+            return await _download_with_session(
+                data, destination, progress, urls, owned_session
             )
 
-    return await _download_to_file_with_session(
-        url=url,
-        file=file,
-        file_progress=file_progress,
-        logger=logger,
-        file_name=file_name,
-        file_size=file_size,
-        progress_end=progress_end,
-        chunk_size=chunk_size,
-        session=session,
-    )
+    return await _download_with_session(data, destination, progress, urls, session)
 
 
-async def _download_to_file_with_session(
-    *,
-    url: str,
-    file: BinaryIO,
-    file_progress: FileProgressState,
-    logger: logging.Logger,
-    file_name: Optional[str],
-    file_size: Optional[int],
-    progress_end: float,
-    chunk_size: int,
-    session,
-) -> int:
-    logger.info("Downloading file file_name: %s", file_name)
-    logger.info("cdn_url: %s", url)
-    logger.info("file_size: %s  progress: %s", file_size, file_progress.state)
+async def _download_with_session(
+    data: FileDemandData,
+    destination: Path,
+    progress: Callable[[float], None],
+    urls: tuple[str, ...],
+    session: aiohttp.ClientSession,
+) -> Path:
+    last_error: Optional[BaseException] = None
 
-    file_progress.state = FileProgressStateEnum.DOWNLOADING
-    file_progress.percent = 0.0
+    for url in urls:
+        downloaded = 0
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                expected = data.file_size or int(
+                    response.headers.get("content-length") or 0
+                )
 
-    downloaded = 0
+                with destination.open("wb") as output:
+                    async for chunk in response.content.iter_any():
+                        if not chunk:
+                            continue
+                        await asyncio.to_thread(output.write, chunk)
+                        downloaded += len(chunk)
+                        if expected:
+                            progress(min(downloaded / expected * 100.0, 100.0))
+                    await asyncio.to_thread(output.flush)
 
-    try:
-        async with session.get(url) as response:
-            response.raise_for_status()
+            if downloaded == 0:
+                raise FileDownloadError(f"Downloaded file from {url} was empty")
+            if data.file_size and downloaded != data.file_size:
+                raise FileDownloadError(
+                    "Downloaded file size mismatch: "
+                    f"expected {data.file_size}, got {downloaded}"
+                )
 
-            async for chunk in response.content.iter_chunked(chunk_size):
-                if not chunk:
-                    continue
+            progress(100.0)
+            return destination
+        except (
+            OSError,
+            SSLError,
+            ClientError,
+            asyncio.TimeoutError,
+            FileDownloadError,
+        ) as error:
+            last_error = error
 
-                await asyncio.to_thread(file.write, chunk)
-                downloaded += len(chunk)
+    if isinstance(last_error, FileDownloadError):
+        raise last_error
+    if last_error is not None:
+        raise FileDownloadError(
+            f"Failed to download file: {last_error}"
+        ) from last_error
+    raise FileDownloadError("Failed to download file")
 
-                if file_size:
-                    file_progress.percent = min(
-                        (downloaded / file_size) * progress_end,
-                        progress_end,
-                    )
 
-        if downloaded == 0:
-            raise ValueError("Downloaded file is empty")
-
-        if file_size and downloaded != file_size:
-            raise ValueError(
-                f"Downloaded file size mismatch: expected {file_size}, got {downloaded}"
-            )
-
-        await asyncio.to_thread(file.flush)
-        await asyncio.to_thread(file.seek, 0)
-        file_progress.percent = progress_end
-
-        return downloaded
-    except Exception as exc:
-        file_progress.state = FileProgressStateEnum.ERROR
-        file_progress.message = f"Download failed: {exc}"
-        logger.exception("Download failed")
-        raise
+__all__ = ["FileDownloadError", "download_file"]

@@ -12,7 +12,7 @@ a frame across it. Two backends cover that:
   light sync camera stream off the main loop.
 
 Both expose the same backend surface the handle calls -- ``poll`` / ``start`` /
-``pause`` / ``stop`` -- and feed frames via ``handle._set_frame(data, ts)``. The
+``pause`` / ``stop`` -- and feed frames via ``handle.deliver_frame(data, ts)``. The
 PROCESS path keeps its own machinery in :mod:`.pool`; these are its peers.
 """
 
@@ -125,16 +125,16 @@ class InlineCameraBackend:
             async for frame in aiter:
                 if not once and self._stopped:
                     break
-                self._handle._set_frame(frame, time.time())
+                self._handle.deliver_frame(frame, time.time())
                 if once:
                     break
         except asyncio.CancelledError:
             raise
         except (CameraProtocolConnectionError, CameraProtocolInvalidState):
-            self._handle._set_frame(None, time.time())
+            self._handle.deliver_frame(None, time.time())
         except Exception as e:  # noqa: BLE001
             self._logger.debug("inline camera read failed: %s", e)
-            self._handle._set_frame(None, time.time())
+            self._handle.deliver_frame(None, time.time())
 
 
 class _PauseTimer:
@@ -209,7 +209,7 @@ class ThreadCameraBackend:
 
     def _deliver(self, item) -> None:
         frame, timestamp = item
-        self._handle._set_frame(frame, timestamp)
+        self._handle.deliver_frame(frame, timestamp)
 
     def poll(self) -> None:
         if self._continuous:

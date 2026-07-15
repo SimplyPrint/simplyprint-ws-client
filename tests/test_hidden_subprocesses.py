@@ -73,7 +73,9 @@ def test_macos_ssid_uses_networksetup_when_airport_is_missing(monkeypatch):
     monkeypatch.setattr(physical_machine.os.path, "exists", fake_exists)
     monkeypatch.setattr(physical_machine, "capped_check_output", fake_check_output)
 
-    ssid_macos = physical_machine.PhysicalMachine._PhysicalMachine__ssid_macos.__wrapped__
+    ssid_macos = (
+        physical_machine.PhysicalMachine._PhysicalMachine__ssid_macos.__wrapped__
+    )
 
     assert ssid_macos() == "Shop Floor"
     assert all(physical_machine._MACOS_AIRPORT_PATH not in call for call in calls)

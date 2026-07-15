@@ -19,6 +19,7 @@ engine knowing the condition.
 from __future__ import annotations
 
 from typing import (
+    Any,
     Awaitable,
     Callable,
     List,
@@ -27,6 +28,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    final,
 )
 
 from simplyprint_ws_client.integration.flow.base import (
@@ -76,13 +78,15 @@ async def _resolve_content(content: Content, state: Mapping[str, object]) -> Lis
     return list(content or [])
 
 
+@final
 class FieldsStep(Step):
     """Collect a set of inputs once (with optional markdown ``content`` shown
     above them), then advance with them merged into state.
 
     ``fields`` is a static list or a callable of state -- so a step can drop a
-    field it already knows. An answer missing a required field re-offers the
-    screen.
+    field it already knows. ``schema_transform`` customizes a generated model
+    schema before fields are derived from it. An answer missing a required field
+    re-offers the screen.
     """
 
     def __init__(
@@ -108,11 +112,16 @@ class FieldsStep(Step):
                 Callable[[Mapping[str, object]], Mapping[str, object]],
             ]
         ] = None,
+        schema_transform: Optional[
+            Callable[[Mapping[str, object], dict[str, Any]], Mapping[str, Any]]
+        ] = None,
         include: Optional[Include] = None,
         show_in_outline: bool = True,
     ) -> None:
         if fields is None and input_model is None:
             raise FlowError("FieldsStep requires fields or input_model")
+        if schema_transform is not None and input_model is None:
+            raise FlowError("FieldsStep schema_transform requires input_model")
         self.key = key
         self.label = label
         self.show_in_outline = show_in_outline
@@ -124,48 +133,8 @@ class FieldsStep(Step):
         self._kind = kind
         self._input_model = input_model
         self._input_values = input_values
+        self._schema_transform = schema_transform
         self._include = include
-
-    def _schema(self, state: Mapping[str, object]) -> Optional[Mapping[str, object]]:
-        if self._input_model is None:
-            return None
-        values = (
-            self._input_values(state)
-            if callable(self._input_values)
-            else self._input_values
-        )
-        return model_input_schema(
-            self._input_model,
-            values=values,
-            prefilled=(values or {}).keys(),
-        )
-
-    def _resolve_fields(
-        self, state: Mapping[str, object], schema: Optional[Mapping[str, object]]
-    ) -> List[StepField]:
-        if self._fields is None:
-            return fields_from_schema(schema or {})
-        fields = self._fields(state) if callable(self._fields) else self._fields
-        return list(fields)
-
-    def _prompt(
-        self,
-        fields: Sequence[StepField],
-        content: Sequence[str],
-        footer: Sequence[str],
-        schema: Optional[Mapping[str, object]],
-    ) -> StepPrompt:
-        return StepPrompt(
-            key=self.key,
-            label=self.label,
-            help_text=self._help,
-            kind=self._kind,
-            content=list(content),
-            fields=list(fields),
-            input_schema=schema,
-            actions=list(self._actions),
-            footer=list(footer),
-        )
 
     async def run(
         self,
@@ -176,13 +145,43 @@ class FieldsStep(Step):
         if not await _included(self._include, state):
             return Advance()
 
-        schema = self._schema(state)
-        fields = self._resolve_fields(state, schema)
+        schema: Optional[Mapping[str, Any]] = None
+        if self._input_model is not None:
+            values = (
+                self._input_values(state)
+                if callable(self._input_values)
+                else self._input_values
+            )
+            schema = model_input_schema(
+                self._input_model,
+                values=values,
+                prefilled=(values or {}).keys(),
+            )
+            if self._schema_transform is not None:
+                schema = self._schema_transform(state, schema)
+
+        if self._fields is None:
+            fields = fields_from_schema(schema or {})
+        else:
+            fields = list(
+                self._fields(state) if callable(self._fields) else self._fields
+            )
         content = await _resolve_content(self._content, state)
         footer = await _resolve_content(self._footer, state)
+        prompt = StepPrompt(
+            key=self.key,
+            label=self.label,
+            help_text=self._help,
+            kind=self._kind,
+            content=content,
+            fields=fields,
+            input_schema=schema,
+            actions=list(self._actions),
+            footer=footer,
+        )
 
         if answer is None:
-            return Ask(self._prompt(fields, content, footer, schema))
+            return Ask(prompt)
 
         # A prefilled field carries its known value, so a renderer may collapse it
         # into a summary and not re-submit it; fall back to that value when the
@@ -196,7 +195,7 @@ class FieldsStep(Step):
         if missing:
             return Reject(
                 "Please fill in: " + ", ".join(missing),
-                self._prompt(fields, content, footer, schema),
+                prompt,
             )
 
         updates = {f.key: effective(f) for f in fields if effective(f) is not None}
@@ -204,16 +203,18 @@ class FieldsStep(Step):
             try:
                 updates = validate_input(self._input_model, updates, fields=fields)
             except InputValidationError as exc:
-                return Reject(str(exc), self._prompt(fields, content, footer, schema))
+                return Reject(str(exc), prompt)
         return Advance(updates)
 
 
+@final
 class ChoiceStep(Step):
     """A branch point: present a fixed set of options and merge the chosen value.
 
     Later steps gate on it (``include=lambda s: s.get(key) == "lan"``), so a flow
     forks without the engine knowing the condition. ``content`` is markdown shown
-    above the options; ``notices`` are typed callouts between the two.
+    above the options, ``footer`` below them; ``notices`` are typed callouts between
+    the two.
     """
 
     def __init__(
@@ -224,6 +225,7 @@ class ChoiceStep(Step):
         label: str,
         help_text: Optional[str] = None,
         content: Optional[Content] = None,
+        footer: Optional[Content] = None,
         notices: Optional[Sequence[Notice]] = None,
         include: Optional[Include] = None,
         show_in_outline: bool = True,
@@ -234,19 +236,9 @@ class ChoiceStep(Step):
         self.label = label
         self._help = help_text
         self._content = content or []
+        self._footer = footer or []
         self._notices = list(notices or [])
         self._include = include
-
-    def _prompt(self, content: Sequence[str]) -> StepPrompt:
-        return StepPrompt(
-            key=self.key,
-            label=self.label,
-            help_text=self._help,
-            kind="choice",
-            content=list(content),
-            options=list(self._options),
-            notices=list(self._notices),
-        )
 
     async def run(
         self,
@@ -262,13 +254,24 @@ class ChoiceStep(Step):
             return Advance()
 
         content = await _resolve_content(self._content, state)
+        footer = await _resolve_content(self._footer, state)
+        prompt = StepPrompt(
+            key=self.key,
+            label=self.label,
+            help_text=self._help,
+            kind="choice",
+            content=content,
+            options=list(self._options),
+            notices=list(self._notices),
+            footer=footer,
+        )
 
         if answer is None:
-            return Ask(self._prompt(content))
+            return Ask(prompt)
 
         chosen = answer.get(self.key)
         if chosen not in {option.value for option in self._options}:
-            return Reject("Please choose an option.", self._prompt(content))
+            return Reject("Please choose an option.", prompt)
         return Advance({self.key: chosen})
 
 

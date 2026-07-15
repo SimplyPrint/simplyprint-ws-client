@@ -6,7 +6,7 @@ itself an asyncio-native wire: a concrete subclass fills FOUR hooks on itself --
 :meth:`~Reconnecting.aclose` -- and this base supplies everything around them: a
 single supervision task, the connect/consume/drop/backoff cycle, the generation
 counter, state, and the lifecycle events. There is no separate "link" object; the
-hooks are methods on the concrete impl, so a wire is one class top to bottom.
+hooks are methods on the concrete transport, so a wire is one class top to bottom.
 
 The loop always keeps retrying. The :class:`~simplyprint_ws_client.wire.policy.RetryPolicy`
 only decides the pace and, optionally, when to give up entirely -- at which point

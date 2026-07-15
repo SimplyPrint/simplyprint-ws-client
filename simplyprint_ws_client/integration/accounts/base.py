@@ -29,7 +29,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from simplyprint_ws_client import PrinterConfig
+    from simplyprint_ws_client import ConfigManager, PrinterConfig
 
 
 __all__ = [
@@ -196,6 +196,8 @@ class AccountProvider(Protocol):
     password/challenge flows can each expose their own flow-owned authenticator
     while still sharing saved-account storage and device adoption.
     """
+
+    config_manager: "ConfigManager"
 
     def get_accounts(self) -> List[AccountResource]: ...
 

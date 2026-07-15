@@ -1,62 +1,36 @@
-import logging
-from io import BytesIO
-from types import SimpleNamespace
+"""Behavioral tests for the pure source downloader."""
 
+import aiohttp
 import pytest
 
-from simplyprint_ws_client import FileDemandData, FileProgressStateEnum
-from simplyprint_ws_client.core.files import file_download as file_download_module
-from simplyprint_ws_client.core.files.file_download import FileDownload, FileDownloadError
-from simplyprint_ws_client.integration.transfer import download_to_file
+from simplyprint_ws_client import FileDemandData
+from simplyprint_ws_client.integration.transfer import FileDownloadError, download_file
+from simplyprint_ws_client.integration.transfer import download as download_module
 
 
-class FakeContent:
-    def __init__(self, chunks):
-        self._chunks = list(chunks)
+@pytest.fixture(autouse=True)
+def _inline_file_io(monkeypatch):
+    async def immediate(function, *args):
+        return function(*args)
 
-    async def iter_chunked(self, _chunk_size):
-        for chunk in self._chunks:
-            yield chunk
-
-
-class FakeResponse:
-    def __init__(self, chunks, *, error=None):
-        self.content = FakeContent(chunks)
-        self._error = error
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return None
-
-    def raise_for_status(self):
-        if self._error is not None:
-            raise self._error
+    monkeypatch.setattr(download_module.asyncio, "to_thread", immediate)
 
 
-class FakeSession:
-    def __init__(self, response):
-        self.response = response
-        self.urls = []
-
-    def get(self, url):
-        self.urls.append(url)
-        return self.response
-
-
-class FakeAioContent:
-    def __init__(self, chunks):
-        self._chunks = list(chunks)
+class Content:
+    def __init__(self, chunks, error=None):
+        self.chunks = list(chunks)
+        self.error = error
 
     async def iter_any(self):
-        for chunk in self._chunks:
+        for chunk in self.chunks:
             yield chunk
+        if self.error is not None:
+            raise self.error
 
 
-class FakeAioResponse:
-    def __init__(self, chunks=(), *, status=200, headers=None):
-        self.content = FakeAioContent(chunks)
+class Response:
+    def __init__(self, chunks=(), *, status=200, headers=None, error=None):
+        self.content = Content(chunks, error)
         self.status = status
         self.headers = headers or {}
 
@@ -66,130 +40,113 @@ class FakeAioResponse:
     async def __aexit__(self, *_exc):
         return None
 
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise aiohttp.ClientResponseError(
+                request_info=None,
+                history=(),
+                status=self.status,
+            )
 
-class FakeAioSession:
+
+class Session:
     def __init__(self, responses):
         self.responses = list(responses)
         self.urls = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return None
 
     def get(self, url):
         self.urls.append(url)
         return self.responses.pop(0)
 
 
-def patch_aio_session(monkeypatch, session):
-    monkeypatch.setattr(
-        file_download_module.aiohttp,
-        "ClientSession",
-        lambda timeout: session,
-    )
+@pytest.mark.asyncio
+async def test_missing_urls_are_rejected(tmp_path):
+    with pytest.raises(FileDownloadError, match="No file URL"):
+        await download_file(
+            FileDemandData(file_name="job.gcode"),
+            tmp_path / "job.gcode",
+            lambda _percent: None,
+        )
 
 
 @pytest.mark.asyncio
-async def test_download_to_file_writes_flushes_and_rewinds():
-    session = FakeSession(FakeResponse([b"abc"]))
-    file = BytesIO()
-    progress = SimpleNamespace(state=None, percent=None, message=None)
-
-    downloaded = await download_to_file(
-        url="https://example.test/file.gcode",
-        file=file,
-        file_progress=progress,
-        logger=logging.getLogger(__name__),
-        file_name="file.gcode",
-        file_size=3,
+async def test_download_writes_and_reports_byte_progress(tmp_path):
+    progress = []
+    session = Session([Response([b"ab", b"cd"], headers={})])
+    destination = tmp_path / "job.gcode"
+    result = await download_file(
+        FileDemandData(
+            file_name="job.gcode",
+            file_size=4,
+            cdn_url="https://cdn.test/job.gcode",
+        ),
+        destination,
+        progress.append,
         session=session,
     )
-
-    assert downloaded == 3
-    assert file.tell() == 0
-    assert file.read() == b"abc"
-    assert progress.state == FileProgressStateEnum.DOWNLOADING
-    assert progress.percent == 50.0
-    assert session.urls == ["https://example.test/file.gcode"]
+    assert result == destination
+    assert destination.read_bytes() == b"abcd"
+    assert progress == [50.0, 100.0, 100.0]
 
 
 @pytest.mark.asyncio
-async def test_download_to_file_marks_error_on_size_mismatch():
-    session = FakeSession(FakeResponse([b"abc"]))
-    progress = SimpleNamespace(state=None, percent=None, message=None)
-
-    with pytest.raises(ValueError, match="size mismatch"):
-        await download_to_file(
-            url="https://example.test/file.gcode",
-            file=BytesIO(),
-            file_progress=progress,
-            logger=logging.getLogger(__name__),
-            file_name="file.gcode",
-            file_size=4,
-            session=session,
-        )
-
-    assert progress.state == FileProgressStateEnum.ERROR
-    assert "size mismatch" in progress.message
-
-
-@pytest.mark.asyncio
-async def test_file_download_rejects_missing_urls(client):
-    downloader = FileDownload(client)
-
-    with pytest.raises(FileDownloadError, match="No file URL provided"):
-        await downloader.download_as_bytes(FileDemandData(file_name="file.gcode"))
-
-    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
-    assert client.printer.file_progress.message == "No file URL provided"
-
-
-@pytest.mark.asyncio
-async def test_file_download_rejects_empty_success_response(client, tmp_path, monkeypatch):
-    session = FakeAioSession([FakeAioResponse([], headers={"content-length": "0"})])
-    patch_aio_session(monkeypatch, session)
-    downloader = FileDownload(client)
-
-    with pytest.raises(FileDownloadError, match="was empty"):
-        await downloader.download_as_file(
-            FileDemandData(file_name="file.gcode", cdn_url="https://cdn.test/file.gcode"),
-            tmp_path / "file.gcode",
-        )
-
-    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
-    assert client.printer.file_progress.message == (
-        "Downloaded file from https://cdn.test/file.gcode was empty"
-    )
-    assert session.urls == ["https://cdn.test/file.gcode"]
-
-
-@pytest.mark.asyncio
-async def test_file_download_falls_back_after_empty_primary(client, tmp_path, monkeypatch):
-    session = FakeAioSession(
+async def test_empty_primary_falls_back_without_concatenation(tmp_path):
+    session = Session(
         [
-            FakeAioResponse([], headers={"content-length": "0"}),
-            FakeAioResponse([b"abc"], headers={"content-length": "3"}),
+            Response([], headers={"content-length": "0"}),
+            Response([b"fallback"], headers={"content-length": "8"}),
         ]
     )
-    patch_aio_session(monkeypatch, session)
-    downloader = FileDownload(client)
-
-    dest = await downloader.download_as_file(
+    destination = tmp_path / "job.gcode"
+    await download_file(
         FileDemandData(
-            file_name="file.gcode",
-            cdn_url="https://cdn.test/file.gcode",
-            url="https://fallback.test/file.gcode",
+            file_name="job.gcode",
+            cdn_url="https://cdn.test/job.gcode",
+            url="https://fallback.test/job.gcode",
         ),
-        tmp_path / "file.gcode",
+        destination,
+        lambda _percent: None,
+        session=session,
     )
-
-    assert dest.read_bytes() == b"abc"
-    assert client.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
-    assert client.printer.file_progress.percent == 100
-    assert client.printer.file_progress.message is None
+    assert destination.read_bytes() == b"fallback"
     assert session.urls == [
-        "https://cdn.test/file.gcode",
-        "https://fallback.test/file.gcode",
+        "https://cdn.test/job.gcode",
+        "https://fallback.test/job.gcode",
     ]
+
+
+@pytest.mark.asyncio
+async def test_partial_primary_is_truncated_before_fallback(tmp_path):
+    session = Session(
+        [
+            Response([b"partial"], error=OSError("link lost")),
+            Response([b"good"]),
+        ]
+    )
+    destination = tmp_path / "job.gcode"
+    await download_file(
+        FileDemandData(
+            file_name="job.gcode",
+            cdn_url="https://cdn.test/job.gcode",
+            url="https://fallback.test/job.gcode",
+        ),
+        destination,
+        lambda _percent: None,
+        session=session,
+    )
+    assert destination.read_bytes() == b"good"
+
+
+@pytest.mark.asyncio
+async def test_expected_size_mismatch_is_terminal(tmp_path):
+    with pytest.raises(FileDownloadError, match="size mismatch"):
+        await download_file(
+            FileDemandData(
+                file_name="job.gcode",
+                file_size=5,
+                cdn_url="https://cdn.test/job.gcode",
+            ),
+            tmp_path / "job.gcode",
+            lambda _percent: None,
+            session=Session([Response([b"four"])]),
+        )

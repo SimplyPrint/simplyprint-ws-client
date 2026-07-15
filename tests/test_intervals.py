@@ -1,6 +1,6 @@
 from typing import ClassVar
 
-from simplyprint_ws_client import Intervals
+from simplyprint_ws_client.core.state import Interval, Intervals
 
 
 class TimeControlledIntervals(Intervals):
@@ -25,37 +25,37 @@ def test_intervals():
 
     assert intervals.now() == 30000.0
 
-    intervals.set("ping", 1000)
+    intervals.ping = 1000
 
     assert intervals.ping == 1000.0
-    assert intervals.is_ready("ping")
+    assert intervals.is_ready(Interval.PING)
 
-    intervals.use("ping")
+    intervals.use(Interval.PING)
 
-    assert not intervals.is_ready("ping")
-    assert intervals.time_until_ready("ping") == 1000
+    assert not intervals.is_ready(Interval.PING)
+    assert intervals.time_until_ready(Interval.PING) == 1000
 
     intervals.step_time(1000.0)
 
-    assert intervals.is_ready("ping")
-    assert intervals.time_until_ready("ping") == 0
+    assert intervals.is_ready(Interval.PING)
+    assert intervals.time_until_ready(Interval.PING) == 0
 
-    intervals.use("ping")
+    intervals.use(Interval.PING)
 
-    assert not intervals.is_ready("ping")
-    assert intervals.time_until_ready("ping") == 1000
-
-    intervals.step_time(500.0)
-
-    assert not intervals.is_ready("ping")
-    assert intervals.time_until_ready("ping") == 500
-    assert not intervals.use("ping")
+    assert not intervals.is_ready(Interval.PING)
+    assert intervals.time_until_ready(Interval.PING) == 1000
 
     intervals.step_time(500.0)
 
-    assert intervals.is_ready("ping")
+    assert not intervals.is_ready(Interval.PING)
+    assert intervals.time_until_ready(Interval.PING) == 500
+    assert not intervals.use(Interval.PING)
 
-    intervals.use("ping")
+    intervals.step_time(500.0)
 
-    assert not intervals.is_ready("ping")
-    assert intervals.time_until_ready("ping") == 1000
+    assert intervals.is_ready(Interval.PING)
+
+    intervals.use(Interval.PING)
+
+    assert not intervals.is_ready(Interval.PING)
+    assert intervals.time_until_ready(Interval.PING) == 1000

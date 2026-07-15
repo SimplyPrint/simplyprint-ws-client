@@ -67,6 +67,7 @@ from simplyprint_ws_client.wire.messages import (
 from simplyprint_ws_client.wire.mqtt import mqtt_message_route
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
     MqttTransport,
@@ -595,9 +596,11 @@ async def mqtt_flaky_topic_pool_throughput(
 
     await wait_for(lambda: processed == total, timeout=120.0)
     await wait_for(
-        lambda: connecting == expected_lifecycle
-        and connected == expected_lifecycle
-        and disconnected == expected_lifecycle,
+        lambda: (
+            connecting == expected_lifecycle
+            and connected == expected_lifecycle
+            and disconnected == expected_lifecycle
+        ),
         timeout=120.0,
     )
 
@@ -644,7 +647,7 @@ def skipped_metric(name: str, notes: str) -> Metric:
     )
 
 
-async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
+async def actual_ws_loopback_throughput(total: int) -> Metric:
     """Measure a real ws:// loopback through the public ws.connect front door."""
     server = ActualWsServer()
     lease = None
@@ -652,14 +655,13 @@ async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
     try:
         await server.start()
     except ImportError as error:
-        return skipped_metric(f"actual websocket {impl}", f"skipped: {error}")
+        return skipped_metric("actual websocket", f"skipped: {error}")
 
     try:
         provider = EventLoopProvider(loop=asyncio.get_running_loop())
-        pool = ws.build_pool(impl, None, provider)
+        pool = ws.pool_for(PoolRegistry(), provider)
         lease = ws.connect(
             server.url,
-            impl=impl,
             pool=pool,
             options=ConnectionOptions(retry=fast_retry(), provider=provider),
         )
@@ -672,7 +674,7 @@ async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
         lease.event_bus.on(MessageReceived, handler)
         if not await lease.ready(timeout=5.0):
             return skipped_metric(
-                f"actual websocket {impl}",
+                "actual websocket",
                 "skipped: connection did not become ready",
             )
 
@@ -692,7 +694,7 @@ async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
         tracemalloc.stop()
 
         return metric(
-            f"actual websocket {impl}",
+            "actual websocket",
             total,
             processed,
             0,
@@ -713,7 +715,6 @@ async def actual_ws_loopback_throughput(total: int, impl: str) -> Metric:
 
 async def actual_ws_flaky_loopback_throughput(
     total: int,
-    impl: str,
     interval: int,
 ) -> Metric:
     """Measure real WebSocket reconnect churn through the public front door."""
@@ -726,14 +727,13 @@ async def actual_ws_flaky_loopback_throughput(
     try:
         await server.start()
     except ImportError as error:
-        return skipped_metric(f"actual websocket flaky {impl}", f"skipped: {error}")
+        return skipped_metric("actual websocket flaky", f"skipped: {error}")
 
     try:
         provider = EventLoopProvider(loop=asyncio.get_running_loop())
-        pool = ws.build_pool(impl, None, provider)
+        pool = ws.pool_for(PoolRegistry(), provider)
         lease = ws.connect(
             server.url,
-            impl=impl,
             pool=pool,
             options=ConnectionOptions(retry=fast_retry(), provider=provider),
         )
@@ -758,7 +758,7 @@ async def actual_ws_flaky_loopback_throughput(
         lease.event_bus.on(Disconnected, on_disconnected)
         if not await lease.ready(timeout=5.0):
             return skipped_metric(
-                f"actual websocket flaky {impl}",
+                "actual websocket flaky",
                 "skipped: connection did not become ready",
             )
 
@@ -790,8 +790,10 @@ async def actual_ws_flaky_loopback_throughput(
 
         await wait_for(lambda: processed == total, timeout=120.0)
         await wait_for(
-            lambda: connected - connected_before >= cycles
-            and disconnected - disconnected_before >= cycles,
+            lambda: (
+                connected - connected_before >= cycles
+                and disconnected - disconnected_before >= cycles
+            ),
             timeout=120.0,
         )
 
@@ -801,7 +803,7 @@ async def actual_ws_flaky_loopback_throughput(
         tracemalloc.stop()
 
         return metric(
-            f"actual websocket flaky {impl}",
+            "actual websocket flaky",
             total,
             processed,
             0,
@@ -823,7 +825,6 @@ async def actual_ws_flaky_loopback_throughput(
 async def actual_mqtt_broker_throughput(
     total: int,
     url: str,
-    impl: str,
     topic: Optional[str],
 ) -> Metric:
     """Measure a real broker only when the caller provides one explicitly."""
@@ -834,10 +835,9 @@ async def actual_mqtt_broker_throughput(
     try:
         provider = EventLoopProvider(loop=asyncio.get_running_loop())
         retry = fast_retry()
-        pool = mqtt.build_pool(impl, retry, None, provider)
+        pool = mqtt.pool_for(PoolRegistry(), provider)
         lease = mqtt.connect(
             parsed,
-            impl=impl,
             pool=pool,
             options=ConnectionOptions(retry=retry, provider=provider),
         )
@@ -850,7 +850,7 @@ async def actual_mqtt_broker_throughput(
         lease.event_bus.on(MessageReceived, handler)
         if not await lease.ready(timeout=5.0):
             return skipped_metric(
-                f"actual mqtt {impl}",
+                "actual mqtt paho",
                 "skipped: connection did not become ready",
             )
         await lease.subscribe(benchmark_topic)
@@ -873,7 +873,7 @@ async def actual_mqtt_broker_throughput(
         tracemalloc.stop()
 
         return metric(
-            f"actual mqtt {impl}",
+            "actual mqtt paho",
             total,
             processed,
             0,
@@ -883,7 +883,7 @@ async def actual_mqtt_broker_throughput(
             f"broker {parsed.host}:{parsed.port or 1883}, topic {benchmark_topic}",
         )
     except ImportError as error:
-        return skipped_metric(f"actual mqtt {impl}", f"skipped: {error}")
+        return skipped_metric("actual mqtt paho", f"skipped: {error}")
     finally:
         if tracemalloc.is_tracing():
             tracemalloc.stop()
@@ -1103,28 +1103,18 @@ async def run_benchmarks(args: argparse.Namespace) -> List[Metric]:
         await courier_block_backpressure(args.block_messages, args.block_maxsize)
     )
     if args.actual_ws:
-        impls = (
-            ("websockets", "aiohttp")
-            if args.actual_ws_impl == "both"
-            else (args.actual_ws_impl,)
+        metrics.append(await actual_ws_loopback_throughput(args.actual_ws_messages))
+        metrics.append(
+            await actual_ws_flaky_loopback_throughput(
+                args.actual_ws_messages,
+                args.flaky_interval,
+            )
         )
-        for impl in impls:
-            metrics.append(
-                await actual_ws_loopback_throughput(args.actual_ws_messages, impl)
-            )
-            metrics.append(
-                await actual_ws_flaky_loopback_throughput(
-                    args.actual_ws_messages,
-                    impl,
-                    args.flaky_interval,
-                )
-            )
     if args.actual_mqtt_url:
         metrics.append(
             await actual_mqtt_broker_throughput(
                 args.actual_mqtt_messages,
                 args.actual_mqtt_url,
-                args.actual_mqtt_impl,
                 args.actual_mqtt_topic,
             )
         )
@@ -1144,19 +1134,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flaky-interval", type=int, default=DEFAULT_FLAKY_INTERVAL)
     parser.add_argument("--actual-ws", action="store_true")
     parser.add_argument(
-        "--actual-ws-impl",
-        choices=("websockets", "aiohttp", "both"),
-        default="websockets",
-    )
-    parser.add_argument(
         "--actual-ws-messages", type=int, default=DEFAULT_ACTUAL_WS_MESSAGES
     )
     parser.add_argument("--actual-mqtt-url")
-    parser.add_argument(
-        "--actual-mqtt-impl",
-        choices=("aiomqtt", "paho"),
-        default="aiomqtt",
-    )
     parser.add_argument("--actual-mqtt-topic")
     parser.add_argument(
         "--actual-mqtt-messages", type=int, default=DEFAULT_ACTUAL_MQTT_MESSAGES

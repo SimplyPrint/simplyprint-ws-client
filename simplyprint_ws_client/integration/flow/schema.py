@@ -52,7 +52,7 @@ def model_input_schema(
     *,
     values: Optional[Mapping[str, object]] = None,
     prefilled: Optional[Iterable[str]] = None,
-) -> Mapping[str, Any]:
+) -> Dict[str, Any]:
     """The JSON Schema a prompt exposes for the answer object it accepts."""
     schema = copy.deepcopy(model.model_json_schema(mode="validation"))
     properties = schema.get("properties")

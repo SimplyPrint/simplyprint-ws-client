@@ -1,191 +1,166 @@
-To begin using the client library to connect to SimplyPrint create a file `client.py` to define
-your [client](concepts/client.md) class.
+# Build a printer integration
+
+An integration has three explicit pieces:
+
+1. a persisted `PrinterConfig` type;
+2. a `PrinterClient` that translates device state and commands;
+3. one immutable `IntegrationSpec` value that connects the two.
+
+The following can live in a single `client.py` while an integration is small.
 
 ```python
-from simplyprint_ws_client import *
+from __future__ import annotations
+
+from simplyprint_ws_client import (
+    ClientApp,
+    ClientContext,
+    ClientSettings,
+    ConfigManagerType,
+    ConnectedMsg,
+    FileDemandData,
+    GcodeDemandData,
+    IntegrationCapability,
+    IntegrationId,
+    IntegrationSpec,
+    IntegrationTransport,
+    PrinterConfig,
+    PrinterStatus,
+)
+from simplyprint_ws_client.integration import DevicePoller, PrinterClient
+from simplyprint_ws_client.integration.discovery import DiscoveryService
+from simplyprint_ws_client.integration.spec import ProductMetadata
 
 
-class MyPrinterClient(Client[PrinterConfig]):
+class MyPrinterConfig(PrinterConfig):
+    address: str | None = None
+    serial: str | None = None
+
+    def hardware_identity(self) -> str | None:
+        return self.serial
+
+    def network_addresses(self) -> tuple[str, ...]:
+        return (self.address,) if self.address else ()
+
+
+class MyPrinterClient(PrinterClient[MyPrinterConfig]):
+    def __init__(
+        self,
+        config: MyPrinterConfig,
+        *,
+        context: ClientContext,
+    ) -> None:
+        super().__init__(config, context=context)
+        self.printer.set_info("My Printer", "0.1.0")
+        self.printer.tool_count = 1
+        # Replace this polling driver with WsDriver or MqttDriver for a device
+        # that pushes state.
+        self.driver = self.attach_driver(
+            DevicePoller(self, interval=1.0, offline_after=10.0)
+        )
+
+    async def poll_device(self) -> None:
+        # Read your device API here, then update the neutral printer state.
+        self.printer.bed.temperature.actual = 22.0
+        self.printer.tool0.temperature.actual = 24.0
+        self.apply_status(PrinterStatus.OPERATIONAL)
+
+    async def on_connected(self, _message: ConnectedMsg) -> None:
+        print("Connected to SimplyPrint; setup code:", self.config.short_id)
+
+    async def on_gcode(self, data: GcodeDemandData) -> None:
+        print("Execute G-code on the device:", data.list)
+
+    async def on_file(self, data: FileDemandData) -> None:
+        print("Download and prepare this file:", data)
+
+
+INTEGRATION = IntegrationSpec(
+    id=IntegrationId("my-printer"),
+    client_factory=MyPrinterClient,
+    config_factory=MyPrinterConfig,
+    metadata=ProductMetadata(
+        display_name="My Printer",
+        image_url="/img/my-printer.png",
+        supported_transports=(IntegrationTransport.HTTP,),
+        capabilities=(IntegrationCapability.FILE_UPLOAD,),
+    ),
+)
+```
+
+`PrinterClient` declares the typed command hooks (`on_gcode`, `on_file`,
+`on_pause`, `on_resume`, `on_cancel`, and the other supported demands). The
+runtime registers that fixed contract explicitly; arbitrary method names and
+annotations do not create listeners.
+
+Every device driver must be attached in the concrete client's constructor,
+after `super().__init__()`, with `self.attach_driver(driver)`. Construction is
+the only driver-registration phase: there is no `device_drivers()` discovery
+hook and drivers added later miss the client's owned lifecycle. The read-only
+`client.drivers` tuple is available for inspection; retain the return value from
+`attach_driver()` when brand code needs to send through a particular driver.
+
+## Run and persist the integration
+
+Pass the integration value to `ClientSettings`. JSON storage keeps the same
+printer slot across restarts.
+
+```python
+def main() -> None:
+    settings = ClientSettings(
+        integrations=(INTEGRATION,),
+        name="my-printers",
+        config_manager_t=ConfigManagerType.JSON,
+    )
+    app = ClientApp(
+        settings,
+        discovery_service=DiscoveryService(),
+        account_providers={},
+    )
+
+    stored = app.config_manager.get_all()
+    if stored:
+        config = stored[0]
+    else:
+        config = MyPrinterConfig.get_new()
+        config.address = "http://192.168.1.42"
+
+    client = app.add(config)
+    print(client.config)
+    app.run_blocking()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+With one integration, `app.add(config)` and `app.get_config_manager()` are
+unambiguous. A process hosting several integrations must pass the exact id:
+
+```python
+app.add(config, integration_id="my-printer")
+manager = app.get_config_manager(integration_id="my-printer")
+```
+
+No config-class or inheritance matching is performed.
+
+## Push-based devices
+
+For a device that publishes updates, attach a `WsDriver` or `MqttDriver` in
+`__init__` exactly like the poller above, then implement the typed device edges:
+
+```python
+async def on_device_connected(self, driver) -> None:
+    self.apply_status(PrinterStatus.OPERATIONAL)
+
+async def on_device_disconnected(self, driver, reason) -> None:
+    self.apply_status(PrinterStatus.OFFLINE)
+
+async def on_device_message(self, message, driver) -> None:
+    # Decode the brand payload and update self.printer.
     ...
 ```
 
-Every client has an associated configuration that is saved automatically you can either use the builtin `PrinterConfig`
-class or extend it to store more data for your printer client, for now we will use the builtin config class.
-
-To use your Printer Client class you must create a `ClientApp` instance, typically you would want this to also
-be the entrypoint to your python script, so we put it in the `__main__` block (only run it when executed directly).
-
-```python
-from simplyprint_ws_client import *
-
-...  # your client definition here
-
-if __name__ == '__main__':
-    client_settings = ClientSettings(MyPrinterClient, PrinterConfig)
-    client_app = ClientApp(client_settings)
-    client_app.run_blocking()
-```
-
-If you run your `client.py` file now, nothing happens! Use CTRL+C to stop the client.
-
-We haven't yet added any client to our app instance. To add a client we called the `add` method on the `client_app` instance with a new configuration.
-
-
-```python
-from simplyprint_ws_client import *
-
-...  # your client definition here
-
-if __name__ == '__main__':
-    client_settings = ClientSettings(MyPrinterClient, PrinterConfig)
-    client_app = ClientApp(client_settings)
-    my_client = client_app.add(PrinterConfig.get_new())
-    print(my_client.config)
-    client_app.run_blocking()
-```
-
-This now outputs a new empty configuration!
-
-```bash
-$ python client.py
-PrinterConfig(id=0, token='0', name=None, in_setup=None, short_id=None, public_ip=None, unique_id='04be1d2a-248c-425d-a08f-d5892287b288')
-CTRL+C
-```
-
-But there is an issue, everytime we restart the application we get a new configuration, we would really like to persist the configuration we create between runs. So lets do that.
-
-```python
-from simplyprint_ws_client import *
-
-...  # your client definition here
-
-if __name__ == '__main__':
-    client_settings = ClientSettings(
-        MyPrinterClient, 
-        PrinterConfig, 
-        config_manager_t=ConfigManagerType.JSON # save the configuration to a JSON file
-    )
-    client_app = ClientApp(client_settings)
-    
-    # Check if we already have added a client.
-    if len(client_app.config_manager.get_all()) > 0:
-        my_config = client_app.config_manager.get_all()[0]
-    else:
-        my_config = PrinterConfig.get_new()
-        
-    my_client = client_app.add(my_config)
-    print(my_client.config)
-    client_app.run_blocking()
-```
-
-Suddenly now our unique id is the same, and the config has some additional values it received from SimplyPrint on our second run.
-
-```bash
-$ python client.py
-PrinterConfig(id=0, token='0', name=None, in_setup=None, short_id=None, public_ip=None, unique_id='08086eeb-812b-4bda-9159-99852aff509b')
-CTRL+C
-$ python client.py
-PrinterConfig(id=0, token='595a482a-745f-41a6-88c7-1402cffa1e9c', name=None, in_setup=True, short_id='9ZZM', public_ip=None, unique_id='08086eeb-812b-4bda-9159-99852aff509b')
-CTRL+C
-```
-
-Already at this point our printer client has been recognized by SimplyPrint, and we could follow the [setup guide](https://simplyprint.io/setup-guide) and add the printer to SimplyPrint with the `short_id` as the setup code.
-
-But most likely we also want to be able to both send and receive some messages to be able to do something interesting. So lets extend our MyPrinterClient:
-
-```python
-from simplyprint_ws_client import *
-
-
-class MyPrinterClient(Client[PrinterConfig]):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Set basic information
-        self.printer.set_info('MyPrinterClient', "0.0.1")
-        self.printer.nozzle_count = 1
-        self.printer.material_count = 1
-        self.printer.populate_info_from_physical_machine()
-
-    def on_connected(self, msg: ConnectedMsg):
-        print("Connected to SimplyPrint! Setup code is: ", msg.data.short_id)
-
-    def on_gcode(self, data: GcodeDemandData):
-        print("Got GCODE from SimplyPrint to run", data.list)
-
-    def on_file(self, data: FileDemandData):
-        print("Got file to start from SimplyPrint", data)
-
-# main entrypoint code below
-```
-
-Here we have added some functions prefixed with `on_` that handle some common messages and demands from SimplyPrint, see [messages](concepts/messages.md) for an exhaustive overview.
-
-How to extend this to be able to receive updates from my printer?
-```python
-from simplyprint_ws_client import *
-
-# Custom logic to talk with printer in another class
-class CustomPrinterConnection:
-    def __init__(self, url):
-        self.url = url
-        
-    ... # logic to talk with printer
-    
-    def get_printer_status(self) -> PrinterStatus:
-        my_status = "custom_printing"
-        
-        if my_status == "custom_printing":
-            return PrinterStatus.PRINTING
-        else:
-            return PrinterStatus.OPERATIONAL
-
-    def get_bed_temperature(self) -> float:
-        ...
-    
-    def get_bed_target_temperature(self) -> float:
-        ...
-
-# Custom config class that extends base config class
-# to store custom data
-class MyPrinterConfig(PrinterConfig):
-    my_printer_url: str | None = None
-
-# Extend client class to hold instance of custom printer connection
-# and use the custom config.
-class MyPrinterClient(Client[MyPrinterConfig]): # Specify custom config
-    printer_connection: CustomPrinterConnection
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        ... # other basic setup
-        self.printer_connection = CustomPrinterConnection(self.config.my_printer_url)
-    
-    ... # messages handlers
-
-    async def tick(self, _):
-        # Update SimplyPrint printer state by setting fields on the printer-state field.
-        self.printer.status = self.printer_connection.get_printer_status()
-        self.printer.bed_temperature.actual = self.printer_connection.get_bed_temperature()
-        self.printer.bed_temperature.target = self.printer_connection.get_bed_target_temperature()
-        ... # Etc.
-
-# Updated to use MyPrinterConfig instead of generic config.
-if __name__ == '__main__':
-    client_settings = ClientSettings(
-        MyPrinterClient,
-        MyPrinterConfig,
-        config_manager_t=ConfigManagerType.JSON
-    )
-    client_app = ClientApp(client_settings)
-
-    if len(client_app.config_manager.get_all()) > 0:
-        my_config = client_app.config_manager.get_all()[0]
-    else:
-        my_config = MyPrinterConfig.get_new()
-        my_config.my_printer_url = "per printer setup here"
-
-    my_client = client_app.add(my_config)
-    client_app.run_blocking()
-```
-
-We have added a lot of logic, but it all boils down to we now connect our `CustomPrinterConnection` with the SimplyPrint `MyPrinterClient` class and store some extra information we can use on start up in `MyPrinterConfig`
+For discovery, guided onboarding, cameras, accounts, or background services,
+set the corresponding optional field on `IntegrationSpec`. See
+[`example/headless_vendor.py`](../example/headless_vendor.py) for a complete
+headless composition with discovery and an add-printer flow.

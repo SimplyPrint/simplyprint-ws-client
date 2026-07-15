@@ -1,6 +1,7 @@
 """Test Temperature state + index based state producer rules with * as index."""
 
-from simplyprint_ws_client import Client, TemperatureMsg
+from simplyprint_ws_client import Client
+from simplyprint_ws_client.core.protocol.messages import TemperatureMsg
 
 
 def test_tool0_temperature(client: Client):

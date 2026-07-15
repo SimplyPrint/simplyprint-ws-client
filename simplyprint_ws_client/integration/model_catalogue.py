@@ -6,10 +6,9 @@ This is the brand-agnostic seam between "what model is this printer?" and the
 surfaces that consume the answer -- the printer-card presentation, the
 discovery candidate dict, and the onboarding model picker. Each integration
 exposes one concrete :class:`ModelCatalogue` through
-:meth:`simplyprint_ws_client.integration.spec.PrinterSpec.model_catalogue`; the
-base ``PrinterSpec`` defaults to ``None`` (no catalogue / single-model), so
-surfaces ask ``spec.model_catalogue() is not None`` or
-``spec.provides("model_catalogue")`` before using it.
+:attr:`simplyprint_ws_client.integration.spec.IntegrationSpec.model_catalogue`;
+the field defaults to ``None`` (no catalogue / single-model), so
+surfaces simply skip a ``None`` result.
 
 Two generic, reusable implementations ship here:
 
@@ -140,7 +139,11 @@ class RowModelCatalogue(ModelCatalogue):
         # (an int). Resolve each id to its product-photo URL here so the picker
         # gets usable image URLs, not raw ids.
         resolved_rows = [
-            (row[0], row[1], self._image_url_for(row[2]) if row[2] is not None else None)
+            (
+                row[0],
+                row[1],
+                self._image_url_for(row[2]) if row[2] is not None else None,
+            )
             for row in self._rows
         ]
         return ModelChoiceCatalog.from_rows(resolved_rows, unknown=self._unknown_label)
@@ -188,10 +191,11 @@ class EnumModelCatalogue(ModelCatalogue):
 
     ``sp_model_ids`` maps each enum member to its SimplyPrint model id (the
     product photo resolver). ``resolver`` maps a device-reported string to an
-    enum member (e.g. Bambu's ``get_device_type_from_dev_name``); if absent,
-    :meth:`resolve` falls back to ``enum_cls.from_model_id``. ``unknown_value``
-    is the enum's ``Unknown`` member ``.value`` so the ``is it set?`` check is
-    uniform across row and enum brands.
+    enum member and ``label`` maps a member to its human name. Both functions
+    are explicit integration dependencies: the catalogue never guesses method
+    names or falls back to enum construction. ``unknown_value`` is the enum's
+    unknown member value so the ``is it set?`` check is uniform across row and
+    enum brands.
     """
 
     def __init__(
@@ -199,7 +203,8 @@ class EnumModelCatalogue(ModelCatalogue):
         enum_cls,
         sp_model_ids: dict,
         *,
-        resolver: Optional[Callable[[Optional[str]], object]] = None,
+        resolver: Callable[[Optional[str]], object | None],
+        label: Callable[[object], str],
         unknown_value: Optional[str] = None,
         image_url_for: Optional[Callable[[int], str]] = None,
         unknown: str = UNKNOWN_MODEL_LABEL,
@@ -207,6 +212,7 @@ class EnumModelCatalogue(ModelCatalogue):
         self._enum_cls = enum_cls
         self._sp_model_ids = dict(sp_model_ids)
         self._resolver = resolver
+        self._label = label
         self._image_url_for = image_url_for or _default_image_url
         self._unknown_label = unknown
         if unknown_value is not None:
@@ -225,11 +231,10 @@ class EnumModelCatalogue(ModelCatalogue):
             (
                 member
                 for member in self._enum_cls
-                if member.name != "Unknown"
                 if not _is_unknown_value(member.value, self.unknown_value)
             ),
             value=lambda member: str(member.value),
-            label=lambda member: _enum_label(member),
+            label=self._label,
             image=lambda member: self._member_image(member),
             unknown=self._unknown_label,
         )
@@ -238,7 +243,7 @@ class EnumModelCatalogue(ModelCatalogue):
         member = self._member(value)
         if member is None or _is_unknown_value(member.value, self.unknown_value):
             return None
-        return _enum_label(member)
+        return self._label(member)
 
     def image_url(self, value: Optional[str]) -> Optional[str]:
         member = self._member(value)
@@ -249,15 +254,7 @@ class EnumModelCatalogue(ModelCatalogue):
         return self._image_url_for(model_id) if model_id is not None else None
 
     def resolve(self, device_string: Optional[str]) -> Optional[str]:
-        if self._resolver is not None:
-            member = self._resolver(device_string)
-        elif hasattr(self._enum_cls, "from_model_id"):
-            member = self._enum_cls.from_model_id(device_string)
-        else:
-            try:
-                member = self._enum_cls(device_string)
-            except ValueError:
-                member = None
+        member = self._resolver(device_string)
         if member is None:
             return None
         if _is_unknown_value(member.value, self.unknown_value):
@@ -265,9 +262,6 @@ class EnumModelCatalogue(ModelCatalogue):
         return str(member.value)
 
 
-# --------------------------------------------------------------------------- #
-# Internal helpers
-# --------------------------------------------------------------------------- #
 # The product-photo URL scheme is owned by the integration (it knows its web
 # path layout). The library catalogue resolves the *id*; the integration
 # supplies the URL builder via the ``image_url_for`` constructor param. This
@@ -275,15 +269,9 @@ class EnumModelCatalogue(ModelCatalogue):
 # catalogue is self-contained for tests and third-party use; the SimplyPrint
 # app passes its own ``model_image_url`` to stay consistent with its assets.
 
+
 def _default_image_url(model_id: int) -> str:
     return f"/img/pimg/{model_id}.webp"
-
-
-def _enum_label(member) -> str:
-    get_name = getattr(member, "get_name", None)
-    if callable(get_name):
-        return get_name()
-    return str(member.value)
 
 
 def _is_unknown_value(value, unknown_value: str) -> bool:
