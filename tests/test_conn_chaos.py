@@ -20,9 +20,6 @@ What each region pins (the engine's contract, read straight off ``reconnect.py``
   supervised attempt (a wire that fails a write is dead or dying);
 * ``open`` hanging -> bounded by ``open_timeout``; a timeout is a failed attempt;
 * ``aclose`` raising -> swallowed by ``teardown``; supervision survives it;
-* ``RetryPolicy`` ``max_attempts`` / ``give_up_after`` exhaustion -> the loop stops,
-  stays ``DISCONNECTED``, ``supervising()`` is ``False``, and a lease's
-  ``ready()`` resolves ``False``;
 * ``FatalError`` vs ``TransientError`` -> both keep retrying, both ride through to
   ``Disconnected.code``;
 * generation bumps exactly once per *established* attempt, and ``Disconnected``
@@ -361,24 +358,18 @@ async def test_write_raising_propagates_to_send_caller_and_trips_the_link():
 
 
 @pytest.mark.asyncio
-async def test_send_raises_not_connected_before_open_and_after_giveup():
-    """send() refuses when there is no live wire (never started; gave up)."""
-    wire = make_wire(open_script=[TransientError("x")] * 50)  # never connects
-    wire.policy = RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2)
+async def test_send_raises_not_connected_before_start_and_after_stop():
+    wire = make_wire()
 
     # Never started: no wire at all.
     with pytest.raises(NotConnected):
         await wire.send("nope")
 
     wire.start()
-    try:
-        await wait_for(lambda: not wire.supervising())
-        # Gave up: still no live wire, so send still refuses.
-        with pytest.raises(NotConnected):
-            await wire.send("still-nope")
-        assert wire.writes == 0  # write() never even reached
-    finally:
-        await wire.stop()
+    await wait_for(lambda: wire.connected)
+    await wire.stop()
+    with pytest.raises(NotConnected):
+        await wire.send("still-nope")
 
 
 # --------------------------------------------------------------------------- #
@@ -448,101 +439,7 @@ async def test_state_is_disconnected_after_stop_from_live_wire():
 
 
 # --------------------------------------------------------------------------- #
-# RetryPolicy exhaustion: max_attempts and give_up_after.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_max_attempts_exhaustion_stays_disconnected():
-    """max_attempts caps failed attempts; the loop gives up and stays down."""
-    downs: List[Any] = []
-    wire = make_wire(
-        open_script=[TransientError(f"f{i}") for i in range(10)],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=3),
-    )
-    wire.events.on(Disconnected, lambda e: downs.append(e))
-    wire.start()
-    try:
-        await wait_for(lambda: not wire.supervising())
-
-        assert wire.gave_up is True
-        assert wire.supervising() is False
-        assert wire.connected is False
-        assert wire.state is ConnectionState.DISCONNECTED
-        # Exactly one Disconnected per failed attempt up to the cap.
-        assert len(downs) == 3
-        assert all(isinstance(d.code, TransientError) for d in downs)
-        assert wire.opens == 3  # no further attempts after give-up
-
-        # No live wire ever existed, so generation never advanced.
-        assert wire.generation == 0
-        assert all(d.generation == 0 for d in downs)
-
-        # The give-up is sticky across loop turns.
-        await asyncio.sleep(0.02)
-        assert wire.opens == 3
-        assert not wire.supervising()
-    finally:
-        await wire.stop()
-
-
-@pytest.mark.asyncio
-async def test_give_up_after_deadline_exhaustion_stays_disconnected():
-    """give_up_after caps wall-clock; the loop gives up and stays DISCONNECTED."""
-    downs: List[Any] = []
-    # backoff of 0.05s with a 0.12s deadline: the loop can only afford a couple
-    # of retries before elapsed+delay crosses the deadline.
-    wire = make_wire(
-        open_script=[TransientError(f"f{i}") for i in range(100)],
-        policy=RetryPolicy(backoff=ConstantBackoff(0.05), give_up_after=0.12),
-    )
-    wire.events.on(Disconnected, lambda e: downs.append(e))
-    wire.start()
-    try:
-        await wait_for(lambda: not wire.supervising(), timeout=3.0)
-
-        assert wire.gave_up is True
-        assert wire.connected is False
-        assert wire.state is ConnectionState.DISCONNECTED
-        assert len(downs) >= 1
-        assert all(isinstance(d.code, TransientError) for d in downs)
-
-        opens_at_giveup = wire.opens
-        await asyncio.sleep(0.2)
-        assert wire.opens == opens_at_giveup  # no more attempts after the deadline
-    finally:
-        await wire.stop()
-
-
-@pytest.mark.asyncio
-async def test_giveup_resets_after_a_successful_connect():
-    """A success resets the attempt bookkeeping so a later drop retries afresh."""
-    # Fail twice, then succeed; with max_attempts=3 a naive (non-resetting) counter
-    # would give up after the post-connect drop. The engine resets on connect, so
-    # it must reconnect again instead of giving up.
-    downs: List[Any] = []
-    wire = make_wire(
-        open_script=[TransientError("a"), TransientError("b")],  # then success
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=3),
-    )
-    wire.events.on(Disconnected, lambda e: downs.append(e))
-    wire.start()
-    try:
-        await wait_for(lambda: wire.generation == 1 and wire.connected)
-        assert len(downs) == 2  # the two failed opens
-
-        # Drop the live wire; because the attempt counter reset on connect, the
-        # loop has its full budget again and reconnects (does not give up).
-        wire.inbox.put_nowait(TransientError("post-connect drop"))
-        await wait_for(lambda: wire.generation == 2 and wire.connected)
-        assert wire.supervising() is True
-        assert wire.gave_up is False
-    finally:
-        await wire.stop()
-
-
-# --------------------------------------------------------------------------- #
-# Generation accounting: exactly one bump per established attempt.
+# Repeated failures never terminate supervision.
 # --------------------------------------------------------------------------- #
 
 
@@ -702,27 +599,6 @@ async def test_start_is_idempotent_no_double_supervisor():
 # --------------------------------------------------------------------------- #
 # Lease integration: ready() resolves False on a permanent give-up.
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_lease_ready_false_when_transport_gives_up():
-    """A lease over a giving-up transport resolves ready() to False, not hang."""
-    wire = make_wire(
-        open_script=[TransientError(f"f{i}") for i in range(10)],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2),
-    )
-    pool = Pool(
-        build=lambda url, params: wire,
-        key=lambda url, params: "k",
-        provider=current_provider(),
-    )
-    lease = pool.connect(wire.url)
-
-    waiter = asyncio.ensure_future(lease.ready(timeout=2.0))
-
-    assert await waiter is False  # terminal give-up resolves ready() False
-    assert not wire.supervising()
-    await wire.stop()
 
 
 @pytest.mark.asyncio
@@ -935,64 +811,7 @@ async def test_message_received_carries_live_generation_and_drop_matches():
 
 
 # --------------------------------------------------------------------------- #
-# max_attempts boundary: 1 means "give up after the first failed attempt".
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_max_attempts_one_gives_up_after_a_single_failure():
-    """max_attempts=1 stops after exactly one failed open with one Disconnected."""
-    downs: List[Any] = []
-    wire = make_wire(
-        open_script=[TransientError("only-try")] * 5,
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=1),
-    )
-    wire.events.on(Disconnected, lambda e: downs.append(e))
-    wire.start()
-    try:
-        await wait_for(lambda: not wire.supervising())
-        assert wire.opens == 1  # gave up immediately after the first failure
-        assert wire.gave_up is True
-        assert wire.connected is False
-        assert wire.generation == 0  # never established
-        assert len(downs) == 1
-        assert isinstance(downs[0].code, TransientError)
-        assert downs[0].generation == 0
-        assert wire.state is ConnectionState.DISCONNECTED
-    finally:
-        await wire.stop()
-
-
-# --------------------------------------------------------------------------- #
-# After a permanent give-up, ready() resolves False even when called fresh
-# (the wait must not hang against a dead supervisor), and state is read True.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_lease_ready_false_when_called_after_giveup_already_happened():
-    """A ready() entered *after* the engine already gave up resolves False at once."""
-    wire = make_wire(
-        open_script=[TransientError(f"f{i}") for i in range(10)],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2),
-    )
-    pool = Pool(
-        build=lambda url, params: wire,
-        key=lambda url, params: "k",
-        provider=current_provider(),
-    )
-    lease = pool.connect(wire.url)
-    await wait_for(lambda: not wire.supervising())
-
-    # The give-up already happened and no future Connected/Disconnected will fire.
-    # ready() must short-circuit on the dead supervisor rather than block forever.
-    assert await lease.ready(timeout=1.0) is False
-    await wire.stop()
-
-
-# --------------------------------------------------------------------------- #
-# Cancellation parked in teardown's aclose: stop() during a slow aclose must
-# still cancel cleanly and leave no leaked task.
+# Cancellation and restart boundaries.
 # --------------------------------------------------------------------------- #
 
 
@@ -1145,96 +964,6 @@ async def test_stop_immediately_after_start_before_connect_leaks_nothing():
 # --------------------------------------------------------------------------- #
 # A restart after a permanent give-up: start() clears the give-up flag and the
 # supervisor runs again (the policy bookkeeping is per-run, not sticky).
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_start_after_giveup_resumes_supervision():
-    """After giving up, a fresh start() re-arms the loop and can reconnect."""
-    wire = make_wire(
-        open_script=[TransientError("a"), TransientError("b")],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2),
-    )
-    wire.start()
-    try:
-        await wait_for(lambda: not wire.supervising())
-        assert wire.gave_up is True
-        assert wire.opens == 2
-
-        # The next attempt index (>= len(open_script)) succeeds, so a fresh start()
-        # must clear gave_up and bring the wire up.
-        wire.start()
-        await wait_for(lambda: wire.connected)
-        assert wire.gave_up is False
-        assert wire.supervising() is True
-        assert wire.generation == 1
-    finally:
-        await wire.stop()
-
-
-@pytest.mark.asyncio
-async def test_generation_is_monotonic_across_giveup_then_restart():
-    """A connect, drop-to-giveup, then restart never rewinds the generation epoch.
-
-    ``generation`` is a monotonic connection epoch -- it must keep counting up
-    across a permanent give-up and a later restart, never reset to a value a stale
-    waiter could mistake for a fresh link.
-    """
-    # Open #0 succeeds; every later open fails. With max_attempts=2 the post-drop
-    # recovery exhausts the budget and gives up after one live link (gen 1).
-    wire = make_wire(
-        open_script=[None, TransientError("d1"), TransientError("d2")],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2),
-    )
-    wire.start()
-    try:
-        await wait_for(lambda: wire.connected and wire.generation == 1)
-        wire.inbox.put_nowait(TransientError("drop into giveup"))
-        await wait_for(lambda: not wire.supervising())
-        assert wire.generation == 1  # the give-up did not advance or rewind it
-
-        # Allow success again and restart: the next epoch must be 2, not 1.
-        wire.open_script = [None]
-        wire.opens = 0  # the success branch reads index 0 -> None (connects)
-        wire.start()
-        await wait_for(lambda: wire.connected)
-        assert wire.generation == 2  # strictly continues from the prior epoch
-    finally:
-        await wire.stop()
-
-
-# --------------------------------------------------------------------------- #
-# ready(timeout=None) against a permanent give-up must resolve False, not hang
-# forever waiting on a Connected that will never come.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_lease_ready_no_timeout_resolves_false_on_giveup():
-    """ready() with no timeout still resolves False when the engine gives up."""
-    wire = make_wire(
-        open_script=[TransientError(f"f{i}") for i in range(10)],
-        policy=RetryPolicy(backoff=ConstantBackoff(0), max_attempts=2),
-    )
-    pool = Pool(
-        build=lambda url, params: wire,
-        key=lambda url, params: "k",
-        provider=current_provider(),
-    )
-    lease = pool.connect(wire.url)
-
-    waiter = asyncio.ensure_future(lease.ready())  # timeout=None
-
-    # An outer guard ensures a regression that hangs fails loudly instead of
-    # stalling the suite forever.
-    assert await asyncio.wait_for(waiter, timeout=3.0) is False
-    assert not wire.supervising()
-    await wire.stop()
-
-
-# --------------------------------------------------------------------------- #
-# Closing a lease while one of its async handlers is parked mid-coroutine does not
-# leak a lease-owned delivery task; delivery is the caller's awaited EventBus emit.
 # --------------------------------------------------------------------------- #
 
 

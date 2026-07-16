@@ -11,6 +11,7 @@ from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_fut
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.wire import mqtt
+from simplyprint_ws_client.wire import paho as paho_wire
 from simplyprint_ws_client.wire.events import WireEvent
 from simplyprint_ws_client.wire.options import WireKeepalive
 from simplyprint_ws_client.wire.pool import Pool
@@ -101,6 +102,10 @@ class LoopBoundTransport(Transport):
 
     async def send(self, message: object) -> None:
         return None
+
+    def trip(self, generation: int, reason: Exception) -> None:
+        if generation == self.generation:
+            self.state = ConnectionState.DISCONNECTED
 
 
 class GatedStartTransport(LoopBoundTransport):
@@ -280,13 +285,14 @@ async def test_registry_close_finishes_after_caller_cancellation() -> None:
 
 class QuietPahoClient:
     def __init__(self) -> None:
-        self.on_pre_connect = None
         self.on_connect = None
-        self.on_connect_fail = None
+        self.on_subscribe = None
         self.on_message = None
         self.on_disconnect = None
-        self.stops = 0
-        self.stop_thread: Optional[str] = None
+        self.loop_entered = threading.Event()
+        self.loop_exit = threading.Event()
+        self.loop_returned = threading.Event()
+        self.disconnects = 0
 
     def username_pw_set(self, username, password) -> None:
         return None
@@ -294,16 +300,15 @@ class QuietPahoClient:
     def connect_async(self, host, port, keepalive) -> None:
         return None
 
-    def loop_start(self) -> int:
-        return 0
-
-    def loop_stop(self) -> int:
-        self.stops += 1
-        self.stop_thread = threading.current_thread().name
-        return 0
+    def loop_forever(self, timeout=1.0, retry_first_connection=False) -> int:
+        self.loop_entered.set()
+        self.loop_exit.wait()
+        self.loop_returned.set()
+        return 4
 
     def disconnect(self) -> None:
-        return None
+        self.disconnects += 1
+        self.loop_exit.set()
 
     def is_connected(self) -> bool:
         return False
@@ -318,12 +323,15 @@ class BlockingStopPahoClient(QuietPahoClient):
 
     def disconnect(self) -> None:
         self.calls.append("disconnect")
+        super().disconnect()
 
-    def loop_stop(self) -> int:
-        self.calls.append("loop_stop")
+    def loop_forever(self, timeout=1.0, retry_first_connection=False) -> int:
+        self.loop_entered.set()
+        self.loop_exit.wait()
         self.stop_entered.set()
         self.stop_release.wait()
-        return super().loop_stop()
+        self.loop_returned.set()
+        return 4
 
 
 async def _install_paho_pool(registry, client: QuietPahoClient):
@@ -347,13 +355,13 @@ async def test_registry_stops_live_paho_after_owner_loop_has_closed(
     pool, lease = await await_concurrent_future(
         owner.submit(_install_paho_pool(registry, client))
     )
+    assert client.loop_entered.wait(1)
     owner.stop()
 
     await registry.close()
 
-    assert client.stops == 1
-    assert client.stop_thread is not None
-    assert client.stop_thread != "stopped-paho-owner"
+    assert client.disconnects == 1
+    assert client.loop_returned.is_set()
     await lease.close()
 
 
@@ -369,6 +377,7 @@ async def test_last_paho_lease_keeps_owner_loop_responsive_during_slow_stop(
     provider = EventLoopProvider(asyncio.get_running_loop())
     pool = mqtt.pool_for(registry, provider, WireKeepalive(interval=20))
     lease = mqtt.connect("mqtt://printer", pool=pool)
+    assert await asyncio.to_thread(client.loop_entered.wait, 1)
 
     close_task = asyncio.create_task(lease.close())
     try:
@@ -389,8 +398,30 @@ async def test_last_paho_lease_keeps_owner_loop_responsive_during_slow_stop(
         client.stop_release.set()
         await close_task
 
-    assert client.calls == ["disconnect", "loop_stop"]
-    assert client.stops == 1
-    assert client.stop_thread is not None
-    assert client.stop_thread != threading.current_thread().name
+    assert client.calls == ["disconnect"]
+    assert client.disconnects == 1
+    assert client.loop_returned.is_set()
+    assert pool.endpoints == {}
+
+
+@pytest.mark.asyncio
+async def test_stuck_paho_worker_cannot_block_transport_shutdown(
+    monkeypatch,
+) -> None:
+    client = BlockingStopPahoClient()
+    monkeypatch.setattr(
+        mqtt, "default_paho_client", lambda _url, _logger, **_kwargs: client
+    )
+    monkeypatch.setattr(paho_wire, "WORKER_SHUTDOWN_TIMEOUT", 0.01)
+    provider = EventLoopProvider(asyncio.get_running_loop())
+    pool = mqtt.pool_for(PoolRegistry(), provider, WireKeepalive(interval=20))
+    lease = mqtt.connect("mqtt://printer", pool=pool)
+    assert await asyncio.to_thread(client.loop_entered.wait, 1)
+
+    try:
+        await asyncio.wait_for(lease.close(), timeout=0.2)
+        assert client.stop_entered.is_set()
+    finally:
+        client.stop_release.set()
+
     assert pool.endpoints == {}

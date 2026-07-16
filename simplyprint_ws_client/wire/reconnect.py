@@ -9,8 +9,7 @@ counter, state, and the lifecycle events. There is no separate "link" object; th
 hooks are methods on the concrete transport, so a wire is one class top to bottom.
 
 The loop always keeps retrying. The :class:`~simplyprint_ws_client.wire.policy.RetryPolicy`
-only decides the pace and, optionally, when to give up entirely -- at which point
-the loop stops and the transport stays ``DISCONNECTED``. ``open`` and ``recv`` may
+only decides the pace. ``open`` and ``recv`` may
 raise to end an attempt; the kind of exception is carried through to
 ``Disconnected.code`` but never changes the decision to retry.
 """
@@ -56,8 +55,7 @@ class Reconnecting(Transport):
     backoff, and streams :meth:`recv` as :class:`MessageReceived` until the wire
     drops. On any drop it tears the wire down with :meth:`aclose`, goes
     ``DISCONNECTED`` with a :class:`Disconnected` tagged by the failure, then backs
-    off and retries -- unless the policy's give-up bound is exhausted, in which case
-    it stops and stays ``DISCONNECTED``.
+    off and tries again until :meth:`stop` is called.
     """
 
     #: Default bound on one :meth:`open` attempt. Wire libraries bound their
@@ -87,7 +85,6 @@ class Reconnecting(Transport):
         self.logger = logger or logging.getLogger("wire.reconnect")
         self.live = False
         self.stopped = False
-        self.gave_up = False
         self.task: Optional[asyncio.Task] = None
         #: Armed while an attempt's consume loop runs; a failed send sets it via
         #: :meth:`trip` so the attempt ends even when recv never gets to raise.
@@ -122,15 +119,13 @@ class Reconnecting(Transport):
         return self.state is ConnectionState.CONNECTED and self.live
 
     def supervising(self) -> bool:
-        """``True`` while the loop will still try to reconnect; ``False`` once it
-        has permanently given up (retry policy exhausted), been stopped, or its
-        supervision task has otherwise finished.
+        """``True`` while the loop will still try to reconnect.
 
         The last clause keeps the answer honest if the task dies for a reason the
         flags do not capture -- e.g. a wire hook that violates the contract by
         raising :class:`asyncio.CancelledError` itself. A finished task is not
         going to reconnect, so a waiter must not believe one is still in flight."""
-        if self.gave_up or self.stopped:
+        if self.stopped:
             return False
         return self.task is None or not self.task.done()
 
@@ -138,7 +133,6 @@ class Reconnecting(Transport):
         if self.task is not None and not self.task.done():
             return
         self.stopped = False
-        self.gave_up = False
         loop = self.provider.event_loop
 
         def spawn() -> None:
@@ -236,7 +230,6 @@ class Reconnecting(Transport):
         once -- on a successful open -- so every :class:`Connected` and
         :class:`MessageReceived` for that link shares one epoch.
         """
-        attempt = self.policy.attempt()
         try:
             while not self.stopped:
                 await self.mark_connecting()
@@ -257,7 +250,7 @@ class Reconnecting(Transport):
                     self._trip_reason = None
                     self._tripped = asyncio.Event()
                     await self.mark_connected()
-                    attempt.reset()
+                    self.policy.reset()
                     await self.consume()
                 except asyncio.CancelledError:
                     raise
@@ -272,19 +265,10 @@ class Reconnecting(Transport):
                 if self.stopped:
                     break
 
-                # Decide whether to retry *before* announcing the drop, so the
-                # Disconnected a waiter sees already carries the terminal verdict
-                # (``supervising()`` is False on a give-up).
-                delay = attempt.next_delay()
-                self.gave_up = delay is None
                 await self.mark_disconnected(code)
-
-                if delay is None:
-                    self.logger.debug("wire %s gave up retrying", self.url)
-                    break
-                await asyncio.sleep(delay)
+                await asyncio.sleep(self.policy.delay())
         finally:
-            # A stopped or given-up link has no live wire -- settle the public
+            # A stopped link has no live wire -- settle the public
             # state to DISCONNECTED on EVERY exit, including a stop() that cancels
             # this task mid-open or mid-recv (the cancellation re-raises past the
             # loop body, so this finally is the only spot that always runs).

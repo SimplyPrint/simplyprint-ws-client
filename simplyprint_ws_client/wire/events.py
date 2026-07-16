@@ -1,10 +1,10 @@
 """The connection event vocabulary -- the single language every wire speaks.
 
-A transport publishes these on an :class:`~simplyprint_ws_client.events.EventBus`,
-keyed by type, so a consumer subscribes with ``bus.on(Connected, handler)`` and
-the handler receives the typed instance. The same four events flow whether the
-wire underneath is MQTT or WebSocket, sync or async -- a consumer that only
-listens never learns which it got.
+A transport publishes its lifecycle and messages on an
+:class:`~simplyprint_ws_client.events.EventBus`, keyed by type, so a consumer
+subscribes with ``bus.on(Connected, handler)``. A lease can additionally report
+that its routed application traffic timed out without claiming the shared
+transport disconnected.
 
 Every event carries the :attr:`~WireEvent.generation` it belongs to: a
 monotonic epoch that the transport bumps once per established attempt. A consumer
@@ -53,6 +53,19 @@ class Disconnected(WireEvent):
     """
 
     code: Optional[TransportError] = None
+
+
+@dataclass(frozen=True, eq=False)
+class ActivityTimeout(WireEvent):
+    """This lease's routed device traffic stopped while its wire stayed up.
+
+    Multiplexed transports can remain healthy while one device behind them is
+    silent.  This is deliberately distinct from :class:`Disconnected`: it is a
+    lease observation, not a transport edge.
+    """
+
+    code: TransportError
+    last_activity: float
 
 
 @dataclass(frozen=True, eq=False)

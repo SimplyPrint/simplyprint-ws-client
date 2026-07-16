@@ -42,12 +42,16 @@ import yarl
 
 from simplyprint_ws_client.wire import mqtt as mqtt_front_door
 from simplyprint_ws_client.wire import websocket as ws_front_door
-from simplyprint_ws_client.wire.errors import FatalError, TransientError
-from simplyprint_ws_client.wire.events import Connected, Disconnected, MessageReceived
+from simplyprint_ws_client.wire.errors import AuthenticationError, TransientError
+from simplyprint_ws_client.wire.events import (
+    ActivityTimeout,
+    Connected,
+    Disconnected,
+    MessageReceived,
+)
 from simplyprint_ws_client.wire.lease import Lease, MqttLease, WsLease
 from simplyprint_ws_client.wire.messages import MqttMessage, WsMessage
 from simplyprint_ws_client.wire.options import ConnectionOptions
-from simplyprint_ws_client.wire.reconnect import Reconnecting
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.integration.client import PrinterClient
@@ -101,8 +105,7 @@ class DeviceSession:
 
     ``generation`` advances once per continuous reachable period.
     ``observed_at`` is the last activity while UP and the first observation
-    time while DOWN. The client derives any status-projection deadline from
-    that fact; policy does not leak into the driver.
+    time while DOWN.
     """
 
     generation: int = 0
@@ -140,9 +143,8 @@ class DeviceDriver(ABC):
       link parameters are callables.
 
     Liveness is the immutable :attr:`session` record. Repeating an edge is a
-    no-op; reconnecting advances its generation. A short loss can retain a
-    protected print/transfer status until the record's bounded deadline while
-    the raw disconnect still reaches device bookkeeping immediately.
+    no-op; reconnecting advances its generation. Device reachability is kept
+    separate from device-reported printer and job state.
 
     Credential refresh: :meth:`request_credential_refresh` is single-flight; it
     awaits the client's ``refresh_device_credentials(driver)`` on the client's
@@ -222,7 +224,6 @@ class DeviceDriver(ABC):
         )
         self.session = session
         await self.client.on_device_disconnected(self, reason=reason)
-        await self.client.project_device_reachability(now)
         return True
 
     def note_device_message(self) -> bool:
@@ -316,7 +317,7 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
     """A driver over a pooled lease; concrete drivers pick the front door.
 
     Generic over its lease type, so a concrete driver's ``lease`` carries the
-    full protocol API (``MqttDriver(...).lease.subscribe_soon`` resolves in an
+    full protocol API (``MqttDriver(...).lease.subscribe`` resolves in an
     IDE without casts), and over its inbound payload type, so ``message_payload`` and
     the wire-message handler agree on what ``on_device_message`` receives.
     """
@@ -364,12 +365,8 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         lease = self.lease
         if lease is not None and not lease.closed:
             if not lease.transport.supervising():
-                # The shared wire permanently gave up (bounded retry policy
-                # exhausted): the lease is open but nothing would ever
-                # reconnect it. start() re-arms supervision for every lease
-                # on the endpoint; the tick sweep retries this for free.
                 self.client.logger.debug(
-                    "%s link gave up retrying; re-arming supervision", self.name
+                    "%s link supervision stopped; restarting it", self.name
                 )
                 lease.transport.start()
             return
@@ -414,20 +411,19 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
 
         self.lease = lease
         self._start_failure = None
-        lease.event_bus.on(MessageReceived, partial(self._on_wire_message, lease))
-        lease.event_bus.on(Connected, partial(self._on_wire_connected, lease))
-        lease.event_bus.on(Disconnected, partial(self._on_wire_disconnected, lease))
+        lease.event_bus.on(MessageReceived, partial(self.wire_message, lease))
+        lease.event_bus.on(Connected, partial(self.wire_connected, lease))
+        lease.event_bus.on(Disconnected, partial(self.wire_disconnected, lease))
+        lease.event_bus.on(ActivityTimeout, partial(self.wire_inactive, lease))
         self.configure_lease(lease)
         if lease.connected:
             # Attached to an already-live shared wire: deliver the edge now.
-            lease.create_task(
-                self._on_wire_connected(lease, Connected(lease.generation))
-            )
+            lease.create_task(self.wire_connected(lease, Connected(lease.generation)))
 
     #: A short startup-ordering window before an unconstructable link becomes
     #: a real DOWN observation. Time, rather than scheduler call count, defines
     #: the bound.
-    START_FAILURE_OFFLINE_AFTER = 30.0
+    START_FAILURE_DOWN_AFTER = 30.0
 
     def _count_start_failure(self, error: Exception) -> None:
         """Track one continuous start failure and publish it after the bound."""
@@ -439,7 +435,7 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         elif failure.reason != reason:
             failure = self._start_failure = _StartFailure(failure.since, reason)
         if (
-            now - failure.since < self.START_FAILURE_OFFLINE_AFTER
+            now - failure.since < self.START_FAILURE_DOWN_AFTER
             or self.session.reachability is DeviceReachability.DOWN
         ):
             return
@@ -544,7 +540,7 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
             same_url = yarl.URL(str(self._url())) == lease.url
         except Exception:  # noqa: BLE001 -- config in flux counts as "moved"
             same_url = False
-        if same_url and isinstance(lease.transport, Reconnecting):
+        if same_url:
             lease.transport.trip(
                 lease.transport.generation, TransientError("driver restart")
             )
@@ -568,31 +564,59 @@ class LeaseDriver(DeviceDriver, Generic[TLease, TPayload]):
         return (
             DeviceSource(id(lease), event.generation)
             if lease is self.lease
-            and isinstance(event, (Connected, Disconnected, MessageReceived))
+            and isinstance(
+                event, (ActivityTimeout, Connected, Disconnected, MessageReceived)
+            )
             and event.generation == lease.generation
             else None
         )
 
-    async def _on_wire_connected(self, lease: TLease, event: Connected) -> None:
+    async def set_reachability(
+        self,
+        reachability: DeviceReachability,
+        *,
+        reason: Optional[object] = None,
+        source: Optional[DeviceSource] = None,
+    ) -> bool:
+        lease = self.lease
+        if source is None and lease is not None and not lease.closed:
+            source = DeviceSource(id(lease), lease.generation)
+        return await super().set_reachability(
+            reachability, reason=reason, source=source
+        )
+
+    def note_device_message(self) -> bool:
+        lease = self.lease
+        if lease is not None:
+            lease.note_activity()
+        return super().note_device_message()
+
+    async def wire_connected(self, lease: TLease, event: Connected) -> None:
         source = self._wire_source(lease, event)
         if source is not None:
             await self.set_reachability(DeviceReachability.UP, source=source)
 
-    async def _on_wire_disconnected(self, lease: TLease, event: Disconnected) -> None:
+    async def wire_disconnected(self, lease: TLease, event: Disconnected) -> None:
         source = self._wire_source(lease, event)
         if source is None:
             return
         await self.set_reachability(
             DeviceReachability.DOWN, reason=event.code, source=source
         )
-        if isinstance(event.code, FatalError):
+        if isinstance(event.code, AuthenticationError):
             self.request_credential_refresh()
 
-    async def _on_wire_message(self, lease: TLease, event: MessageReceived) -> None:
+    async def wire_inactive(self, lease: TLease, event: ActivityTimeout) -> None:
+        source = self._wire_source(lease, event)
+        if source is not None and lease.last_activity == event.last_activity:
+            await self.set_reachability(
+                DeviceReachability.DOWN, reason=event.code, source=source
+            )
+
+    async def wire_message(self, lease: TLease, event: MessageReceived) -> None:
         source = self._wire_source(lease, event)
         if source is None:
             return
-        self.note_device_message()
         await self.client.on_device_message(self.message_payload(event.message), self)
 
     @staticmethod
@@ -655,11 +679,13 @@ class MqttDriver(LeaseDriver[MqttLease, MqttMessage]):
             options.provider,
             options.wire_keepalive,
         )
-        return mqtt_front_door.connect(url, pool=pool, options=options)
+        return mqtt_front_door.connect(
+            url, pool=pool, options=options, topics=self._topics()
+        )
 
-    def configure_lease(self, lease: MqttLease) -> None:
-        for topic in self._topics():
-            lease.subscribe_soon(topic)
+    async def wire_connected(self, lease: MqttLease, event: Connected) -> None:
+        if self._wire_source(lease, event) is not None:
+            await self.client.on_device_transport_connected(self)
 
     def publish_soon(self, message: MqttMessage) -> bool:
         """Schedule a publish if the wire is up; ``False`` if not."""
@@ -677,18 +703,18 @@ class DevicePoller(DeviceDriver):
         *,
         interval: float,
         poll: Optional[Callable[[], Awaitable[None]]] = None,
-        offline_after: float = 300.0,
+        unreachable_after: float = 300.0,
         failure_backoff: float = 10.0,
         poll_timeout: float = 30.0,
         name: Optional[str] = None,
     ) -> None:
         super().__init__(client, name=name)
         self.interval = interval
-        self.offline_after = offline_after
+        self.unreachable_after = unreachable_after
         self.failure_backoff = failure_backoff
         #: Hard bound on one ``poll_device()`` call. A poll stuck on a dead
         #: socket must count as a failure and keep the silence clock running --
-        #: an unbounded poll would freeze the loop and the offline edge with it.
+        #: an unbounded poll would freeze the loop and the DOWN edge with it.
         self.poll_timeout = poll_timeout
         self._poll = poll
         self._task: Optional[asyncio.Task] = None
@@ -767,7 +793,7 @@ class DevicePoller(DeviceDriver):
             )
             if (
                 self.session.reachability is not DeviceReachability.DOWN
-                and time.monotonic() - last_life >= self.offline_after
+                and time.monotonic() - last_life >= self.unreachable_after
             ):
                 await self.set_reachability(DeviceReachability.DOWN)
 

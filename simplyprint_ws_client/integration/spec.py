@@ -40,6 +40,7 @@ __all__ = [
     "IntegrationTransport",
     "IntegrationCapability",
     "IntegrationSpec",
+    "BetaInfo",
     "ProductMetadata",
     "discover_from_service",
     "model_aware_presentation",
@@ -123,6 +124,15 @@ class IntegrationCapability(StrEnum):
     LAN_ACCESS_CODE = "lan_access_code"
 
 
+class BetaInfo(BaseModel):
+    """Optional setup links shown for a beta integration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    setup_guide_url: Optional[str] = None
+    helpdesk_url: Optional[str] = None
+
+
 class ProductMetadata(BaseModel):
     """Neutral product facts exposed by the integration catalogue."""
 
@@ -132,6 +142,7 @@ class ProductMetadata(BaseModel):
     image_url: str
     supported_transports: tuple[IntegrationTransport, ...]
     capabilities: tuple[IntegrationCapability, ...]
+    beta: Optional[BetaInfo] = None
 
 
 def no_camera_protocols() -> Tuple[Type["BaseCameraProtocol"], ...]:

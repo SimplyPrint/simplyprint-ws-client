@@ -8,13 +8,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
-from simplyprint_ws_client.wire.events import (
-    Connected,
-    Disconnected,
-    MessageReceived,
-)
-from simplyprint_ws_client.wire.reconnect import Reconnecting
-from simplyprint_ws_client.wire.transport import TransientError
+from simplyprint_ws_client.wire.events import ActivityTimeout, Connected, Disconnected
+from simplyprint_ws_client.wire.errors import TransportError
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.wire.lease import Lease
@@ -22,7 +17,7 @@ if TYPE_CHECKING:
 KeepaliveProbe = Callable[["Lease"], object]
 
 
-class KeepaliveTimeout(TransientError):
+class KeepaliveTimeout(TransportError):
     """The lease saw no inbound activity after its configured probes."""
 
 
@@ -31,9 +26,9 @@ class Keepalive:
     """Application-level liveness policy for one connection lease.
 
     ``probe`` is protocol-specific and may be sync or async. The lease handles the
-    generic parts: inbound activity resets the miss counter, stale intervals call
-    the probe, and too many missed probes emits a generic ``Disconnected`` event on
-    the lease bus.
+    generic parts: inbound activity resets the miss counter, stale intervals
+    call the probe, and exhausted probes report application inactivity without
+    mutating the transport.
     """
 
     interval: float
@@ -56,18 +51,15 @@ class ConnectionKeepalive:
         self.policy = policy
         self.logger = logger or logging.getLogger("wire.keepalive")
         self.misses = 0
-        self.timed_out = False
-        self.last_activity = 0.0
+        self.timed_out_activity: Optional[float] = None
         self.task: Optional[asyncio.Task] = None
 
     def start(self) -> "ConnectionKeepalive":
         if self.task is not None and not self.task.done():
             return self
 
-        loop = self.connection.provider.event_loop
-        self.last_activity = loop.time()
+        self.connection.note_activity()
         self.connection.event_bus.on(Connected, self._on_activity)
-        self.connection.event_bus.on(MessageReceived, self._on_activity)
         self.connection.event_bus.on(Disconnected, self._on_disconnected)
         self.connection.on_close(self.stop)
         self.task = self.connection.create_task(self._run())
@@ -76,7 +68,6 @@ class ConnectionKeepalive:
     def stop(self) -> None:
         self.connection.off_close(self.stop)
         self.connection.event_bus.off(Connected, self._on_activity)
-        self.connection.event_bus.off(MessageReceived, self._on_activity)
         self.connection.event_bus.off(Disconnected, self._on_disconnected)
         task = self.task
         self.task = None
@@ -84,9 +75,9 @@ class ConnectionKeepalive:
             task.cancel()
 
     async def _on_activity(self, _event) -> None:
-        self.last_activity = self.connection.provider.event_loop.time()
+        self.connection.note_activity()
         self.misses = 0
-        self.timed_out = False
+        self.timed_out_activity = None
 
     async def _on_disconnected(self, _event: Disconnected) -> None:
         self.misses = 0
@@ -102,34 +93,42 @@ class ConnectionKeepalive:
             return
 
     async def _check(self) -> None:
-        if self.timed_out or not self.connection.connected:
+        if not self.connection.connected:
             return
 
+        transport = self.connection.transport
+        generation = transport.generation
+        activity = self.connection.last_activity
         now = self.connection.provider.event_loop.time()
-        if now - self.last_activity < self.policy.interval:
+        if now - activity < self.policy.interval:
+            self.misses = 0
+            self.timed_out_activity = None
             return
+        if self.timed_out_activity == activity:
+            await self._probe()
+            return
+        if self.timed_out_activity is not None:
+            self.misses = 0
+            self.timed_out_activity = None
 
         if self.misses >= self.policy.max_misses:
-            self.timed_out = True
-            self.misses = 0
             reason = KeepaliveTimeout(self.policy.timeout_message)
-            transport = self.connection.transport
-            if isinstance(transport, Reconnecting):
-                # Heal, don't just report: trip the supervised attempt so the
-                # zombie wire tears down and reconnects. Supervise then emits
-                # the ONE real ``Disconnected(code=KeepaliveTimeout)`` --
-                # emitting a synthetic one here too would double the edge.
-                transport.trip(transport.generation, reason)
-                return
-            # Self-healing transports (paho owns its own thread + reconnect
-            # loop) cannot be tripped; the synthetic lease-level event remains
-            # the report so drivers still see the device go quiet.
-            await self.connection.event_bus.emit(
-                Disconnected(self.connection.generation, code=reason)
+            self.timed_out_activity = activity
+            self.connection.deliver(
+                ActivityTimeout(generation, code=reason, last_activity=activity)
             )
+            await self._probe()
             return
 
         await self._probe()
+        if (
+            not self.connection.connected
+            or transport.generation != generation
+            or self.connection.last_activity != activity
+        ):
+            self.misses = 0
+            self.timed_out_activity = None
+            return
         self.misses += 1
 
     async def _probe(self) -> None:

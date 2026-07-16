@@ -27,7 +27,6 @@ from simplyprint_ws_client.common.asyncio.utils import submit_coro_threadsafe
 from simplyprint_ws_client.wire.events import (
     Connected,
     WireEvent,
-    Disconnected,
     MessageReceived,
 )
 from simplyprint_ws_client.wire.messages import (
@@ -96,6 +95,7 @@ class Lease(Generic[T]):
         #: closes so no waiter outlives its event source.
         self._ready_waiters: Set[asyncio.Future] = set()
         self.closed = False
+        self.last_activity = self.provider.event_loop.time()
 
     @property
     def generation(self) -> int:
@@ -120,12 +120,10 @@ class Lease(Generic[T]):
         return any(topic_matches(topic, route) for topic in self.topics)
 
     async def ready(self, timeout: Optional[float] = None) -> bool:
-        """Resolve ``True`` on the next :class:`Connected`, ``False`` on give-up or
-        timeout.
+        """Resolve ``True`` on the next :class:`Connected`, ``False`` on timeout.
 
-        Returns immediately if already connected. A permanent give-up (the
-        transport reaching ``DISCONNECTED`` with no live wire after exhausting its
-        retry policy) resolves ``False``.
+        Returns immediately if already connected. Closing the lease resolves any
+        outstanding waiter with ``False``.
         """
         if self.connected:
             return True
@@ -137,22 +135,13 @@ class Lease(Generic[T]):
             if not result.done():
                 result.set_result(True)
 
-        def on_disconnected(_: Disconnected) -> None:
-            # Only a *terminal* disconnect (the supervisor gave up) ends the wait;
-            # an ordinary drop is followed by another connect attempt.
-            if not result.done() and not self.transport.supervising():
-                result.set_result(False)
-
         self.event_bus.on(Connected, on_connected)
-        self.event_bus.on(Disconnected, on_disconnected)
         self._ready_waiters.add(result)
         try:
             if self.closed and not result.done():
                 result.set_result(False)
             elif self.connected and not result.done():
                 result.set_result(True)
-            elif not self.transport.supervising() and not result.done():
-                result.set_result(False)
             if timeout is None:
                 return await result
             return await asyncio.wait_for(result, timeout)
@@ -161,7 +150,6 @@ class Lease(Generic[T]):
         finally:
             self._ready_waiters.discard(result)
             self.event_bus.off(Connected, on_connected)
-            self.event_bus.off(Disconnected, on_disconnected)
 
     async def ready_transport(self) -> T:
         """Await a live connection and return the shared transport."""
@@ -177,6 +165,10 @@ class Lease(Generic[T]):
         """Queue a routed event for this lease without blocking the transport recv loop."""
         if not self.closed:
             self._courier.post(event)
+
+    def note_activity(self) -> None:
+        """Record protocol-validated activity for application liveness."""
+        self.last_activity = self.provider.event_loop.time()
 
     def _schedule(
         self, coro: Coroutine[object, object, object]
@@ -329,33 +321,28 @@ class MqttLease(Lease[MqttTransport]):
             message = MqttMessage(topics[0], payload)
         await self.transport.send(message)
 
-    async def subscribe(self, topic: str) -> None:
-        """Track ``topic`` on this lease (for routing) and assert it on the shared
-        socket (refcounted across leases by the broker transport)."""
+    def subscribe(self, topic: str) -> None:
+        """Add this lease's interest and assert the first shared subscription."""
+        if topic in self.topics:
+            return
         self.topics.add(topic)
-        self.pool.add_route(self, topic)
-        await self.transport.subscribe(topic)
+        if self.pool.add_route(self, topic):
+            self.transport.subscribe(topic)
 
-    def subscribe_soon(self, topic: str) -> None:
-        """Subscribe from sync code: interest is recorded on the lease NOW (so
-        routing is correct the instant the link comes up, and re-asserted on every
-        (re)connect), and the wire subscribe runs as a task on the lease's loop."""
-        self.topics.add(topic)
-        self.pool.add_route(self, topic)
-        self.create_task(self.transport.subscribe(topic))
-
-    async def unsubscribe(self, topic: str) -> None:
-        """Stop tracking ``topic`` and drop the subscription on the shared socket."""
+    def unsubscribe(self, topic: str) -> None:
+        """Drop this lease's interest and the last shared subscription."""
+        if topic not in self.topics:
+            return
         self.topics.discard(topic)
-        self.pool.remove_route(self, topic)
-        await self.transport.unsubscribe(topic)
+        if self.pool.remove_route(self, topic):
+            self.transport.unsubscribe(topic)
 
     async def close(self) -> None:
         if self.closed:
             return
         for topic in tuple(self.topics):
             try:
-                await self.unsubscribe(topic)
+                self.unsubscribe(topic)
             except Exception:  # noqa: BLE001 -- a broken link must not abort close
                 # Local route bookkeeping is already dropped (unsubscribe does
                 # it before the broker call); transport teardown handles the

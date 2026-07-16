@@ -23,9 +23,13 @@ from simplyprint_ws_client.integration.drivers import (
     DeviceReachability,
     LeaseDriver,
 )
-from simplyprint_ws_client.wire.errors import FatalError
-from simplyprint_ws_client.wire.events import Disconnected
+from simplyprint_ws_client.wire.errors import AuthenticationError
+from simplyprint_ws_client.wire.events import ActivityTimeout, Disconnected, WireEvent
+from simplyprint_ws_client.wire.keepalive import KeepaliveTimeout
+from simplyprint_ws_client.wire.pool import Pool
 from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.state import ConnectionState
+from simplyprint_ws_client.wire.transport import NotConnected, Transport
 
 
 class FakeClient:
@@ -36,7 +40,6 @@ class FakeClient:
         self.logger = logging.getLogger("test.lease.driver")
         self.connected_edges: List[object] = []
         self.disconnected_edges: List[object] = []
-        self.projections = 0
 
     @property
     def event_loop(self):
@@ -50,10 +53,6 @@ class FakeClient:
 
     async def on_device_disconnected(self, driver, reason=None) -> None:
         self.disconnected_edges.append(reason)
-
-    async def project_device_reachability(self, now=None) -> bool:
-        self.projections += 1
-        return False
 
     def clear_camera_uri(self) -> None:  # pragma: no cover - unused
         pass
@@ -93,6 +92,7 @@ class FakeLease:
         self.event_bus = EventBus()
         self.closed = False
         self.connected = False
+        self.last_activity = asyncio.get_event_loop().time()
         self._journal = journal
         self.close_gate: Optional[asyncio.Event] = None
 
@@ -130,6 +130,44 @@ class FakeLeaseDriver(LeaseDriver):
         self.built.append(lease)
         self.journal.append("start")
         return lease
+
+
+class PooledTransport(Transport):
+    def __init__(self, url: yarl.URL) -> None:
+        self.url = url
+        self.events: EventBus[WireEvent] = EventBus()
+        self.state = ConnectionState.DISCONNECTED
+        self.generation = 0
+        self.starts = 0
+        self.stops = 0
+
+    @property
+    def connected(self) -> bool:
+        return False
+
+    def supervising(self) -> bool:
+        return self.starts > self.stops
+
+    def start(self) -> None:
+        self.starts += 1
+
+    async def stop(self) -> None:
+        self.stops += 1
+
+    async def send(self, message: object) -> None:
+        raise NotConnected("test transport is down")
+
+    def trip(self, generation: int, reason: Exception) -> None:
+        return None
+
+
+class PooledLeaseDriver(LeaseDriver):
+    def __init__(self, client, url, pool) -> None:
+        super().__init__(client, url)
+        self.pool = pool
+
+    def acquire_lease(self, url, options):
+        return self.pool.connect(url)
 
 
 async def _settle(predicate, timeout: float = 2.0) -> None:
@@ -176,16 +214,57 @@ async def test_old_lease_events_never_reach_handlers_after_restart():
 
 
 @pytest.mark.asyncio
-async def test_fatal_wire_disconnect_requests_credential_refresh():
+async def test_authentication_rejection_requests_credential_refresh():
     driver = _driver()
     driver.start()
     lease = driver.lease
     driver.request_credential_refresh = MagicMock()
 
-    await lease.event_bus.emit(Disconnected(lease.generation, code=FatalError("auth")))
+    await lease.event_bus.emit(
+        Disconnected(lease.generation, code=AuthenticationError("auth"))
+    )
 
     assert driver.session.reachability is DeviceReachability.DOWN
     driver.request_credential_refresh.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_route_activity_timeout_marks_only_its_current_device_source_down():
+    driver = _driver()
+    driver.start()
+    lease = driver.lease
+    await driver.set_reachability(DeviceReachability.UP)
+
+    await lease.event_bus.emit(
+        ActivityTimeout(
+            lease.generation,
+            code=KeepaliveTimeout("silent"),
+            last_activity=lease.last_activity,
+        )
+    )
+
+    assert driver.session.reachability is DeviceReachability.DOWN
+    assert isinstance(driver.client.disconnected_edges[-1], KeepaliveTimeout)
+
+
+@pytest.mark.asyncio
+async def test_activity_after_timeout_decision_discards_the_stale_offline_edge():
+    driver = _driver()
+    driver.start()
+    lease = driver.lease
+    await driver.set_reachability(DeviceReachability.UP)
+    stale_activity = lease.last_activity
+    lease.last_activity += 1
+
+    await lease.event_bus.emit(
+        ActivityTimeout(
+            lease.generation,
+            code=KeepaliveTimeout("silent"),
+            last_activity=stale_activity,
+        )
+    )
+
+    assert driver.session.reachability is DeviceReachability.UP
 
 
 @pytest.mark.asyncio
@@ -231,6 +310,39 @@ async def test_moved_url_restart_does_not_kick_the_old_wire():
 
 
 @pytest.mark.asyncio
+async def test_moved_endpoint_releases_old_transport_before_acquiring_new():
+    urls = ["ws://host/a"]
+    transports: List[PooledTransport] = []
+
+    def build(url: yarl.URL, _params: object) -> PooledTransport:
+        transport = PooledTransport(url)
+        transports.append(transport)
+        return transport
+
+    pool = Pool(build=build, key=lambda url, _params: str(url))
+    driver = PooledLeaseDriver(
+        FakeClient(asyncio.get_running_loop()),
+        lambda: urls[0],
+        pool,
+    )
+    driver.start()
+    old_lease = driver.lease
+    old_transport = transports[0]
+
+    urls[0] = "ws://host/b"
+    driver.ensure_current()
+    await _settle(lambda: driver.lease is not None and driver.lease.url.host == "host")
+    await _settle(lambda: driver.lease is not old_lease)
+
+    assert old_lease.closed
+    assert old_transport.stops == 1
+    assert set(pool.endpoints) == {"ws://host/b"}
+    assert len(transports) == 2
+
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_stop_racing_an_in_flight_restart_wins():
     driver = _driver()
     driver.start()
@@ -248,7 +360,7 @@ async def test_stop_racing_an_in_flight_restart_wins():
 
 
 @pytest.mark.asyncio
-async def test_persistent_start_failures_flip_the_offline_edge_once():
+async def test_persistent_start_failures_flip_the_down_edge_once():
     client = FakeClient(asyncio.get_event_loop())
     boom = ["host not set"]
 
@@ -258,7 +370,7 @@ async def test_persistent_start_failures_flip_the_offline_edge_once():
         return "ws://host/a"
 
     driver = FakeLeaseDriver(client, url)
-    driver.START_FAILURE_OFFLINE_AFTER = 0.01
+    driver.START_FAILURE_DOWN_AFTER = 0.01
 
     driver.start()
     await asyncio.sleep(0.02)

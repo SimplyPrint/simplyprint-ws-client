@@ -427,8 +427,8 @@ async def test_send_after_stop_raises_not_connected(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("make", WIRES)
-async def test_connect_to_dead_port_then_give_up(make) -> None:
-    """A closed port never connects; a bounded policy gives up and stops supervising."""
+async def test_connect_to_dead_port_keeps_retrying(make) -> None:
+    """A closed port never ends supervision."""
     # Bind+immediately close a socket to grab a port that nothing listens on.
     import socket
 
@@ -437,19 +437,18 @@ async def test_connect_to_dead_port_then_give_up(make) -> None:
     dead_port = probe.getsockname()[1]
     probe.close()
 
-    policy = RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=3)
+    policy = RetryPolicy(backoff=ConstantBackoff(0.01))
     transport = make(yarl.URL(f"ws://127.0.0.1:{dead_port}/"), policy)
     rec = Recorder()
     rec.attach(transport)
 
     transport.start()
     try:
-        await wait_until(lambda: not transport.supervising(), timeout=5.0)
+        await wait_until(lambda: len(rec.disconnected) >= 3, timeout=5.0)
         assert transport.state is ConnectionState.DISCONNECTED
         assert not transport.connected
         assert transport.generation == 0  # never established
-        # Each failed attempt announced a Disconnected with a code.
-        assert rec.disconnected
+        assert transport.supervising()
         assert all(code is not None for _, code in rec.disconnected)
     finally:
         await transport.stop()
@@ -754,43 +753,6 @@ async def test_front_door_two_leases_both_receive_broadcast(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("make", WIRES)
-async def test_ready_false_on_terminal_give_up_real_socket(make) -> None:
-    """ready() resolves False once a bounded policy permanently gives up.
-
-    Over a REAL dead port: a lease/transport that exhausts its retry budget must
-    end the ready() wait with False (not hang), because supervising() is False.
-    """
-    import socket
-
-    from simplyprint_ws_client.wire.lease import WsLease
-
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.bind(("127.0.0.1", 0))
-    dead_port = probe.getsockname()[1]
-    probe.close()
-
-    policy = RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=3)
-    transport = make(yarl.URL(f"ws://127.0.0.1:{dead_port}/"), policy)
-
-    # Drive ready() through a real lease over the transport (no pool needed here:
-    # ready() reads supervising()/connected/Disconnected straight off the transport).
-    from simplyprint_ws_client.wire.pool import Pool
-
-    pool: Pool = Pool(
-        build=lambda url, params: transport,
-        key=lambda url, params: "k",
-        lease_class=WsLease,
-    )
-    lease = pool.connect(transport.url)
-    try:
-        assert await lease.ready(timeout=5.0) is False
-        assert not transport.supervising()
-        assert transport.generation == 0
-    finally:
-        await lease.close()
-
-
 @pytest.mark.asyncio
 async def test_front_door_ready_timeout_false_while_still_retrying() -> None:
     """ready(timeout) returns False (not None, no raise) on a slow endpoint.
@@ -937,24 +899,6 @@ async def test_stop_while_connecting_is_clean(make) -> None:
         assert not transport.connected
     finally:
         listener.close()
-
-
-@pytest.mark.asyncio
-async def test_front_door_ready_false_on_give_up() -> None:
-    """The full ws.connect path resolves ready() False on a permanent give-up."""
-    import socket
-
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.bind(("127.0.0.1", 0))
-    dead_port = probe.getsockname()[1]
-    probe.close()
-
-    url = yarl.URL(f"ws://127.0.0.1:{dead_port}/")
-    bounded = RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=2)
-    async with front_door(url, retry=bounded) as conn:
-        assert await conn.ready(timeout=5.0) is False
-        assert not conn.transport.supervising()
-        assert conn.state is ConnectionState.DISCONNECTED
 
 
 @pytest.mark.asyncio

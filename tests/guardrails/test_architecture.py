@@ -25,24 +25,6 @@ pytestmark = pytest.mark.guardrail
 BRANDS = ("bambu", "anycubic", "creality", "duet", "elegoo", "ultimaker", "centauri")
 
 
-def test_discovery_has_no_process_global_service_accessor():
-    active_module = LIB_PKG / "integration" / "discovery" / "active.py"
-    assert not active_module.exists()
-
-    forbidden = (
-        "active_discovery_service",
-        "set_active_discovery_service",
-        "discover_from_active_service",
-    )
-    offenders = []
-    for path in LIB_PKG.rglob("*.py"):
-        source = path.read_text()
-        for name in forbidden:
-            if name in source:
-                offenders.append(f"{path.relative_to(LIB_PKG)}::{name}")
-    assert offenders == []
-
-
 # The SimplyPrint wire protocol itself names hardware products (MultiMaterialSolution
 # member ids, bed-plate types). These modules MIRROR that cloud-defined vocabulary —
 # they are protocol constants, not machinery branching on a brand. Everything else

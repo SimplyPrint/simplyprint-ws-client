@@ -54,3 +54,7 @@ class TransientError(TransportError):
 
 class FatalError(TransportError):
     """A wire failure that looks unrecoverable, surfaced distinctly to callers."""
+
+
+class AuthenticationError(FatalError):
+    """The endpoint rejected the configured credentials."""

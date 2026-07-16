@@ -131,6 +131,11 @@ class FakeTransport(Transport):
             raise NotConnected("fake transport is not connected")
         self.sent.append(message)
 
+    def trip(self, generation: int, _reason: Exception) -> None:
+        if generation == self.generation:
+            self.live = False
+            self.state = ConnectionState.DISCONNECTED
+
     async def push(self, message: WsMessage) -> None:
         await self.events.emit(MessageReceived(self.generation, message, message.qos))
 
@@ -162,10 +167,15 @@ class FakeMqttTransport(MqttTransport):
         if not self.live:
             raise NotConnected("fake mqtt transport is not connected")
 
-    async def subscribe(self, topic: str) -> None:
+    def trip(self, generation: int, _reason: Exception) -> None:
+        if generation == self.generation:
+            self.live = False
+            self.state = ConnectionState.DISCONNECTED
+
+    def subscribe(self, topic: str) -> None:
         self.subscriptions.append(topic)
 
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         try:
             self.subscriptions.remove(topic)
         except ValueError:
@@ -473,7 +483,7 @@ async def mqtt_topic_pool_throughput(
         lease = pool.connect(yarl.URL(f"mqtt://broker-{endpoint}/"))
         if not isinstance(lease, MqttLease):
             raise TypeError("mqtt pool did not return an MqttLease")
-        await lease.subscribe(topic)
+        lease.subscribe(topic)
         lease.event_bus.on(MessageReceived, handler)
         leases.append(lease)
         topics.append(topic)
@@ -561,7 +571,7 @@ async def mqtt_flaky_topic_pool_throughput(
         lease = pool.connect(yarl.URL(f"mqtt://flaky-broker-{endpoint}/"))
         if not isinstance(lease, MqttLease):
             raise TypeError("mqtt pool did not return an MqttLease")
-        await lease.subscribe(topic)
+        lease.subscribe(topic)
         lease.event_bus.on(MessageReceived, on_message)
         lease.event_bus.on(Connecting, on_connecting)
         lease.event_bus.on(Connected, on_connected)
@@ -628,7 +638,7 @@ async def mqtt_flaky_topic_pool_throughput(
 
 
 def fast_retry() -> RetryPolicy:
-    return RetryPolicy(backoff=ConstantBackoff(0.0), max_attempts=3)
+    return RetryPolicy(backoff=ConstantBackoff(0.0))
 
 
 def skipped_metric(name: str, notes: str) -> Metric:
@@ -853,7 +863,7 @@ async def actual_mqtt_broker_throughput(
                 "actual mqtt paho",
                 "skipped: connection did not become ready",
             )
-        await lease.subscribe(benchmark_topic)
+        lease.subscribe(benchmark_topic)
 
         message = MqttMessage(benchmark_topic, b"x", qos=QoS.AT_LEAST_ONCE)
 

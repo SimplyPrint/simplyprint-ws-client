@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from simplyprint_ws_client.wire.events import WireEvent
 from simplyprint_ws_client.wire.errors import (
+    AuthenticationError,
     FatalError,
     NotConnected,
     TransientError,
@@ -41,6 +42,7 @@ __all__ = [
     "NotConnected",
     "TransientError",
     "FatalError",
+    "AuthenticationError",
     "Transport",
     "MqttTransport",
     "WsTransport",
@@ -95,13 +97,15 @@ class Transport(ABC):
         QoS requires an acknowledgement the call awaits that ack.
         """
 
+    @abstractmethod
+    def trip(self, generation: int, reason: Exception) -> None:
+        """End one live generation so supervision replaces its wire."""
+
     def supervising(self) -> bool:
         """Whether the transport is still trying to keep the link up.
 
         ``True`` by default (a self-healing wire never stops on its own). A
-        :class:`~simplyprint_ws_client.wire.reconnect.Reconnecting`
-        transport returns ``False`` once its retry policy is exhausted and it has
-        permanently given up -- the signal a waiter uses to resolve "gave up".
+        A stopped transport returns ``False``.
         """
         return True
 
@@ -115,13 +119,12 @@ class MqttTransport(Transport):
     """
 
     @abstractmethod
-    async def subscribe(self, topic: str) -> None:
+    def subscribe(self, topic: str) -> None:
         """Assert a subscription for ``topic`` on the shared socket."""
 
     @abstractmethod
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         """Drop a subscription for ``topic`` from the shared socket."""
-
 
 class WsTransport(Transport):
     """A 1:1 WebSocket transport: no topics, every message is the lease's.

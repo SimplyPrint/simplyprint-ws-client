@@ -42,6 +42,7 @@ class SessionClient(PrinterClient[PrinterConfig]):
         self, driver: DeviceDriver, reason: Optional[object] = None
     ) -> None:
         self.disconnected_edges.append(reason)
+        await super().on_device_disconnected(driver, reason)
 
     def clear_camera_uri(self) -> None:
         self.camera_clears += 1
@@ -83,9 +84,8 @@ async def test_duplicate_edges_are_idempotent_and_keep_first_down_observation():
 
 
 @pytest.mark.asyncio
-async def test_protected_down_uses_fixed_observation_and_reconnect_clears_it():
+async def test_down_preserves_device_status_and_clears_camera_once():
     client = SessionClient()
-    client.device_loss_grace = 30.0
     client.printer.status = PrinterStatus.PRINTING
     source = DeviceSource(lease_id=1, wire_generation=1)
 
@@ -94,42 +94,12 @@ async def test_protected_down_uses_fixed_observation_and_reconnect_clears_it():
     down = client.driver.session
 
     assert client.printer.status is PrinterStatus.PRINTING
-    assert not await client.project_device_reachability(
-        now=down.observed_at + client.device_loss_grace - 0.001
-    )
+    assert client.camera_clears == 1
 
     assert await client.driver.set_reachability(DeviceReachability.UP, source=source)
     assert client.driver.session.generation == down.generation + 1
-    assert not await client.project_device_reachability(
-        now=down.observed_at + client.device_loss_grace + 1.0
-    )
+    assert client.camera_clears == 1
     assert client.printer.status is PrinterStatus.PRINTING
-
-
-@pytest.mark.asyncio
-async def test_protected_down_projects_offline_once_at_expiry():
-    client = SessionClient()
-    client.device_loss_grace = 10.0
-    client.printer.status = PrinterStatus.PRINTING
-    source = DeviceSource(lease_id=1, wire_generation=1)
-
-    await client.driver.set_reachability(DeviceReachability.UP, source=source)
-    await client.driver.set_reachability(DeviceReachability.DOWN, source=source)
-    down = client.driver.session
-
-    assert not await client.project_device_reachability(
-        now=down.observed_at + client.device_loss_grace - 0.001
-    )
-    assert await client.project_device_reachability(
-        now=down.observed_at + client.device_loss_grace
-    )
-    assert client.printer.status is PrinterStatus.OFFLINE
-    assert client.camera_clears == 1
-
-    assert not await client.project_device_reachability(
-        now=down.observed_at + client.device_loss_grace + 1.0
-    )
-    assert client.camera_clears == 1
 
 
 @pytest.mark.asyncio

@@ -49,8 +49,7 @@ class ConnectionOptions:
 
     ``wire_keepalive`` configures the native transport. ``app_keepalive`` configures
     lease-level application probes. ``provider`` binds the pool and lease events to
-    a specific loop. ``retry`` paces reconnects (supervised async transports use it
-    fully; paho maps its backoff onto ``reconnect_delay_set``). ``verify_tls``
+    a specific loop. ``retry`` paces the shared reconnect supervisor. ``verify_tls``
     controls broker certificate verification for ``mqtts://`` - off by default
     because printer fleets routinely present self-signed certificates, but an
     explicit, opt-in knob. ``tls_client_auth`` supplies mutual-TLS credentials
@@ -69,5 +68,5 @@ class ConnectionOptions:
     verify_tls: bool = False
     tls_client_auth: Optional[TlsClientAuth] = None
     logger: Optional["logging.Logger"] = None
-    #: Bound on one WebSocket connect attempt (paho owns its own timeouts).
+    #: Bound on one connection attempt.
     open_timeout: Optional[float] = None

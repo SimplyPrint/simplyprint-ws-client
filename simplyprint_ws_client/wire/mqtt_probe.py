@@ -1,4 +1,4 @@
-"""One-shot MQTT diagnostics over an owner-scoped pooled lease."""
+"""One-shot MQTT diagnostics isolated from persistent application connections."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopPr
 from simplyprint_ws_client.wire.errors import ErrorCode
 from simplyprint_ws_client.wire.events import Connected, Disconnected, MessageReceived
 from simplyprint_ws_client.wire.messages import MqttMessage
-from simplyprint_ws_client.wire.mqtt import connect, initial_topics, pool_for
+from simplyprint_ws_client.wire.mqtt import connect, pool_for
 from simplyprint_ws_client.wire.options import ConnectionOptions, WireKeepalive
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pools import PoolRegistry
@@ -42,7 +42,6 @@ _AUTH_FAILURE_REASON_CODES = frozenset((134, 135, 140))
 
 
 async def probe_mqtt(
-    registry: PoolRegistry[MqttTransport],
     url: Union[str, yarl.URL],
     *,
     connect_timeout: float,
@@ -57,18 +56,18 @@ async def probe_mqtt(
 
     provider = EventLoopProvider(asyncio.get_running_loop())
     keepalive = WireKeepalive(interval=20)
+    registry: PoolRegistry[MqttTransport] = PoolRegistry()
     pool = pool_for(registry, provider, keepalive)
     options = ConnectionOptions(
         provider=provider,
-        retry=RetryPolicy(max_attempts=1),
+        retry=RetryPolicy(),
         wire_keepalive=keepalive,
     )
     parsed_url = yarl.URL(url) if isinstance(url, str) else url
-    topics = initial_topics(parsed_url)
     try:
-        # A bounded probe awaits SUBSCRIBE before publishing its report request.
-        lease = connect(parsed_url.with_query(None), pool=pool, options=options)
+        lease = connect(parsed_url, pool=pool, options=options)
     except Exception as error:  # noqa: BLE001 -- a diagnostic returns wire failure
+        await registry.close()
         return MqttProbeResult(MqttProbeOutcome.CONNECT_FAILED, reason=str(error))
 
     lifecycle: asyncio.Future[Union[Connected, Disconnected]] = (
@@ -86,6 +85,7 @@ async def probe_mqtt(
 
     lease.event_bus.on(Connected, on_lifecycle)
     lease.event_bus.on(Disconnected, on_lifecycle)
+    lease.event_bus.on(MessageReceived, on_message)
     try:
         if lease.connected and not lifecycle.done():
             lifecycle.set_result(Connected(lease.generation))
@@ -103,10 +103,6 @@ async def probe_mqtt(
                 else MqttProbeOutcome.CONNECT_FAILED
             )
             return MqttProbeResult(outcome, reason=reason, reason_code=reason_code)
-
-        for topic in topics:
-            await lease.subscribe(topic)
-        lease.event_bus.on(MessageReceived, on_message)
 
         for message in initial_messages:
             try:
@@ -131,3 +127,4 @@ async def probe_mqtt(
         lease.event_bus.off(Disconnected, on_lifecycle)
         lease.event_bus.off(MessageReceived, on_message)
         await lease.close()
+        await registry.close()

@@ -68,7 +68,7 @@ class VendorPrinter(PrinterClient[VendorConfig]):
         # A real vendor polls its device's HTTP API here; the simulation just
         # synthesizes readings, so every poll is a "sign of life".
         self.driver = self.attach_driver(
-            DevicePoller(self, interval=1.0, offline_after=10.0)
+            DevicePoller(self, interval=1.0, unreachable_after=10.0)
         )
 
     async def setup_device(self) -> None:  # called from your own init() if needed

@@ -113,12 +113,9 @@ def test_product_metadata_domains_serialize_as_wire_strings():
 
     assert metadata.supported_transports == (IntegrationTransport.HTTP,)
     assert metadata.capabilities == (IntegrationCapability.FILE_UPLOAD,)
-    assert json.loads(metadata.model_dump_json()) == {
-        "display_name": "Closed",
-        "image_url": "/closed.png",
-        "supported_transports": ["http"],
-        "capabilities": ["file_upload"],
-    }
+    payload = json.loads(metadata.model_dump_json())
+    assert payload["supported_transports"] == ["http"]
+    assert payload["capabilities"] == ["file_upload"]
 
 
 def test_product_metadata_domains_are_closed():

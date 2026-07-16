@@ -24,7 +24,6 @@ class FakeClient:
         self.connected_edges = []
         self.disconnected_edges = []
         self.refreshes = 0
-        self.projections = 0
 
     @property
     def event_loop(self):
@@ -38,10 +37,6 @@ class FakeClient:
 
     async def on_device_disconnected(self, driver, reason=None):
         self.disconnected_edges.append((driver, reason))
-
-    async def project_device_reachability(self, now=None):
-        self.projections += 1
-        return False
 
     async def refresh_device_credentials(self, driver):
         self.refreshes += 1
@@ -58,7 +53,7 @@ async def _wait_for(predicate, timeout=2.0):
 
 @pytest.mark.asyncio
 async def test_cold_start_silence_fires_the_disconnected_edge_once():
-    # A device NEVER reached still reports its offline edge offline_after
+    # A device NEVER reached still reports its DOWN edge unreachable_after
     # seconds after the poller starts -- an unplugged printer must not stay
     # forever unknown.
     async def poll():
@@ -66,7 +61,7 @@ async def test_cold_start_silence_fires_the_disconnected_edge_once():
 
     client = FakeClient(asyncio.get_running_loop(), poll)
     poller = DevicePoller(
-        client, interval=0.01, offline_after=0.05, failure_backoff=0.01
+        client, interval=0.01, unreachable_after=0.05, failure_backoff=0.01
     )
     poller.start()
     try:
@@ -90,7 +85,7 @@ async def test_contact_fires_connected_then_silence_disconnects():
 
     client = FakeClient(asyncio.get_running_loop(), poll)
     poller = DevicePoller(
-        client, interval=0.01, offline_after=0.05, failure_backoff=0.01
+        client, interval=0.01, unreachable_after=0.05, failure_backoff=0.01
     )
     poller.start()
     try:
@@ -109,7 +104,7 @@ async def test_auth_error_runs_single_flight_credential_refresh():
 
     client = FakeClient(asyncio.get_running_loop(), poll)
     poller = DevicePoller(
-        client, interval=0.01, offline_after=10.0, failure_backoff=0.01
+        client, interval=0.01, unreachable_after=10.0, failure_backoff=0.01
     )
     poller.start()
     try:
@@ -121,7 +116,7 @@ async def test_auth_error_runs_single_flight_credential_refresh():
 @pytest.mark.asyncio
 async def test_hung_poll_counts_as_failure_and_keeps_the_edge_clock():
     """A poll stuck on a dead socket is bounded by poll_timeout -- the loop
-    keeps running and the silence clock still flips the offline edge
+    keeps running and the silence clock still flips the DOWN edge
     (regression: an unbounded poll froze the loop and the edge with it)."""
 
     async def hang():
@@ -131,7 +126,7 @@ async def test_hung_poll_counts_as_failure_and_keeps_the_edge_clock():
     poller = DevicePoller(
         client,
         interval=0.01,
-        offline_after=0.05,
+        unreachable_after=0.05,
         failure_backoff=0.01,
         poll_timeout=0.02,
     )

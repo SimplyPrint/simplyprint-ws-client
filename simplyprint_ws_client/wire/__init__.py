@@ -13,6 +13,7 @@ from __future__ import annotations
 from simplyprint_ws_client.wire import mqtt, websocket
 from simplyprint_ws_client.wire.errors import ErrorCode, TransportError
 from simplyprint_ws_client.wire.events import (
+    ActivityTimeout,
     Connected,
     Connecting,
     Disconnected,
@@ -39,6 +40,7 @@ from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.reconnect import Reconnecting
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
+    AuthenticationError,
     FatalError,
     MqttTransport,
     NotConnected,
@@ -55,7 +57,9 @@ __all__ = [
     "mqtt",
     "websocket",
     "ws",
+    "ActivityTimeout",
     "Connected",
+    "AuthenticationError",
     "Connecting",
     "ConnectionKeepalive",
     "ConnectionOptions",

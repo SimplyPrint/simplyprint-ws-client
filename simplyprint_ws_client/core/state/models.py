@@ -44,6 +44,13 @@ class PrinterCpuFlag(IntEnum):
 
 
 class PrinterStatus(StrEnum):
+    """The printer/job state sent to SimplyPrint.
+
+    ``OFFLINE`` is terminal for an active SimplyPrint job. Transport
+    reachability must not be projected to this enum unless losing that
+    transport proves the physical job stopped.
+    """
+
     OPERATIONAL = "operational"
     PRINTING = "printing"
     OFFLINE = "offline"
@@ -53,7 +60,6 @@ class PrinterStatus(StrEnum):
     RESUMING = "resuming"
     DOWNLOADING = "downloading"
     ERROR = "error"
-    NOT_READY = "not_ready"
 
     @staticmethod
     def is_printing(*status: Optional["PrinterStatus"]) -> bool:

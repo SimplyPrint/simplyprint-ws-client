@@ -55,7 +55,7 @@ class MyPrinterClient(PrinterClient[MyPrinterConfig]):
         # Replace this polling driver with WsDriver or MqttDriver for a device
         # that pushes state.
         self.driver = self.attach_driver(
-            DevicePoller(self, interval=1.0, offline_after=10.0)
+            DevicePoller(self, interval=1.0, unreachable_after=10.0)
         )
 
     async def poll_device(self) -> None:
@@ -150,15 +150,20 @@ For a device that publishes updates, attach a `WsDriver` or `MqttDriver` in
 
 ```python
 async def on_device_connected(self, driver) -> None:
-    self.apply_status(PrinterStatus.OPERATIONAL)
+    await super().on_device_connected(driver)
+    # Request a full device report here.
 
 async def on_device_disconnected(self, driver, reason) -> None:
-    self.apply_status(PrinterStatus.OFFLINE)
+    await super().on_device_disconnected(driver, reason)
 
 async def on_device_message(self, message, driver) -> None:
-    # Decode the brand payload and update self.printer.
+    # Decode the brand payload and apply the status reported by the device.
     ...
 ```
+
+A transport disconnect does not change `PrinterState.status`.
+`PrinterStatus.OFFLINE` tells SimplyPrint that an active physical job died; use
+it only when the integration knows that is true.
 
 For discovery, guided onboarding, cameras, accounts, or background services,
 set the corresponding optional field on `IntegrationSpec`. See

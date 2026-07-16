@@ -1,6 +1,10 @@
 # Link loss, print state, and file operations
 
-Status: implemented architecture decision.
+Status: historical design record. Do not treat the implementation described here
+as the target architecture. The connection/file changes did not solve the fleet
+problem, and the current missing-start watchdog can stop a print whose start
+report was lost. The replacement design is
+[`printer-runtime.md`](printer-runtime.md).
 
 ## Problem
 
@@ -25,9 +29,10 @@ Three state owners must remain separate:
 | Printer client | Device reports and their projection to cloud printer status | File-operation completion from link state alone |
 | File transfer | One accepted FILE or START operation, its cancellation and terminal | General device allocation or reconnect policy |
 
-A disconnected link is an observation, not a printer status. A client may
-project it to `OFFLINE` only when doing so cannot contradict protected device or
-operation state.
+A disconnected link is an observation, not a printer status. It never projects
+to `OFFLINE`. `PrinterStatus.OFFLINE` is terminal for the active SimplyPrint job;
+an integration may report it only when the device protocol proves the physical
+job died, such as a directly attached serial printer disappearing.
 
 ## Invariants
 
@@ -83,13 +88,10 @@ Liveness is one immutable `DeviceSession` per driver:
 - reconnect starts a new generation and clears the outage once;
 - teardown awaits the driver, transitions to `stopped`, and detaches the lease.
 
-The driver records facts only. `PrinterClient` aggregates all declared drivers
-and derives a fixed deadline from the most recent down observation plus
-`device_loss_grace`. There is no outage timer, flag cluster, or optional
-capability lookup: the normal client tick performs the projection. Idle loss is
-immediate; printing and a `DOWNLOADING` file operation retain their status until
-the deadline. A reconnect leaves status restoration to the next real device
-report. File transfer sees the raw edge immediately but remains non-terminal.
+The driver records facts only. Link reachability is available to local UI and
+diagnostics, but it does not mutate printer or job status. A reconnect leaves
+status reconciliation to the next real device report. File transfer sees the
+raw edge immediately but remains non-terminal.
 
 The projection is covered by behavior, not field-presence tests:
 
@@ -97,7 +99,8 @@ The projection is covered by behavior, not field-presence tests:
    operation.
 2. A sub-grace flap during printing never emits a job-killing status.
 3. Reconnect resumes normal device-report projection without duplicate handlers.
-4. Deadline expiry produces one bounded offline outcome.
+4. A prolonged network outage remains a reachability outage and preserves the
+   last device-reported job state.
 5. Teardown makes the session terminal and awaits owned work.
 
 ## Rejected shapes

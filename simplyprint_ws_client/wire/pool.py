@@ -28,6 +28,7 @@ from typing import (
     Dict,
     Generic,
     Hashable,
+    Iterable,
     List,
     Optional,
     Set,
@@ -108,24 +109,26 @@ class Endpoint(Generic[T]):
             if not leases:
                 self.route_leases.pop(route, None)
 
-    def add_route(self, lease: "Lease[T]", route: Hashable) -> None:
+    def add_route(self, lease: "Lease[T]", route: Hashable) -> bool:
+        first = route not in self.route_leases
         self.unfiltered_leases.discard(lease)
+        self.route_leases.setdefault(route, set()).add(lease)
         if is_wildcard_filter(route):
             self.wildcard_leases.add(lease)
-            return
-        self.route_leases.setdefault(route, set()).add(lease)
+        return first
 
-    def remove_route(self, lease: "Lease[T]", route: Hashable) -> None:
+    def remove_route(self, lease: "Lease[T]", route: Hashable) -> bool:
+        leases = self.route_leases.get(route)
+        if leases is not None:
+            leases.discard(lease)
+            if not leases:
+                self.route_leases.pop(route, None)
         if is_wildcard_filter(route):
-            self.wildcard_leases.discard(lease)
-        else:
-            leases = self.route_leases.get(route)
-            if leases is not None:
-                leases.discard(lease)
-                if not leases:
-                    self.route_leases.pop(route, None)
+            if not any(is_wildcard_filter(topic) for topic in lease.topics):
+                self.wildcard_leases.discard(lease)
         if lease in self.leases and not lease.topics:
             self.unfiltered_leases.add(lease)
+        return route not in self.route_leases
 
     def attach(self) -> None:
         """Begin fanning the transport's events out to the leases."""
@@ -211,7 +214,13 @@ class Pool(Generic[T]):
         #: an endpoint in an already-detached, no-longer-owned pool.
         self._stopped = False
 
-    def connect(self, url: Union[str, yarl.URL], params: object = None) -> "Lease[T]":
+    def connect(
+        self,
+        url: Union[str, yarl.URL],
+        params: object = None,
+        *,
+        routes: Iterable[Hashable] = (),
+    ) -> "Lease[T]":
         """Lease the shared transport for ``url`` + ``params``.
 
         Synchronous and fire-and-forget: it refcounts and returns at once. Building
@@ -239,7 +248,10 @@ class Pool(Generic[T]):
             lease = self.lease_class(
                 self, shared, parsed, endpoint_key, provider=self.provider
             )
+            lease.topics.update(routes)
             endpoint.add_lease(lease)
+            for route in lease.topics:
+                endpoint.add_route(lease, route)
             # ``start`` is a fire-and-forget, non-blocking contract. Keep it in
             # the bookkeeping critical section so terminal ``stop`` cannot
             # collect the transport and then have this connect resume by
@@ -247,8 +259,6 @@ class Pool(Generic[T]):
             if started is not None:
                 started.start()
             elif not shared.supervising():
-                # A fresh lease on an endpoint whose transport permanently gave
-                # up (bounded retry policy exhausted) re-arms supervision.
                 shared.start()
         return lease
 
@@ -285,14 +295,12 @@ class Pool(Generic[T]):
             self.endpoints.clear()
         return [endpoint.transport for endpoint in endpoints]
 
-    def add_route(self, lease: "Lease[T]", route: Hashable) -> None:
+    def add_route(self, lease: "Lease[T]", route: Hashable) -> bool:
         with self.lock:
             endpoint = self.endpoints.get(lease.endpoint_key)
-            if endpoint is not None:
-                endpoint.add_route(lease, route)
+            return endpoint is not None and endpoint.add_route(lease, route)
 
-    def remove_route(self, lease: "Lease[T]", route: Hashable) -> None:
+    def remove_route(self, lease: "Lease[T]", route: Hashable) -> bool:
         with self.lock:
             endpoint = self.endpoints.get(lease.endpoint_key)
-            if endpoint is not None:
-                endpoint.remove_route(lease, route)
+            return endpoint is not None and endpoint.remove_route(lease, route)

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import time
+import weakref
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import (
@@ -55,7 +55,11 @@ from typing_extensions import TypeVar as TypeVarWithDefault
 from simplyprint_ws_client.core.client import Client, ClientConfigChangedEvent
 from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.core.state import FileProgressStateEnum, PrinterStatus
+from simplyprint_ws_client.core.state import (
+    FileProgressStateEnum,
+    PrinterState,
+    PrinterStatus,
+)
 from simplyprint_ws_client.core.protocol.messages import (
     ApiRestartDemandData,
     CancelDemandData,
@@ -171,20 +175,14 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
     hold_pausing: ClassVar[bool] = False
 
     #: Most devices lose their camera with their control link. Brands whose
-    #: camera remains independently reachable opt out without replacing the
-    #: shared disconnect/status projection.
+    #: camera remains independently reachable opt out.
     clear_camera_on_unreachable: ClassVar[bool] = True
-
-    #: Maximum time a true link loss may retain a status that protects active
-    #: physical work. Idle devices still project OFFLINE immediately.
-    device_loss_grace: ClassVar[float] = 300.0
 
     # ``active`` is a pure allocation-policy knob ("represent this printer on
     # the SimplyPrint connection"), true for the client's whole membership.
-    # Device liveness is NOT expressed by toggling it -- an unreachable device
-    # is reported through ``printer.status`` (OFFLINE) while the printer stays
-    # allocated, so SimplyPrint keeps the printer's context (setup codes,
-    # logs, notifications) and the connection doesn't churn on a flaky wire.
+    # Device liveness is NOT expressed by toggling it or by changing
+    # ``printer.status``. Drivers retain reachability while the last device
+    # report remains authoritative for printer and job state.
     # The scheduler runs init and tick (and therefore the drivers) regardless
     # of this flag, because the drivers are what *detect* liveness.
 
@@ -257,6 +255,12 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         self._drivers.append(driver)
         return driver
 
+    def reset_printer_state(self) -> PrinterState:
+        """Replace the device state and restore its client context."""
+        self.printer = PrinterState(config=self.config)
+        self.printer.provide_context(weakref.ref(self))
+        return self.printer
+
     @property
     def drivers(self) -> tuple["DeviceDriver", ...]:
         """The drivers attached by the concrete printer constructor."""
@@ -304,7 +308,6 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         telemetry, the SimplyPrint heartbeat ping (interval-gated, only while
         added), and the driver ensure-started sweep (a driver whose config
         wasn't ready at init retries here for free)."""
-        await self.project_device_reachability()
         self.tick_progress()
         self.printer.ambient_temperature.tick(self.printer)
         await self.update_host_telemetry()
@@ -330,78 +333,33 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
     async def on_device_connected(self, driver: "DeviceDriver") -> None:
         """A driver reached the device: ensure allocation and (re)resolve the
         camera. Override to add device startup commands (call
-        ``await super()...``). The OFFLINE status is *not* cleared here -- the
-        first real device report maps it through ``apply_status``."""
+        ``await super()...``)."""
         self.active = True
         self.logger.info("Connected to printer")
         self.update_camera_uri()
 
+    async def on_device_transport_connected(self, driver: "DeviceDriver") -> None:
+        """A transport is ready for protocol bootstrap; the device may still be silent."""
+
     async def on_device_disconnected(
         self, driver: "DeviceDriver", reason: Optional[object] = None
     ) -> None:
-        """Handle the true link edge immediately, without inferring job state.
-
-        The driver separately projects an unprotected loss (or a protected
-        loss whose bounded deadline expires) through
-        :meth:`on_device_unreachable`.
-        """
+        """Handle a link edge without inferring printer or job state."""
         self.logger.info(
             "Disconnected from printer%s", f" ({reason})" if reason else ""
         )
-
-    def link_loss_is_protected(self) -> bool:
-        """Whether an immediate OFFLINE would contradict active work."""
-        return (
-            self.printer.is_printing()
-            or self.printer.status == PrinterStatus.DOWNLOADING
-            or self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
-        )
-
-    async def project_device_reachability(self, now: Optional[float] = None) -> bool:
-        """Project all driver sessions into one printer liveness outcome.
-
-        Drivers own observations; this client owns status policy. Any live
-        driver keeps the printer reachable. When all observed paths are down,
-        active print/transfer state is held until the most recent down edge's
-        fixed grace expires. Returns whether OFFLINE was applied now.
-        """
         from simplyprint_ws_client.integration.drivers import DeviceReachability
 
-        sessions = tuple((driver, driver.session) for driver in self._drivers)
-        if not sessions or any(
-            session.reachability is DeviceReachability.UP for _, session in sessions
-        ):
-            return False
-        if any(
-            session.reachability is DeviceReachability.NEVER_SEEN
-            for _, session in sessions
-        ):
-            return False
-        down = tuple(
-            (driver, session)
-            for driver, session in sessions
-            if session.reachability is DeviceReachability.DOWN
-        )
-        if not down:
-            return False
-
-        protected = self.link_loss_is_protected()
         if (
-            self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING
-            and not self.printer.is_printing()
+            self._drivers
+            and self.clear_camera_on_unreachable
+            and all(
+                peer.session.reachability
+                in (DeviceReachability.DOWN, DeviceReachability.STOPPED)
+                for peer in self._drivers
+            )
         ):
-            self.printer.status = PrinterStatus.DOWNLOADING
-        latest_down = max(session.observed_at for _, session in down)
-        if protected and (time.monotonic() if now is None else now) < (
-            latest_down + self.device_loss_grace
-        ):
-            return False
-        if self.printer.status == PrinterStatus.OFFLINE:
-            return False
-        self.printer.status = PrinterStatus.OFFLINE
-        if self.clear_camera_on_unreachable:
             self.clear_camera_uri()
-        return True
 
     async def on_device_message(self, message: object, driver: "DeviceDriver") -> None:
         """One inbound device message (a link's frame payload / an MqttMessage).
@@ -637,7 +595,6 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         *,
         raw: object = None,
         downloading: bool = False,
-        apply: bool = True,
     ) -> PrinterStatus:
         """Run the canonical guard -> edge -> apply pipeline shared by all devices.
 
@@ -646,10 +603,9 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         on the :class:`JobEdge`. Then: hold ``CANCELLING`` (always), hold
         ``PAUSING`` (when the class opts in via :attr:`hold_pausing`), hold
         ``DOWNLOADING`` (when ``downloading``); dispatch the job-start /
-        job-finish / in-progress edge to the subclass hook; and apply the status
-        unless ``apply`` is ``False`` (a device with a "state unknown" sentinel
-        passes ``apply=False`` and the edges still run -- matching the existing
-        behaviour where edges fire but the assignment is suppressed).
+        job-finish / in-progress edge to the subclass hook; and apply the status.
+        A device with no meaningful status must not call this method: absence
+        of an observation is not a transition.
 
         Returns the guarded status.
         """
@@ -667,8 +623,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         elif new_status == PrinterStatus.PRINTING:
             self.on_job_progress(edge)
 
-        if apply:
-            self.printer.status = new_status
+        self.printer.status = new_status
         return new_status
 
     def on_job_start(self, edge: JobEdge) -> None:

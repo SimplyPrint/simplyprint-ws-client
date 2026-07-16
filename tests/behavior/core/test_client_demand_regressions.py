@@ -57,4 +57,3 @@ async def test_connected_msg_without_data_is_tolerated(client):
 def test_client_settings_tick_rate_is_a_field():
     settings = ClientSettings(tick_rate=2.5)
     assert settings.tick_rate == 2.5
-    assert not hasattr(settings, "reconnect_timeout")

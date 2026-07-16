@@ -46,6 +46,11 @@ class FakeTransport(Transport):
     async def send(self, message: object) -> None:
         return None
 
+    def trip(self, generation: int, reason: Exception) -> None:
+        if generation == self.generation:
+            self.live = False
+            self.state = ConnectionState.DISCONNECTED
+
     def route(self, message: object) -> Optional[str]:
         return None
 

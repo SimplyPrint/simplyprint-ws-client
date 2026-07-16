@@ -17,7 +17,6 @@ import yarl
 
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 from simplyprint_ws_client.wire.events import (
     Connected,
     MessageReceived,
@@ -26,8 +25,6 @@ from simplyprint_ws_client.wire.events import (
 from simplyprint_ws_client.wire.keepalive import Keepalive, ConnectionKeepalive
 from simplyprint_ws_client.wire.lease import MqttLease
 from simplyprint_ws_client.wire.mqtt import MqttBroker
-from simplyprint_ws_client.wire.paho import retry_delay_bounds
-from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Pool
 from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
@@ -71,6 +68,11 @@ class FakeTransport(Transport):
         if not self.live:
             raise NotConnected("fake transport not connected")
 
+    def trip(self, generation: int, reason: Exception) -> None:
+        if generation == self.generation:
+            self.live = False
+            self.state = ConnectionState.DISCONNECTED
+
     async def go_up(self) -> None:
         self.generation += 1
         self.live = True
@@ -84,10 +86,10 @@ class FakeBrokerTransport(FakeTransport, MqttTransport):
         self.broken_unsubscribe = broken_unsubscribe
         self.subscribed: List[str] = []
 
-    async def subscribe(self, topic: str) -> None:
+    def subscribe(self, topic: str) -> None:
         self.subscribed.append(topic)
 
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         if self.broken_unsubscribe:
             raise OSError("broker link is gone")
         self.subscribed.remove(topic)
@@ -152,13 +154,34 @@ async def test_mqtt_lease_close_survives_broken_unsubscribe():
     transports: List[FakeBrokerTransport] = []
     pool = make_broker_pool(transports, broken_unsubscribe=True)
     lease = pool.connect(yarl.URL("mqtt://host"))
-    await lease.subscribe("printer/report")
+    lease.subscribe("printer/report")
 
     await lease.close()
 
     assert lease.closed
     # The last lease still stopped the shared transport despite the failure.
     assert transports[0].stops == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_subscription_is_asserted_once_and_removed_by_the_last_lease():
+    transports: List[FakeBrokerTransport] = []
+    pool = make_broker_pool(transports)
+    first = pool.connect(yarl.URL("mqtt://host"))
+    second = pool.connect(yarl.URL("mqtt://host"))
+
+    first.subscribe("printer/report")
+    first.subscribe("printer/report")
+    second.subscribe("printer/report")
+    assert transports[0].subscribed == ["printer/report"]
+
+    first.unsubscribe("printer/report")
+    assert transports[0].subscribed == ["printer/report"]
+    second.unsubscribe("printer/report")
+    assert transports[0].subscribed == []
+
+    await first.close()
+    await second.close()
 
 
 @pytest.mark.asyncio
@@ -210,8 +233,8 @@ async def test_plus_wildcard_subscription_receives_messages():
     lease.event_bus.on(MessageReceived, lambda e: received.append(e.message.topic))
     other.event_bus.on(MessageReceived, lambda e: missed.append(e.message.topic))
 
-    await lease.subscribe("device/+/report")
-    await other.subscribe("something/else")
+    lease.subscribe("device/+/report")
+    other.subscribe("something/else")
     await transports[0].deliver("device/123/report")
 
     for _ in range(10):
@@ -246,18 +269,6 @@ async def test_keepalive_start_is_idempotent():
     assert keepalive.task is first_task
 
     await lease.close()
-
-
-# --- paho retry mapping + credential redaction ---------------------------------------
-
-
-def test_retry_delay_bounds_maps_backoff_envelope():
-    policy = RetryPolicy(backoff=ConstantBackoff(7))
-    assert retry_delay_bounds(policy) == (7, 7)
-
-    fast = RetryPolicy(backoff=ConstantBackoff(0))
-    low, high = retry_delay_bounds(fast)
-    assert low >= 1 and high >= low
 
 
 def test_mqtt_broker_repr_redacts_password():

@@ -1,25 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import ssl
+import threading
 from types import SimpleNamespace
 
 import pytest
 import yarl
-from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
 from simplyprint_ws_client.wire import mqtt
-from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 from simplyprint_ws_client.wire.messages import MqttMessage
 from simplyprint_ws_client.wire.mqtt_probe import MqttProbeOutcome, probe_mqtt
-from simplyprint_ws_client.wire.options import WireKeepalive
-from simplyprint_ws_client.wire.paho import default_paho_client
-from simplyprint_ws_client.wire.policy import RetryPolicy
-from simplyprint_ws_client.wire.pools import PoolRegistry
 
 
 class FakePublishInfo:
@@ -51,7 +43,10 @@ class FakePahoClient:
         self.connect_args = None
         self.subscriptions: list[str] = []
         self.published: list[tuple[str, bytes]] = []
-        self.stopped = 0
+        self.disconnects = 0
+        self.loop_exit = threading.Event()
+        self.drove_connection = False
+        self.reported = False
         self.on_pre_connect = None
         self.on_connect = None
         self.on_connect_fail = None
@@ -64,37 +59,23 @@ class FakePahoClient:
     def connect_async(self, host, port, keepalive) -> None:
         self.connect_args = host, port, keepalive
 
-    def loop_start(self) -> int:
-        if self.connect_failure:
-            self.on_connect_fail(self, None)
-            return 0
-        if self.reason_code is None:
-            return 0
-        self.on_pre_connect(self, None)
-        if self.reason_code == 0:
-            self.connected = True
-            self.on_connect(self, None, {}, 0, None)
-            if self.report_topic is not None:
-                self.on_message(
-                    self,
-                    None,
-                    SimpleNamespace(
-                        topic=self.report_topic,
-                        payload=b"report",
-                        qos=0,
-                        retain=False,
-                    ),
-                )
-        else:
-            self.on_connect(self, None, {}, self.reason_code, None)
-        return 0
-
-    def loop_stop(self) -> int:
-        self.stopped += 1
-        return 0
+    def loop_forever(self, timeout=1.0, retry_first_connection=False) -> int:
+        if not self.drove_connection:
+            self.drove_connection = True
+            if self.connect_failure:
+                self.on_connect_fail(self, None)
+            elif self.reason_code == 0:
+                self.connected = True
+                self.on_connect(self, None, {}, 0, None)
+            elif self.reason_code is not None:
+                self.on_connect(self, None, {}, self.reason_code, None)
+        self.loop_exit.wait()
+        return 4
 
     def disconnect(self) -> None:
+        self.disconnects += 1
         self.connected = False
+        self.loop_exit.set()
 
     def is_connected(self) -> bool:
         return self.connected
@@ -108,35 +89,23 @@ class FakePahoClient:
 
     def publish(self, topic, payload, *, qos, retain) -> FakePublishInfo:
         self.published.append((topic, payload))
+        if self.publish_rc == 0 and self.report_topic is not None and not self.reported:
+            self.reported = True
+            self.on_message(
+                self,
+                None,
+                SimpleNamespace(
+                    topic=self.report_topic,
+                    payload=b"report",
+                    qos=0,
+                    retain=False,
+                ),
+            )
         return FakePublishInfo(self.publish_rc)
 
 
 def install_client(monkeypatch, client: FakePahoClient) -> None:
     monkeypatch.setattr(mqtt, "default_paho_client", lambda _url, _logger, **_k: client)
-
-
-def test_default_paho_client_matches_released_bambu_wire_parameters():
-    client = default_paho_client(
-        yarl.URL("mqtts://printer"),
-        logging.getLogger("test.paho.defaults"),
-    )
-
-    assert client._callback_api_version is CallbackAPIVersion.VERSION2
-    assert client._reconnect_on_failure is True
-    assert (client._reconnect_min_delay, client._reconnect_max_delay) == (1, 5)
-    assert client._tls_insecure is True
-    assert client._ssl_context.verify_mode == ssl.CERT_NONE
-    assert client._logger is None
-
-
-def test_default_paho_client_maps_an_explicit_retry_policy():
-    client = default_paho_client(
-        yarl.URL("mqtt://printer"),
-        logging.getLogger("test.paho.retry"),
-        retry=RetryPolicy(backoff=ConstantBackoff(7)),
-    )
-
-    assert (client._reconnect_min_delay, client._reconnect_max_delay) == (7, 7)
 
 
 @pytest.mark.asyncio
@@ -145,14 +114,12 @@ async def test_probe_uses_owner_pool_front_door_and_publishes_before_report(
 ):
     client = FakePahoClient(report_topic="device/SN/report")
     install_client(monkeypatch, client)
-    pools = PoolRegistry()
     commands = (
         MqttMessage("device/SN/request", b"start"),
         MqttMessage("device/SN/request", b"pushall"),
     )
 
     result = await probe_mqtt(
-        pools,
         yarl.URL("mqtts://bblp:secret@printer:8883/?topic=device/SN/report"),
         connect_timeout=0.1,
         report_timeout=0.1,
@@ -170,7 +137,7 @@ async def test_probe_uses_owner_pool_front_door_and_publishes_before_report(
         ("device/SN/request", b"start"),
         ("device/SN/request", b"pushall"),
     ]
-    assert client.stopped == 1
+    assert client.disconnects == 1
 
 
 @pytest.mark.asyncio
@@ -190,7 +157,6 @@ async def test_probe_classifies_mqtt_connack_failures(
     install_client(monkeypatch, client)
 
     result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://user:secret@printer/?topic=status",
         connect_timeout=0.1,
         report_timeout=0,
@@ -199,7 +165,7 @@ async def test_probe_classifies_mqtt_connack_failures(
 
     assert result.outcome is outcome
     assert result.reason_code == reason_code
-    assert client.stopped == 1
+    assert client.disconnects == 1
 
 
 @pytest.mark.asyncio
@@ -208,7 +174,6 @@ async def test_probe_classifies_real_paho_reason_code(monkeypatch):
     install_client(monkeypatch, client)
 
     result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://user:secret@printer/?topic=status",
         connect_timeout=0.1,
         report_timeout=0,
@@ -225,7 +190,6 @@ async def test_probe_reports_first_transient_connect_failure(monkeypatch):
     install_client(monkeypatch, client)
 
     result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://printer/?topic=status",
         connect_timeout=0.1,
         report_timeout=0,
@@ -233,7 +197,7 @@ async def test_probe_reports_first_transient_connect_failure(monkeypatch):
     )
 
     assert result.outcome is MqttProbeOutcome.CONNECT_FAILED
-    assert result.reason == "paho connect failed"
+    assert result.reason == "paho connection failed"
 
 
 @pytest.mark.asyncio
@@ -241,7 +205,6 @@ async def test_probe_distinguishes_connect_and_required_report_timeouts(monkeypa
     silent = FakePahoClient(reason_code=None)
     install_client(monkeypatch, silent)
     connect_result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://printer/?topic=status",
         connect_timeout=0.001,
         report_timeout=0,
@@ -252,7 +215,6 @@ async def test_probe_distinguishes_connect_and_required_report_timeouts(monkeypa
     connected = FakePahoClient()
     install_client(monkeypatch, connected)
     report_result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://printer/?topic=status",
         connect_timeout=0.1,
         report_timeout=0.001,
@@ -267,7 +229,6 @@ async def test_probe_accepts_missing_optional_report(monkeypatch):
     install_client(monkeypatch, client)
 
     result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://printer/?topic=elegoo/%23",
         connect_timeout=0.1,
         report_timeout=0.001,
@@ -284,7 +245,6 @@ async def test_probe_reports_initial_publish_failure(monkeypatch):
     install_client(monkeypatch, client)
 
     result = await probe_mqtt(
-        PoolRegistry(),
         "mqtt://printer/?topic=status",
         connect_timeout=0.1,
         report_timeout=0.1,
@@ -299,11 +259,8 @@ async def test_probe_reports_initial_publish_failure(monkeypatch):
 async def test_probe_cancellation_releases_lease_and_stops_transport(monkeypatch):
     client = FakePahoClient(reason_code=None)
     install_client(monkeypatch, client)
-    pools = PoolRegistry()
-
     probe = asyncio.create_task(
         probe_mqtt(
-            pools,
             "mqtt://printer/?topic=status",
             connect_timeout=30,
             report_timeout=30,
@@ -316,7 +273,4 @@ async def test_probe_cancellation_releases_lease_and_stops_transport(monkeypatch
     with pytest.raises(asyncio.CancelledError):
         await probe
 
-    provider = EventLoopProvider(asyncio.get_running_loop())
-    pool = mqtt.pool_for(pools, provider, WireKeepalive(interval=20))
-    assert pool.endpoints == {}
-    assert client.stopped == 1
+    assert client.disconnects == 1
