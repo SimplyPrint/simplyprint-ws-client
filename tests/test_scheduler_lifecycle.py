@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from simplyprint_ws_client.core.client import Client
+from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.manager import ClientList
@@ -130,6 +130,32 @@ async def test_active_edge_allocates_without_reinit(scheduler, client):
     await scheduler._schedule_client(client)
     assert scheduler.manager.allocate_calls == 1
     assert client.init_calls == 1  # allocation is not (re)initialization
+
+
+@pytest.mark.asyncio
+async def test_failed_send_keeps_state_for_the_next_scheduler_pass(
+    scheduler, client, monkeypatch
+):
+    client.state = ClientState.CONNECTED
+    client.printer.job_info.progress = 42
+
+    async def fail_send(*_args, **_kwargs):
+        raise ConnectionError("socket closed during write")
+
+    monkeypatch.setattr(client, "send", fail_send)
+    await scheduler._schedule_client(client)
+
+    assert [item.message.data for item in client.pending_messages()] == [
+        {"progress": 42}
+    ]
+
+    async def complete_send(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(client, "send", complete_send)
+    await scheduler._schedule_client(client)
+
+    assert client.pending_messages() == []
 
 
 @pytest.mark.asyncio
