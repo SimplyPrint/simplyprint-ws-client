@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,6 +16,7 @@ from simplyprint_ws_client import (
 from simplyprint_ws_client.common.utils.slugify import slugify
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.integration.client import PrinterClient
+from simplyprint_ws_client.integration.transfer import file_transfer as transfer_module
 from simplyprint_ws_client.integration.transfer import (
     FileOperationError,
     FileTransfer,
@@ -48,6 +50,7 @@ class Driver(PrintFileDriver):
         self.urls = 0
         self.atomic = 0
         self.closed = 0
+        self.cancelled_starts = 0
         self.requests = []
         self.upload_errors = []
 
@@ -80,6 +83,9 @@ class Driver(PrintFileDriver):
 
     async def close(self):
         self.closed += 1
+
+    async def cancel_start(self):
+        self.cancelled_starts += 1
 
 
 def _transfer(
@@ -215,8 +221,136 @@ async def test_url_route_skips_connector_download_and_waits_for_device(client: C
     assert transfer.awaiting_device_start
     assert transfer.progress(63)
     assert client.printer.file_progress.percent == 63
+    assert transfer.awaiting_device_start
     assert transfer.started()
     assert client.printer.file_progress.state == FileProgressStateEnum.READY
+
+
+@pytest.mark.asyncio
+async def test_device_transfer_finishes_before_start_grace_begins(client: Client):
+    driver = Driver(
+        route=PreparationKind.URL,
+        disposition=StartDisposition.AWAIT_DEVICE_TRANSFER,
+    )
+    transfer = _transfer(client, driver)
+    transfer.submit(
+        FileDemandData(
+            file_name="job.3mf",
+            cdn_url="https://cdn.test/job.3mf",
+            auto_start=True,
+        )
+    )
+    await transfer.wait()
+
+    assert client.printer.file_progress.percent == 0
+    assert not transfer.awaiting_device_start
+    assert transfer.progress(92)
+    assert not transfer.awaiting_device_start
+    assert transfer.progress(100)
+    assert transfer.awaiting_device_start
+
+    assert transfer.progress(39)
+    assert not transfer.awaiting_device_start
+    assert transfer.progress(100)
+    assert transfer.awaiting_device_start
+    assert transfer.started()
+    assert client.printer.file_progress.state == FileProgressStateEnum.READY
+
+
+@pytest.mark.asyncio
+async def test_device_can_reject_while_its_transfer_is_in_progress(client: Client):
+    driver = Driver(
+        route=PreparationKind.URL,
+        disposition=StartDisposition.AWAIT_DEVICE_TRANSFER,
+    )
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(file_name="job.3mf", auto_start=True))
+    await transfer.wait()
+
+    assert transfer.progress(42)
+    assert transfer.rejected("bad file")
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
+    assert transfer.observe_job_start("firmware.3mf") == ("firmware.3mf", False)
+
+
+@pytest.mark.asyncio
+async def test_device_can_start_while_its_transfer_is_in_progress(client: Client):
+    driver = Driver(
+        route=PreparationKind.URL,
+        disposition=StartDisposition.AWAIT_DEVICE_TRANSFER,
+    )
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(file_name="job.3mf", auto_start=True))
+    await transfer.wait()
+
+    assert transfer.progress(42)
+    assert transfer.started()
+    assert client.printer.file_progress.state == FileProgressStateEnum.READY
+
+
+@pytest.mark.asyncio
+async def test_device_transfer_completion_race_still_arms_start_grace(client: Client):
+    class ProgressBeforeResponse(Driver):
+        def __init__(self):
+            super().__init__(
+                route=PreparationKind.URL,
+                disposition=StartDisposition.AWAIT_DEVICE_TRANSFER,
+            )
+            self.reported = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def start_url(self, data, progress):
+            progress(100)
+            self.reported.set()
+            await self.release.wait()
+            return self.disposition
+
+    driver = ProgressBeforeResponse()
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(file_name="job.3mf", auto_start=True))
+    await driver.reported.wait()
+
+    assert not transfer.awaiting_device_start
+    driver.release.set()
+    await transfer.wait()
+    assert transfer.awaiting_device_start
+    assert transfer.started()
+
+
+@pytest.mark.asyncio
+async def test_device_transfer_timeout_starts_after_real_100(
+    client: Client, monkeypatch
+):
+    now = 0.0
+    monkeypatch.setattr(
+        transfer_module, "time", SimpleNamespace(monotonic=lambda: now)
+    )
+    driver = Driver(
+        route=PreparationKind.URL,
+        disposition=StartDisposition.AWAIT_DEVICE_TRANSFER,
+    )
+    transfer = _transfer(client, driver)
+    transfer.watchdog_interval_seconds = 0
+    transfer.submit(FileDemandData(file_name="job.3mf", auto_start=True))
+    await transfer.wait()
+
+    assert transfer.progress(92)
+    now = 61
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert driver.cancelled_starts == 0
+
+    assert transfer.progress(100)
+    now = 111
+    assert transfer.progress(100)
+    now = 122
+    for _ in range(10):
+        if driver.cancelled_starts:
+            break
+        await asyncio.sleep(0)
+
+    assert driver.cancelled_starts == 1
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,9 @@ class StartDisposition(Enum):
 
     COMPLETE = "complete"
     AWAIT_DEVICE = "await_device"
+    # The device still has to fetch the file. Its start grace begins at 100 and
+    # is disarmed if the device reports that transfer restarted below 100.
+    AWAIT_DEVICE_TRANSFER = "await_device_transfer"
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,7 @@ class _TransferLifecycle:
     activity_at: Optional[float] = None
     awaiting_since: Optional[float] = None
     start_in_flight: bool = False
+    start_disposition: Optional[StartDisposition] = None
     watchdog: Optional[asyncio.Task] = field(default=None, repr=False)
 
     @property
@@ -491,8 +495,14 @@ class FileTransfer:
             self._mark_ready("device accepted start")
             return
         if disposition is StartDisposition.AWAIT_DEVICE:
+            lifecycle.start_disposition = disposition
             lifecycle.awaiting_since = lifecycle.activity_at = time.monotonic()
             self._progress_state.percent = 100
+            return
+        if disposition is StartDisposition.AWAIT_DEVICE_TRANSFER:
+            lifecycle.start_disposition = disposition
+            if self._progress_state.percent >= 100:
+                lifecycle.awaiting_since = lifecycle.activity_at
             return
         raise FileOperationError(
             "Printer returned an invalid start result",
@@ -567,7 +577,10 @@ class FileTransfer:
         if (
             lifecycle is None
             or not lifecycle.is_preparing
-            or not (lifecycle.start_in_flight or lifecycle.awaiting_since is not None)
+            or not (
+                lifecycle.start_in_flight
+                or lifecycle.start_disposition is not None
+            )
         ):
             return False
         self._touch_activity()
@@ -580,7 +593,10 @@ class FileTransfer:
         if (
             lifecycle is None
             or not lifecycle.is_preparing
-            or not (lifecycle.start_in_flight or lifecycle.awaiting_since is not None)
+            or not (
+                lifecycle.start_in_flight
+                or lifecycle.start_disposition is not None
+            )
         ):
             return False
         self._fail(message, reason)
@@ -588,9 +604,16 @@ class FileTransfer:
 
     def progress(self, percent: float) -> bool:
         """Project printer-side URL preparation progress."""
-        if not self.is_preparing_to_print:
+        lifecycle = self._lifecycle
+        if lifecycle is None or not lifecycle.is_preparing:
             return False
         self._device_progress(percent)
+        if lifecycle.start_disposition is StartDisposition.AWAIT_DEVICE_TRANSFER:
+            if self._progress_state.percent >= 100:
+                if lifecycle.awaiting_since is None:
+                    lifecycle.awaiting_since = lifecycle.activity_at
+            else:
+                lifecycle.awaiting_since = None
         return True
 
     def _normalize_request(self, data: FileDemandData) -> FileDemandData:
@@ -622,6 +645,7 @@ class FileTransfer:
         lifecycle.activity_at = None
         lifecycle.awaiting_since = None
         lifecycle.start_in_flight = False
+        lifecycle.start_disposition = None
         watchdog, lifecycle.watchdog = lifecycle.watchdog, None
         if watchdog is not None:
             watchdog.cancel()
@@ -639,7 +663,7 @@ class FileTransfer:
         lifecycle = self._active_for_context()
         if lifecycle is None:
             return
-        if lifecycle.start_in_flight or lifecycle.awaiting_since is not None:
+        if lifecycle.start_in_flight or lifecycle.start_disposition is not None:
             self._sent_start_filename = None
         lifecycle.terminal = FileProgressStateEnum.ERROR
         self._progress_state.state = FileProgressStateEnum.ERROR
