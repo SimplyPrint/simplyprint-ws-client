@@ -53,6 +53,12 @@ from typing import (
 from typing_extensions import TypeVar as TypeVarWithDefault
 
 from simplyprint_ws_client.core.client import Client, ClientConfigChangedEvent
+from simplyprint_ws_client.core.job import (
+    FinishJob,
+    JobOutcome,
+    NativeJobObservation,
+    StartJob,
+)
 from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import (
@@ -259,6 +265,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         """Replace the device state and restore its client context."""
         self.printer = PrinterState(config=self.config)
         self.printer.provide_context(weakref.ref(self))
+        self.job_timeline.reset()
         return self.printer
 
     @property
@@ -582,9 +589,9 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         )
 
     def is_job_finish(self, new_status: PrinterStatus) -> bool:
-        """True on the edge from a printing state back to OPERATIONAL."""
+        """True when a printing state reaches an idle or dead printer."""
         return (
-            new_status == PrinterStatus.OPERATIONAL
+            new_status in (PrinterStatus.OPERATIONAL, PrinterStatus.OFFLINE)
             and self.printer.status is not None
             and self.printer.is_printing()
         )
@@ -595,6 +602,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         *,
         raw: object = None,
         downloading: bool = False,
+        job_observation: Optional[NativeJobObservation] = None,
     ) -> PrinterStatus:
         """Run the canonical guard -> edge -> apply pipeline shared by all devices.
 
@@ -613,14 +621,29 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         if self.hold_pausing:
             new_status = self.hold_status_on_pause(new_status)
         new_status = self.hold_status_while_downloading(new_status, downloading)
+        new_status = self.job_timeline.guard_status(
+            self.printer.status, new_status, job_observation
+        )
 
         edge = JobEdge(new_status, self.printer.status, raw)
-        if self.is_job_start(new_status):
-            self.printer.job_info.started = True
-            self.on_job_start(edge)
-        elif self.is_job_finish(new_status):
-            self.on_job_finish(edge)
-        elif new_status == PrinterStatus.PRINTING:
+        transitions = self.job_timeline.transitions(
+            self.printer.status, new_status, job_observation
+        )
+        for transition in transitions:
+            if isinstance(transition, FinishJob):
+                classified = self.on_job_finish(edge)
+                outcome = transition.outcome or classified
+                self._record_job_terminal(outcome, transition.native_id)
+            elif isinstance(transition, StartJob):
+                self.printer.job_info.started = True
+                self.on_job_start(edge)
+                version = self.next_msg_id()
+                self.job_timeline.record_start(
+                    self.printer, version, transition.native_id
+                )
+                self.signal()
+
+        if not transitions and new_status == PrinterStatus.PRINTING:
             self.on_job_progress(edge)
 
         self.printer.status = new_status
@@ -631,9 +654,23 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         detection) from ``edge.raw``. ``job_info.started`` is already set by
         :meth:`apply_status`."""
 
-    def on_job_finish(self, edge: JobEdge) -> None:
-        """Classify the finish from ``edge.raw``: set exactly one of
-        ``job_info.finished`` / ``.cancelled`` / ``.failed``."""
+    def on_job_finish(self, edge: JobEdge) -> JobOutcome:
+        """Classify the finish from ``edge.raw``."""
+        return JobOutcome.FINISHED
+
+    def _record_job_terminal(
+        self, outcome: JobOutcome, native_id: Optional[str]
+    ) -> None:
+        if outcome == JobOutcome.FINISHED:
+            self.printer.job_info.finished = True
+        elif outcome == JobOutcome.CANCELLED:
+            self.printer.job_info.cancelled = True
+        else:
+            self.printer.job_info.failed = True
+
+        version = self.next_msg_id()
+        self.job_timeline.record_terminal(self.printer, version, native_id)
+        self.signal()
 
     def on_job_progress(self, edge: JobEdge) -> None:
         """Update in-progress job fields (progress/layer/time). Default no-op."""

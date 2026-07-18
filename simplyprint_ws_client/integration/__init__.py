@@ -1,6 +1,11 @@
 """Public authoring components for a printer integration."""
 
 from simplyprint_ws_client.core.client_context import ClientContext
+from simplyprint_ws_client.core.job import (
+    JobOutcome,
+    NativeJobObservation,
+    NativeJobTerminal,
+)
 from simplyprint_ws_client.integration.client import AppUpdater, JobEdge, PrinterClient
 from simplyprint_ws_client.integration.drivers import (
     DeviceAuthError,
@@ -37,8 +42,11 @@ __all__ = [
     "IntegrationSpec",
     "IntegrationTransport",
     "JobEdge",
+    "JobOutcome",
     "LeaseDriver",
     "MqttDriver",
+    "NativeJobObservation",
+    "NativeJobTerminal",
     "PrinterClient",
     "ProductMetadata",
     "WsDriver",

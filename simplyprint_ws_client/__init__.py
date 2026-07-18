@@ -15,6 +15,11 @@ from simplyprint_ws_client.core.client import (
     PeripheralDefinitions,
 )
 from simplyprint_ws_client.core.client_context import ClientContext
+from simplyprint_ws_client.core.job import (
+    JobOutcome,
+    NativeJobObservation,
+    NativeJobTerminal,
+)
 from simplyprint_ws_client.core.config import (
     Config,
     ConfigManager,
@@ -97,6 +102,9 @@ __all__ = [
     "NotificationEventSeverity",
     "NotificationEventType",
     "NozzleType",
+    "JobOutcome",
+    "NativeJobObservation",
+    "NativeJobTerminal",
     "ObjectsMsg",
     "PeripheralAction",
     "PeripheralActionDemandData",

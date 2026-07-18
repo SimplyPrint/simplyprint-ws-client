@@ -39,6 +39,7 @@ from simplyprint_ws_client.core.state import (
     NotificationEvent,
     NotificationEventKwargs,
 )
+from simplyprint_ws_client.core.job import JobTimeline
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionOutgoingEvent,
@@ -135,6 +136,13 @@ class PendingMessage(NamedTuple):
     message: ClientMsg
     version: int
     interval: Optional[Interval]
+    order: int
+    owner: "MessageOwner"
+
+
+class MessageOwner(IntEnum):
+    STATE = 0
+    JOB_TIMELINE = 1
 
 
 class ClientConfigChangedEvent(Event): ...
@@ -315,6 +323,7 @@ class Client(
         self.event_bus = EventBus(event_loop_provider=self)
         self.printer = PrinterState(config=config)
         self.printer.provide_context(weakref.ref(self))
+        self.job_timeline = JobTimeline()
         self.logger = printer_logger(self.unique_id)
         self._register_core_handlers()
 
@@ -397,7 +406,7 @@ class Client(
 
     @property
     def has_changes(self) -> bool:
-        return self.printer.model_has_changed
+        return self.printer.model_has_changed or self.job_timeline.has_pending
 
     def next_msg_id(self):
         self.msg_id += 1
@@ -501,15 +510,38 @@ class Client(
             if msg.dispatch_mode(self.printer) != DispatchMode.DISPATCH:
                 continue
 
+            if msg_kind is JobInfoMsg and self.job_timeline.has_pending:
+                continue
+
             pending.append(
-                PendingMessage(msg, highest, msg.dispatch_interval(self.printer))
+                PendingMessage(
+                    msg,
+                    highest,
+                    msg.dispatch_interval(self.printer),
+                    lowest,
+                    MessageOwner.STATE,
+                )
             )
 
-        return pending
+        if not is_pending or JobInfoMsg.msg_type().when_pending():
+            pending.extend(
+                PendingMessage(
+                    item.message,
+                    item.version,
+                    None,
+                    item.version,
+                    MessageOwner.JOB_TIMELINE,
+                )
+                for item in self.job_timeline.pending_messages()
+            )
+
+        return sorted(pending, key=lambda item: item.order)
 
     def commit_message(self, pending: PendingMessage) -> None:
         """Acknowledge one projection after its socket write completed."""
         pending.message.reset_changes(self.printer, v=pending.version)
+        if pending.owner == MessageOwner.JOB_TIMELINE:
+            self.job_timeline.commit(pending.version)
         if pending.interval is not None:
             self.printer.intervals.use(pending.interval)
 

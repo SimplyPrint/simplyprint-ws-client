@@ -141,7 +141,6 @@ from simplyprint_ws_client.core.state import (
     JobInfoState,
     MaterialEntry,
     JobObjectEntry,
-    PrinterStatus,
     NotificationActionResponses,
 )
 
@@ -815,10 +814,6 @@ class StateChangeMsg(ClientMsg[Literal[ClientMsgType.STATUS]]):
         yield "new", state.status
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        # When the printer goes operational, we can clear the current job id.
-        if state.status == PrinterStatus.OPERATIONAL:
-            state.current_job_id = None
-
         state.model_reset_changed("status", v=v)
 
 
@@ -849,11 +844,11 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
             yield key, value
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        # When an ended field has been changed to true, we can clear the current job id.
         ended_fields = {"cancelled", "failed", "finished"}
-        if state.job_info.model_has_changes(*ended_fields) and (
-            state.job_info.cancelled or state.job_info.failed or state.job_info.finished
-        ):
+        data = self.data or {}
+        if any(data.get(field) is True for field in ended_fields) and data.get(
+            "job_id"
+        ) == state.current_job_id:
             state.current_job_id = None
 
         state.job_info.model_reset_changed(v=v)

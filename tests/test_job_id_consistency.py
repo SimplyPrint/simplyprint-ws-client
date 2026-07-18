@@ -79,13 +79,11 @@ def test_job_id_consistency_flow(client: Client):
     # Should still have job_id in the finished message
     assert job_info_msg is not None
     assert job_info_msg.data["job_id"] == job_id
-
-    # After reset_changes is called (simulating message dispatch), job_id should be cleared
-    job_info_msg.reset_changes(client.printer)
     assert client.printer.current_job_id is None
 
-    # Going back to operational should also clear job_id if it wasn't already cleared
-    client.printer.current_job_id = job_id  # Set it again
+    # An operational status is not a job terminal and cannot clear a newer
+    # association on its own.
+    client.printer.current_job_id = job_id
     client.printer.status = PrinterStatus.OPERATIONAL
 
     msgs = commit_pending(client)
@@ -93,6 +91,4 @@ def test_job_id_consistency_flow(client: Client):
 
     assert status_msg is not None
 
-    # After reset_changes is called, job_id should be cleared
-    status_msg.reset_changes(client.printer)
-    assert client.printer.current_job_id is None
+    assert client.printer.current_job_id == job_id
