@@ -1,5 +1,6 @@
 __all__ = [
     "Client",
+    "PendingMessage",
     "ClientConfigChangedEvent",
     "ClientStateChangeEvent",
     "ClientState",
@@ -126,6 +127,14 @@ class ClientState(IntEnum):
 class VersionedState(NamedTuple):
     v: int
     s: ClientState
+
+
+class PendingMessage(NamedTuple):
+    """One immutable state projection and the newest version it contains."""
+
+    message: ClientMsg
+    version: int
+    interval: Optional[Interval]
 
 
 class ClientConfigChangedEvent(Event): ...
@@ -294,7 +303,6 @@ class Client(
         )
         self.v = -1
         self.msg_id = -1
-        self.last_msg_id = -1
         self._should_be_allocated = True
         self.initialized = False
         self.offload = context.offload
@@ -389,7 +397,7 @@ class Client(
 
     @property
     def has_changes(self) -> bool:
-        return self.msg_id > self.last_msg_id
+        return self.printer.model_has_changed
 
     def next_msg_id(self):
         self.msg_id += 1
@@ -461,10 +469,8 @@ class Client(
     def signal(self):
         self.event_bus.emit_sync(ClientStateChangeEvent)
 
-    def consume(self) -> list:
-        """Consume and return the list of pending messages."""
-        self.last_msg_id = self.msg_id
-
+    def pending_messages(self) -> list[PendingMessage]:
+        """Project pending state without acknowledging or mutating it."""
         msg_kinds = {}
 
         # Build a unique map of message kinds together with their highest version.
@@ -474,7 +480,7 @@ class Client(
 
         is_pending = self.printer.config.is_pending()
 
-        msgs = []
+        pending = []
 
         # Sort by the lowest version.
         for msg_kind, (lowest, highest) in sorted(
@@ -495,10 +501,17 @@ class Client(
             if msg.dispatch_mode(self.printer) != DispatchMode.DISPATCH:
                 continue
 
-            msgs.append(msg)
-            msg.reset_changes(self.printer, v=highest)
+            pending.append(
+                PendingMessage(msg, highest, msg.dispatch_interval(self.printer))
+            )
 
-        return msgs
+        return pending
+
+    def commit_message(self, pending: PendingMessage) -> None:
+        """Acknowledge one projection after its socket write completed."""
+        pending.message.reset_changes(self.printer, v=pending.version)
+        if pending.interval is not None:
+            self.printer.intervals.use(pending.interval)
 
     # internal methods
 
@@ -586,6 +599,8 @@ class Client(
             return
 
         await self.event_bus.emit(SimplyPrintConnectionOutgoingEvent, msg, self.v)
+        if not skip_dispatch:
+            msg.mark_dispatched(self.printer)
 
     # lifetime methods
 

@@ -245,7 +245,7 @@ class FileTransfer:
                 )
             )
         )
-        self._previous_print_filename = sent
+        self._previous_print_filename = filename
         self._sent_start_filename = None
         return filename, reprint
 

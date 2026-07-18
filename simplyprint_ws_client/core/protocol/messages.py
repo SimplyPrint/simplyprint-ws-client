@@ -617,13 +617,20 @@ class ClientMsg(Msg[TMsgType, Optional[dict]]):
         pass
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        """
-        Based on the Msg and client state, determine if
-        this message needs to be rate-limited, always sent or treated
-        as normal. This takes intervals into consideration.
-        """
-        _ = self
-        return DispatchMode.DISPATCH
+        interval = self.dispatch_interval(state)
+        if interval is None or state.intervals.is_ready(interval):
+            return DispatchMode.DISPATCH
+        return DispatchMode.RATELIMIT
+
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        """Return the interval charged only after a successful send."""
+        _ = state
+        return None
+
+    def mark_dispatched(self, state: PrinterState) -> None:
+        interval = self.dispatch_interval(state)
+        if interval is not None:
+            state.intervals.use(interval)
 
 
 class MultiPrinterAddConnectionMsg(ClientMsg[Literal[ClientMsgType.ADD_CONNECTION]]):
@@ -661,7 +668,7 @@ class MachineDataMsg(ClientMsg[Literal[ClientMsgType.INFO]]):
         yield from state.info.model_dump(mode="json", exclude_none=True).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.info.model_reset_changed()
+        state.info.model_reset_changed(v=v)
 
 
 class WebcamStatusMsg(ClientMsg[Literal[ClientMsgType.WEBCAM_STATUS]]):
@@ -682,7 +689,7 @@ class WebcamMsg(ClientMsg[Literal[ClientMsgType.WEBCAM]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.webcam_settings.model_reset_changed()
+        state.webcam_settings.model_reset_changed(v=v)
 
 
 class InstalledPluginsMsg(ClientMsg[Literal[ClientMsgType.INSTALLED_PLUGINS]]): ...
@@ -715,7 +722,7 @@ class FirmwareMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE]]):
         yield "fw", data
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.firmware.model_reset_changed()
+        state.firmware.model_reset_changed(v=v)
 
 
 class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
@@ -727,7 +734,7 @@ class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.firmware_warning.model_reset_changed()
+        state.firmware_warning.model_reset_changed(v=v)
 
 
 class ToolMsg(ClientMsg[Literal[ClientMsgType.TOOL]]):
@@ -760,16 +767,16 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
             yield f"tool{i}", tool.temperature.to_list()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.bed.model_reset_changed("temperature")
-        state.bed.temperature.model_reset_changed()
-        state.chamber.model_reset_changed("temperature")
-        state.chamber.temperature.model_reset_changed()
+        state.bed.model_reset_changed("temperature", v=v)
+        state.bed.temperature.model_reset_changed(v=v)
+        state.chamber.model_reset_changed("temperature", v=v)
+        state.chamber.temperature.model_reset_changed(v=v)
 
         for tool in state.tools:
-            tool.model_reset_changed("temperature")
-            tool.temperature.model_reset_changed()
+            tool.model_reset_changed("temperature", v=v)
+            tool.temperature.model_reset_changed(v=v)
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
         # If any target has been set, we need to send the message.
         if any(
             "target" in x.model_self_changed_fields
@@ -778,13 +785,13 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
                 map(lambda t: t.temperature, state.tools),
             )
         ):
-            return DispatchMode.DISPATCH
+            return None
 
         # For normal temperature changes, report more often if we are heating up or down.
         interval = (
             Interval.TEMPERATURE_TARGET if state.is_heating() else Interval.TEMPERATURE
         )
-        return state.intervals.dispatch_mode(interval)
+        return interval
 
 
 class AmbientTemperatureMsg(ClientMsg[Literal[ClientMsgType.AMBIENT]]):
@@ -793,7 +800,7 @@ class AmbientTemperatureMsg(ClientMsg[Literal[ClientMsgType.AMBIENT]]):
         yield "new", state.ambient_temperature.ambient
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.ambient_temperature.model_reset_changed()
+        state.ambient_temperature.model_reset_changed(v=v)
 
 
 class ConnectionMsg(ClientMsg[Literal[ClientMsgType.CONNECTION]]): ...
@@ -812,7 +819,7 @@ class StateChangeMsg(ClientMsg[Literal[ClientMsgType.STATUS]]):
         if state.status == PrinterStatus.OPERATIONAL:
             state.current_job_id = None
 
-        state.model_reset_changed("status")
+        state.model_reset_changed("status", v=v)
 
 
 class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
@@ -849,16 +856,16 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
         ):
             state.current_job_id = None
 
-        state.job_info.model_reset_changed()
+        state.job_info.model_reset_changed(v=v)
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
         # Check if there is an intersection between the changed fields and the boolean fields
         if JobInfoState.MUTUALLY_EXCLUSIVE_FIELDS.intersection(
             state.job_info.model_changed_fields
         ):
-            return DispatchMode.DISPATCH
+            return None
 
-        return state.intervals.dispatch_mode(Interval.JOB)
+        return Interval.JOB
 
 
 class PrinterErrorMsg(ClientMsg[Literal[ClientMsgType.PRINTER_ERROR]]): ...
@@ -871,13 +878,13 @@ class StreamMsg(ClientMsg[Literal[ClientMsgType.STREAM]]):
     def __init__(self, base64jpg: str):
         super().__init__(data={"base": base64jpg})
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode(Interval.WEBCAM)
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        return Interval.WEBCAM
 
 
 class PingMsg(ClientMsg[Literal[ClientMsgType.PING]]):
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode(Interval.PING)
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        return Interval.PING
 
 
 class LatencyMsg(ClientMsg[Literal[ClientMsgType.LATENCY]]):
@@ -886,7 +893,7 @@ class LatencyMsg(ClientMsg[Literal[ClientMsgType.LATENCY]]):
         yield "ms", state.latency.get_latency()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.latency.model_reset_changed()
+        state.latency.model_reset_changed(v=v)
 
 
 class FileProgressMsg(ClientMsg[Literal[ClientMsgType.FILE_PROGRESS]]):
@@ -921,7 +928,7 @@ class FilamentSensorMsg(ClientMsg[Literal[ClientMsgType.FILAMENT_SENSOR]]):
         yield "state", state.filament_sensor.state
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.filament_sensor.model_reset_changed()
+        state.filament_sensor.model_reset_changed(v=v)
 
 
 class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
@@ -930,7 +937,7 @@ class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
         yield "on", state.psu_info
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.psu_info.model_reset_changed()
+        state.psu_info.model_reset_changed(v=v)
 
 
 class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
@@ -942,10 +949,10 @@ class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.cpu_info.model_reset_changed()
+        state.cpu_info.model_reset_changed(v=v)
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode(Interval.CPU)
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        return Interval.CPU
 
 
 class MeshDataMsg(ClientMsg[Literal[ClientMsgType.MESH_DATA]]): ...
@@ -1059,8 +1066,8 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
         for peripheral in state.peripherals.entries.values():
             peripheral.model_reset_changed(v=v)
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode(Interval.PERIPHERAL)
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        return Interval.PERIPHERAL
 
 
 class PeripheralDefinitionsMsg(
@@ -1107,8 +1114,8 @@ class NotificationMsg(ClientMsg[Literal[ClientMsgType.NOTIFICATION]]):
 
         yield "events", events
 
-    def dispatch_mode(self, state: PrinterState) -> DispatchMode:
-        return state.intervals.dispatch_mode(Interval.NOTIFICATION)
+    def dispatch_interval(self, state: PrinterState) -> Optional[Interval]:
+        return Interval.NOTIFICATION
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         for event_id, notification in list(state.notifications.notifications.items()):

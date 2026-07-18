@@ -4,6 +4,7 @@ from simplyprint_ws_client import Client, NotificationEventSeverity
 from simplyprint_ws_client.core.protocol.messages import NotificationMsg
 from simplyprint_ws_client.core.state import NotificationEventPayload
 from tests.test_intervals import TimeControlledIntervals
+from tests.util import commit_pending
 
 
 def test_keyed_notifications(client: Client):
@@ -51,7 +52,7 @@ def test_keyed_notifications(client: Client):
     assert event1.resolved_at is not None
 
     intervals.set_time(0)
-    msg = client.consume()
+    msg = commit_pending(client)
     assert len(msg) == 1 and msg[0].__class__ == NotificationMsg
 
     # After consuming, resolved notifications may be cleaned up
@@ -75,7 +76,7 @@ def test_keyed_notifications(client: Client):
     assert event5.resolved_at is not None
 
     intervals.set_time(1000)
-    msg = client.consume()
+    msg = commit_pending(client)
     assert len(msg) == 1 and msg[0].__class__ == NotificationMsg
 
     # Allow for cleanup behavior after consuming

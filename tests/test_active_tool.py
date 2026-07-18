@@ -2,6 +2,7 @@
 
 from simplyprint_ws_client import Client
 from simplyprint_ws_client.core.protocol.messages import ToolMsg
+from tests.util import commit_pending
 
 
 def test_active_material_change(client: Client):
@@ -11,7 +12,7 @@ def test_active_material_change(client: Client):
     # Change active_material on tool0
     client.printer.tool0.active_material = 1
 
-    messages = client.consume()
+    messages = commit_pending(client)
 
     assert len(messages) == 1
 

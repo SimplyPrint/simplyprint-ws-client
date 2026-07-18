@@ -255,10 +255,9 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             if not client.has_changes:
                 return
 
-            msgs = client.consume()
-
-            for msg in msgs:
-                await client.send(msg, skip_dispatch=True)
+            for pending in client.pending_messages():
+                await client.send(pending.message, skip_dispatch=True)
+                client.commit_message(pending)
 
         except Exception as e:
             client.logger.error("Error while scheduling client", exc_info=e)

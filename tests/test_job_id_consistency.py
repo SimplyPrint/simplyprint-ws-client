@@ -8,6 +8,7 @@ from simplyprint_ws_client.core.protocol.messages import (
     JobInfoMsg,
     StateChangeMsg,
 )
+from tests.util import commit_pending
 
 
 def test_job_id_consistency_flow(client: Client):
@@ -18,7 +19,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.current_job_id = None
 
     # Clear any initial messages
-    client.consume()
+    commit_pending(client)
 
     # Set a job_id and transition to downloading
     job_id = 12345
@@ -27,7 +28,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
     client.printer.file_progress.percent = 25.0
 
-    msgs = client.consume()
+    msgs = commit_pending(client)
 
     # Find the relevant messages
     status_msg = next((m for m in msgs if isinstance(m, StateChangeMsg)), None)
@@ -45,7 +46,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.job_info.started = True
     client.printer.job_info.progress = 10.0
 
-    msgs = client.consume()
+    msgs = commit_pending(client)
 
     # Find the relevant messages
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
@@ -61,7 +62,7 @@ def test_job_id_consistency_flow(client: Client):
     # Continue printing with progress updates
     client.printer.job_info.progress = 50.0
 
-    msgs = client.consume()
+    msgs = commit_pending(client)
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
 
     # Should still have the same job_id
@@ -72,7 +73,7 @@ def test_job_id_consistency_flow(client: Client):
     # Finish the job
     client.printer.job_info.finished = True
 
-    msgs = client.consume()
+    msgs = commit_pending(client)
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
 
     # Should still have job_id in the finished message
@@ -87,7 +88,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.current_job_id = job_id  # Set it again
     client.printer.status = PrinterStatus.OPERATIONAL
 
-    msgs = client.consume()
+    msgs = commit_pending(client)
     status_msg = next((m for m in msgs if isinstance(m, StateChangeMsg)), None)
 
     assert status_msg is not None

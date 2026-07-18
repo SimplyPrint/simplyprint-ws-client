@@ -31,6 +31,7 @@ from simplyprint_ws_client.core.protocol.events import (
 from simplyprint_ws_client.core.protocol.messages import (
     PingMsg,
 )
+from simplyprint_ws_client.wire import NotConnected
 
 from tests._fakes import FakeTransport
 
@@ -76,23 +77,24 @@ async def test_initial_version_is_zero(connection):
 
 
 @pytest.mark.asyncio
-async def test_message_dropped_when_version_mismatch(connection, fake_transport):
-    """Test that messages are dropped when targeting a different version."""
+async def test_send_fails_when_version_mismatch(connection, fake_transport):
+    """A caller retains ownership when no live matching connection can write."""
     # Start with version 0
     assert connection.v == 0
 
     # Create a test message
     test_msg = PingMsg()
 
-    # Send message targeting version 0 - should be dropped (not connected)
-    await connection.send(test_msg, v=0)
-    assert len(fake_transport.sent) == 0  # Not connected, message dropped
+    with pytest.raises(NotConnected):
+        await connection.send(test_msg, v=0)
+    assert len(fake_transport.sent) == 0
 
     # Now connect (fake) and try targeting wrong version
     connection.transport = fake_transport.open_for_test()
     connection.protocol.attach(fake_transport)
-    await connection.send(test_msg, v=1)
-    assert len(fake_transport.sent) == 0  # Version mismatch, dropped
+    with pytest.raises(NotConnected):
+        await connection.send(test_msg, v=1)
+    assert len(fake_transport.sent) == 0
 
 
 @pytest.mark.asyncio
@@ -110,10 +112,11 @@ async def test_message_sent_when_version_matches(connection, fake_transport):
     await connection.send(test_msg, v=0)
     assert len(fake_transport.sent) == 1
 
-    # Increment version and try again - should fail
+    # Increment version and try again - ownership returns to the caller.
     connection.v = 1
-    await connection.send(test_msg, v=0)
-    assert len(fake_transport.sent) == 1  # Not sent due to version mismatch
+    with pytest.raises(NotConnected):
+        await connection.send(test_msg, v=0)
+    assert len(fake_transport.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -216,8 +219,8 @@ async def test_version_isolation_between_connections():
 
 
 @pytest.mark.asyncio
-async def test_message_dropped_when_not_connected(connection):
-    """Test that messages are dropped when the transport is not connected."""
+async def test_send_fails_when_not_connected(connection):
+    """Test that unsent messages are returned to their caller."""
     # Ensure not connected
     connection.transport = None
     connection.protocol.transport = None
@@ -225,12 +228,8 @@ async def test_message_dropped_when_not_connected(connection):
 
     test_msg = PingMsg()
 
-    # Send message without version constraint - should still be dropped
-    # because we're not connected
-    await connection.send(test_msg, v=None)
-
-    # The send method should not raise an exception, just drop the message silently
-    assert True
+    with pytest.raises(NotConnected):
+        await connection.send(test_msg, v=None)
 
 
 @pytest.mark.asyncio

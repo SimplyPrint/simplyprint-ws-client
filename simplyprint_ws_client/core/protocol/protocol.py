@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Optional
 
 from pydantic import ValidationError
-from pydantic_core import PydanticSerializationError
 
 from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionEstablishedEvent,
@@ -20,7 +18,7 @@ from simplyprint_ws_client.core.protocol.messages import (
     Msg,
     ServerMsg,
 )
-from simplyprint_ws_client.wire import TransportError
+from simplyprint_ws_client.wire import NotConnected
 from simplyprint_ws_client.wire.events import (
     Connected,
     Disconnected,
@@ -32,15 +30,6 @@ from simplyprint_ws_client.common.asyncio.courier import Courier, OverflowPolicy
 from simplyprint_ws_client.common.logging import printer_logger
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.utils.bounded_variable import BoundedInterval
-
-#: Connection-shaped failures a send may swallow. CancelledError is
-#: deliberately NOT here: swallowing it would break task cancellation.
-WsConnectionErrors = (
-    OSError,
-    ConnectionError,
-    asyncio.TimeoutError,
-    TransportError,
-)
 
 WsSuspectConnectionBoundedInterval = BoundedInterval[int](7, 1)
 
@@ -184,23 +173,16 @@ class SimplyPrintProtocol:
     ) -> None:
         transport = self.transport
         if transport is None or not transport.connected:
-            self.logger.warning("Dropped message %s, not connected.", msg)
-            return
+            raise NotConnected(f"cannot send {msg.msg_type()}: not connected")
 
         if v is not None and self.v != v:
-            self.logger.warning(
-                "Dropped message %s, version mismatch. %d != %d", msg, self.v, v
+            raise NotConnected(
+                f"cannot send {msg.msg_type()}: connection version "
+                f"changed from {v} to {self.v}"
             )
-            return
 
-        try:
-            data = msg.model_dump_json()
-            await transport.send(data)
-            self._message_logger(msg).debug(
-                "sent %s", data if len(data) < 1024 else msg.msg_type()
-            )
-        except (PydanticSerializationError, UnicodeError) as e:
-            self.logger.error("Serialization error.", exc_info=e)
-        except WsConnectionErrors as e:
-            # The reconnect loop owns recovery; the dropped send is only logged.
-            self.logger.debug("send of %s dropped: %s", msg.msg_type(), e)
+        data = msg.model_dump_json()
+        await transport.send(data)
+        self._message_logger(msg).debug(
+            "sent %s", data if len(data) < 1024 else msg.msg_type()
+        )

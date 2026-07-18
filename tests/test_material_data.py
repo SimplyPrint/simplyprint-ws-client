@@ -7,6 +7,7 @@ import pytest
 from simplyprint_ws_client import Client, MaterialDataMsg
 from simplyprint_ws_client.core.state import MaterialLayoutEntry
 from simplyprint_ws_client.core.state.models import VolumeType, NozzleType, BedType
+from tests.util import commit_pending
 
 
 @pytest.mark.parametrize(
@@ -30,7 +31,7 @@ def test_producer_triggers(client: Client, field, value, expected_data_key):
     elif field == "tools.*.type":
         client.printer.tool0.type = value
 
-    messages = client.consume()
+    messages = commit_pending(client)
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert expected_data_key in messages[0].data
@@ -59,7 +60,7 @@ def test_materials_chain_iterator_bug(client: Client):
     tool0.materials[0].type = "PLA"
     tool1.materials[0].type = "ABS"
 
-    messages = client.consume()
+    messages = commit_pending(client)
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert "materials" in messages[0].data
@@ -81,7 +82,7 @@ def test_mms_layout_changes(client: Client):
     """Test mms_layout changes trigger MaterialDataMsg."""
     client.printer.update_mms_layout([MaterialLayoutEntry(nozzle=0, size=4)])
 
-    messages = client.consume()
+    messages = commit_pending(client)
     assert len(messages) == 1
     assert messages[0].__class__ == MaterialDataMsg
     assert "layout" in messages[0].data
@@ -128,8 +129,8 @@ def test_reset_changes_mirrors_producer_fields(client: Client):
         assert {"size", "type", "volume_type"}.issubset(tool.model_changed_fields)
 
     # Build and reset message
-    msgs = client.consume()
+    msgs = commit_pending(client)
     assert len(msgs) == 1
     assert msgs[0].__class__ == MaterialDataMsg
-    msgs = client.consume()
+    msgs = commit_pending(client)
     assert len(msgs) == 0

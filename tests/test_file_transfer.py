@@ -112,6 +112,7 @@ def test_print_identity_tracks_accepted_start_and_same_file_reprint(client: Clie
         "/local/model.gcode",
         True,
     )
+    assert transfer.observe_job_start("model.gcode") == ("model.gcode", True)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from simplyprint_ws_client import Client
 from simplyprint_ws_client.core.protocol.messages import TemperatureMsg
+from tests.util import commit_pending
 
 
 def test_tool0_temperature(client: Client):
@@ -14,7 +15,7 @@ def test_tool0_temperature(client: Client):
     tool0.temperature.actual = 200
     tool0.temperature.target = 250
 
-    messages = client.consume()
+    messages = commit_pending(client)
 
     assert len(messages) == 1
 
@@ -32,7 +33,7 @@ def test_tool0_temperature(client: Client):
     tool0.temperature.actual = 250
     client.printer.bed.temperature.target = 60
 
-    messages = client.consume()
+    messages = commit_pending(client)
 
     assert len(messages) == 1
 
@@ -61,7 +62,7 @@ def test_multiple_tools_temperatures(client: Client):
     tool1.temperature.actual = 180
     tool1.temperature.target = 220
 
-    messages = client.consume()
+    messages = commit_pending(client)
 
     assert len(messages) == 1
     message = messages[0]
