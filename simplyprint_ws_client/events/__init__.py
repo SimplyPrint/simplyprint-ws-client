@@ -1,4 +1,4 @@
 __all__ = ["Event", "EventBus"]
 
-from .event import Event
-from .event_bus import EventBus
+from simplyprint_ws_client.events.event import Event
+from simplyprint_ws_client.events.event_bus import EventBus

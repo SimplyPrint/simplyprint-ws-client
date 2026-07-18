@@ -4,8 +4,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generic, List, Optional, Type, TypeVar, Set
 
-from .config import Config, PrinterConfig
-from ...const import APP_DIRS
+from simplyprint_ws_client.core.config import Config, PrinterConfig
+from simplyprint_ws_client.const import APP_DIRS
 
 TConfig = TypeVar("TConfig", bound=Config)
 
@@ -51,9 +51,12 @@ class ConfigManager(ABC, Generic[TConfig]):
     def by_unique_id(self, unique_id: str) -> Optional[TConfig]:
         return self.find(unique_id=unique_id)
 
-    def find(self, other: Optional[TConfig] = None, **kwargs) -> Optional[TConfig]:
-        kwargs = self.config_t.update_dict_keys(kwargs)
+    def by_key(self, pk: int, sk: str) -> Optional[TConfig]:
+        return next(
+            (config for config in self.get_all() if config.key == (pk, sk)), None
+        )
 
+    def find(self, other: Optional[TConfig] = None, **kwargs) -> Optional[TConfig]:
         for config in self.get_all():
             if config.partial_eq(config=other, **kwargs):
                 return config
@@ -77,6 +80,14 @@ class ConfigManager(ABC, Generic[TConfig]):
 
     def clear(self):
         self.configurations.clear()
+
+    @property
+    def storage_path(self) -> Optional[Path]:
+        """The single on-disk file backing this manager, or ``None`` for stores
+        that are not a single file (memory, SQLite). Used by config export/backup
+        to enumerate the files that make up the registry without reaching into a
+        subclass's private attributes."""
+        return None
 
     @abstractmethod
     def flush(self, config: Optional[TConfig] = None):

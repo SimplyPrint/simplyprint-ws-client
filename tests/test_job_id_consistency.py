@@ -1,11 +1,14 @@
 from simplyprint_ws_client import (
     Client,
-    PrinterStatus,
     FileProgressStateEnum,
-    JobInfoMsg,
+    PrinterStatus,
+)
+from simplyprint_ws_client.core.protocol.messages import (
     FileProgressMsg,
+    JobInfoMsg,
     StateChangeMsg,
 )
+from tests.util import commit_pending
 
 
 def test_job_id_consistency_flow(client: Client):
@@ -16,7 +19,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.current_job_id = None
 
     # Clear any initial messages
-    client.consume()
+    commit_pending(client)
 
     # Set a job_id and transition to downloading
     job_id = 12345
@@ -25,7 +28,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.file_progress.state = FileProgressStateEnum.DOWNLOADING
     client.printer.file_progress.percent = 25.0
 
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
 
     # Find the relevant messages
     status_msg = next((m for m in msgs if isinstance(m, StateChangeMsg)), None)
@@ -43,7 +46,7 @@ def test_job_id_consistency_flow(client: Client):
     client.printer.job_info.started = True
     client.printer.job_info.progress = 10.0
 
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
 
     # Find the relevant messages
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
@@ -59,7 +62,7 @@ def test_job_id_consistency_flow(client: Client):
     # Continue printing with progress updates
     client.printer.job_info.progress = 50.0
 
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
 
     # Should still have the same job_id
@@ -70,30 +73,24 @@ def test_job_id_consistency_flow(client: Client):
     # Finish the job
     client.printer.job_info.finished = True
 
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
     job_info_msg = next((m for m in msgs if isinstance(m, JobInfoMsg)), None)
 
     # Should still have job_id in the finished message
     assert job_info_msg is not None
     assert job_info_msg.data["job_id"] == job_id
-
-    # After reset_changes is called (simulating message dispatch), job_id should be cleared
-    job_info_msg.reset_changes(client.printer)
     assert client.printer.current_job_id is None
 
-    # Going back to operational does not clear job_id. Some printers briefly flap
-    # to operational between file_progress and job_info.started; only terminal
-    # job_info clears the id.
-    client.printer.current_job_id = job_id  # Set it again
+    # An operational status is not a job terminal and cannot clear a newer
+    # association on its own.
+    client.printer.current_job_id = job_id
     client.printer.status = PrinterStatus.OPERATIONAL
 
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
     status_msg = next((m for m in msgs if isinstance(m, StateChangeMsg)), None)
 
     assert status_msg is not None
 
-    # After reset_changes is called, job_id should still be retained.
-    status_msg.reset_changes(client.printer)
     assert client.printer.current_job_id == job_id
 
 
@@ -101,18 +98,17 @@ def test_operational_state_does_not_clear_pending_job_id(client: Client):
     job_id = 5788086
     client.printer.status = PrinterStatus.DOWNLOADING
     client.printer.current_job_id = job_id
-    client.consume()
+    commit_pending(client)
 
     client.printer.status = PrinterStatus.OPERATIONAL
-    msgs, _ = client.consume()
-    status_msg = next(m for m in msgs if isinstance(m, StateChangeMsg))
-    status_msg.reset_changes(client.printer)
+    msgs = commit_pending(client)
+    assert any(isinstance(message, StateChangeMsg) for message in msgs)
 
     assert client.printer.current_job_id == job_id
 
     client.printer.status = PrinterStatus.PRINTING
     client.printer.job_info.started = True
-    msgs, _ = client.consume()
+    msgs = commit_pending(client)
     job_info_msg = next(m for m in msgs if isinstance(m, JobInfoMsg))
 
     assert job_info_msg.data["job_id"] == job_id

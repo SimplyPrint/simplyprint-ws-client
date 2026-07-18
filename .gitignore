@@ -163,3 +163,6 @@ virtual_local
 Pipfile*
 config.db
 .vscode
+
+example/images/*
+!example/images/.gitkeep

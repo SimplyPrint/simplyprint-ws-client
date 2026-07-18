@@ -3,6 +3,7 @@ __all__ = [
     "PrinterStatus",
     "FileProgressStateEnum",
     "FilamentSensorEnum",
+    "Interval",
     "Intervals",
     "DisplaySettings",
     "PrinterSettings",
@@ -22,12 +23,14 @@ __all__ = [
 
 import asyncio
 import time
-from enum import IntEnum, StrEnum, Enum
+from enum import IntEnum, Enum
+
+from simplyprint_ws_client._compat import StrEnum
 from typing import Optional, Dict, Any, Literal, Generic, TypeVar, Union, Annotated
 
 from pydantic import BaseModel, PrivateAttr, Field
 
-from ..ws_protocol.models import DispatchMode
+from simplyprint_ws_client.core.protocol.models import DispatchMode
 
 try:
     from typing import Self
@@ -41,6 +44,13 @@ class PrinterCpuFlag(IntEnum):
 
 
 class PrinterStatus(StrEnum):
+    """The printer/job state sent to SimplyPrint.
+
+    ``OFFLINE`` is terminal for an active SimplyPrint job. Transport
+    reachability must not be projected to this enum unless losing that
+    transport proves the physical job stopped.
+    """
+
     OPERATIONAL = "operational"
     PRINTING = "printing"
     OFFLINE = "offline"
@@ -50,7 +60,6 @@ class PrinterStatus(StrEnum):
     RESUMING = "resuming"
     DOWNLOADING = "downloading"
     ERROR = "error"
-    NOT_READY = "not_ready"
 
     @staticmethod
     def is_printing(*status: Optional["PrinterStatus"]) -> bool:
@@ -83,18 +92,18 @@ class FilamentSensorEnum(StrEnum):
     RUNOUT = "runout"
 
 
-IntervalT = Literal[
-    "ai",
-    "job",
-    "temps",
-    "temps_target",
-    "cpu",
-    "reconnect",
-    "ready_message",
-    "ping",
-    "webcam",
-    "notification",
-]
+class Interval(StrEnum):
+    AI = "ai"
+    JOB = "job"
+    TEMPERATURE = "temps"
+    TEMPERATURE_TARGET = "temps_target"
+    PERIPHERAL = "peripheral"
+    CPU = "cpu"
+    RECONNECT = "reconnect"
+    READY_MESSAGE = "ready_message"
+    PING = "ping"
+    WEBCAM = "webcam"
+    NOTIFICATION = "notification"
 
 
 class Intervals(BaseModel):
@@ -102,6 +111,7 @@ class Intervals(BaseModel):
     job: int = 5000
     temps: int = 5000
     temps_target: int = 2500
+    peripheral: int = 0
     cpu: int = 30000
     reconnect: int = 1000
     ready_message: int = 60000
@@ -109,56 +119,87 @@ class Intervals(BaseModel):
     webcam: int = 1000
     notification: int = 1000
 
-    _usages: Dict[str, Optional[int]] = PrivateAttr(...)
+    _usages: Dict[Interval, Optional[int]] = PrivateAttr(...)
 
     def model_post_init(self, __context: Any) -> None:
-        self._usages = {key: None for key in self.__class__.model_fields.keys()}
+        self._usages = {interval: None for interval in Interval}
 
     @staticmethod
     def now() -> int:
         return int(time.monotonic_ns() / 1_000_000)
 
-    def time_until_ready(self, t: IntervalT) -> int:
-        if self._usages[t] is None:
+    def duration(self, interval: Interval) -> int:
+        if interval is Interval.AI:
+            return self.ai
+        if interval is Interval.JOB:
+            return self.job
+        if interval is Interval.TEMPERATURE:
+            return self.temps
+        if interval is Interval.TEMPERATURE_TARGET:
+            return self.temps_target
+        if interval is Interval.PERIPHERAL:
+            return self.peripheral
+        if interval is Interval.CPU:
+            return self.cpu
+        if interval is Interval.RECONNECT:
+            return self.reconnect
+        if interval is Interval.READY_MESSAGE:
+            return self.ready_message
+        if interval is Interval.PING:
+            return self.ping
+        if interval is Interval.WEBCAM:
+            return self.webcam
+        if interval is Interval.NOTIFICATION:
+            return self.notification
+        raise ValueError(f"Unknown interval: {interval}")
+
+    def time_until_ready(self, interval: Interval) -> int:
+        if self._usages[interval] is None:
             return 0
 
-        return getattr(self, t) - (self.now() - self._usages[t])
+        return self.duration(interval) - (self.now() - self._usages[interval])
 
-    def is_ready(self, t: IntervalT):
-        if self._usages[t] is None:
+    def is_ready(self, interval: Interval):
+        if self._usages[interval] is None:
             return True
 
-        return self.now() - self._usages[t] >= getattr(self, t)
+        return self.now() - self._usages[interval] >= self.duration(interval)
 
-    def dispatch_mode(self, t: IntervalT):
-        if not self.use(t):
+    def dispatch_mode(self, interval: Interval):
+        if not self.use(interval):
             return DispatchMode.RATELIMIT
 
         return DispatchMode.DISPATCH
 
-    def use(self, t: IntervalT) -> bool:
-        if not self.is_ready(t):
+    def use(self, interval: Interval) -> bool:
+        if not self.is_ready(interval):
             return False
 
-        self._usages[t] = self.now()
+        self._usages[interval] = self.now()
 
         return True
 
-    async def wait_for(self, t: IntervalT):
+    async def wait_for(self, interval: Interval):
         while True:
-            time_remaining = self.time_until_ready(t)
+            time_remaining = self.time_until_ready(interval)
 
             if time_remaining <= 0:
                 break
 
             await asyncio.sleep(time_remaining / 1000.0)
 
-    def set(self, t: IntervalT, value: int):
-        setattr(self, t, value)
-
     def update(self, other: Self):
-        for key in other.model_fields.keys():
-            setattr(self, key, getattr(other, key))
+        self.ai = other.ai
+        self.job = other.job
+        self.temps = other.temps
+        self.temps_target = other.temps_target
+        self.peripheral = other.peripheral
+        self.cpu = other.cpu
+        self.reconnect = other.reconnect
+        self.ready_message = other.ready_message
+        self.ping = other.ping
+        self.webcam = other.webcam
+        self.notification = other.notification
 
 
 class DisplaySettings(BaseModel):
@@ -190,6 +231,9 @@ class MultiMaterialSolution(Enum):
     BOXTURTLE = "boxturtle"
     CREALITY_CFS = "creality_cfs"
     ANYCUBIC_ACE_PRO = "anycubic_ace_pro"
+    ELEGOO_CANVAS = "elegoo_canvas"
+    QIDI_BOX = "qidi_box"
+    SNAPMAKER_U1 = "snapmaker_u1"
     VIRTUAL = "virtual"
     CUSTOM = "custom"
 
@@ -198,6 +242,7 @@ class MultiMaterialSolution(Enum):
         return self in {
             self.CREALITY_CFS,
             self.ANYCUBIC_ACE_PRO,
+            self.QIDI_BOX,
             self.BAMBU_AMS,
             self.BAMBU_AMS_2_PRO,
             self.BAMBU_AMS_HT,
@@ -212,6 +257,8 @@ class MultiMaterialSolution(Enum):
             self.BAMBU_AMS_2_PRO: 4,
             self.BAMBU_AMS_LITE: 1,
             self.CREALITY_CFS: 4,
+            self.ANYCUBIC_ACE_PRO: 4,
+            self.QIDI_BOX: 4,
         }.get(self)
 
     @property

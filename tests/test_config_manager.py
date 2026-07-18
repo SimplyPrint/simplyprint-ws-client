@@ -1,8 +1,10 @@
 from simplyprint_ws_client import (
-    MemoryConfigManager,
-    PrinterConfig,
     ConfigManager,
+    PrinterConfig,
+)
+from simplyprint_ws_client.core.config import (
     JsonConfigManager,
+    MemoryConfigManager,
     SQLiteConfigManager,
 )
 

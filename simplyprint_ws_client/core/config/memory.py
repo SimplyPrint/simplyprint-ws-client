@@ -2,8 +2,8 @@ __all__ = ["MemoryConfigManager"]
 
 from typing import Optional
 
-from .manager import ConfigManager
-from .config import Config
+from simplyprint_ws_client.core.config.manager import ConfigManager
+from simplyprint_ws_client.core.config import Config
 
 
 class MemoryConfigManager(ConfigManager):

@@ -1,21 +1,37 @@
 from simplyprint_ws_client import (
     ClientApp,
-    ConfigManagerType,
     ClientSettings,
+    ConfigManagerType,
     ConnectionMode,
+    IntegrationId,
+    IntegrationCapability,
+    IntegrationSpec,
+    ProductMetadata,
 )
-from simplyprint_ws_client.shared.asyncio.event_loop_runner import EventLoopBackend
-from simplyprint_ws_client.shared.cli.cli import ClientCli
-from simplyprint_ws_client.shared.logging import setup_logging
-from .virtual_client import VirtualClient, VirtualConfig, VirtualCamera
+from simplyprint_ws_client.common.asyncio.event_loop_runner import EventLoopBackend
+from simplyprint_ws_client.common.logging import setup_logging
+from simplyprint_ws_client.integration.discovery import DiscoveryService
+
+from .virtual_client import VirtualCamera, VirtualClient, VirtualConfig
 
 if __name__ == "__main__":
     settings = ClientSettings(
-        name="VirtualPrinters",
-        mode=ConnectionMode.MULTI,
+        integrations=(
+            IntegrationSpec(
+                id=IntegrationId("virtual"),
+                client_factory=VirtualClient,
+                config_factory=VirtualConfig,
+                metadata=ProductMetadata(
+                    display_name="Virtual",
+                    image_url="/virtual.png",
+                    supported_transports=(),
+                    capabilities=(IntegrationCapability.CAMERA,),
+                ),
+            ),
+        ),
+        name="la_fair_printers",
+        mode=ConnectionMode.SINGLE,
         event_loop_backend=EventLoopBackend.AUTO,
-        client_factory=VirtualClient,
-        config_factory=VirtualConfig,
         allow_setup=True,
         config_manager_t=ConfigManagerType.JSON,
         development=True,
@@ -24,7 +40,9 @@ if __name__ == "__main__":
     )
 
     setup_logging(settings)
-    app = ClientApp(settings)
-    cli = ClientCli(app)
-    cli.start_client = lambda: app.run_blocking()
-    cli(prog_name="python -m simplyprint_ws_client")
+    app = ClientApp(
+        settings,
+        discovery_service=DiscoveryService(),
+        account_providers={},
+    )
+    app.run_blocking()

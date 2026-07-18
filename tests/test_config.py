@@ -1,4 +1,16 @@
+import uuid
+from typing import Optional
+
 from simplyprint_ws_client import PrinterConfig
+
+
+class _HwConfig(PrinterConfig):
+    """A config whose hardware identity is its serial (test double)."""
+
+    serial: Optional[str] = None
+
+    def hardware_identity(self) -> Optional[str]:
+        return self.serial or super().hardware_identity()
 
 
 def test_config_fields():
@@ -21,6 +33,10 @@ def test_config_fields():
         "short_id": None,
         "unique_id": config1.unique_id,
         "public_ip": None,
+        "mac": None,
+        # Every printer supports a user webcam override (resolved by the base
+        # PrinterClient, edited through a config-bound presentation field).
+        "custom_webcam_url": None,
     }
 
     config1.id = 1
@@ -66,3 +82,48 @@ def test_config_fields():
         }
     )
     assert not config4.is_empty()
+
+
+def test_hardware_identity_defaults_to_the_neutral_mac_fallback():
+    assert PrinterConfig.get_blank().hardware_identity() is None
+    assert _HwConfig.get_blank().hardware_identity() is None
+    config = PrinterConfig.get_blank()
+    config.mac = "aa:bb:cc:dd:ee:ff"
+    assert config.hardware_identity() == "aa:bb:cc:dd:ee:ff"
+
+
+def test_webcam_url_domain_setter_normalizes_empty_values():
+    config = PrinterConfig.get_blank()
+
+    config.set_webcam_url("http://camera.local/stream")
+    assert config.custom_webcam_url == "http://camera.local/stream"
+
+    config.set_webcam_url("")
+    assert config.custom_webcam_url is None
+
+
+def test_get_new_mints_a_stable_unique_id_uuid():
+    # unique_id is the slot reference: a proper UUID, minted once at creation and
+    # then stable (it is stored, not re-derived). get_blank leaves it unset so an
+    # empty placeholder config stays empty.
+    cfg = _HwConfig.get_new()
+    assert uuid.UUID(cfg.unique_id)  # a valid UUID
+    assert cfg.unique_id == cfg.unique_id  # stable
+    assert PrinterConfig.get_blank().unique_id is None
+
+
+def test_unique_id_is_independent_of_the_hardware_id():
+    # Two printers that happen to share a serial still get distinct slot ids
+    # (the slot id is not derived from the hardware id).
+    a, b = _HwConfig.get_new(), _HwConfig.get_new()
+    a.serial = b.serial = "SN-123"
+    assert a.unique_id != b.unique_id
+
+
+def test_mac_is_the_neutral_hardware_fallback_field():
+    # The MAC is stored separately from the slot id, for matching a re-discovered
+    # device when the brand exposes no serial/guid.
+    cfg = PrinterConfig.get_blank()
+    assert cfg.mac is None
+    cfg.mac = "aa:bb:cc:dd:ee:ff"
+    assert cfg.as_dict()["mac"] == "aa:bb:cc:dd:ee:ff"
