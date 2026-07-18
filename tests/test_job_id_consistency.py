@@ -92,3 +92,23 @@ def test_job_id_consistency_flow(client: Client):
     assert status_msg is not None
 
     assert client.printer.current_job_id == job_id
+
+
+def test_operational_state_does_not_clear_pending_job_id(client: Client):
+    job_id = 5788086
+    client.printer.status = PrinterStatus.DOWNLOADING
+    client.printer.current_job_id = job_id
+    commit_pending(client)
+
+    client.printer.status = PrinterStatus.OPERATIONAL
+    msgs = commit_pending(client)
+    assert any(isinstance(message, StateChangeMsg) for message in msgs)
+
+    assert client.printer.current_job_id == job_id
+
+    client.printer.status = PrinterStatus.PRINTING
+    client.printer.job_info.started = True
+    msgs = commit_pending(client)
+    job_info_msg = next(m for m in msgs if isinstance(m, JobInfoMsg))
+
+    assert job_info_msg.data["job_id"] == job_id
