@@ -175,6 +175,7 @@ class FakeRoutedTransport(FakeTransport, MqttTransport):
     def unsubscribe(self, topic: str) -> None:  # pragma: no cover - unused
         pass
 
+
 def build_pool(transports: List[FakeTransport], *, routed: bool = False) -> Pool:
     """A pool keyed by URL string that records the transports it builds."""
     cls = FakeRoutedTransport if routed else FakeTransport
@@ -905,6 +906,7 @@ async def test_mqtt_multi_topic_on_one_connection():
 
     await lease.close()
 
+
 @pytest.mark.asyncio
 async def test_successful_connack_asserts_topics_before_becoming_ready():
     clients: List[FakePahoClient] = []
@@ -977,7 +979,9 @@ async def test_paho_thread_ingress_is_bounded_without_reconnecting(
     await wait_for(lambda: lease.connected)
 
     received: List[bytes] = []
-    lease.event_bus.on(MessageReceived, lambda event: received.append(event.message.payload))
+    lease.event_bus.on(
+        MessageReceived, lambda event: received.append(event.message.payload)
+    )
     loop = asyncio.get_running_loop()
     call_soon_threadsafe = loop.call_soon_threadsafe
     cross_thread_wakes = 0
@@ -991,9 +995,7 @@ async def test_paho_thread_ingress_is_bounded_without_reconnecting(
 
     def flood() -> None:
         for value in range(100):
-            first.fire_message(
-                WireMqttMessage("device/SN/report", bytes((value,)))
-            )
+            first.fire_message(WireMqttMessage("device/SN/report", bytes((value,))))
 
     producer = threading.Thread(target=flood)
     producer.start()

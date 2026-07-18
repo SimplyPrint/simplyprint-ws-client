@@ -126,6 +126,7 @@ class MqttTransport(Transport):
     def unsubscribe(self, topic: str) -> None:
         """Drop a subscription for ``topic`` from the shared socket."""
 
+
 class WsTransport(Transport):
     """A 1:1 WebSocket transport: no topics, every message is the lease's.
 

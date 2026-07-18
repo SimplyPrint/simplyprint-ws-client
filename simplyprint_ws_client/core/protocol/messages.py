@@ -846,9 +846,10 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         ended_fields = {"cancelled", "failed", "finished"}
         data = self.data or {}
-        if any(data.get(field) is True for field in ended_fields) and data.get(
-            "job_id"
-        ) == state.current_job_id:
+        if (
+            any(data.get(field) is True for field in ended_fields)
+            and data.get("job_id") == state.current_job_id
+        ):
             state.current_job_id = None
 
         state.job_info.model_reset_changed(v=v)

@@ -633,7 +633,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
             if isinstance(transition, FinishJob):
                 classified = self.on_job_finish(edge)
                 outcome = transition.outcome or classified
-                self._record_job_terminal(outcome, transition.native_id)
+                self.finish_job(outcome, transition.native_id)
             elif isinstance(transition, StartJob):
                 self.printer.job_info.started = True
                 self.on_job_start(edge)
@@ -658,15 +658,22 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         """Classify the finish from ``edge.raw``."""
         return JobOutcome.FINISHED
 
-    def _record_job_terminal(
-        self, outcome: JobOutcome, native_id: Optional[str]
-    ) -> None:
+    def finish_job(self, outcome: JobOutcome, native_id: Optional[str] = None) -> None:
+        """Record one integration-authoritative terminal job observation.
+
+        Normal status edges call this automatically through
+        :meth:`on_job_finish`. A brand may call it directly only when its
+        protocol proves that a running job ended without an idle/OFFLINE status
+        edge, such as a device fault that is terminal by specification.
+        """
         if outcome == JobOutcome.FINISHED:
             self.printer.job_info.finished = True
         elif outcome == JobOutcome.CANCELLED:
             self.printer.job_info.cancelled = True
-        else:
+        elif outcome == JobOutcome.FAILED:
             self.printer.job_info.failed = True
+        else:
+            raise ValueError(f"unsupported job outcome: {outcome!r}")
 
         version = self.next_msg_id()
         self.job_timeline.record_terminal(self.printer, version, native_id)

@@ -353,7 +353,11 @@ class Paho(MqttTransport):
             )
 
     def trip(self, generation: int, reason: Exception) -> None:
-        error = reason if isinstance(reason, TransportError) else TransientError.wrap(reason)
+        error = (
+            reason
+            if isinstance(reason, TransportError)
+            else TransientError.wrap(reason)
+        )
         with self.lock:
             if not self.started or generation != self.generation:
                 return
@@ -471,9 +475,7 @@ class Paho(MqttTransport):
                 if stop.is_set():
                     return
                 self.logger.exception("paho %s network loop crashed", self.url.host)
-                error = TransientError.wrap(
-                    exception, "paho network loop crashed"
-                )
+                error = TransientError.wrap(exception, "paho network loop crashed")
             self._connection_failed(client, error)
             stop.wait(WORKER_RESTART_DELAY)
 
@@ -498,9 +500,7 @@ class Paho(MqttTransport):
         with self.lock:
             return self.client is client and self.started
 
-    def _connection_failed(
-        self, client: PahoClient, error: TransportError
-    ) -> None:
+    def _connection_failed(self, client: PahoClient, error: TransportError) -> None:
         with self.lock:
             if self.client is not client or not self.started:
                 return
