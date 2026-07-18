@@ -275,6 +275,77 @@ async def test_discovery_service_builds_mdns_backend_and_snapshots():
     assert snapshot[0]["host"] == "192.0.2.7"
 
 
+def test_discovery_service_merges_multicast_and_mdns_for_one_brand():
+    from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+    from simplyprint_ws_client.integration.discovery.service import DiscoveryService
+    from simplyprint_ws_client.integration.discovery.spec import MDNSSpec, MulticastSpec
+
+    multicast = MulticastSpec(
+        brand="probe",
+        group="239.255.255.250",
+        port=1900,
+        event_type=_ProbeEvent,
+        mapper=lambda request, addr: None,
+        key=lambda device: device.hardware_identity() or device.host,
+    )
+    mdns = MDNSSpec(
+        brand="probe",
+        queries=("_octoprint._tcp.local",),
+        event_type=_ProbeEvent,
+        mapper=lambda response, addr: None,
+        key=lambda device: device.hardware_identity() or device.host,
+    )
+    service = DiscoveryService(multicast_specs=[multicast], mdns_specs=[mdns])
+    service._multicast["probe"].devices["192.0.2.7"] = DiscoveredDevice(
+        host="192.0.2.7", name="OctoPrint", extra={"source": "ssdp"}
+    )
+    service._mdns["probe"].devices["uuid-7"] = DiscoveredDevice(
+        host="192.0.2.7",
+        hardware_id="uuid-7",
+        extra={"model": "Raspberry Pi"},
+    )
+
+    assert service.snapshot("probe") == [
+        DiscoveredDevice(
+            host="192.0.2.7",
+            name="OctoPrint",
+            hardware_id="uuid-7",
+            extra={"model": "Raspberry Pi", "source": "ssdp"},
+        )
+    ]
+
+
+def test_discovery_service_keeps_distinct_hardware_identities():
+    from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
+    from simplyprint_ws_client.integration.discovery.service import DiscoveryService
+    from simplyprint_ws_client.integration.discovery.spec import MDNSSpec, MulticastSpec
+
+    multicast = MulticastSpec(
+        brand="probe",
+        group="239.255.255.250",
+        port=1900,
+        event_type=_ProbeEvent,
+        mapper=lambda request, addr: None,
+        key=lambda device: device.hardware_identity() or device.host,
+    )
+    mdns = MDNSSpec(
+        brand="probe",
+        queries=("_octoprint._tcp.local",),
+        event_type=_ProbeEvent,
+        mapper=lambda response, addr: None,
+        key=lambda device: device.hardware_identity() or device.host,
+    )
+    service = DiscoveryService(multicast_specs=[multicast], mdns_specs=[mdns])
+    service._multicast["probe"].devices["uuid-a"] = DiscoveredDevice(
+        host="192.0.2.7", hardware_id="uuid-a"
+    )
+    service._mdns["probe"].devices["uuid-b"] = DiscoveredDevice(
+        host="192.0.2.7", hardware_id="uuid-b"
+    )
+
+    assert len(service.snapshot("probe")) == 2
+
+
 def test_integration_spec_mdns_field_is_nullable():
     from simplyprint_ws_client.core.client import Client
     from simplyprint_ws_client.core.config import PrinterConfig

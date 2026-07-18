@@ -19,6 +19,7 @@ from typing import Iterable, Mapping
 from simplyprint_ws_client.events import EventBus
 
 from simplyprint_ws_client.integration.discovery.host import DiscoveryServiceHost
+from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
 from simplyprint_ws_client.integration.discovery.mdns import MDNSDiscoveryBackend
 from simplyprint_ws_client.integration.discovery.multicast import (
     MulticastDiscoveryBackend,
@@ -37,6 +38,35 @@ from simplyprint_ws_client.integration.discovery.spec import (
     SubnetScanSpec,
 )
 from simplyprint_ws_client.integration.discovery.subnet import SubnetScanBackend
+from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
+
+
+def _same_device(left: object, right: object) -> bool:
+    if not isinstance(left, DiscoveredDevice) or not isinstance(
+        right, DiscoveredDevice
+    ):
+        return False
+    left_id = DeviceReconciler.normalize_identity(left.hardware_identity())
+    right_id = DeviceReconciler.normalize_identity(right.hardware_identity())
+    if left_id is not None and right_id is not None:
+        return left_id == right_id
+    return DeviceReconciler.same_network_address(left, right)
+
+
+def _merge_device(left: object, right: object) -> object:
+    if not isinstance(left, DiscoveredDevice) or not isinstance(
+        right, DiscoveredDevice
+    ):
+        return left
+    extra = dict(right.extra)
+    extra.update(left.extra)
+    return DiscoveredDevice(
+        host=left.host or right.host,
+        name=left.name or right.name,
+        serial=left.serial or right.serial,
+        hardware_id=left.hardware_id or right.hardware_id,
+        extra=extra,
+    )
 
 
 class DiscoveryService:
@@ -103,8 +133,29 @@ class DiscoveryService:
 
     def snapshot(self, brand: str) -> list:
         """Devices currently in a brand's passive cache (empty if none)."""
-        backend = self._multicast.get(brand) or self._mdns.get(brand)
-        return list(backend.get_devices()) if backend is not None else []
+        devices: list[tuple[str, object]] = []
+        for backend in (self._multicast.get(brand), self._mdns.get(brand)):
+            if backend is None:
+                continue
+            for device in backend.get_devices():
+                key = str(backend.spec.key(device))
+                duplicate = next(
+                    (
+                        index
+                        for index, (known_key, known_device) in enumerate(devices)
+                        if known_key == key or _same_device(known_device, device)
+                    ),
+                    None,
+                )
+                if duplicate is None:
+                    devices.append((key, device))
+                else:
+                    known_key, known_device = devices[duplicate]
+                    devices[duplicate] = (
+                        known_key,
+                        _merge_device(known_device, device),
+                    )
+        return [device for _, device in devices]
 
     async def scan(self, brand: str, timeout: float = 5.0) -> list:
         """Run a brand's on-demand active subnet scan (empty if it has none)."""
