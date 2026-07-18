@@ -36,6 +36,7 @@ class SessionClient(PrinterClient[PrinterConfig]):
         self.driver = self.attach_driver(SessionDriver(self))
 
     async def on_device_connected(self, driver: DeviceDriver) -> None:
+        await super().on_device_connected(driver)
         self.connected_edges.append(driver.session)
 
     async def on_device_disconnected(
@@ -52,6 +53,7 @@ def test_driver_is_attached_during_construction():
     client = SessionClient()
 
     assert client.drivers == (client.driver,)
+    assert not client.active
 
 
 @pytest.mark.asyncio
@@ -62,6 +64,7 @@ async def test_duplicate_edges_are_idempotent_and_keep_first_down_observation():
 
     assert await client.driver.set_reachability(DeviceReachability.UP, source=source)
     up = client.driver.session
+    assert client.active
     assert up.generation == 1
     assert not await client.driver.set_reachability(
         DeviceReachability.UP, source=source
@@ -81,6 +84,7 @@ async def test_duplicate_edges_are_idempotent_and_keep_first_down_observation():
     assert client.driver.session == down
     assert client.driver.session.observed_at == down.observed_at
     assert len(client.disconnected_edges) == 1
+    assert not client.active
 
 
 @pytest.mark.asyncio
@@ -90,15 +94,17 @@ async def test_down_preserves_device_status_and_clears_camera_once():
     source = DeviceSource(lease_id=1, wire_generation=1)
 
     await client.driver.set_reachability(DeviceReachability.UP, source=source)
+    clears_before_down = client.camera_clears
     await client.driver.set_reachability(DeviceReachability.DOWN, source=source)
     down = client.driver.session
 
+    assert not client.active
     assert client.printer.status is PrinterStatus.PRINTING
-    assert client.camera_clears == 1
+    assert client.camera_clears == clears_before_down + 1
 
     assert await client.driver.set_reachability(DeviceReachability.UP, source=source)
     assert client.driver.session.generation == down.generation + 1
-    assert client.camera_clears == 1
+    assert client.active
     assert client.printer.status is PrinterStatus.PRINTING
 
 

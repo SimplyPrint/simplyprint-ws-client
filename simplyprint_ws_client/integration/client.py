@@ -178,13 +178,9 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
     #: camera remains independently reachable opt out.
     clear_camera_on_unreachable: ClassVar[bool] = True
 
-    # ``active`` is a pure allocation-policy knob ("represent this printer on
-    # the SimplyPrint connection"), true for the client's whole membership.
-    # Device liveness is NOT expressed by toggling it or by changing
-    # ``printer.status``. Drivers retain reachability while the last device
-    # report remains authoritative for printer and job state.
-    # The scheduler runs init and tick (and therefore the drivers) regardless
-    # of this flag, because the drivers are what *detect* liveness.
+    # ``active`` is device reachability and gates SimplyPrint allocation. The
+    # scheduler still runs drivers while inactive so they can reconnect it.
+    # Printer and job state remain independent device-reported facts.
 
     # init runs once at scheduler entry; tick every scheduling slice (active or
     # not); halt on SimplyPrint deallocation; teardown once at final cleanup
@@ -197,6 +193,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         context: ClientContext,
     ) -> None:
         super().__init__(config, context=context)
+        self.active = False
         self.app_updater = context.app_updater
         self.host_telemetry = context.host_telemetry
         self.camera = CameraController(
@@ -345,6 +342,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         self, driver: "DeviceDriver", reason: Optional[object] = None
     ) -> None:
         """Handle a link edge without inferring printer or job state."""
+        self.active = False
         self.logger.info(
             "Disconnected from printer%s", f" ({reason})" if reason else ""
         )
