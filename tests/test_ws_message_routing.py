@@ -1,7 +1,7 @@
-"""SimplyPrintConnection routes each WS message's log line to the printer it belongs to.
+"""SimplyPrintConnection routes each SP-cloud WS log line to its printer.
 
 The headline requirement: backend WebSocket messages about a printer land in that
-printer's log file (``<uid>/ws.log``), not the global one -- while genuinely
+printer's ``<uid>/sp-ws.log``, not a device driver's ``ws.log`` -- while genuinely
 global messages (MULTI-mode handshake etc.) stay on the system ``ws`` logger.
 """
 
@@ -35,7 +35,7 @@ def test_multi_mode_routes_message_to_its_printer():
     )
     msg = SimpleNamespace(for_client="printer-9")
     assert conn.protocol._message_logger(msg).name == printer_logger_name(
-        "printer-9", "ws"
+        "printer-9", "sp-ws"
     )
     conn.stop()
 
@@ -60,6 +60,6 @@ def test_single_mode_routes_to_the_connection_printer():
     # SINGLE: one printer; every message belongs to it, regardless of for_client.
     msg = SimpleNamespace(for_client=None)
     assert conn.protocol._message_logger(msg).name == printer_logger_name(
-        config.unique_id, "ws"
+        config.unique_id, "sp-ws"
     )
     conn.stop()

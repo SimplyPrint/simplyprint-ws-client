@@ -176,7 +176,7 @@ class SimplyPrintProtocol:
         else:
             client_id = self.connection.hint.config.unique_id
         if client_id:
-            return printer_logger(str(client_id), "ws")
+            return printer_logger(str(client_id), "sp-ws")
         return self.logger
 
     async def send(

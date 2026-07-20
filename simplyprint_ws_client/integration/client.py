@@ -332,7 +332,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         camera. Override to add device startup commands (call
         ``await super()...``)."""
         self.active = True
-        self.logger.info("Connected to printer")
+        self.logger.info("Printer reachable via %s device link", driver.name)
         self.update_camera_uri()
 
     async def on_device_transport_connected(self, driver: "DeviceDriver") -> None:
@@ -344,7 +344,9 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         """Handle a link edge without inferring printer or job state."""
         self.active = False
         self.logger.info(
-            "Disconnected from printer%s", f" ({reason})" if reason else ""
+            "Printer unreachable via %s device link%s",
+            driver.name,
+            f" ({reason})" if reason else "",
         )
         from simplyprint_ws_client.integration.drivers import DeviceReachability
 

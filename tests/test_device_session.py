@@ -1,3 +1,4 @@
+import logging
 from typing import List, Optional
 
 import pytest
@@ -85,6 +86,21 @@ async def test_duplicate_edges_are_idempotent_and_keep_first_down_observation():
     assert client.driver.session.observed_at == down.observed_at
     assert len(client.disconnected_edges) == 1
     assert not client.active
+
+
+@pytest.mark.asyncio
+async def test_reachability_logs_identify_the_device_link(caplog):
+    client = SessionClient()
+
+    with caplog.at_level(logging.INFO):
+        await client.driver.set_reachability(DeviceReachability.UP)
+        await client.driver.set_reachability(
+            DeviceReachability.DOWN, reason="link lost"
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Printer reachable via session device link" in messages
+    assert "Printer unreachable via session device link (link lost)" in messages
 
 
 @pytest.mark.asyncio
