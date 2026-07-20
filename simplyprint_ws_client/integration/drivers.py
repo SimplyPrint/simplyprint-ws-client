@@ -631,7 +631,9 @@ class WsDriver(LeaseDriver[WsLease, Union[str, bytes]]):
     (``str``/``bytes``) — the unwrap four brands wrote defensively is owned here.
     """
 
-    default_name = "ws"
+    # ``ws`` belongs to the SimplyPrint server protocol log. Device-side
+    # WebSocket traffic follows the established ``client-ws.log`` convention.
+    default_name = "client_ws"
 
     def acquire_lease(
         self, url: Union[str, yarl.URL], options: ConnectionOptions

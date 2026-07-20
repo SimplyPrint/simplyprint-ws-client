@@ -84,18 +84,18 @@ def test_routing_per_printer_and_system(tmp_path):
     handler.close()
 
 
-def test_sp_cloud_websocket_does_not_share_a_device_websocket_log(tmp_path):
+def test_server_websocket_does_not_share_a_device_websocket_log(tmp_path):
     handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
-    handler.emit(_record(printer_logger_name("p7", "sp-ws"), "cloud frame"))
-    handler.emit(_record(printer_logger_name("p7", "ws"), "device frame"))
+    handler.emit(_record(printer_logger_name("p7", "ws"), "server frame"))
+    handler.emit(_record(printer_logger_name("p7", "client_ws"), "device frame"))
     _drain(handler)
 
-    cloud_log = (tmp_path / "p7" / "sp-ws.log").read_text()
-    device_log = (tmp_path / "p7" / "ws.log").read_text()
-    assert "cloud frame" in cloud_log
-    assert "device frame" not in cloud_log
+    server_log = (tmp_path / "p7" / "ws.log").read_text()
+    device_log = (tmp_path / "p7" / "client-ws.log").read_text()
+    assert "server frame" in server_log
+    assert "device frame" not in server_log
     assert "device frame" in device_log
-    assert "cloud frame" not in device_log
+    assert "server frame" not in device_log
     handler.close()
 
 
