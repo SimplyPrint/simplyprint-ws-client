@@ -150,7 +150,6 @@ def default_paho_client(
         reconnect_on_failure=True,
     )
     client.reconnect_delay_set(RECONNECT_MIN_DELAY, RECONNECT_MAX_DELAY)
-    client.enable_logger(logger)
     if url.scheme == "mqtts":
         if tls_client_auth is not None:
             client.tls_set_context(client_cert_ssl_context(tls_client_auth))

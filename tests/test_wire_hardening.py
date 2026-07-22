@@ -9,6 +9,7 @@ through reprs.
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import List
 
@@ -26,6 +27,7 @@ from simplyprint_ws_client.wire.keepalive import Keepalive, ConnectionKeepalive
 from simplyprint_ws_client.wire.lease import MqttLease
 from simplyprint_ws_client.wire.mqtt import MqttBroker
 from simplyprint_ws_client.wire.pool import Pool
+from simplyprint_ws_client.wire.paho import default_paho_client
 from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
@@ -39,6 +41,14 @@ from simplyprint_ws_client.wire.transport import (
 
 def current_provider() -> EventLoopProvider:
     return EventLoopProvider(factory=asyncio.get_running_loop)
+
+
+def test_default_paho_client_does_not_attach_packet_logger() -> None:
+    client = default_paho_client(
+        yarl.URL("mqtt://printer.local"), logging.getLogger("test.mqtt")
+    )
+
+    assert client.on_log is None
 
 
 class FakeTransport(Transport):
