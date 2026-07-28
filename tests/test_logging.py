@@ -8,6 +8,8 @@ the root-level app log; rules are configurable; the LogStore browses the tree.
 import gzip
 import json
 import logging
+import queue
+import threading
 import zipfile
 
 import pytest
@@ -25,10 +27,21 @@ from simplyprint_ws_client.common.logging import (
     scope_of,
 )
 from simplyprint_ws_client.common.logging.naming import decode_uid, encode_uid
+from simplyprint_ws_client.common.logging.routing import PassthroughQueueHandler
 
 
 def _record(name, message="msg", level=logging.INFO):
     return logging.LogRecord(name, level, __file__, 1, message, None, None)
+
+
+def test_logging_queue_keeps_newest_records_when_full():
+    records: queue.Queue = queue.Queue(maxsize=2)
+    handler = PassthroughQueueHandler(records)
+
+    for message in ("one", "two", "three"):
+        handler.emit(_record("supervisor", message))
+
+    assert [records.get_nowait().msg, records.get_nowait().msg] == ["two", "three"]
 
 
 @pytest.mark.parametrize(
@@ -81,6 +94,18 @@ def test_routing_per_printer_and_system(tmp_path):
     assert (tmp_path / "system.log").read_text().strip().endswith("from system")
     # No per-integration file leaked at the root.
     assert {p.name for p in tmp_path.glob("*.log")} == {"system.log"}
+    handler.close()
+
+
+def test_routing_buffers_a_burst_until_flushed(tmp_path):
+    handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
+    handler.emit(_record(printer_logger_name("p7", "mqtt"), "raw packet"))
+
+    path = tmp_path / "p7" / "mqtt.log"
+    assert path.read_text() == ""
+
+    handler.flush()
+    assert path.read_text().strip().endswith("raw packet")
     handler.close()
 
 
@@ -198,6 +223,53 @@ def test_configure_logging_uses_fixed_system_stem(tmp_path):
     assert facility.config.system_log_stem == "system"
     assert (tmp_path / "system.log").read_text().strip().endswith("boot")
     assert not (tmp_path / "BambuClient.log").exists()
+
+
+def test_configure_logging_drains_records_across_batch_boundary(
+    tmp_path, monkeypatch
+):
+    from simplyprint_ws_client.common.logging.routing import (
+        BatchedRotatingFileHandler,
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingFileHandler(BatchedRotatingFileHandler):
+        def emit(self, record):
+            if not entered.is_set():
+                entered.set()
+                release.wait(timeout=5)
+            super().emit(record)
+
+    def make_file_handler(config, path):
+        return BlockingFileHandler(
+            path,
+            maxBytes=config.max_bytes,
+            backupCount=config.backup_count,
+            delay=True,
+        )
+
+    monkeypatch.setattr(LoggingConfig, "make_file_handler", make_file_handler)
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    logger = logging.getLogger(printer_logger_name("p7", "mqtt"))
+    try:
+        logger.debug("packet 0")
+        assert entered.wait(timeout=1)
+        for index in range(1, 301):
+            logger.debug("packet %d", index)
+        release.set()
+        facility.stop()
+    finally:
+        release.set()
+        logging.basicConfig(handlers=[], force=True)
+
+    lines = (tmp_path / "p7" / "mqtt.log").read_text().splitlines()
+    assert len(lines) == 301
+    assert lines[0].endswith("packet 0")
+    assert lines[-1].endswith("packet 300")
 
 
 def test_configure_logging_sets_effective_levels_for_performance(tmp_path):

@@ -102,7 +102,11 @@ class LoggingConfig:
         return APP_DIRS.user_log_path
 
     def make_file_handler(self, path: Path) -> logging.handlers.RotatingFileHandler:
-        return logging.handlers.RotatingFileHandler(
+        from simplyprint_ws_client.common.logging.routing import (
+            BatchedRotatingFileHandler,
+        )
+
+        return BatchedRotatingFileHandler(
             path,
             maxBytes=self.max_bytes,
             backupCount=self.backup_count,

@@ -80,6 +80,43 @@ __all__ = [
     "configure_logging",
 ]
 
+_LOG_QUEUE_CAPACITY = 10_000
+_LOG_BATCH_SIZE = 256
+
+
+class _BatchingQueueListener(logging.handlers.QueueListener):
+    """Drain bursts together and flush file destinations once per batch."""
+
+    def enqueue_sentinel(self) -> None:
+        # Producers are detached before stop, so the listener will make room and
+        # eventually drain every record already accepted by the bounded queue.
+        self.queue.put(self._sentinel)
+
+    def _monitor(self) -> None:
+        task_done = getattr(self.queue, "task_done", None)
+        stopping = False
+
+        while not stopping:
+            record = self.dequeue(True)
+            for index in range(_LOG_BATCH_SIZE):
+                if record is self._sentinel:
+                    stopping = True
+                else:
+                    self.handle(record)
+                if task_done is not None:
+                    task_done()
+                if stopping:
+                    break
+                if index == _LOG_BATCH_SIZE - 1:
+                    break
+                try:
+                    record = self.dequeue(False)
+                except queue.Empty:
+                    break
+
+            for handler in self.handlers:
+                handler.flush()
+
 
 @dataclass
 class LoggingFacility:
@@ -127,7 +164,7 @@ def _setup_logging(
     config = _resolve_config(settings, config or LoggingConfig())
     restore_levels = config.policy.apply_logger_levels()
 
-    logging_queue: queue.SimpleQueue = queue.SimpleQueue()
+    logging_queue: queue.Queue = queue.Queue(maxsize=_LOG_QUEUE_CAPACITY)
     queue_handler = PassthroughQueueHandler(logging_queue)
     queue_handler.addFilter(LoggingPolicyFilter(config.policy, LOG_TARGET_QUEUE))
     logging.basicConfig(
@@ -146,12 +183,13 @@ def _setup_logging(
     stream_handler.addFilter(LoggingPolicyFilter(config.policy, LOG_TARGET_STREAM))
 
     router = RoutingHandler(config)
-    listener = logging.handlers.QueueListener(
+    listener = _BatchingQueueListener(
         logging_queue, stream_handler, router, respect_handler_level=True
     )
     listener.start()
 
     def stop() -> None:
+        logging.getLogger().removeHandler(queue_handler)
         listener.stop()
         router.close()
         restore_levels()

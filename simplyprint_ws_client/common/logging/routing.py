@@ -13,6 +13,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import threading
 from typing import TYPE_CHECKING, Dict
 
@@ -25,7 +26,12 @@ from simplyprint_ws_client.common.logging.policy import (
 if TYPE_CHECKING:
     from simplyprint_ws_client.common.logging.config import LoggingConfig
 
-__all__ = ["RoutingHandler", "JsonLogFormatter", "PassthroughQueueHandler"]
+__all__ = [
+    "RoutingHandler",
+    "JsonLogFormatter",
+    "PassthroughQueueHandler",
+    "BatchedRotatingFileHandler",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +64,53 @@ class PassthroughQueueHandler(logging.handlers.QueueHandler):
 
     The stock QueueHandler formats in ``prepare()``, which would bake one format
     into the record before it reaches the listener -- defeating per-destination
-    text/JSON formatters. We run a single in-process SimpleQueue, so passing the
-    live record through is safe.
+    text/JSON formatters. When the bounded queue is full, the oldest pending
+    record is discarded so application threads never block and recent evidence
+    is preserved.
     """
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
         return record
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self.queue.get_nowait()
+            self.queue.task_done()
+        except queue.Empty:
+            pass
+
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+
+class BatchedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating file handler flushed by the queue listener after each batch.
+
+    ``StreamHandler.emit`` flushes every line. That defeats the text stream's own
+    buffering during raw MQTT/WebSocket bursts, even though all file work already
+    runs on one queue-listener thread. This variant writes without flushing; the
+    listener flushes as soon as the current queue batch is drained (at most 256
+    records), and ``close`` still flushes through the standard handler lifecycle.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if self.shouldRollover(record):
+                self.doRollover()
+            if self.stream is None:
+                self.stream = self._open()
+            if self.stream is not None:
+                self.stream.write(self.format(record) + self.terminator)
+        except Exception:
+            self.handleError(record)
 
 
 class RoutingHandler(logging.Handler):
@@ -72,6 +119,7 @@ class RoutingHandler(logging.Handler):
     def __init__(self, config: "LoggingConfig") -> None:
         super().__init__()
         self._config = config
+        self._root = config.resolve_log_dir()
         self._rules = config.compiled_rules()  # ordered; catch-all system rule last
         self._handlers: Dict[str, logging.handlers.RotatingFileHandler] = {}
         self._lock = threading.Lock()
@@ -90,11 +138,10 @@ class RoutingHandler(logging.Handler):
         self, record: logging.LogRecord
     ) -> logging.handlers.RotatingFileHandler:
         scope, stem, formatter_kind = self._route(record.name)
-        root = self._config.resolve_log_dir()
         if scope == self._config.system_scope:
-            path = root / (stem + ".log")
+            path = self._root / (stem + ".log")
         else:
-            path = root / scope / (stem + ".log")
+            path = self._root / scope / (stem + ".log")
         key = str(path)
         handler = self._handlers.get(key)
         if handler is not None:
@@ -118,7 +165,7 @@ class RoutingHandler(logging.Handler):
         first, both to release the files (Windows cannot delete open files)
         and to keep this handler table from growing with printer churn.
         """
-        scope_dir = self._config.resolve_log_dir() / scope
+        scope_dir = self._root / scope
         prefix = str(scope_dir) + os.sep
 
         with self._lock:
@@ -167,6 +214,12 @@ class RoutingHandler(logging.Handler):
         finally:
             handler.release()
         return True
+
+    def flush(self) -> None:
+        with self._lock:
+            handlers = list(self._handlers.values())
+        for handler in handlers:
+            handler.flush()
 
     def close(self) -> None:
         with self._lock:
