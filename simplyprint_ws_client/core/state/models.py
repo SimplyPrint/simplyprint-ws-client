@@ -234,6 +234,7 @@ class MultiMaterialSolution(Enum):
     ELEGOO_CANVAS = "elegoo_canvas"
     QIDI_BOX = "qidi_box"
     SNAPMAKER_U1 = "snapmaker_u1"
+    FLASHFORGE_IFS = "flashforge_ifs"
     VIRTUAL = "virtual"
     CUSTOM = "custom"
 

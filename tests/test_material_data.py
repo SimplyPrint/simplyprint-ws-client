@@ -6,7 +6,12 @@ import pytest
 
 from simplyprint_ws_client import Client, MaterialDataMsg
 from simplyprint_ws_client.core.state import MaterialLayoutEntry
-from simplyprint_ws_client.core.state.models import VolumeType, NozzleType, BedType
+from simplyprint_ws_client.core.state.models import (
+    BedType,
+    MultiMaterialSolution,
+    NozzleType,
+    VolumeType,
+)
 
 
 @pytest.mark.parametrize(
@@ -90,6 +95,22 @@ def test_mms_layout_changes(client: Client):
     messages[0].reset_changes(client.printer)
     changeset = client.printer.model_recursive_changeset
     assert changeset == {}
+
+
+def test_flashforge_ifs_layout_serializes_as_dedicated_four_slot_mms(client: Client):
+    client.printer.update_mms_layout(
+        [
+            MaterialLayoutEntry(
+                nozzle=0,
+                mms=MultiMaterialSolution.FLASHFORGE_IFS,
+            )
+        ]
+    )
+
+    data = dict(MaterialDataMsg.build_refresh(client.printer))
+
+    assert data["layout"] == [{"nozzle": 0, "mms": "flashforge_ifs"}]
+    assert client.printer.tool0.material_count == 4
 
 
 def test_refresh_mode_includes_all_sections(client: Client):
