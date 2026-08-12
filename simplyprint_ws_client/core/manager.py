@@ -56,6 +56,7 @@ from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionLostEvent,
     SimplyPrintConnectionSuspectEvent,
 )
+from simplyprint_ws_client.core.protocol.app_messages import get_app_message_handler
 from simplyprint_ws_client.core.protocol.messages import ClientMsg
 from simplyprint_ws_client.core.protocol.messages import (
     MultiPrinterAddedMsg,
@@ -195,6 +196,23 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                 msg, (MultiPrinterAddedMsg, MultiPrinterRemovedMsg)
             ):
                 client_id = msg.data.unique_id
+
+            # A few messages address the *process*, not any printer (a relayed
+            # integration webhook, say). They carry no `for` and no unique_id, so
+            # the per-printer router below would drop them. Hand those to the app's
+            # registered handler instead -- exactly once, not once per printer.
+            if client_id is None:
+                handler = get_app_message_handler(msg.type)
+
+                if handler is not None:
+                    try:
+                        await handler(msg, v)
+                    except Exception as e:
+                        self.logger.error(
+                            "Error when handling app message %s:", msg.type, exc_info=e
+                        )
+
+                    return
 
             if client_id not in self.clients:
                 return

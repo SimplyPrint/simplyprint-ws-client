@@ -257,6 +257,17 @@ class MultiPrinterRemovedMsg(
 ): ...
 
 
+class PaperCutMsgData(BaseModel):
+    #: Event channel, e.g. ``job.done``.
+    path: str
+    #: The forwarded webhook body, verbatim. Deliberately untyped: the shape is
+    #: the integration's business, not the protocol's.
+    data: dict = Field(default_factory=dict)
+
+
+class PaperCutMsg(Msg[Literal[ServerMsgType.PAPERCUT], PaperCutMsgData]): ...
+
+
 class PauseDemandData(BaseModel):
     demand: Literal[DemandMsgType.PAUSE] = DemandMsgType.PAUSE
 
@@ -582,6 +593,10 @@ ServerMsgKind = Union[
     MultiPrinterAddedMsg,
     MultiPrinterRemovedMsg,
     DemandMsg,
+    # A member here is what makes a type *parseable*: the union is closed and
+    # discriminated on ``type``, so an inbound message whose type is missing from
+    # this list fails validation in ``Protocol`` and is dropped before routing.
+    PaperCutMsg,
 ]
 
 
@@ -649,6 +664,17 @@ class MultiPrinterRemoveConnectionMsg(
                 "unique_id": config.unique_id,
             }
         )
+
+
+class PaperCutRegisterMsg(ClientMsg[Literal[ClientMsgType.PAPERCUT_REGISTER]]):
+    """Bind this session to an integration relay ``uuid``.
+
+    Sent on every (re)connect and periodically as a keepalive, so the server's
+    ``uuid -> session`` map survives reconnects and can expire stale bindings.
+    """
+
+    def __init__(self, uuid: str):
+        super().__init__(data={"uuid": uuid})
 
 
 class GcodeScriptsMsg(ClientMsg[Literal[ClientMsgType.GCODE_SCRIPTS]]): ...
