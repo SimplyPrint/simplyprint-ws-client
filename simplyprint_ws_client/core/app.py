@@ -224,6 +224,35 @@ class ClientApp(SyncStoppable):
             thread = self._app_instance
         return thread is not None and thread.is_alive()
 
+    def send_app_message(self, msg, timeout: float = 5.0) -> bool:
+        """Send a process-level message over the client connection, from any thread.
+
+        The thread-safe entry point to
+        :meth:`ClientConnectionManager.send_app_message`. Callers are typically
+        *not* on the client loop -- the integration task scheduler deliberately
+        runs on its own loop in its own daemon thread -- so awaiting the
+        connection directly from there would touch a websocket owned by another
+        loop. This marshals across instead.
+
+        Returns whether a live connection took the message. ``False`` covers
+        "not connected yet" and "the loop isn't running", both of which are
+        ordinary states a periodic caller retries out of.
+        """
+        if not self.scheduler.event_loop_is_running():
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.scheduler.manager.send_app_message(msg),
+                self.scheduler.event_loop,
+            )
+            return bool(future.result(timeout))
+        except Exception as e:
+            # Never let a best-effort app message escape into a caller's loop:
+            # a closed loop, a timeout and a transport error are all just "not
+            # delivered", and the caller retries.
+            self.logger.debug("App message %s was not sent: %s", type(msg).__name__, e)
+            return False
+
     def run_detached(self, *args, **kwargs):
         with self._lifecycle_lock:
             with self._app_lock:

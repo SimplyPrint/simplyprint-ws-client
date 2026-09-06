@@ -456,6 +456,32 @@ class ClientConnectionManager(
     def connections(self) -> Iterable[SimplyPrintConnection]:
         return map(lambda x: cast(ClientView, x).connection, list(self.views))
 
+    async def send_app_message(self, msg: ClientMsg) -> bool:
+        """Send a *process-level* message over any live connection.
+
+        The outbound counterpart to
+        :mod:`~simplyprint_ws_client.core.protocol.app_messages`: some messages
+        address the whole process rather than one printer (announcing an
+        integration relay uuid, say). Sending those through
+        :meth:`Client.send` is wrong twice over -- in
+        :attr:`ConnectionMode.MULTI` a priority-10 hook stamps
+        ``for_client = <that printer's unique_id>`` onto every outgoing message,
+        and the send carries that printer's protocol ``v``, so the message is
+        both mis-addressed and droppable on a version mismatch that has nothing
+        to do with it.
+
+        This goes straight to the connection instead: no ``for_client``, no
+        per-printer ``v``. Returns whether a live connection took it; ``False``
+        simply means "not connected yet", which callers retry rather than treat
+        as an error.
+        """
+        for connection in self.connections:
+            if not connection.connected:
+                continue
+            await connection.send(msg, None)
+            return True
+        return False
+
     def get_connection_for_client(
         self, client: Client
     ) -> Optional[SimplyPrintConnection]:

@@ -26,8 +26,9 @@ class ServerMsgType(StrEnum):
     # An integration webhook relayed to the one session that registered for it.
     # Unlike every other type here it targets the *process*, not a printer, so it
     # carries no ``for`` and is dispatched through the app-message registry
-    # (``core.protocol.app_messages``) rather than per-printer routing.
-    PAPERCUT = "papercut"
+    # (``core.protocol.app_messages``) rather than per-printer routing. The
+    # payload names its own integration, so one type serves every integration.
+    INTEGRATION_WEBHOOK = "integration_webhook"
 
 
 class DemandMsgType(StrEnum):
@@ -119,9 +120,10 @@ class ClientMsgType(StrEnum):
     OBJECTS = "objects"
     PERIPHERAL = "peripheral"
     PERIPHERAL_DEFINITIONS = "peripheral_definitions"
-    # Announces this session's integration-relay uuid so the server can bind
-    # ``uuid -> session`` and route the matching PAPERCUT messages back here.
-    PAPERCUT_REGISTER = "papercut_register"
+    # Announces one of this session's integration-relay uuids so the server can
+    # bind ``uuid -> session`` and route the matching INTEGRATION_WEBHOOK
+    # messages back here. Sent once per registered integration.
+    INTEGRATION_WEBHOOK_REGISTER = "integration_webhook_register"
 
     def when_pending(self) -> bool:
         # Allowed messages for a pending printer connection

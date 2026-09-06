@@ -257,7 +257,11 @@ class MultiPrinterRemovedMsg(
 ): ...
 
 
-class PaperCutMsgData(BaseModel):
+class IntegrationWebhookMsgData(BaseModel):
+    #: Which integration this payload belongs to -- the app-side integration key
+    #: (e.g. ``"papercut"``). One message type serves every integration, so the
+    #: receiver dispatches on this rather than on the type.
+    key: str = ""
     #: Event channel, e.g. ``job.done``.
     path: str
     #: The forwarded webhook body, verbatim. Deliberately untyped: the shape is
@@ -265,7 +269,9 @@ class PaperCutMsgData(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
-class PaperCutMsg(Msg[Literal[ServerMsgType.PAPERCUT], PaperCutMsgData]): ...
+class IntegrationWebhookMsg(
+    Msg[Literal[ServerMsgType.INTEGRATION_WEBHOOK], IntegrationWebhookMsgData]
+): ...
 
 
 class PauseDemandData(BaseModel):
@@ -596,7 +602,7 @@ ServerMsgKind = Union[
     # A member here is what makes a type *parseable*: the union is closed and
     # discriminated on ``type``, so an inbound message whose type is missing from
     # this list fails validation in ``Protocol`` and is dropped before routing.
-    PaperCutMsg,
+    IntegrationWebhookMsg,
 ]
 
 
@@ -666,15 +672,19 @@ class MultiPrinterRemoveConnectionMsg(
         )
 
 
-class PaperCutRegisterMsg(ClientMsg[Literal[ClientMsgType.PAPERCUT_REGISTER]]):
-    """Bind this session to an integration relay ``uuid``.
+class IntegrationWebhookRegisterMsg(
+    ClientMsg[Literal[ClientMsgType.INTEGRATION_WEBHOOK_REGISTER]]
+):
+    """Bind this session to one integration's relay ``uuid``.
 
     Sent on every (re)connect and periodically as a keepalive, so the server's
     ``uuid -> session`` map survives reconnects and can expire stale bindings.
+    ``key`` names the integration the uuid belongs to, so the server can stamp it
+    onto the events it relays back.
     """
 
-    def __init__(self, uuid: str):
-        super().__init__(data={"uuid": uuid})
+    def __init__(self, uuid: str, key: str):
+        super().__init__(data={"uuid": uuid, "key": key})
 
 
 class GcodeScriptsMsg(ClientMsg[Literal[ClientMsgType.GCODE_SCRIPTS]]): ...
