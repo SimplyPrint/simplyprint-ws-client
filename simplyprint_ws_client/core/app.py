@@ -7,25 +7,6 @@ import threading
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
-from simplyprint_ws_client.core.client import (
-    Client,
-    ClientConfigChangedEvent,
-    ClientStateChangeEvent,
-)
-from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.core.client_context import (
-    BackgroundService,
-    ClientContext,
-)
-from simplyprint_ws_client.core.config import ConfigManager
-from simplyprint_ws_client.core.config.flusher import ConfigFlusher
-from simplyprint_ws_client.core.manager import ClientList
-from simplyprint_ws_client.core.protocol.connection import (
-    TransportFactory,
-    default_transport_factory,
-)
-from simplyprint_ws_client.core.scheduler import Scheduler
-from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
 from simplyprint_ws_client.common.asyncio.offload import (
     Offload,
@@ -34,11 +15,32 @@ from simplyprint_ws_client.common.asyncio.offload import (
 from simplyprint_ws_client.common.hardware.physical_machine import (
     make_host_telemetry_reader,
 )
-from simplyprint_ws_client.integration.camera.pool import CameraPool
-from simplyprint_ws_client.integration.spec import IntegrationSpec
+from simplyprint_ws_client.common.utils.stoppable import SyncStoppable
 from simplyprint_ws_client.core.api.sentry import Sentry
 from simplyprint_ws_client.core.api.simplyprint_api import SimplyPrintApi
-from simplyprint_ws_client.common.utils.stoppable import SyncStoppable
+from simplyprint_ws_client.core.client import (
+    Client,
+    ClientConfigChangedEvent,
+    ClientStateChangeEvent,
+)
+from simplyprint_ws_client.core.client_context import (
+    BackgroundService,
+    ClientContext,
+)
+from simplyprint_ws_client.core.config import ConfigManager, PrinterConfig
+from simplyprint_ws_client.core.config.flusher import ConfigFlusher
+from simplyprint_ws_client.core.manager import (
+    AppTransportEstablishedObserver,
+    ClientList,
+)
+from simplyprint_ws_client.core.protocol.connection import (
+    TransportFactory,
+    default_transport_factory,
+)
+from simplyprint_ws_client.core.scheduler import Scheduler
+from simplyprint_ws_client.core.settings import ClientSettings
+from simplyprint_ws_client.integration.camera.pool import CameraPool
+from simplyprint_ws_client.integration.spec import IntegrationSpec
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.integration.accounts import AccountProvider
@@ -252,6 +254,50 @@ class ClientApp(SyncStoppable):
             # delivered", and the caller retries.
             self.logger.debug("App message %s was not sent: %s", type(msg).__name__, e)
             return False
+
+    def acquire_app_transport(self, consumer: str, timeout: float = 5.0) -> bool:
+        """Thread-safe, idempotent acquisition of the process transport."""
+        if not self.scheduler.event_loop_is_running():
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.scheduler.manager.acquire_app_transport(consumer),
+                self.scheduler.event_loop,
+            )
+            return bool(future.result(timeout))
+        except Exception as e:
+            self.logger.debug("App transport was not acquired for %r: %s", consumer, e)
+            return False
+
+    def release_app_transport(self, consumer: str, timeout: float = 5.0) -> bool:
+        """Thread-safe release of a process-transport consumer."""
+        if not self.scheduler.event_loop_is_running():
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.scheduler.manager.release_app_transport(consumer),
+                self.scheduler.event_loop,
+            )
+            future.result(timeout)
+            return True
+        except Exception as e:
+            self.logger.debug("App transport was not released for %r: %s", consumer, e)
+            return False
+
+    def register_app_transport_established_observer(
+        self, consumer: str, observer: AppTransportEstablishedObserver
+    ) -> None:
+        """Install the async reconnect observer used by an app consumer.
+
+        Registration itself is safe before the app loop starts; callbacks always
+        run on the WebSocket owner loop after a MULTI ``ConnectedMsg``.
+        """
+        self.scheduler.manager.register_app_transport_established_observer(
+            consumer, observer
+        )
+
+    def unregister_app_transport_established_observer(self, consumer: str) -> None:
+        self.scheduler.manager.unregister_app_transport_established_observer(consumer)
 
     def run_detached(self, *args, **kwargs):
         with self._lifecycle_lock:

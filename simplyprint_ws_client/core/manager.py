@@ -26,57 +26,76 @@ logic, which is the test for whether things are the same (they are not):
   disconnected (``engine.stop()``) -- the refcount/lease lifecycle, protocol-side.
 """
 
-__all__ = ["ClientConnectionManager", "ClientList", "ClientView"]
+__all__ = [
+    "AppMessageSender",
+    "AppTransportEstablishedObserver",
+    "ClientConnectionManager",
+    "ClientList",
+    "ClientView",
+]
 
 import asyncio
 import functools
 import logging
+import threading
 from datetime import timedelta
-from typing import Union, Dict, Mapping
-from typing import final, Optional, Set, cast, Iterable, MutableSet, Hashable
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    Mapping,
+    MutableSet,
+    Optional,
+    Set,
+    Union,
+    cast,
+    final,
+)
 
 from yarl import URL
 
-from simplyprint_ws_client.core.client import Client
-from simplyprint_ws_client.core.client import ClientState
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
+from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
+from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
+from simplyprint_ws_client.const import APP_DIRS
+from simplyprint_ws_client.core.api.url_builder import default_connectivity_report
+from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.config import PrinterConfig
-from simplyprint_ws_client.core.protocol.connection import ConnectionHint
+from simplyprint_ws_client.core.protocol.app_messages import get_app_message_handler
 from simplyprint_ws_client.core.protocol.connection import (
+    ConnectionHint,
     ConnectionMode,
     SimplyPrintConnection,
     TransportFactory,
     default_transport_factory,
 )
 from simplyprint_ws_client.core.protocol.events import (
-    SimplyPrintConnectionIncomingEvent,
     SimplyPrintConnectionEstablishedEvent,
-)
-from simplyprint_ws_client.core.protocol.events import (
-    SimplyPrintConnectionOutgoingEvent,
+    SimplyPrintConnectionIncomingEvent,
     SimplyPrintConnectionLostEvent,
+    SimplyPrintConnectionOutgoingEvent,
     SimplyPrintConnectionSuspectEvent,
 )
-from simplyprint_ws_client.core.protocol.app_messages import get_app_message_handler
-from simplyprint_ws_client.core.protocol.messages import ClientMsg
 from simplyprint_ws_client.core.protocol.messages import (
+    ClientMsg,
+    ConnectedMsg,
+    Msg,
     MultiPrinterAddedMsg,
     MultiPrinterRemovedMsg,
-    Msg,
-    ConnectedMsg,
 )
-from simplyprint_ws_client.const import APP_DIRS
 from simplyprint_ws_client.events.emitter import Emitter, TEvent
 from simplyprint_ws_client.events.event_bus_listeners import ListenerUniqueness
-from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.debug.connectivity import ConnectivityReport
-from simplyprint_ws_client.common.utils.stoppable import AsyncStoppable
-from simplyprint_ws_client.core.api.url_builder import default_connectivity_report
 
 TUniqueId = Union[str, int]
 
 #: Minimum age of the newest stored connectivity report before another
 #: connectivity test suite is run.
 CONNECTIVITY_REPORT_MIN_INTERVAL = timedelta(minutes=20)
+
+AppMessageSender = Callable[[ClientMsg], Awaitable[bool]]
+AppTransportEstablishedObserver = Callable[[AppMessageSender], Awaitable[None]]
 
 
 class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
@@ -132,12 +151,18 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
         connection: SimplyPrintConnection,
         client_list: ClientList,
         logger=logging.getLogger(__name__),
+        connection_id: int = 0,
+        on_app_transport_established: Optional[
+            Callable[["ClientView"], Awaitable[None]]
+        ] = None,
     ):
         self.mode = mode
         self.connection = connection
         self.client_list = client_list
         self.clients = set()
         self.logger = logger
+        self.connection_id = connection_id
+        self.on_app_transport_established = on_app_transport_established
 
     async def _emit_all(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
         # Iterate over a stable snapshot so mutations to view/client maps during awaits
@@ -161,10 +186,6 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                 )
 
     async def emit(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
-        # Only handle connection events when we have at least one client.
-        if len(self) == 0:
-            return
-
         is_multi_mode = self.mode == ConnectionMode.MULTI
 
         # Custom handling for incoming messages
@@ -185,6 +206,8 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                     v,
                 )
                 await self._emit_all(SimplyPrintConnectionEstablishedEvent(v))
+                if self.on_app_transport_established is not None:
+                    await self.on_app_transport_established(self)
                 return
 
             # We can get a routing hint from the message directly.
@@ -214,6 +237,13 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
 
                     return
 
+            # Unknown top-level messages are not printer broadcasts.
+            if client_id is None:
+                return
+
+            if len(self) == 0:
+                return
+
             if client_id not in self.clients:
                 return
 
@@ -227,6 +257,9 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                     exc_info=e,
                 )
 
+            return
+        # Non-message events have no recipient on an empty view.
+        if len(self) == 0:
             return
 
         if is_multi_mode and isinstance(event, SimplyPrintConnectionEstablishedEvent):
@@ -311,6 +344,10 @@ class ClientConnectionManager(
         self.transport_factory = transport_factory
         self._next_connection_id = 0
         self._connectivity_report_inflight = False
+        self._app_consumers: Set[str] = set()
+        self._app_view: Optional[ClientView] = None
+        self._app_observers: Dict[str, AppTransportEstablishedObserver] = {}
+        self._app_observers_lock = threading.Lock()
 
     def _suspect_connection(self, connection: SimplyPrintConnection, _):
         """Called when a connection suspects its ability to connect is compromised.
@@ -369,13 +406,9 @@ class ClientConnectionManager(
         finally:
             self._connectivity_report_inflight = False
 
-    def _allocate_new_connection(self) -> ClientView:
+    def _create_view(self, mode: ConnectionMode) -> ClientView:
         if self.is_stopped():
             raise RuntimeError("Cannot allocate connections when stopped.")
-
-        existing = self._select_existing_view()
-        if existing is not None:
-            return existing
 
         # Creating a new connection / client view pair.
         loggerName = "ws"
@@ -384,7 +417,7 @@ class ClientConnectionManager(
 
         # Indicate what connection instance this is.
         # In multimode all messages are annotated with an id.
-        if self.mode != ConnectionMode.MULTI:
+        if mode != ConnectionMode.MULTI:
             loggerName = f"{loggerName}[{connection_id}]"
 
         connection = SimplyPrintConnection(
@@ -393,7 +426,13 @@ class ClientConnectionManager(
             logger=logging.getLogger(loggerName),
             transport_factory=self.transport_factory,
         )
-        client_view = ClientView(self.mode, connection, self.client_list)
+        client_view = ClientView(
+            mode,
+            connection,
+            self.client_list,
+            connection_id=connection_id,
+            on_app_transport_established=self._notify_app_transport_established,
+        )
         self.views.add(client_view)
 
         # Registering the connection with the client view.
@@ -423,9 +462,28 @@ class ClientConnectionManager(
 
         return client_view
 
+    def _allocate_new_connection(self) -> ClientView:
+        if self.is_stopped():
+            raise RuntimeError("Cannot allocate connections when stopped.")
+
+        existing = self._select_existing_view()
+        if existing is not None:
+            return existing
+
+        return self._create_view(self.mode)
+
     def _select_existing_view(self) -> Optional[ClientView]:
         if self.mode != ConnectionMode.MULTI or not self.views:
             return None
+
+        # An empty view retained by an app lease is the preferred home for the
+        # next printer, so acquiring process transport does not create a socket
+        # that remains needlessly separate once printers appear.
+        if self._app_view is not None and (
+            self.max_clients_per_connection is None
+            or len(self._app_view) < self.max_clients_per_connection
+        ):
+            return self._app_view
 
         if self.max_clients_per_connection is None:
             candidates = tuple(self.views)
@@ -439,7 +497,7 @@ class ClientConnectionManager(
         if not candidates:
             return None
 
-        return min(candidates, key=lambda view: (len(view), id(view)))
+        return min(candidates, key=lambda view: (len(view), view.connection_id))
 
     def _derive_connection_hint(self, client: Client) -> ConnectionHint:
         # Use up-to-date credentials to connect.
@@ -455,6 +513,87 @@ class ClientConnectionManager(
     @property
     def connections(self) -> Iterable[SimplyPrintConnection]:
         return map(lambda x: cast(ClientView, x).connection, list(self.views))
+
+    def register_app_transport_established_observer(
+        self, key: str, observer: AppTransportEstablishedObserver
+    ) -> None:
+        """Register one process-transport observer under an idempotent key."""
+        with self._app_observers_lock:
+            self._app_observers[key] = observer
+
+    def unregister_app_transport_established_observer(self, key: str) -> None:
+        with self._app_observers_lock:
+            self._app_observers.pop(key, None)
+
+    async def _notify_app_transport_established(self, view: ClientView) -> None:
+        if view is not self._app_view:
+            return
+
+        async def sender(msg: ClientMsg) -> bool:
+            # This closure intentionally stays bound to the connection whose
+            # handshake caused the callback. It never hops to another view.
+            if view is not self._app_view or not view.connection.connected:
+                return False
+            await view.connection.send(msg, None)
+            return True
+
+        with self._app_observers_lock:
+            observers = tuple(self._app_observers.values())
+        for observer in observers:
+            try:
+                await observer(sender)
+            except Exception as e:
+                self.logger.error(
+                    "App transport established observer failed", exc_info=e
+                )
+
+    async def acquire_app_transport(self, consumer: str) -> bool:
+        """Acquire the process-owned MULTI transport for ``consumer``."""
+        if self.is_stopped():
+            return False
+        if consumer in self._app_consumers:
+            return True
+
+        self._app_consumers.add(consumer)
+        if self._app_view is not None:
+            return True
+
+        if self.mode == ConnectionMode.MULTI and self.views:
+            self._app_view = min(
+                self.views, key=lambda view: (len(view), view.connection_id)
+            )
+            return True
+
+        self._app_view = self._create_view(ConnectionMode.MULTI)
+        try:
+            await self._app_view.connection.connect(
+                hint=ConnectionHint(
+                    self.websocket_base,
+                    mode=ConnectionMode.MULTI,
+                    config=PrinterConfig.get_blank(),
+                )
+            )
+        except Exception:
+            failed_view = self._app_view
+            self._app_view = None
+            self._app_consumers.discard(consumer)
+            self.views.discard(failed_view)
+            raise
+        return True
+
+    async def release_app_transport(self, consumer: str) -> None:
+        """Release ``consumer``; retire the pinned view only when it is empty."""
+        if consumer not in self._app_consumers:
+            return
+        self._app_consumers.discard(consumer)
+        if self._app_consumers or self._app_view is None:
+            return
+
+        view = self._app_view
+        self._app_view = None
+        if len(view) == 0:
+            await view.connection.disconnect()
+            self.views.discard(view)
 
     async def send_app_message(self, msg: ClientMsg) -> bool:
         """Send a *process-level* message over any live connection.
@@ -475,12 +614,11 @@ class ClientConnectionManager(
         simply means "not connected yet", which callers retry rather than treat
         as an error.
         """
-        for connection in self.connections:
-            if not connection.connected:
-                continue
-            await connection.send(msg, None)
-            return True
-        return False
+        view = self._app_view
+        if view is None or not view.connection.connected:
+            return False
+        await view.connection.send(msg, None)
+        return True
 
     def get_connection_for_client(
         self, client: Client
@@ -550,7 +688,7 @@ class ClientConnectionManager(
         await client.event_bus.emit(SimplyPrintConnectionLostEvent(client.v))
 
         # Disconnect the connection if no clients are left.
-        if len(client_view) == 0:
+        if len(client_view) == 0 and client_view is not self._app_view:
             await client_view.connection.disconnect()
             self.views.discard(client_view)
 

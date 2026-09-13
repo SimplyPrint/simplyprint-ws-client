@@ -1,27 +1,27 @@
 import threading
 import time
-
-import pytest
 from unittest.mock import AsyncMock
 
+import pytest
 from simplyprint_ws_client import (
+    Client,
+    ClientApp,
     ClientSettings,
     IntegrationId,
     IntegrationSpec,
-    Client,
     PrinterConfig,
-    ClientApp,
 )
-from simplyprint_ws_client.integration.spec import ProductMetadata
-from simplyprint_ws_client.integration.discovery import DiscoveryService
+from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
 from simplyprint_ws_client.core.client import (
     ClientConfigChangedEvent,
     ClientStateChangeEvent,
 )
-from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
 from simplyprint_ws_client.integration.camera.pool import (
     DEFAULT_CAMERA_PROCESS_WORKERS,
 )
+from simplyprint_ws_client.integration.discovery import DiscoveryService
+from simplyprint_ws_client.integration.spec import ProductMetadata
+
 from tests._fakes import FakeTransport
 
 
@@ -119,6 +119,40 @@ def test_virtual_client(app: ClientApp):
         "the scripted connected handshake",
     )
     assert client.config.token == "fixture-token"
+
+
+def test_zero_printer_app_transport_lifecycle_is_thread_safe():
+    settings = ClientSettings(
+        integrations=(_integration("test", Client, PrinterConfig),),
+        camera_workers=0,
+    )
+    app = ClientApp(
+        settings,
+        discovery_service=DiscoveryService(),
+        account_providers={},
+        transport_factory=_fixture_transport_factory,
+    )
+    established = threading.Event()
+
+    async def on_established(sender):
+        established.set()
+
+    app.register_app_transport_established_observer("webhooks", on_established)
+    app.run_detached()
+    try:
+        assert app.acquire_app_transport("webhooks")
+        assert established.wait(2.0)
+        assert len(app.client_list) == 0
+        assert len(app.scheduler.manager.views) == 1
+        from simplyprint_ws_client.core.protocol.messages import (
+            IntegrationWebhookRegisterMsg,
+        )
+
+        assert app.send_app_message(IntegrationWebhookRegisterMsg("u", "k"))
+        assert app.release_app_transport("webhooks")
+        assert app.scheduler.manager.views == set()
+    finally:
+        app.stop()
 
 
 def test_single_connection_active_flag(app: ClientApp):

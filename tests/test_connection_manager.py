@@ -1,8 +1,6 @@
 import asyncio
 
 import pytest
-from yarl import URL
-
 import simplyprint_ws_client.core.manager as connection_manager_module
 from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.client_context import ClientContext
@@ -12,14 +10,26 @@ from simplyprint_ws_client.core.manager import (
     ClientList,
     ClientView,
 )
+from simplyprint_ws_client.core.protocol.app_messages import (
+    register_app_message_handler,
+    unregister_app_message_handler,
+)
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.protocol.events import (
     SimplyPrintConnectionIncomingEvent,
     SimplyPrintConnectionLostEvent,
     SimplyPrintConnectionOutgoingEvent,
 )
-from simplyprint_ws_client.core.protocol.messages import PingMsg
+from simplyprint_ws_client.core.protocol.messages import (
+    ConnectedMsg,
+    IntegrationWebhookMsg,
+    IntegrationWebhookMsgData,
+    IntegrationWebhookRegisterMsg,
+    PingMsg,
+)
+from simplyprint_ws_client.core.protocol.models import ServerMsgType
 from simplyprint_ws_client.events import EventBus
+from yarl import URL
 
 _WS = URL("wss://ws.example")
 
@@ -44,6 +54,7 @@ class _RecordingConnection:
         self.stop_calls = 0
         self.loop_task = None
         self.url = "ws://fake"
+        self.sent = []
         type(self).instances.append(self)
 
     async def connect(self, hint=None):
@@ -51,6 +62,9 @@ class _RecordingConnection:
 
     async def disconnect(self):
         self.disconnect_calls += 1
+
+    async def send(self, msg, v=None):
+        self.sent.append((msg, v))
 
     def stop(self):
         self.stop_calls += 1
@@ -246,6 +260,108 @@ async def test_multi_mode_reuses_partially_free_view(monkeypatch):
     assert len(connections) == 1
     assert manager.get_connection_for_client(clients[2]) is first_connection
     assert sorted(len(view) for view in manager.views) == [2]
+
+
+@pytest.mark.asyncio
+async def test_app_transport_acquire_is_shared_and_final_release_retires_empty_view(
+    monkeypatch,
+):
+    connections = _fake_connections(monkeypatch)
+    manager = ClientConnectionManager(ConnectionMode.MULTI, ClientList(), _WS)
+
+    assert await manager.acquire_app_transport("webhooks")
+    assert await manager.acquire_app_transport("webhooks")
+    assert await manager.acquire_app_transport("other")
+    assert len(manager.views) == len(connections) == 1
+    assert connections[0].connect_hints[0].mode is ConnectionMode.MULTI
+
+    await manager.release_app_transport("webhooks")
+    assert connections[0].disconnect_calls == 0
+    await manager.release_app_transport("other")
+    assert connections[0].disconnect_calls == 1
+    assert manager.views == set()
+
+
+@pytest.mark.asyncio
+async def test_single_mode_uses_separate_multi_app_view(monkeypatch):
+    connections = _fake_connections(monkeypatch)
+    client_list, clients = _client_list(1)
+    manager = ClientConnectionManager(ConnectionMode.SINGLE, client_list, _WS)
+
+    await manager.allocate(clients[0])
+    await manager.acquire_app_transport("webhooks")
+
+    assert len(connections) == 2
+    assert {hint.mode for conn in connections for hint in conn.connect_hints} == {
+        ConnectionMode.SINGLE,
+        ConnectionMode.MULTI,
+    }
+
+
+@pytest.mark.asyncio
+async def test_app_send_uses_only_pinned_established_view(monkeypatch):
+    _fake_connections(monkeypatch)
+    client_list, clients = _client_list(2)
+    manager = ClientConnectionManager(
+        ConnectionMode.MULTI, client_list, _WS, max_clients_per_connection=1
+    )
+    await manager.allocate(clients[0])
+    pinned = manager.get_connection_for_client(clients[0])
+    await manager.acquire_app_transport("webhooks")
+    await manager.allocate(clients[1])
+    other = manager.get_connection_for_client(clients[1])
+    pinned.connected = other.connected = True
+
+    assert await manager.send_app_message(IntegrationWebhookRegisterMsg("u", "k"))
+    assert len(pinned.sent) == 1
+    assert other.sent == []
+
+
+@pytest.mark.asyncio
+async def test_empty_view_dispatches_app_message_once():
+    received = []
+    view = ClientView(ConnectionMode.MULTI, object(), ClientList())
+    register_app_message_handler(
+        ServerMsgType.INTEGRATION_WEBHOOK,
+        lambda msg, v: _append_async(received, (msg, v)),
+    )
+    try:
+        msg = IntegrationWebhookMsg(
+            type=ServerMsgType.INTEGRATION_WEBHOOK,
+            data=IntegrationWebhookMsgData(path="job.done"),
+        )
+        await view.emit(SimplyPrintConnectionIncomingEvent, msg, 7)
+    finally:
+        unregister_app_message_handler(ServerMsgType.INTEGRATION_WEBHOOK)
+
+    assert received == [(msg, 7)]
+
+
+async def _append_async(target, value):
+    target.append(value)
+
+
+@pytest.mark.asyncio
+async def test_connected_notifies_observer_with_view_bound_sender(monkeypatch):
+    _fake_connections(monkeypatch)
+    manager = ClientConnectionManager(ConnectionMode.MULTI, ClientList(), _WS)
+    sent = []
+
+    async def observer(sender):
+        sent.append(await sender(IntegrationWebhookRegisterMsg("u", "k")))
+
+    manager.register_app_transport_established_observer("webhooks", observer)
+    await manager.acquire_app_transport("webhooks")
+    connection = manager._app_view.connection
+    connection.connected = True
+    await connection.event_bus.emit(
+        SimplyPrintConnectionIncomingEvent,
+        ConnectedMsg(type=ServerMsgType.CONNECTED),
+        3,
+    )
+
+    assert sent == [True]
+    assert len(connection.sent) == 1
 
 
 @pytest.mark.asyncio
