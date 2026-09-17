@@ -104,7 +104,6 @@ WsConnectionErrors = (
     ConnectionError,  # Technically a subset of OSError, but more specific.
     ClientError,
     asyncio.TimeoutError,
-    asyncio.CancelledError,
     WebSocketError,
 )
 
@@ -365,20 +364,15 @@ class Connection(
                     )
                     self._state = State.NOT_CONNECTED
 
+            except asyncio.CancelledError:
+                break
             except WsConnectionErrors as e:
-                # Disconnect / No connection handling
-                self._state = State.NOT_CONNECTED
-                _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
-                self.v += 1
-                self.logger.info("%s: %s", type(e), e)
-
-                # For repeated connection failures, we suspect the ability to connect might be compromised.
-                # This could be due to loss of network connectivity, server issues, etc.
-                # To allow external users to react to this, we emit a suspect event.
-                if suspect_bound.guard_until_bound():
-                    _ = self.event_bus.emit_task(ConnectionSuspectEvent, e)
+                self._handle_connection_failure(e, suspect_bound)
             except Exception as e:
-                self.logger.error("Other error.", exc_info=e)
+                self.logger.error(
+                    "Unexpected connection error; reconnecting.", exc_info=e
+                )
+                self._handle_connection_failure(e, suspect_bound)
 
             finally:
                 # If an action arrived while we were polling, we need to handle it.
@@ -399,6 +393,15 @@ class Connection(
         wait_stop_task.discard()
 
         self.logger.info("Connection stopped.")
+
+    def _handle_connection_failure(self, error, suspect_bound) -> None:
+        self._state = State.NOT_CONNECTED
+        _ = self.event_bus.emit_task(ConnectionLostEvent(self.v))
+        self.v += 1
+        self.logger.info("%s: %s", type(error), error)
+
+        if suspect_bound.guard_until_bound():
+            _ = self.event_bus.emit_task(ConnectionSuspectEvent, error)
 
     async def connect(self, hint: Optional[ConnectionHint] = None):
         """Create or resume the connection loop."""
