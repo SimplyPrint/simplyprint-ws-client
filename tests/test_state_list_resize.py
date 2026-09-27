@@ -4,6 +4,7 @@ import pytest
 from concurrent.futures.thread import ThreadPoolExecutor
 
 from simplyprint_ws_client import PrinterState, PrinterConfig
+from simplyprint_ws_client.core.state import VIRTUAL_SPOOL_POSITION
 
 
 def _assert_printer_state_consistent(printer: PrinterState):
@@ -19,16 +20,15 @@ def _assert_printer_state_consistent(printer: PrinterState):
         assert tool.nozzle == i, (
             f"Tool index mismatch: expected {i}, got {tool.nozzle} {printer.tools=}"
         )
-        for j, material in enumerate(tool.materials):
-            assert material.ext == j, (
-                f"Material index mismatch for tool {i}, material {j}: "
-                f"expected {j}, got {material.ext}"
-            )
-            assert material.nozzle == i, (
-                f"Material tool index mismatch for tool {i}, material {j}: "
-                f"expected {i}, got {material.nozzle}"
-                f" {printer.tools=}"
-            )
+        # Snapshot under the tool lock: iterating during a concurrent resize
+        # raises RuntimeError.
+        with tool:
+            items = list(tool.materials.items())
+        for ext, material in items:
+            assert material.ext == ext
+            assert material.nozzle == i
+        seq = sorted(e for e, _ in items if e < VIRTUAL_SPOOL_POSITION)
+        assert seq == list(range(len(seq)))
 
 
 @pytest.fixture
@@ -85,6 +85,28 @@ def _test_state_list_resize_by_property_multithreaded(
 def test_state_list_resize(printer):
     _test_state_list_resize_by_property(printer, printer, "tool_count")
     _test_state_list_resize_by_property(printer, printer.tool(), "material_count")
+
+
+def test_material_resize_preserves_virtual_entries(printer):
+    tool = printer.tool0
+    tool.material_count = 4
+    virtual = tool.material(VIRTUAL_SPOOL_POSITION)
+    virtual.type = "PLA"
+
+    tool.material_count = 8
+    assert set(tool.materials) == set(range(8)) | {VIRTUAL_SPOOL_POSITION}
+    assert tool.materials[VIRTUAL_SPOOL_POSITION] is virtual
+    assert tool.material_count == 8
+    assert printer.material(0, 4) is not None
+    assert printer.material(0, VIRTUAL_SPOOL_POSITION) is virtual
+    assert printer.material(0, 99) is None
+
+    tool.material_count = 4
+    assert set(tool.materials) == set(range(4)) | {VIRTUAL_SPOOL_POSITION}
+    assert tool.material_count == 4
+
+    with pytest.raises(ValueError):
+        tool.material(-1)
 
 
 def test_state_list_resize_multithreaded(printer):

@@ -14,6 +14,7 @@ from simplyprint_ws_client.core.state.models import (
     NozzleType,
     PrinterSettings,
     PrinterStatus,
+    VIRTUAL_SPOOL_POSITION,
     VolumeType,
 )
 from simplyprint_ws_client.core.state.notifications import NotificationsState
@@ -345,7 +346,8 @@ class MaterialLayoutEntry(ReactiveModel):
 
     def get_chains(self) -> int:
         if self.mms and self.mms.can_chain:
-            return min(self.chains or 1, self.mms.max_chains)
+            chains = self.chains or 1
+            return min(chains, self.mms.max_chains or chains)
         return 1
 
     @property
@@ -402,35 +404,62 @@ class ToolState(ReactiveModel):
     size: Optional[float] = None
     temperature: TemperatureState = Field(default_factory=TemperatureState)
     active_material: Optional[int] = None
-    materials: List[MaterialEntry] = Field(default_factory=list)
+    materials: Dict[int, MaterialEntry] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
         """Initialize the tool state with a default material if none are provided."""
+        # ctx is not attached yet during __init__, so insert raw.
         if not self.materials:
-            self.materials.append(MaterialEntry(nozzle=self.nozzle, ext=0))
+            self.materials[0] = MaterialEntry(nozzle=self.nozzle, ext=0)
 
     def is_heating(self):
         """Returns True if the tool is currently heating."""
         return self.temperature.is_heating()
 
+    def material(self, ext: int) -> MaterialEntry:
+        """Get or create the material entry at the given ext position."""
+        if ext < 0:
+            raise ValueError("Material ext must be non-negative")
+
+        entry = self.materials.get(ext)
+
+        if entry is None:
+            entry = MaterialEntry(nozzle=self.nozzle, ext=ext)
+            entry.provide_context(self)
+            self.materials[ext] = entry
+            self.model_set_changed("materials")
+            entry.model_set_changed("ext")
+
+        return entry
+
     @property
     def material_count(self) -> int:
-        """Returns the number of materials for this tool."""
-        return len(self.materials)
+        """Number of sequential material slots, excluding virtual positions."""
+        # Callers may already hold the tool lock, so snapshot the keys instead:
+        # list(dict) runs in C without releasing the GIL, a generator does not.
+        keys = list(self.materials)
+        return sum(1 for ext in keys if 0 <= ext < VIRTUAL_SPOOL_POSITION)
 
     @material_count.setter
     def material_count(self, count: int) -> None:
-        """Sets the number of materials for this tool, resizing the list if necessary."""
         if count < 1:
             raise ValueError("Material count must be at least 1")
 
         with self:
-            _resize_state_inplace(
-                self,
-                self.materials,
-                count,
-                lambda i: MaterialEntry(nozzle=self.nozzle, ext=i),
-            )
+            for ext in range(count):
+                self.material(ext)
+
+            removed = [
+                ext
+                for ext in list(self.materials)
+                if count <= ext < VIRTUAL_SPOOL_POSITION
+            ]
+
+            for ext in removed:
+                del self.materials[ext]
+
+            if removed:
+                self.model_set_changed("materials")
 
 
 class JobObjectEntry(ReactiveModel):
@@ -524,7 +553,7 @@ class PrinterState(ReactiveModel):
         return tool0.materials[0]
 
     @property
-    def materials0(self) -> List[MaterialEntry]:
+    def materials0(self) -> Dict[int, MaterialEntry]:
         """Convenience property to access the materials of the first tool."""
         return self.tool0.materials
 
@@ -552,10 +581,7 @@ class PrinterState(ReactiveModel):
     def material(self, nozzle: int = 0, ext: int = 0) -> Optional[MaterialEntry]:
         """Safe getter for the material at the given nozzle index and ext."""
         if tool := self.tool(nozzle):
-            if ext < 0 or ext >= tool.material_count:
-                return None
-
-            return tool.materials[ext]
+            return tool.materials.get(ext)
 
         return None
 
@@ -565,35 +591,40 @@ class PrinterState(ReactiveModel):
         """
 
         with self:
-            # compare the new layout with the current one
-            if len(self.mms_layout) == len(mms_layout):
-                for a, b in zip(self.mms_layout, mms_layout):
-                    if a == b:
-                        continue
-                    break
-                else:
-                    # If all entries are the same, no need to update
-                    return
+            if len(self.mms_layout) == len(mms_layout) and all(
+                a == b for a, b in zip(self.mms_layout, mms_layout)
+            ):
+                return
 
             self.mms_layout = mms_layout
 
-            layout_per_nozzle: Dict[int, List[MaterialLayoutEntry]] = {}
+            slots_per_nozzle: Dict[int, int] = {}
+            virtual_per_nozzle: Dict[int, Set[int]] = {}
 
             for entry in mms_layout:
-                if entry.nozzle not in layout_per_nozzle:
-                    layout_per_nozzle[entry.nozzle] = []
-                layout_per_nozzle[entry.nozzle].append(entry)
+                slots_per_nozzle[entry.nozzle] = (
+                    slots_per_nozzle.get(entry.nozzle, 0) + entry.get_computed_size()
+                )
 
-            material_count_per_nozzle: Dict[int, int] = {}
-
-            for nozzle, entries in layout_per_nozzle.items():
-                material_count_per_nozzle[nozzle] = 0
-
-                for entry in entries:
-                    material_count_per_nozzle[nozzle] += entry.get_computed_size()
+                if entry.offset:
+                    virtual_per_nozzle.setdefault(entry.nozzle, set()).update(
+                        range(entry.offset, entry.offset + entry.get_size())
+                    )
 
             for i, tool in enumerate(self.tools):
-                tool.material_count = max(material_count_per_nozzle.get(i, 1), 1)
+                tool.material_count = max(slots_per_nozzle.get(i, 1), 1)
+
+                wanted = virtual_per_nozzle.get(i, set())
+
+                # The material_count setter locks the tool itself, so the virtual
+                # phase acquires it separately - Synchronized is non-reentrant.
+                with tool:
+                    for ext in sorted(wanted):
+                        tool.material(ext)
+
+                    for ext, entry in tool.materials.items():
+                        if ext >= VIRTUAL_SPOOL_POSITION and ext not in wanted:
+                            entry.clear()
 
     def peripheral(self, peripheral_id: str) -> PeripheralHandle:
         return self.peripherals.peripheral(peripheral_id)

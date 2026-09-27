@@ -10,6 +10,7 @@ from simplyprint_ws_client.core.state.models import (
     BedType,
     MultiMaterialSolution,
     NozzleType,
+    VIRTUAL_SPOOL_POSITION,
     VolumeType,
 )
 
@@ -72,7 +73,7 @@ def test_materials_chain_iterator_bug(client: Client):
     # This line tests the bug fix - materials must be converted to list
     # before being used in the generator, otherwise iterator gets consumed
     materials = list(
-        chain.from_iterable(map(lambda t: t.materials, client.printer.tools))
+        chain.from_iterable(t.materials.values() for t in client.printer.tools)
     )
     assert len(materials) >= 2
 
@@ -127,6 +128,51 @@ def test_refresh_mode_includes_all_sections(client: Client):
     assert "materials" in msg.data
 
 
+def test_material_resize_is_visible_to_delta_build(client: Client):
+    client.printer.tool0.material_count = 4
+    msgs = client.consume()
+    assert len(msgs) == 1 and msgs[0].__class__ == MaterialDataMsg
+    sent = {(m["nozzle"], m["ext"]) for m in msgs[0].data["materials"]}
+    assert sent == {(0, e) for e in range(4)}
+    msgs[0].reset_changes(client.printer)
+    assert client.printer.model_recursive_changeset == {}
+
+    client.printer.tool0.material_count = 2
+    msgs = client.consume()
+    assert len(msgs) == 1
+    sent = {(m["nozzle"], m["ext"]) for m in msgs[0].data["materials"]}
+    assert sent == {(0, 0), (0, 1)}
+
+
+def test_virtual_layout_entry_is_addressable(client: Client):
+    client.printer.update_mms_layout(
+        [
+            MaterialLayoutEntry(nozzle=0, mms=MultiMaterialSolution.QIDI_BOX),
+            MaterialLayoutEntry(nozzle=0, mms=MultiMaterialSolution.VIRTUAL),
+        ]
+    )
+    tool = client.printer.tool0
+    assert tool.material_count == 4
+    assert set(tool.materials) == set(range(4)) | {VIRTUAL_SPOOL_POSITION}
+    assert client.printer.material(0, VIRTUAL_SPOOL_POSITION) is not None
+
+    # Removing VIRTUAL from the layout keeps the key but clears the entry:
+    # deleting it would be invisible to SimplyPrint (only cleared entries are
+    # sent), and leaving it populated would resend stale data on refresh.
+    client.printer.material(0, VIRTUAL_SPOOL_POSITION).type = "PLA"
+    client.printer.update_mms_layout(
+        [MaterialLayoutEntry(nozzle=0, mms=MultiMaterialSolution.QIDI_BOX)]
+    )
+    assert set(tool.materials) == set(range(4)) | {VIRTUAL_SPOOL_POSITION}
+    assert tool.materials[VIRTUAL_SPOOL_POSITION].type is None
+
+
+def test_boxturtle_get_chains_no_max():
+    entry = MaterialLayoutEntry(nozzle=0, mms=MultiMaterialSolution.BOXTURTLE, chains=2)
+    assert entry.get_chains() == 2
+    assert entry.get_computed_size() == 8
+
+
 def test_reset_changes_mirrors_producer_fields(client: Client):
     """Test that reset_changes clears exactly the fields that producer watches."""
     # Make changes to all producer-watched fields
@@ -141,7 +187,7 @@ def test_reset_changes_mirrors_producer_fields(client: Client):
         tool.type = NozzleType.HARDENED_STEEL
         tool.volume_type = VolumeType.HIGH_FLOW
         client.printer.update_mms_layout([MaterialLayoutEntry(nozzle=i, size=4)])
-        for material in tool.materials:
+        for material in tool.materials.values():
             material.type = "PLA"
             material.color = "Blue"
             material.hex = "#FF0000"

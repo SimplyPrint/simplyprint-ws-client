@@ -206,12 +206,19 @@ def _message_changes(
     )
     yield PowerControllerMsg, (_field_version(state, "psu_info", (state.psu_info,)),)
     yield CpuInfoMsg, (_field_version(state, "cpu_info", (state.cpu_info,)),)
+    tool_materials = []
+
+    for tool in state.tools:
+        # A concurrent resize mutates the dict, so snapshot under the tool lock.
+        with tool:
+            tool_materials.append((tool, list(tool.materials.values())))
+
     yield (
         MaterialDataMsg,
         (
             *(
-                _field_version(tool, "materials", tool.materials)
-                for tool in state.tools
+                _field_version(tool, "materials", materials)
+                for tool, materials in tool_materials
             ),
             *(_field_version(tool, "size") for tool in state.tools),
             *(_field_version(tool, "type") for tool in state.tools),

@@ -1036,15 +1036,21 @@ class MaterialDataMsg(ClientMsg[Literal[ClientMsgType.MATERIAL_DATA]]):
                 ],
             )
 
-        materials = list(chain.from_iterable(map(lambda t: t.materials, state.tools)))
+        resized = any(t.model_has_changes("materials") for t in state.tools)
+        materials = []
 
-        if is_refresh or any(m.model_has_changed for m in materials):
+        for t in state.tools:
+            # A concurrent resize mutates the dict, so snapshot under the tool lock.
+            with t:
+                materials.extend(m for _, m in sorted(t.materials.items()))
+
+        if is_refresh or resized or any(m.model_has_changed for m in materials):
             yield (
                 "materials",
                 [
                     m.model_dump(exclude_none=True, mode="json")
                     for m in materials
-                    if m.model_has_changed or is_refresh
+                    if is_refresh or resized or m.model_has_changed
                 ],
             )
 
@@ -1053,8 +1059,12 @@ class MaterialDataMsg(ClientMsg[Literal[ClientMsgType.MATERIAL_DATA]]):
         state.model_reset_changed("mms_layout", v=v)
         state.bed.model_reset_changed(*self._BED_FIELDS, v=v)
         for t in state.tools:
-            for m in t.materials:
+            with t:
+                materials = list(t.materials.values())
+
+            for m in materials:
                 m.model_reset_changed(v=v)
+
             t.model_reset_changed("materials", *self._TOOL_FIELDS, v=v)
 
 
