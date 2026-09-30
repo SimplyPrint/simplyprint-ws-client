@@ -26,6 +26,11 @@ Lifetime rules that keep this safe:
 
 A frame larger than a slab is rare; it falls back to a one-off ``send_bytes`` (a
 single copy) and is logged so the slab size can be raised.
+
+One channel serves every producer in a worker process. Each record carries its
+producer id, and besides frames the pipe carries two control records in the same
+order: a producer's *done* marker (after its last frame) and forwarded log
+records from the worker.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ if TYPE_CHECKING:
     from multiprocessing.connection import Connection
     from multiprocessing.sharedctypes import SynchronizedArray
 
-__all__ = ["SlabLease", "SharedSlabChannel"]
+__all__ = ["SlabLease", "SharedSlabChannel", "KIND_FRAME", "KIND_DONE", "KIND_LOG"]
 
 _logger = logging.getLogger("worker.channel")
 
@@ -52,6 +57,13 @@ _META = struct.Struct("<iIId")
 # slab_index sentinels (never a real index)
 _FAILED = -1  # the producer yielded no frame (error); data is None
 _OVERSIZED = -2  # frame > slab_size; the payload bytes follow via send_bytes
+_DONE = -3  # the producer returned; nothing more will arrive for its id
+_LOG = -4  # a pickled log record from the worker follows via send_bytes
+
+#: What a received :class:`SlabLease` carries.
+KIND_FRAME = 0
+KIND_DONE = 1
+KIND_LOG = 2
 
 _FREE = 0
 _IN_USE = 1
@@ -100,11 +112,15 @@ class SlabLease:
     ``data`` is a zero-copy ``memoryview`` into a shared slab for the common case,
     or owned ``bytes`` for the oversized fallback, or ``None`` for a failed frame.
     Hold it only briefly: the slab cannot be reused until you release it.
+
+    ``kind`` is :data:`KIND_FRAME` for a frame, :data:`KIND_DONE` when the
+    producer has finished (no data), or :data:`KIND_LOG` for a pickled log record.
     """
 
     __slots__ = (
         "producer_id",
         "timestamp",
+        "kind",
         "_view",
         "_release_cb",
         "_data_bytes",
@@ -119,9 +135,11 @@ class SlabLease:
         view: Optional[memoryview] = None,
         release_cb: Optional[Callable[[], None]] = None,
         data_bytes: Optional[bytes] = None,
+        kind: int = KIND_FRAME,
     ) -> None:
         self.producer_id = producer_id
         self.timestamp = timestamp
+        self.kind = kind
         self._view = view
         self._release_cb = release_cb
         self._data_bytes = data_bytes
@@ -252,19 +270,16 @@ class SharedSlabChannel:
         return self._parent_conn.fileno()
 
     def send(self, producer_id: int, data: Optional[Any], timestamp: float) -> bool:
-        """Hand a payload to the parent. ``False`` if it was dropped (slabs full).
+        """Hand a payload to the parent. ``False`` if it was dropped (slabs full)
+        or the parent is gone.
 
-        Safe to call concurrently from several producer threads in one process
-        (the camera worker's thread pool): slab claims are serialized by the slab
-        lock, and the pipe write is serialized by ``_send_lock`` -- a bare
-        ``Connection.send_bytes`` is not safe under concurrent writers.
+        Safe to call concurrently from every producer thread in the worker: slab
+        claims are serialized by the slab lock, and the pipe write is serialized
+        by ``_send_lock`` -- a bare ``Connection.send_bytes`` is not safe under
+        concurrent writers.
         """
         if data is None:
-            with self._send_lock:
-                self._child_conn.send_bytes(
-                    _META.pack(_FAILED, 0, producer_id, timestamp)
-                )
-            return True
+            return self._write(_META.pack(_FAILED, 0, producer_id, timestamp))
 
         length = len(data)
         if length > self._slab_size:
@@ -273,12 +288,9 @@ class SharedSlabChannel:
                 length,
                 self._slab_size,
             )
-            with self._send_lock:
-                self._child_conn.send_bytes(
-                    _META.pack(_OVERSIZED, length, producer_id, timestamp)
-                )
-                self._child_conn.send_bytes(bytes(data))
-            return True
+            return self._write(
+                _META.pack(_OVERSIZED, length, producer_id, timestamp), bytes(data)
+            )
 
         idx = self._claim_slab()
         if idx is None:
@@ -287,8 +299,31 @@ class SharedSlabChannel:
 
         offset = idx * self._slab_size
         self._data.buf[offset : offset + length] = data  # parallel: distinct slabs
+        if self._write(_META.pack(idx, length, producer_id, timestamp)):
+            return True
+        self._free_slab(idx)
+        return False
+
+    def send_done(self, producer_id: int, timestamp: float) -> bool:
+        """Tell the parent ``producer_id`` has finished. Ordered after its frames."""
+        return self._write(_META.pack(_DONE, 0, producer_id, timestamp))
+
+    def send_log(self, payload: bytes, timestamp: float) -> bool:
+        """Forward one pickled log record to the parent."""
+        return self._write(_META.pack(_LOG, len(payload), 0, timestamp), payload)
+
+    def _write(self, meta: bytes, payload: Optional[bytes] = None) -> bool:
+        # A worker outliving its parent (or a producer thread still running after
+        # shutdown) must not crash on the dead pipe; the record is simply lost.
         with self._send_lock:
-            self._child_conn.send_bytes(_META.pack(idx, length, producer_id, timestamp))
+            if self._closed:
+                return False
+            try:
+                self._child_conn.send_bytes(meta)
+                if payload is not None:
+                    self._child_conn.send_bytes(payload)
+            except (OSError, EOFError, ValueError):
+                return False
         return True
 
     def _claim_slab(self) -> Optional[int]:
@@ -320,12 +355,16 @@ class SharedSlabChannel:
         if slab == _FAILED:
             return SlabLease(producer_id, timestamp, data_bytes=None)
 
-        if slab == _OVERSIZED:
+        if slab == _DONE:
+            return SlabLease(producer_id, timestamp, kind=KIND_DONE)
+
+        if slab in (_OVERSIZED, _LOG):
             try:
                 payload = conn.recv_bytes()
             except (EOFError, OSError):
                 return None
-            return SlabLease(producer_id, timestamp, data_bytes=payload)
+            kind = KIND_LOG if slab == _LOG else KIND_FRAME
+            return SlabLease(producer_id, timestamp, data_bytes=payload, kind=kind)
 
         offset = slab * self._slab_size
         view = self._data.buf[offset : offset + length]
@@ -346,9 +385,10 @@ class SharedSlabChannel:
         All outstanding :class:`SlabLease` s must be released first (an alive
         ``memoryview`` blocks ``SharedMemory.close``).
         """
-        if self._closed:
-            return
-        self._closed = True
+        with self._send_lock:  # no write may race the pipe close
+            if self._closed:
+                return
+            self._closed = True
         for conn in (self._parent_conn, self._child_conn):
             if conn is not None:
                 try:
