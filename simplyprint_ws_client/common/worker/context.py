@@ -6,8 +6,10 @@ routes on an explicit :class:`ExecutionContext`, derived from a protocol's
 CPU-intensity + async-ness (with an explicit override), not from ``is_async``
 alone:
 
-* **PROCESS** -- CPU-heavy work (RTSP/OpenCV decode+encode). Its own subprocess;
-  payloads ride zero-copy shared memory (see :mod:`.channel`).
+* **PROCESS** -- CPU-heavy work (RTSP/OpenCV decode+encode). Runs in one of the
+  pool's shared worker processes (at most one per core), a thread each or, when
+  async, on that worker's loop; payloads ride zero-copy shared memory (see
+  :mod:`.channel`).
 * **THREAD** -- a light async (or blocking) producer in its own thread+loop;
   results are couriered back to the consumer loop.
 * **INLINE** -- a light async producer run as a task *directly on* the consumer

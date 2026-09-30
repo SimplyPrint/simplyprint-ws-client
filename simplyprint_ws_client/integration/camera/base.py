@@ -57,9 +57,10 @@ class BaseCameraProtocol(ABC, Iterable[FrameT], AsyncIterable[FrameT]):
     execution_context: ClassVar[Optional["ExecutionContext"]] = None
     """Explicit override for where this protocol runs. When ``None`` the pool
     routes it: an async protocol runs INLINE on the consumer loop (no process, no
-    pickle); a sync protocol runs in a worker PROCESS (CPU-isolated, the proven
-    path). Set it to ``THREAD`` to run an async camera in its own thread, or to
-    force any protocol onto a specific context."""
+    pickle); a sync protocol runs in the shared worker PROCESSes (a thread each,
+    CPU-isolated from the loop). Set ``PROCESS`` to move a CPU-heavy async camera
+    off the loop too (it then runs on a worker's event loop), or ``THREAD`` to
+    give a camera its own thread in this process."""
 
     uri: URL
     """Configuration URI for the camera protocol, and the only input we have access to."""

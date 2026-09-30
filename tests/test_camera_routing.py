@@ -146,6 +146,7 @@ def test_sync_protocol_routes_to_process():
 
 def test_explicit_execution_context_wins():
     assert CameraPool._route(_SyncStreamThread) is ExecutionContext.THREAD
+    assert CameraPool._route(_AsyncCameraInProcess) is ExecutionContext.PROCESS
 
 
 # -- async camera execution -------------------------------------------------- #
@@ -220,3 +221,64 @@ async def test_process_camera_starts_under_spawn():
         await _assert_process_camera_delivers_via_shared_memory()
     finally:
         _restore_start_method(previous)
+
+
+class _LiveSyncCamera(BaseCameraProtocol):
+    """A continuous sync camera that holds its connection open for good, like a
+    Bambu port-6000 or RTSP stream -> runs in a worker process."""
+
+    is_async = False
+    polling_mode = CameraProtocolPollingMode.CONTINUOUS
+
+    @staticmethod
+    def test(uri):
+        return uri.scheme == "live"
+
+    def read(self):
+        while True:
+            yield self.uri.host.encode()
+            time.sleep(0.02)
+
+
+class _AsyncCameraInProcess(_AsyncStream):
+    execution_context = ExecutionContext.PROCESS
+
+
+@pytest.mark.asyncio
+async def test_more_live_cameras_than_worker_processes_all_stream():
+    """Five never-ending cameras on two worker processes all deliver frames.
+    With one process per camera behind a two-slot limit, cameras 3-5 waited
+    forever and their streams never started."""
+    pool = CameraPool(
+        event_loop_provider=EventLoopProvider(loop=asyncio.get_running_loop()),
+        process_workers=2,
+    )
+    pool.protocols.append(_LiveSyncCamera)
+    handles = [pool.create(URL(f"live://printer{i}")) for i in range(5)]
+    try:
+        for handle in handles:
+            handle.start()
+        frames = await asyncio.wait_for(
+            asyncio.gather(*(handle.receive_frame() for handle in handles)), 20.0
+        )
+        assert frames == [f"printer{i}".encode() for i in range(5)]
+        assert pool._workers.process_loads() == [4, 1]
+    finally:
+        for handle in handles:
+            handle.stop()
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_camera_can_run_in_a_worker_process():
+    pool = _pool(asyncio.get_running_loop())
+    pool.protocols.append(_AsyncCameraInProcess)
+    handle = pool.create(URL("x://cam"))
+    try:
+        handle.start()
+        frame = await asyncio.wait_for(handle.receive_frame(), 10.0)
+        assert len(frame) == 8
+        assert pool._workers.process_loads() == [1]
+    finally:
+        handle.stop()
+        pool.stop()

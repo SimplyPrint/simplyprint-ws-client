@@ -8,7 +8,9 @@ a subprocess across a zero-copy shared-memory channel.
 """
 
 import asyncio
+import logging
 import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -183,34 +185,6 @@ async def test_process_delivers_frame_when_producer_exits_immediately():
 
 
 @pytest.mark.asyncio
-async def test_bounded_process_lane_reopens_after_oneshot_exit():
-    loop = asyncio.get_running_loop()
-    pool = WorkerPool(
-        event_loop_provider=EventLoopProvider(loop=loop), max_process_workers=1
-    )
-
-    async def run_once():
-        delivered = loop.create_future()
-        handle = await pool.allocate_async(
-            ExecutionContext.PROCESS,
-            _oneshot_producer,
-            lambda data, timestamp: delivered.set_result((bytes(data), timestamp)),
-            overflow=OverflowPolicy.UNBOUNDED,
-        )
-        return handle, await delivered
-
-    first, first_frame = await run_once()
-    try:
-        second, second_frame = await asyncio.wait_for(run_once(), 2.0)
-        assert first_frame == second_frame == (b"final", 42.0)
-    finally:
-        first.stop()
-        if "second" in locals():
-            second.stop()
-        pool.stop()
-
-
-@pytest.mark.asyncio
 async def test_inline_rejects_a_sync_producer():
     pool = WorkerPool(
         event_loop_provider=EventLoopProvider(loop=asyncio.get_running_loop())
@@ -220,78 +194,252 @@ async def test_inline_rejects_a_sync_producer():
 
 
 @pytest.mark.asyncio
-async def test_process_rejects_an_async_producer():
-    pool = WorkerPool(
-        event_loop_provider=EventLoopProvider(loop=asyncio.get_running_loop())
-    )
-    with pytest.raises(ValueError):
-        pool.allocate(ExecutionContext.PROCESS, _async_producer, lambda d, t: None)
-
-
-@pytest.mark.asyncio
-async def test_bounded_process_lane_waits_instead_of_spawning_past_limit(monkeypatch):
+async def test_process_runs_an_async_producer():
     loop = asyncio.get_running_loop()
-    provider = EventLoopProvider(loop=loop)
-    pool = WorkerPool(
-        event_loop_provider=provider,
-        max_process_workers=1,
-    )
-    allocated = []
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop))
+    got = []
 
-    class FakeHandle:
-        def __init__(self, release_capacity):
-            self._release_capacity = release_capacity
-
-        def stop(self):
-            self._release_capacity()
-
-    def fake_allocate(*_args, _release_capacity=None, **_kwargs):
-        handle = FakeHandle(_release_capacity)
-        allocated.append(handle)
-        return handle
-
-    monkeypatch.setattr(pool, "allocate", fake_allocate)
-
-    first = await pool.allocate_async(
+    handle = pool.allocate(
         ExecutionContext.PROCESS,
-        _cooperative_producer,
-        lambda _data, _ts: None,
+        _async_producer,
+        lambda data, ts: got.append(bytes(data)),
+        args=(6, 64),
+        overflow=OverflowPolicy.UNBOUNDED,
     )
-    assert len(allocated) == 1
+    try:
+        await _drain(got, 6)
+    finally:
+        handle.stop()
+        pool.stop()
 
-    second_allocation = asyncio.create_task(
-        pool.allocate_async(
-            ExecutionContext.PROCESS,
-            _cooperative_producer,
-            lambda _data, _ts: None,
+    assert got[:6] == [_frame(i, 64) for i in range(6)]
+
+
+# -- the process group: bounded processes, unbounded producers --------------- #
+
+
+def _tagged_stream(emit, is_stopped, tag):
+    """A continuous producer, like a live camera: it never ends on its own."""
+    while not is_stopped():
+        emit(tag, time.time())
+        time.sleep(0.01)
+
+
+def _crash_after_first_frame(emit, is_stopped):
+    emit(b"last words", time.time())
+    time.sleep(0.2)
+    os._exit(3)  # takes the whole worker process down
+
+
+def _logging_producer(emit, is_stopped):
+    logging.getLogger("worker.test").warning("hello from %s", "the worker")
+    emit(b"logged", 0.0)
+
+
+async def _first_items(pool, count, producer, args_for, *, attempts=1000):
+    """Allocate ``count`` producers and wait until each delivered an item."""
+    seen = {}
+    handles = []
+    for i in range(count):
+        handles.append(
+            pool.allocate(
+                ExecutionContext.PROCESS,
+                producer,
+                lambda data, ts, i=i: seen.setdefault(i, bytes(data)),
+                args=args_for(i),
+            )
         )
-    )
-    await asyncio.sleep(0.05)
-    assert not second_allocation.done()
-    assert len(allocated) == 1
-
-    first.stop()
-    second = await asyncio.wait_for(second_allocation, 1.0)
-    assert len(allocated) == 2
-
-    second.stop()
-    pool.stop()
+    for _ in range(attempts):
+        if len(seen) == count:
+            break
+        await asyncio.sleep(0.01)
+    return handles, seen
 
 
 @pytest.mark.asyncio
-async def test_bounded_process_lane_rejects_sync_allocation_bypass():
+async def test_producers_are_not_limited_by_the_process_count():
+    """Six never-ending producers on two processes all deliver: the process
+    count bounds CPU parallelism, never how many producers run."""
+    loop = asyncio.get_running_loop()
     pool = WorkerPool(
-        event_loop_provider=EventLoopProvider(loop=asyncio.get_running_loop()),
-        max_process_workers=1,
+        event_loop_provider=EventLoopProvider(loop=loop),
+        max_processes=2,
+        producers_per_process=1,
     )
-    with pytest.raises(RuntimeError, match="allocate_async"):
-        pool.allocate(
-            ExecutionContext.PROCESS,
-            _sync_producer,
-            lambda _data, _ts: None,
-            args=(1, 1),
+    handles, seen = await _first_items(
+        pool, 6, _tagged_stream, lambda i: (f"cam{i}".encode(),)
+    )
+    try:
+        assert seen == {i: f"cam{i}".encode() for i in range(6)}
+        assert sorted(pool.process_loads()) == [3, 3]
+    finally:
+        for handle in handles:
+            handle.stop()
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_worker_fills_before_the_next_one_starts():
+    """Memory follows load: six producers need two workers, not one per core."""
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop), max_processes=4)
+    handles, seen = await _first_items(pool, 6, _tagged_stream, lambda i: (b"x",))
+    try:
+        assert len(seen) == 6
+        assert pool.process_loads() == [4, 2]
+    finally:
+        for handle in handles:
+            handle.stop()
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_producers_spread_over_processes_before_sharing_one():
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(
+        event_loop_provider=EventLoopProvider(loop=loop),
+        max_processes=3,
+        producers_per_process=1,
+    )
+    handles, seen = await _first_items(pool, 3, _tagged_stream, lambda i: (b"x",))
+    try:
+        assert len(seen) == 3
+        assert pool.process_loads() == [1, 1, 1]
+    finally:
+        for handle in handles:
+            handle.stop()
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_oneshot_producers_reuse_a_live_worker():
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop), max_processes=1)
+    children = set()
+    try:
+        for _ in range(3):
+            delivered = loop.create_future()
+            handle = pool.allocate(
+                ExecutionContext.PROCESS,
+                _oneshot_producer,
+                lambda data, ts, done=delivered: (
+                    done.done() or done.set_result((bytes(data), ts))
+                ),
+            )
+            assert await asyncio.wait_for(delivered, 5.0) == (b"final", 42.0)
+            children.update(p.pid for p in mp.active_children())
+            for _ in range(200):  # completion retires the handle, not the worker
+                if handle.stopped:
+                    break
+                await asyncio.sleep(0.01)
+            assert handle.stopped
+        assert pool.process_loads() == [0]
+        assert len(children) == 1
+    finally:
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_producer_delivers_nothing_more():
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop), max_processes=1)
+    got = []
+    handle = pool.allocate(
+        ExecutionContext.PROCESS,
+        _tagged_stream,
+        lambda data, ts: got.append(data),
+        args=(b"f",),
+    )
+    try:
+        await _drain(got, 3)
+        handle.stop()
+        settled = len(got)
+        await asyncio.sleep(0.2)
+        assert len(got) == settled
+        assert pool.process_loads() == [0]
+    finally:
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_worker_fails_every_producer_on_it():
+    """A worker that dies takes its producers down; each gets a failed (None)
+    item and completes, and the pool starts a fresh worker for the next one."""
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop), max_processes=1)
+    items = {"steady": [], "crash": []}
+    steady = pool.allocate(
+        ExecutionContext.PROCESS,
+        _tagged_stream,
+        lambda data, ts: items["steady"].append(data),
+        args=(b"s",),
+    )
+    crash = pool.allocate(
+        ExecutionContext.PROCESS,
+        _crash_after_first_frame,
+        lambda data, ts: items["crash"].append(data),
+    )
+    try:
+        for _ in range(500):
+            if steady.stopped and crash.stopped:
+                break
+            await asyncio.sleep(0.01)
+        assert steady.stopped and crash.stopped
+        assert items["crash"][0] == b"last words"
+        assert items["steady"][-1] is None
+        assert items["crash"][-1] is None
+        assert pool.process_loads() == []
+
+        handles, seen = await _first_items(
+            pool, 1, _tagged_stream, lambda i: (b"again",)
         )
-    pool.stop()
+        assert seen == {0: b"again"}
+        handles[0].stop()
+    finally:
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_worker_shuts_down():
+    loop = asyncio.get_running_loop()
+    base = len(mp.active_children())
+    pool = WorkerPool(
+        event_loop_provider=EventLoopProvider(loop=loop),
+        max_processes=1,
+        idle_timeout=0.1,
+    )
+    try:
+        handles, seen = await _first_items(pool, 1, _tagged_stream, lambda i: (b"x",))
+        assert len(seen) == 1
+        assert len(mp.active_children()) == base + 1
+        handles[0].stop()
+        for _ in range(300):
+            if not pool.process_loads() and len(mp.active_children()) == base:
+                break
+            await asyncio.sleep(0.01)
+        assert pool.process_loads() == []
+        assert len(mp.active_children()) == base
+    finally:
+        pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_log_records_reach_the_parent(caplog):
+    loop = asyncio.get_running_loop()
+    pool = WorkerPool(event_loop_provider=EventLoopProvider(loop=loop), max_processes=1)
+    delivered = loop.create_future()
+    with caplog.at_level(logging.WARNING, logger="worker.test"):
+        handle = pool.allocate(
+            ExecutionContext.PROCESS,
+            _logging_producer,
+            lambda data, ts: delivered.done() or delivered.set_result(bytes(data)),
+        )
+        try:
+            assert await asyncio.wait_for(delivered, 5.0) == b"logged"
+        finally:
+            handle.stop()
+            pool.stop()
+    assert "hello from the worker" in caplog.text
 
 
 # -- reaper: stops never block the loop; teardown leaks nothing -------------- #

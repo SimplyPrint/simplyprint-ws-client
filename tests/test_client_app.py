@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -19,9 +20,6 @@ from simplyprint_ws_client.core.client import (
     ClientStateChangeEvent,
 )
 from simplyprint_ws_client.core.api.url_builder import SimplyPrintBackend
-from simplyprint_ws_client.integration.camera.pool import (
-    DEFAULT_CAMERA_PROCESS_WORKERS,
-)
 from tests._fakes import FakeTransport
 
 
@@ -201,9 +199,10 @@ def test_factory_receives_only_its_late_started_background_service():
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [(0, DEFAULT_CAMERA_PROCESS_WORKERS), (1, 1)],
+    [(0, os.cpu_count() or 1), (1, 1)],
 )
 def test_camera_worker_setting_controls_process_budget(configured, expected):
+    """``camera_workers`` caps the camera worker processes (0: one per core)."""
     app = ClientApp(
         ClientSettings(
             integrations=(_integration("test", Client, PrinterConfig),),
