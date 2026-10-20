@@ -79,7 +79,7 @@ class ReactiveModel(BaseModel, Synchronized):
     )
 
     @classmethod
-    @functools.lru_cache
+    @functools.lru_cache(maxsize=None)
     def is_pydantic_change_detect_annotation(
         cls,
         annotation: Optional[Type[Any]] = None,

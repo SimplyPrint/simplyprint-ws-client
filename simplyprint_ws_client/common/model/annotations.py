@@ -32,7 +32,7 @@ _TExclusive = TypeVar("_TExclusive", bound=Any)
 Exclusive = Annotated[_TExclusive, _ExclusiveSentinel]
 
 
-@functools.lru_cache
+@functools.lru_cache(maxsize=None)
 def _is_exclusive(field_info: FieldInfo) -> bool:
     return any(v is _ExclusiveSentinel for v in field_info.metadata)
 
@@ -42,7 +42,7 @@ _TUntracked = TypeVar("_TUntracked", bound=Any)
 Untracked = Annotated[_TUntracked, _UntrackedSentinel]
 
 
-@functools.lru_cache
+@functools.lru_cache(maxsize=None)
 def _is_untracked(field_info: FieldInfo) -> bool:
     return any(v is _UntrackedSentinel for v in field_info.metadata)
 
@@ -52,7 +52,7 @@ _TAtomic = TypeVar("_TAtomic", bound=Any)
 Atomic = Annotated[_TAtomic, _AtomicSentinel]
 
 
-@functools.lru_cache
+@functools.lru_cache(maxsize=None)
 def is_atomic(field_info: FieldInfo) -> bool:
     return any(m is _AtomicSentinel for m in field_info.metadata)
 
@@ -62,7 +62,7 @@ _TExtra = TypeVar("_TExtra", bound=Any)
 ExtraInfo = Annotated[_TExtra, _ExtraSentinel]
 
 
-@functools.lru_cache
+@functools.lru_cache(maxsize=None)
 def is_extra(field_info: FieldInfo) -> bool:
     return any(m is _ExtraSentinel for m in field_info.metadata)
 

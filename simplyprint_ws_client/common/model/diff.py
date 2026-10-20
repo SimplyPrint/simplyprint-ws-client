@@ -12,7 +12,9 @@ accumulate-changeset engine and shares the annotation vocabulary in
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+from itertools import compress, repeat
+from operator import is_not, itemgetter
+from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 try:
     from typing import Self
@@ -105,26 +107,97 @@ class UpdateModel(ABC):
     def update_model(self, other: Self | BaseModel) -> UpdatedFieldsType: ...
 
 
+class _MergePlan:
+    """The per-``(self class, other class)`` field walk of ``update_model``.
+
+    ``names`` / ``atomic`` list, in the other class's field order, the fields
+    a merge may touch: present on self and not ``ExtraInfo``. ``read`` pulls
+    their values out of an instance ``__dict__`` in one C call.
+    """
+
+    __slots__ = (
+        "self_fields",
+        "other_fields",
+        "names",
+        "atomic",
+        "read",
+        "indices",
+        "nothing",
+    )
+
+    def __init__(self, self_fields: Any, other_fields: Any) -> None:
+        self.self_fields = self_fields
+        self.other_fields = other_fields
+        fields = [
+            (name, field)
+            for name, field in other_fields.items()
+            if name in self_fields and not is_extra(field)
+        ]
+        self.names = tuple(name for name, _ in fields)
+        self.atomic = tuple(is_atomic(field) for _, field in fields)
+        self.indices = range(len(self.names))
+        #: The values of a report that carries nothing for this class.
+        self.nothing = (None,) * len(self.names)
+        if len(self.names) > 1:
+            self.read = itemgetter(*self.names)
+        elif self.names:
+            only = self.names[0]
+            self.read = lambda values: (values[only],)
+        else:
+            self.read = lambda values: ()
+
+    def values(self, other: Any) -> Tuple[Any, ...]:
+        try:
+            return self.read(other.__dict__)
+        except (KeyError, AttributeError):
+            # Not a plain pydantic instance dict: read attribute by attribute.
+            return tuple(getattr(other, name) for name in self.names)
+
+
+#: Plans are computed once per class pair. The field dicts are kept so a
+#: ``model_rebuild`` (which swaps them) invalidates the entry.
+_MERGE_PLANS: Dict[Tuple[type, type], _MergePlan] = {}
+
+
+def _merge_plan(self_cls: type, other_cls: type) -> _MergePlan:
+    plan = _MERGE_PLANS.get((self_cls, other_cls))
+    if (
+        plan is not None
+        and plan.self_fields is self_cls.__pydantic_fields__
+        and plan.other_fields is other_cls.__pydantic_fields__
+    ):
+        return plan
+    plan = _MERGE_PLANS[(self_cls, other_cls)] = _MergePlan(
+        self_cls.model_fields, other_cls.model_fields
+    )
+    return plan
+
+
 class SimpleUpdateModel(UpdateModel):
     def update_model(
         self: Self | BaseModel, other: Self | BaseModel
     ) -> UpdatedFieldsType:
         updated_fields: Dict[str, Any] = {}
-        self_fields = self.__class__.model_fields
-        other_fields = other.__class__.model_fields
+        # Hot path: runs on every inbound device report, over every field of
+        # wide models, most of them None in a partial report. The per-class
+        # plan replaces the per-field annotation checks, and the None fields
+        # are skipped in C (itemgetter + compress) instead of one by one.
+        plan = _merge_plan(self.__class__, other.__class__)
+        values = plan.values(other)
+        if values == plan.nothing:
+            # An empty sub-model (a default-factory one riding along in a
+            # partial report): nothing to merge, skip the walk.
+            return updated_fields
+        names, atomics = plan.names, plan.atomic
 
-        for name, field in other_fields.items():
-            if name not in self_fields or is_extra(field):
-                continue
-
-            value2 = getattr(other, name)
-
-            if value2 is None:
-                continue
+        for i in compress(plan.indices, map(is_not, values, repeat(None))):
+            name = names[i]
+            atomic = atomics[i]
+            value2 = values[i]
 
             value1 = getattr(self, name)
 
-            if not is_atomic(field):
+            if not atomic:
                 if isinstance(value1, UpdateModel):
                     if changes := value1.update_model(value2):
                         updated_fields[name] = changes
