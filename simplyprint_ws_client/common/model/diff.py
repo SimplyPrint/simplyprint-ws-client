@@ -14,7 +14,17 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from itertools import compress, repeat
 from operator import is_not, itemgetter
-from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 try:
     from typing import Self
@@ -115,15 +125,7 @@ class _MergePlan:
     their values out of an instance ``__dict__`` in one C call.
     """
 
-    __slots__ = (
-        "self_fields",
-        "other_fields",
-        "names",
-        "atomic",
-        "read",
-        "indices",
-        "nothing",
-    )
+    __slots__ = ("self_fields", "other_fields", "names", "atomic", "read")
 
     def __init__(self, self_fields: Any, other_fields: Any) -> None:
         self.self_fields = self_fields
@@ -135,9 +137,6 @@ class _MergePlan:
         ]
         self.names = tuple(name for name, _ in fields)
         self.atomic = tuple(is_atomic(field) for _, field in fields)
-        self.indices = range(len(self.names))
-        #: The values of a report that carries nothing for this class.
-        self.nothing = (None,) * len(self.names)
         if len(self.names) > 1:
             self.read = itemgetter(*self.names)
         elif self.names:
@@ -146,12 +145,45 @@ class _MergePlan:
         else:
             self.read = lambda values: ()
 
-    def values(self, other: Any) -> Tuple[Any, ...]:
-        try:
-            return self.read(other.__dict__)
-        except (KeyError, AttributeError):
-            # Not a plain pydantic instance dict: read attribute by attribute.
-            return tuple(getattr(other, name) for name in self.names)
+    def present(self, self_: Any, other: Any) -> Iterator[Tuple[int, Any]]:
+        """``(index, value)`` of every non-None mergeable field of ``other``.
+
+        The fast path snapshots ``other.__dict__`` up front and drops the None
+        values in C (``is_not``: identity only, so a value whose ``__eq__``
+        raises or returns a non-bool is never compared). It falls back to the
+        old field-by-field read, interleaved with the merge, whenever a
+        snapshot could observe something the old walk did not:
+
+        * a field missing from ``other.__dict__`` (``model_construct`` without
+          a required field): the earlier fields are merged first, then the
+          ``getattr`` of the missing one raises ``AttributeError``;
+        * a self-merge (``other is self``): a ``validate_assignment`` model
+          validator may rebind later fields mid-walk, and each one must be
+          read after the earlier ones were assigned.
+
+        The one remaining difference: when ``other`` is a distinct object
+        whose fields are rebound *during* the walk (only possible if a
+        validator on ``self`` reaches into ``other``), the snapshot keeps the
+        values ``other`` had when the merge started.
+        """
+        if other is not self_:
+            try:
+                values = self.read(other.__dict__)
+            except (KeyError, AttributeError):
+                pass
+            else:
+                return compress(enumerate(values), map(is_not, values, repeat(None)))
+        return _read_one_by_one(other, self.names)
+
+
+def _read_one_by_one(
+    other: Any, names: Tuple[str, ...]
+) -> Iterator[Tuple[int, Any]]:
+    """The old walk's read: one ``getattr`` per field, as the merge goes."""
+    for index, name in enumerate(names):
+        value = getattr(other, name)
+        if value is not None:
+            yield index, value
 
 
 #: Plans are computed once per class pair. The field dicts are kept so a
@@ -181,19 +213,15 @@ class SimpleUpdateModel(UpdateModel):
         # Hot path: runs on every inbound device report, over every field of
         # wide models, most of them None in a partial report. The per-class
         # plan replaces the per-field annotation checks, and the None fields
-        # are skipped in C (itemgetter + compress) instead of one by one.
+        # are skipped in C (see _MergePlan.present). An empty sub-model (a
+        # default-factory one riding along in a partial report) yields
+        # nothing, so the loop body never runs.
         plan = _merge_plan(self.__class__, other.__class__)
-        values = plan.values(other)
-        if values == plan.nothing:
-            # An empty sub-model (a default-factory one riding along in a
-            # partial report): nothing to merge, skip the walk.
-            return updated_fields
         names, atomics = plan.names, plan.atomic
 
-        for i in compress(plan.indices, map(is_not, values, repeat(None))):
+        for i, value2 in plan.present(self, other):
             name = names[i]
             atomic = atomics[i]
-            value2 = values[i]
 
             value1 = getattr(self, name)
 

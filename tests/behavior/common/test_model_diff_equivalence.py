@@ -11,9 +11,10 @@ import random
 from typing import Any, Dict, List, Optional
 
 import pytest
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from simplyprint_ws_client.common.model import Atomic, ExtraInfo, SimpleUpdateModel
+from simplyprint_ws_client.common.model.annotations import is_extra
 from simplyprint_ws_client.common.model.diff import UpdatedField, _MERGE_PLANS
 
 from tests._reference_update_model import reference_update_model
@@ -281,23 +282,163 @@ def test_models_with_zero_and_one_mergeable_field():
 
 
 def test_a_rebuilt_model_gets_a_fresh_plan():
+    """A forward reference completed by ``model_rebuild`` swaps the field dict.
+
+    While ``_Later`` is undefined the ``late`` annotation cannot be evaluated,
+    so its FieldInfo carries no ``ExtraInfo`` marker and the merge walks it.
+    Once rebuilt, ``late`` is ``ExtraInfo`` and must be skipped: a plan
+    cached before the rebuild would still merge it.
+    """
+
+    class _LaterImpl(BaseModel):
+        x: int = 0
+
+    # ``_Later`` is bound only by the rebuild namespace below.
+    class _Fwd(BaseModel, SimpleUpdateModel):
+        a: Optional[int] = None
+        late: "ExtraInfo[Optional[_Later]]" = None
+
+    unresolved = _Fwd.__pydantic_fields__
+    assert not is_extra(unresolved["late"]), "the forward ref resolved early"
+
+    # An incomplete model cannot validate, but model_construct works on it.
+    fast, ref = _Fwd.model_construct(), _Fwd.model_construct()
+    seven = _LaterImpl(x=7)
+    report = _Fwd.model_construct(a=1, late=seven)
+    expected = {"a": UpdatedField(None, 1), "late": UpdatedField(None, seven)}
+    assert fast.update_model(report) == expected
+    assert reference_update_model(ref, report) == expected
+    stale = _MERGE_PLANS[(_Fwd, _Fwd)]
+    assert stale.names == ("a", "late")
+
+    assert _Fwd.model_rebuild(_types_namespace={"_Later": _LaterImpl})
+    assert _Fwd.__pydantic_fields__ is not unresolved
+    assert is_extra(_Fwd.__pydantic_fields__["late"])
+
+    report = _Fwd(a=2, late=_LaterImpl(x=1))
+    _assert_same(
+        fast, ref, fast.update_model(report), reference_update_model(ref, report)
+    )
+    assert fast.late is seven  # ExtraInfo now: not merged
+    fresh = _MERGE_PLANS[(_Fwd, _Fwd)]
+    assert fresh is not stale
+    assert fresh.names == ("a",)
+
+
+class _Angry:
+    """An ``Any`` value that cannot be compared (``__eq__`` raises)."""
+
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        raise TypeError("cannot compare")
+
+
+class _ArrayLike:
+    """numpy-like: ``==`` returns an object that refuses ``bool()``."""
+
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        return _Ambiguous()
+
+
+class _Ambiguous:
+    def __bool__(self):
+        raise ValueError("truth value is ambiguous")
+
+
+@pytest.mark.parametrize("make", [_Angry, _ArrayLike])
+def test_values_that_cannot_be_compared_are_merged(make):
     class _M(BaseModel, SimpleUpdateModel):
         a: Optional[int] = None
+        blob: Any = None
+        b: Optional[int] = None
 
-    left = _M()
-    left.update_model(_M(a=1))
-    stale = _MERGE_PLANS[(_M, _M)]
+    fast, ref = _M(), _M()
+    blob = make()
+    for report in (_M(blob=blob), _M(a=1, blob=blob), _M(), _M(b=2, blob=make())):
+        fast_diff = fast.update_model(report)
+        ref_diff = reference_update_model(ref, report)
+        assert list(fast_diff) == list(ref_diff)
+        for name, change in fast_diff.items():
+            assert change.old is ref_diff[name].old
+            assert change.new is ref_diff[name].new
+        assert fast.blob is ref.blob and (fast.a, fast.b) == (ref.a, ref.b)
 
-    _M.__annotations__["b"] = Optional[int]
-    _M.b = None
-    _M.model_rebuild(force=True)
 
-    if _M.model_fields is stale.other_fields:  # pydantic kept the dict
-        pytest.skip("model_rebuild did not replace the field dict")
-    fresh = _M(a=2, b=5)
-    left2 = _M()
-    assert left2.update_model(fresh) == {
-        "a": UpdatedField(None, 2),
-        "b": UpdatedField(None, 5),
+class _Required(BaseModel, SimpleUpdateModel):
+    a: Optional[int] = None
+    b: int
+    c: Optional[int] = None
+
+
+def test_a_report_missing_a_field_merges_the_earlier_fields_first():
+    """``model_construct`` without a required field: like the old walk, the
+    fields before the missing one are merged, then ``AttributeError``."""
+    fast, ref = _Required(b=0), _Required(b=0)
+    report = _Required.model_construct(a=1, c=3)
+
+    with pytest.raises(AttributeError):
+        fast.update_model(report)
+    with pytest.raises(AttributeError):
+        reference_update_model(ref, report)
+    assert (fast.a, fast.b, fast.c) == (1, 0, None)
+    assert fast.model_dump() == ref.model_dump()
+    assert _fields_sets(fast) == _fields_sets(ref)
+
+
+class _Linked(BaseModel, SimpleUpdateModel):
+    """Assigning ``a`` rewrites ``b`` (a validator that rebinds later fields)."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    a: Optional[int] = None
+    b: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _derive_b(self):
+        if self.a is not None:
+            # Not ``self.b = ...``: that would re-enter validate_assignment.
+            self.__dict__["b"] = self.a * 10
+        return self
+
+
+def test_a_self_merge_reads_each_field_after_the_earlier_ones_merged():
+    """The old walk read ``b`` after assigning ``a`` (which rewrote ``b``)."""
+    fast = _Linked.model_construct(a=1, b=2)
+    ref = _Linked.model_construct(a=1, b=2)
+
+    fast_diff = fast.update_model(fast)
+    ref_diff = reference_update_model(ref, ref)
+    _assert_same(fast, ref, fast_diff, ref_diff)
+    assert fast_diff == {"a": UpdatedField(1, 1), "b": UpdatedField(10, 10)}
+    assert (fast.a, fast.b) == (1, 10)
+
+
+def test_a_distinct_report_is_read_before_the_merge_starts():
+    """Pinned difference: a distinct ``other`` is snapshotted up front, so a
+    rebind of its fields during the walk is not seen (the old walk saw it)."""
+
+    class _Poke(BaseModel, SimpleUpdateModel):
+        model_config = ConfigDict(validate_assignment=True)
+
+        a: Optional[int] = None
+        b: Optional[int] = None
+
+        @model_validator(mode="after")
+        def _poke_report(self):
+            target = self.__dict__.get("a")
+            if isinstance(target, int) and _POKED:
+                _POKED[0].__dict__["b"] = 99
+            return self
+
+    _POKED: List[Any] = []
+    state = _Poke()
+    report = _Poke(a=1, b=2)
+    _POKED.append(report)
+    assert state.update_model(report) == {
+        "a": UpdatedField(None, 1),
+        "b": UpdatedField(None, 2),  # the old walk would have read 99
     }
-    assert _MERGE_PLANS[(_M, _M)] is not stale
+    assert report.b == 99
