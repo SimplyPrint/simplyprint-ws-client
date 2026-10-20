@@ -229,3 +229,66 @@ async def test_stream_off_preempts_stream_but_preserves_snapshot():
     await asyncio.wait_for(camera._camera_work_queue.join(), 1.0)
     assert camera._request_count == 0
     await camera.close()
+
+
+async def _wait_for(predicate, timeout=2.0):
+    for _ in range(int(timeout / 0.01)):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stream_demand_keeps_its_credit_and_retries():
+    """The cloud asks for the next frame only after receiving one. Dropping
+    the credit on a failed read would end the stream for good; instead it is
+    retried after a backoff until a frame goes out."""
+    camera = _controller()
+    camera._request_count = 0
+    camera._STREAM_RETRY_MIN = camera._stream_retry_delay = 0.01
+    calls = []
+
+    async def process(work):
+        calls.append(work.data.id)
+        if len(calls) < 3:
+            return False  # no frame yet (camera still connecting)
+        camera._request_count -= 1  # what publishing a frame does
+        return True
+
+    camera._process_camera_work = process
+    await camera.snapshot(WebcamSnapshotDemandData())
+
+    await _wait_for(lambda: len(calls) == 3)
+    await asyncio.wait_for(camera._camera_work_queue.join(), 1.0)
+    assert camera._request_count == 0
+    assert camera._stream_retry_handle is None
+    assert camera._stream_retry_delay == camera._STREAM_RETRY_MIN
+    await camera.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_off_cancels_a_pending_stream_retry():
+    camera = _controller()
+    camera._request_count = 0
+    camera._STREAM_RETRY_MIN = camera._stream_retry_delay = 0.2
+    calls = []
+
+    async def process(work):
+        calls.append(work.data.id)
+        return False
+
+    camera._process_camera_work = process
+    await camera.snapshot(WebcamSnapshotDemandData())
+    await _wait_for(lambda: camera._stream_retry_handle is not None)
+
+    await camera.stream_off()
+    assert camera._stream_retry_handle is None
+    assert camera._camera_stream_pending is False
+    await asyncio.sleep(0.3)
+    assert calls == [None]  # the retry never ran
+
+    # A new stream starts at once rather than waiting out the old backoff.
+    await camera.snapshot(WebcamSnapshotDemandData())
+    await _wait_for(lambda: len(calls) == 2)
+    await camera.close()

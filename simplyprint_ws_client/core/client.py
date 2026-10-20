@@ -9,6 +9,7 @@ __all__ = [
 
 import asyncio
 import logging
+import re
 import weakref
 from datetime import timedelta, datetime
 from enum import IntEnum
@@ -550,7 +551,15 @@ class Client(
 
     async def _on_multi_printer_added(self, msg: MultiPrinterAddedMsg):
         if not msg.data.status:
-            self.logger.debug("Failed to add connection. %s", msg)
+            retry_after = self._apply_server_retry_after(msg.data.reason)
+            if retry_after is None:
+                self.logger.warning("Failed to add connection. %s", msg)
+            else:
+                self.logger.warning(
+                    "Failed to add connection; server requested retry in %ss. %s",
+                    retry_after,
+                    msg,
+                )
             self.state = ClientState.NOT_CONNECTED
             self.signal()
             return
@@ -560,6 +569,19 @@ class Client(
         self.config.id = msg.data.pid
         self.state = ClientState.CONNECTED
         self.signal()
+
+    def _apply_server_retry_after(self, reason: Optional[str]) -> Optional[float]:
+        if not reason:
+            return None
+
+        match = re.search(r"retry-after:\s*(\d+(?:\.\d+)?)s", reason, re.IGNORECASE)
+        if match is None:
+            return None
+
+        retry_after = float(match.group(1))
+        self._pending_action_ts = datetime.now()
+        self._pending_action_delay = timedelta(seconds=retry_after)
+        return retry_after
 
     async def _on_multi_printer_removed(self, msg: MultiPrinterRemovedMsg):
         self.logger.debug("Connection removed. %s", msg)

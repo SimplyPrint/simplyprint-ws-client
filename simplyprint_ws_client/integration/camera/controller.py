@@ -51,6 +51,9 @@ class CameraController:
     #: Queue entries, not tasks. Stream demand is coalesced to one entry, while
     #: ID'd snapshots remain individual up to this hard memory bound.
     _CAMERA_QUEUE_MAXSIZE = 20
+    #: Backoff between attempts while a stream demand finds no frame.
+    _STREAM_RETRY_MIN = 5.0
+    _STREAM_RETRY_MAX = 60.0
     _camera_pool: Optional[CameraPool]
     _camera_uri: Optional[URL]
     _camera_handle: Optional[CameraHandle]
@@ -116,6 +119,8 @@ class CameraController:
         self._camera_backlog_reported = False
         self._camera_closing = False
         self._camera_stream_cancel_requested = False
+        self._stream_retry_delay = self._STREAM_RETRY_MIN
+        self._stream_retry_handle: Optional[asyncio.TimerHandle] = None
 
     @property
     def uri(self) -> Optional[URL]:
@@ -194,6 +199,7 @@ class CameraController:
     async def close(self) -> None:
         """Cancel owned work, then release the camera handle."""
         self._camera_closing = True
+        self._cancel_stream_retry()
         active = self._camera_active_task
         worker = self._camera_worker_task
         if active is not None:
@@ -244,6 +250,8 @@ class CameraController:
         self._stream_lock.cancel()
         self._request_count = 0
         self._last_stream_frame_at = None
+        self._cancel_stream_retry()
+        self._stream_retry_delay = self._STREAM_RETRY_MIN
         # A stream read/upload is expendable once streaming is disabled. ID'd
         # snapshots and webcam tests remain lossless and are never preempted.
         if (
@@ -323,6 +331,34 @@ class CameraController:
             return
         self._camera_stream_pending = True
 
+    def _schedule_stream_retry(self) -> None:
+        """Re-queue the stream marker after a backoff. Holds the pending flag
+        meanwhile, so nothing else re-queues it early."""
+        if self._stream_retry_handle is not None:
+            return
+        delay = self._stream_retry_delay
+        self._stream_retry_delay = min(delay * 2, self._STREAM_RETRY_MAX)
+        self._camera_logger.debug(
+            f"No stream frame; retrying the stream in {delay:.0f}s."
+        )
+        self._camera_stream_pending = True
+        self._stream_retry_handle = asyncio.get_running_loop().call_later(
+            delay, self._retry_stream
+        )
+
+    def _retry_stream(self) -> None:
+        self._stream_retry_handle = None
+        self._camera_stream_pending = False
+        if not self._camera_closing:
+            self._queue_stream_marker()
+
+    def _cancel_stream_retry(self) -> None:
+        if self._stream_retry_handle is None:
+            return
+        self._stream_retry_handle.cancel()
+        self._stream_retry_handle = None
+        self._camera_stream_pending = False
+
     def _ensure_camera_worker(self) -> None:
         """Lazily create the one owner of frame reads and uploads."""
         if self._camera_closing:
@@ -384,9 +420,14 @@ class CameraController:
                     ):
                         self._camera_backlog_reported = False
                 elif work.kind is _CameraWorkKind.STREAM:
-                    if not result and self._request_count > 0:
-                        self._request_count -= 1
                     self._camera_stream_pending = False
+                    if result:
+                        self._stream_retry_delay = self._STREAM_RETRY_MIN
+                    elif self._request_count > 0 and not self._camera_closing:
+                        # Keep the credit: the cloud sends its next demand only
+                        # after a frame, so dropping it would end the stream for
+                        # good. Try again later instead, backing off.
+                        self._schedule_stream_retry()
                     if self._request_count > 0 and not self._camera_closing:
                         self._queue_stream_marker()
 

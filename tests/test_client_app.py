@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from unittest.mock import AsyncMock
@@ -235,9 +236,10 @@ def test_factory_receives_only_its_late_started_background_service():
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [(0, DEFAULT_CAMERA_PROCESS_WORKERS), (1, 1)],
+    [(0, os.cpu_count() or 1), (1, 1)],
 )
 def test_camera_worker_setting_controls_process_budget(configured, expected):
+    """``camera_workers`` caps the camera worker processes (0: one per core)."""
     app = ClientApp(
         ClientSettings(
             integrations=(_integration("test", Client, PrinterConfig),),

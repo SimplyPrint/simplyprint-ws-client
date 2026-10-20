@@ -1,3 +1,11 @@
+"""The camera pool: one :class:`CameraHandle` per configured camera source.
+
+Where a camera runs follows its protocol (see :meth:`CameraPool._route`): an async
+protocol is a task on the consumer loop, a sync one runs in the shared worker
+processes of :class:`WorkerPool` -- a thread each, spread over at most one
+process per core, with no limit on the number of cameras.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +19,6 @@ from typing import Callable, Dict, List, Optional, Type, final
 
 from yarl import URL
 
-from simplyprint_ws_client.integration.camera.backends import _PauseTimer
 from simplyprint_ws_client.integration.camera.base import (
     BaseCameraProtocol,
     CameraProtocolConnectionError,
@@ -27,7 +34,9 @@ from simplyprint_ws_client.common.worker.context import ExecutionContext
 from simplyprint_ws_client.common.worker.pool import WorkerHandle, WorkerPool
 
 
-DEFAULT_CAMERA_PROCESS_WORKERS = min(2, max(1, os.cpu_count() or 1))
+#: Frames queued for the loop per camera. Latest wins: a newer frame replaces
+#: one the loop has not taken yet.
+_FRAME_QUEUE = 2
 
 
 async def _resolve_aiter(protocol: BaseCameraProtocol):
@@ -72,6 +81,47 @@ async def _async_camera_producer(
     except Exception as e:  # noqa: BLE001
         logging.getLogger("camera.pool").debug("camera read failed: %s", e)
         emit(None, time.time())
+
+
+class _PauseTimer:
+    """One rescheduling pause timer instead of a new ``threading.Timer`` per poll.
+
+    ``touch()`` pushes the deadline; the single timer thread re-checks at the
+    deadline and only fires ``on_expire`` when no touch arrived in between.
+    """
+
+    def __init__(self, timeout: float, on_expire) -> None:
+        self._timeout = timeout
+        self._on_expire = on_expire
+        self._deadline = 0.0
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+
+    def touch(self) -> None:
+        with self._lock:
+            self._deadline = time.monotonic() + self._timeout
+            if self._timer is None:
+                self._schedule(self._timeout)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _schedule(self, delay: float) -> None:
+        self._timer = threading.Timer(delay, self._check)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _check(self) -> None:
+        with self._lock:
+            remaining = self._deadline - time.monotonic()
+            if remaining > 0:
+                self._schedule(remaining)
+                return
+            self._timer = None
+        self._on_expire()
 
 
 class _Desired(Enum):
@@ -189,9 +239,14 @@ class CameraWorkerBackend:
         if not want_new:
             return
 
-        worker = await self._allocate(
-            continuous=start_continuous, generation=generation
-        )
+        try:
+            worker = self._allocate(continuous=start_continuous, generation=generation)
+        except Exception:  # noqa: BLE001 -- e.g. an unpicklable protocol
+            logging.getLogger("camera.pool").warning(
+                "could not start camera %s", self._handle.id, exc_info=True
+            )
+            self._handle.deliver_frame(None, time.time())  # fail waiters now
+            return
         with self._lock:
             if self._generation == generation:
                 self._worker = worker
@@ -200,7 +255,7 @@ class CameraWorkerBackend:
             # A newer reconcile superseded us mid-allocate; retire the orphan.
             worker.stop()
 
-    async def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
+    def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
         producer = (
             _async_camera_producer if self._protocol.is_async else _sync_camera_producer
         )
@@ -210,12 +265,13 @@ class CameraWorkerBackend:
             if _generation == self._generation:
                 self._handle.deliver_frame(payload, timestamp)
 
-        return await self._worker_pool.allocate_async(
+        return self._worker_pool.allocate(
             self._context,
             producer,
             on_item,
             args=(self._protocol, continuous),
             is_async=self._protocol.is_async,
+            maxsize=_FRAME_QUEUE,
         )
 
     def _refresh_timer(self) -> None:
@@ -238,6 +294,8 @@ class CameraPool(ProcessStoppable, Synchronized):
         event_loop_provider: Optional[EventLoopProvider] = None,
         process_workers: int = 0,
     ) -> None:
+        """``process_workers`` caps the worker processes sync cameras share
+        (``0``: one per core). It never limits how many cameras run."""
         ProcessStoppable.__init__(self)
         Synchronized.__init__(self)
 
@@ -246,11 +304,16 @@ class CameraPool(ProcessStoppable, Synchronized):
         self._provider = event_loop_provider or EventLoopProvider.default()
         if process_workers < 0:
             raise ValueError("process_workers must not be negative")
-        self.process_workers = process_workers or DEFAULT_CAMERA_PROCESS_WORKERS
+        debug = "SIMPLYPRINT_DEBUG_CAMERA" in os.environ
+        if debug:
+            # Worker read failures log at DEBUG on this logger.
+            logging.getLogger("camera.pool").setLevel(logging.DEBUG)
         self._workers = WorkerPool(
             event_loop_provider=self._provider,
-            max_process_workers=self.process_workers,
+            max_processes=process_workers or None,
+            log_level=logging.DEBUG if debug else None,
         )
+        self.process_workers = self._workers.max_processes
         self._id_counter = 0
 
     def _release(self, camera_id: int) -> None:
