@@ -16,7 +16,6 @@ DEFAULT_NOISY_LOGGERS: Tuple[str, ...] = (
     "httpcore",
     "httpx",
     "multipart",
-    "paho",
     "PIL",
     "tzlocal",
     "urllib3",

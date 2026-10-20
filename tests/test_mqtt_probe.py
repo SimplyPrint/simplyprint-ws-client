@@ -1,276 +1,254 @@
+"""``probe_mqtt`` over real loopback sockets: the test broker (TCP and TLS) for
+the protocol paths, a silent server for timeouts/cancellation, and a closed
+port for a refused connection."""
+
 from __future__ import annotations
 
 import asyncio
-import threading
-from types import SimpleNamespace
+import socket
 
 import pytest
+import pytest_asyncio
 import yarl
-from paho.mqtt.packettypes import PacketTypes
-from paho.mqtt.reasoncodes import ReasonCode
 
-from simplyprint_ws_client.wire import mqtt
-from simplyprint_ws_client.wire.messages import MqttMessage
+from simplyprint_ws_client.wire import async_mqtt
+from simplyprint_ws_client.wire import mqtt_codec as codec
+from simplyprint_ws_client.wire import mqtt_probe
+from simplyprint_ws_client.wire.messages import MqttMessage, QoS
 from simplyprint_ws_client.wire.mqtt_probe import MqttProbeOutcome, probe_mqtt
+from tests.mqtt_broker import Broker
+from tests.silent_server import SilentServer
+
+pytestmark = pytest.mark.behavior
+
+REPORT = "device/SN/report"
 
 
-class FakePublishInfo:
-    def __init__(self, rc: int) -> None:
-        self.rc = rc
-
-    def wait_for_publish(self, timeout=None) -> None:
-        return None
-
-    def is_published(self) -> bool:
-        return self.rc == 0
+@pytest_asyncio.fixture
+async def broker():
+    b = await Broker().start()
+    yield b
+    await b.stop()
 
 
-class FakePahoClient:
-    def __init__(
-        self,
-        *,
-        reason_code: int | ReasonCode | None = 0,
-        report_topic: str | None = None,
-        publish_rc: int = 0,
-        connect_failure: bool = False,
-    ) -> None:
-        self.reason_code = reason_code
-        self.report_topic = report_topic
-        self.publish_rc = publish_rc
-        self.connect_failure = connect_failure
-        self.connected = False
-        self.credentials = None
-        self.connect_args = None
-        self.subscriptions: list[str] = []
-        self.published: list[tuple[str, bytes]] = []
-        self.disconnects = 0
-        self.loop_exit = threading.Event()
-        self.drove_connection = False
-        self.reported = False
-        self.on_pre_connect = None
-        self.on_connect = None
-        self.on_connect_fail = None
-        self.on_message = None
-        self.on_disconnect = None
-
-    def username_pw_set(self, username, password) -> None:
-        self.credentials = username, password
-
-    def connect_async(self, host, port, keepalive) -> None:
-        self.connect_args = host, port, keepalive
-
-    def loop_forever(self, timeout=1.0, retry_first_connection=False) -> int:
-        if not self.drove_connection:
-            self.drove_connection = True
-            if self.connect_failure:
-                self.on_connect_fail(self, None)
-            elif self.reason_code == 0:
-                self.connected = True
-                self.on_connect(self, None, {}, 0, None)
-            elif self.reason_code is not None:
-                self.on_connect(self, None, {}, self.reason_code, None)
-        self.loop_exit.wait()
-        return 4
-
-    def disconnect(self) -> None:
-        self.disconnects += 1
-        self.connected = False
-        self.loop_exit.set()
-
-    def is_connected(self) -> bool:
-        return self.connected
-
-    def subscribe(self, topic: str):
-        self.subscriptions.append(topic)
-        return 0, len(self.subscriptions)
-
-    def unsubscribe(self, topic: str):
-        return 0, 1
-
-    def publish(self, topic, payload, *, qos, retain) -> FakePublishInfo:
-        self.published.append((topic, payload))
-        if self.publish_rc == 0 and self.report_topic is not None and not self.reported:
-            self.reported = True
-            self.on_message(
-                self,
-                None,
-                SimpleNamespace(
-                    topic=self.report_topic,
-                    payload=b"report",
-                    qos=0,
-                    retain=False,
-                ),
-            )
-        return FakePublishInfo(self.publish_rc)
+@pytest_asyncio.fixture(params=[False, True], ids=["tcp", "tls"])
+async def any_broker(request):
+    b = await Broker(tls=request.param).start()
+    yield b
+    await b.stop()
 
 
-def install_client(monkeypatch, client: FakePahoClient) -> None:
-    monkeypatch.setattr(mqtt, "default_paho_client", lambda _url, _logger, **_k: client)
+@pytest_asyncio.fixture
+async def silent():
+    server = await SilentServer().start()
+    yield server
+    await server.stop()
+
+
+def probe_url(broker: Broker, topic: str = "status") -> yarl.URL:
+    return yarl.URL(broker.url + "/").with_query(topic=topic)
+
+
+def subscribed(broker: Broker) -> list:
+    """Every topic the client asked the broker for, in order."""
+    topics = []
+    for _kind, _flags, body in broker.packets(codec.SUBSCRIBE):
+        offset = 2  # past the packet id
+        while offset < len(body):
+            length = int.from_bytes(body[offset : offset + 2], "big")
+            topics.append(body[offset + 2 : offset + 2 + length].decode())
+            offset += 2 + length + 1  # topic + requested QoS
+    return topics
+
+
+async def settled(broker: Broker) -> None:
+    """The probe leaves nothing behind: the broker saw its session end."""
+    await broker.wait_for(lambda: not broker.sessions)
 
 
 @pytest.mark.asyncio
 async def test_probe_uses_owner_pool_front_door_and_publishes_before_report(
-    monkeypatch,
+    any_broker,
 ):
-    client = FakePahoClient(report_topic="device/SN/report")
-    install_client(monkeypatch, client)
+    broker = any_broker
     commands = (
         MqttMessage("device/SN/request", b"start"),
         MqttMessage("device/SN/request", b"pushall"),
     )
 
-    result = await probe_mqtt(
-        yarl.URL("mqtts://bblp:secret@printer:8883/?topic=device/SN/report"),
-        connect_timeout=0.1,
-        report_timeout=0.1,
-        require_report=True,
-        initial_messages=commands,
-    )
+    async def answer_pushall() -> None:
+        await broker.wait_for(lambda: len(broker.published) == 2)
+        broker.publish(REPORT, b"report")
+
+    responder = asyncio.ensure_future(answer_pushall())
+    try:
+        result = await probe_mqtt(
+            probe_url(broker, REPORT),
+            connect_timeout=5,
+            report_timeout=5,
+            require_report=True,
+            initial_messages=commands,
+        )
+    finally:
+        responder.cancel()
 
     assert result.outcome is MqttProbeOutcome.VERIFIED
-    assert result.report == MqttMessage("device/SN/report", b"report")
+    assert result.report == MqttMessage(REPORT, b"report")
     assert result.messages_seen == 1
-    assert client.credentials == ("bblp", "secret")
-    assert client.connect_args == ("printer", 8883, 20)
-    assert "device/SN/report" in client.subscriptions
-    assert client.published == [
+    session = broker.connects[0]
+    assert (session.username, session.password) == ("bblp", "secret")
+    assert session.keepalive == 20
+    assert subscribed(broker) == [REPORT]
+    assert [(topic, payload) for topic, payload, _q, _r in broker.published] == [
         ("device/SN/request", b"start"),
         ("device/SN/request", b"pushall"),
     ]
-    assert client.disconnects == 1
+    assert len(broker.connects) == 1
+    await broker.wait_for(lambda: broker.packets(codec.DISCONNECT))
+    await settled(broker)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reason_code", "outcome"),
+    ("connack_code", "outcome"),
     [
-        (134, MqttProbeOutcome.AUTH_FAILED),
-        (135, MqttProbeOutcome.AUTH_FAILED),
-        (140, MqttProbeOutcome.AUTH_FAILED),
-        (136, MqttProbeOutcome.CONNECT_FAILED),
+        (1, MqttProbeOutcome.CONNECT_FAILED),  # unacceptable protocol version
+        (2, MqttProbeOutcome.CONNECT_FAILED),  # identifier rejected
+        (3, MqttProbeOutcome.CONNECT_FAILED),  # server unavailable
+        pytest.param(
+            4,
+            MqttProbeOutcome.AUTH_FAILED,  # bad user name or password
+        ),
+        pytest.param(
+            5,
+            MqttProbeOutcome.AUTH_FAILED,  # not authorized
+        ),
     ],
 )
-async def test_probe_classifies_mqtt_connack_failures(
-    monkeypatch, reason_code, outcome
-):
-    client = FakePahoClient(reason_code=reason_code)
-    install_client(monkeypatch, client)
+async def test_probe_classifies_mqtt_connack_failures(broker, connack_code, outcome):
+    broker.connack_code = connack_code
 
     result = await probe_mqtt(
-        "mqtt://user:secret@printer/?topic=status",
-        connect_timeout=0.1,
+        probe_url(broker),
+        connect_timeout=5,
         report_timeout=0,
         require_report=False,
     )
 
     assert result.outcome is outcome
-    assert result.reason_code == reason_code
-    assert client.disconnects == 1
+    assert result.reason_code == connack_code
+    await settled(broker)
 
 
 @pytest.mark.asyncio
-async def test_probe_classifies_real_paho_reason_code(monkeypatch):
-    client = FakePahoClient(reason_code=ReasonCode(PacketTypes.CONNACK, identifier=135))
-    install_client(monkeypatch, client)
+async def test_probe_classifies_async_mqtt_authentication_error(broker):
+    """The production wire's own refusal (an AuthenticationError from a real
+    CONNACK) must classify as an auth failure, whatever form its code takes."""
+    broker.connack_code = 5
 
     result = await probe_mqtt(
-        "mqtt://user:secret@printer/?topic=status",
-        connect_timeout=0.1,
+        probe_url(broker),
+        connect_timeout=5,
         report_timeout=0,
         require_report=False,
     )
 
     assert result.outcome is MqttProbeOutcome.AUTH_FAILED
-    assert result.reason_code == 135
+    assert result.reason == "MQTT connection refused (code 5)"
 
 
 @pytest.mark.asyncio
-async def test_probe_reports_first_transient_connect_failure(monkeypatch):
-    client = FakePahoClient(connect_failure=True)
-    install_client(monkeypatch, client)
+async def test_probe_reports_first_transient_connect_failure():
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()  # nothing listens here: the connect is refused
 
     result = await probe_mqtt(
-        "mqtt://printer/?topic=status",
-        connect_timeout=0.1,
+        f"mqtt://127.0.0.1:{port}/?topic=status",
+        connect_timeout=5,
         report_timeout=0,
         require_report=False,
     )
 
     assert result.outcome is MqttProbeOutcome.CONNECT_FAILED
-    assert result.reason == "paho connection failed"
+    assert result.reason
+    assert result.reason_code is None
 
 
 @pytest.mark.asyncio
-async def test_probe_distinguishes_connect_and_required_report_timeouts(monkeypatch):
-    silent = FakePahoClient(reason_code=None)
-    install_client(monkeypatch, silent)
+async def test_probe_distinguishes_connect_and_required_report_timeouts(
+    broker, silent
+):
     connect_result = await probe_mqtt(
-        "mqtt://printer/?topic=status",
-        connect_timeout=0.001,
+        silent.url(query="?topic=status"),
+        connect_timeout=0.2,
         report_timeout=0,
         require_report=True,
     )
     assert connect_result.outcome is MqttProbeOutcome.CONNECT_TIMEOUT
+    await silent.wait_for(lambda: silent.closed == silent.accepted == 1)
 
-    connected = FakePahoClient()
-    install_client(monkeypatch, connected)
     report_result = await probe_mqtt(
-        "mqtt://printer/?topic=status",
-        connect_timeout=0.1,
-        report_timeout=0.001,
+        probe_url(broker),
+        connect_timeout=5,
+        report_timeout=0.1,
         require_report=True,
     )
     assert report_result.outcome is MqttProbeOutcome.REPORT_TIMEOUT
+    await settled(broker)
 
 
 @pytest.mark.asyncio
-async def test_probe_accepts_missing_optional_report(monkeypatch):
-    client = FakePahoClient()
-    install_client(monkeypatch, client)
-
+async def test_probe_accepts_missing_optional_report(broker):
     result = await probe_mqtt(
-        "mqtt://printer/?topic=elegoo/%23",
-        connect_timeout=0.1,
-        report_timeout=0.001,
+        probe_url(broker, "elegoo/#"),
+        connect_timeout=5,
+        report_timeout=0.05,
         require_report=False,
     )
 
     assert result.outcome is MqttProbeOutcome.VERIFIED
     assert result.report is None
+    assert subscribed(broker) == ["elegoo/#"]
+    await settled(broker)
 
 
 @pytest.mark.asyncio
-async def test_probe_reports_initial_publish_failure(monkeypatch):
-    client = FakePahoClient(report_topic="status", publish_rc=4)
-    install_client(monkeypatch, client)
+async def test_probe_reports_initial_publish_failure(broker, monkeypatch):
+    monkeypatch.setattr(async_mqtt, "PUBLISH_ACK_TIMEOUT", 0.1)
+    broker.ack_publishes = False  # the QoS 1 command is never acknowledged
 
     result = await probe_mqtt(
-        "mqtt://printer/?topic=status",
-        connect_timeout=0.1,
-        report_timeout=0.1,
+        probe_url(broker),
+        connect_timeout=5,
+        report_timeout=5,
         require_report=True,
-        initial_messages=(MqttMessage("request", b"state"),),
+        initial_messages=(MqttMessage("request", b"state", QoS.AT_LEAST_ONCE),),
     )
 
     assert result.outcome is MqttProbeOutcome.PUBLISH_FAILED
+    assert "PUBACK" in (result.reason or "")
+    await settled(broker)
 
 
 @pytest.mark.asyncio
-async def test_probe_cancellation_releases_lease_and_stops_transport(monkeypatch):
-    client = FakePahoClient(reason_code=None)
-    install_client(monkeypatch, client)
+async def test_probe_cancellation_releases_lease_and_stops_transport(silent):
     probe = asyncio.create_task(
         probe_mqtt(
-            "mqtt://printer/?topic=status",
+            silent.url(query="?topic=status"),
             connect_timeout=30,
             report_timeout=30,
             require_report=True,
         )
     )
-    await asyncio.sleep(0)
+    await silent.wait_for(lambda: silent.accepted == 1)
     probe.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await probe
 
-    assert client.disconnects == 1
+    # The socket was closed, not leaked: the server saw the connection end,
+    # after the CONNECT the probe sent (it never got a CONNACK).
+    await silent.wait_for(lambda: silent.closed == 1)
+    assert silent.received[0][:1] == bytes((codec.CONNECT << 4,))

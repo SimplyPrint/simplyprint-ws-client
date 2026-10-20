@@ -157,7 +157,7 @@ def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     handler.emit(_record("supervisor", "system info", logging.INFO))
     handler.emit(_record("websockets.client", "websocket info", logging.INFO))
     handler.emit(_record("websockets.client", "websocket warning", logging.WARNING))
-    handler.emit(_record("paho.mqtt.client", "paho info", logging.INFO))
+    handler.emit(_record("aiohttp.client", "aiohttp info", logging.INFO))
     handler.emit(
         _record(printer_logger_name("p7", "mqtt"), "mqtt debug", logging.DEBUG)
     )
@@ -169,8 +169,8 @@ def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     assert "websocket warning" in system
     assert "system debug" not in system
     assert "websocket info" not in system
-    # paho (the MQTT stack) is clamped to warnings like the other noisy roots.
-    assert "paho info" not in system
+    # Other noisy third-party roots are clamped to warnings too.
+    assert "aiohttp info" not in system
     assert "mqtt debug" in printer
     handler.close()
 

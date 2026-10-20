@@ -7,10 +7,9 @@ shares one socket per endpoint through its caller-owned
 :class:`~simplyprint_ws_client.wire.pool.Pool`,
 and hands back a lease already carrying the URL's initial subscriptions.
 
-The concrete broker wire is :class:`~simplyprint_ws_client.wire.paho.Paho`:
-Paho retains one client and network loop and owns routine reconnects.
-The dependency is imported lazily, so importing this module does not require
-``paho-mqtt`` to be installed.
+The concrete broker wire is :class:`~simplyprint_ws_client.wire.async_mqtt.AsyncMqtt`:
+an MQTT 3.1.1 client that lives on the event loop (no network thread), on the
+same supervised reconnect loop as the WebSocket wire.
 
 Everything beyond ``url``/``pool`` is carried by one
 :class:`~simplyprint_ws_client.wire.options.ConnectionOptions`.
@@ -27,7 +26,7 @@ import yarl
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.wire.messages import MqttMessage
-from simplyprint_ws_client.wire.paho import Paho, default_paho_client
+from simplyprint_ws_client.wire.async_mqtt import AsyncMqtt
 from simplyprint_ws_client.wire.transport import MqttTransport
 from simplyprint_ws_client.wire.lease import MqttLease
 from simplyprint_ws_client.wire.options import (
@@ -120,11 +119,11 @@ def pool_for(
     provider: Optional[EventLoopProvider] = None,
     wire_keepalive: Optional[WireKeepalive] = None,
 ) -> Pool[MqttTransport]:
-    """Return this owner's Paho pool for a loop/keepalive identity.
+    """Return this owner's MQTT pool for a loop/keepalive identity.
 
     The pool shares one wire per compatible :class:`MqttEndpoint` and hands out
-    :class:`MqttLease` leases backed by the sync network-thread
-    :class:`~simplyprint_ws_client.wire.paho.Paho`.
+    :class:`MqttLease` leases backed by
+    :class:`~simplyprint_ws_client.wire.async_mqtt.AsyncMqtt`.
     Per-connect retry/TLS settings ride in the
     :class:`MqttConnectParams` each ``connect`` passes, never in this closure -
     the pool is cached, so a closure would freeze the first caller's options.
@@ -138,16 +137,12 @@ def pool_for(
         else:
             verify_tls, logger = False, None
             tls_client_auth = None
-        transport = Paho(
+        transport = AsyncMqtt(
             url,
-            provider=provider,
+            provider,
             keepalive=mqtt_keepalive or 60,
-            client_factory=lambda u, logger: default_paho_client(
-                u,
-                logger,
-                verify_tls=verify_tls,
-                tls_client_auth=tls_client_auth,
-            ),
+            verify_tls=verify_tls,
+            tls_client_auth=tls_client_auth,
             logger=logger,
         )
         if isinstance(params, MqttConnectParams):
@@ -228,7 +223,7 @@ def connect(
         )
 
     # A new transport received these before Pool.start; an existing shared
-    # transport receives them now. Paho's desired-topic set is idempotent.
+    # transport receives them now. The desired-topic set is idempotent.
     for topic in subscriptions:
         lease.transport.subscribe(topic)
 

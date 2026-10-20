@@ -3,8 +3,8 @@ asyncio loop -- safely, in order, and with low latency.
 
 Three worlds exist at runtime: the main thread, the one asyncio loop everything
 async runs on (the "SimplyPrint loop"), and assorted producer threads / worker
-subprocesses. Work that runs off the loop -- a paho network thread, a camera
-reader thread -- must hand its results *back* onto the loop before any async
+subprocesses. Work that runs off the loop -- a camera reader thread, a worker
+process -- must hand its results *back* onto the loop before any async
 consumer can touch them. That hop is what this module owns, once, so no transport
 or pool writes it again (badly).
 

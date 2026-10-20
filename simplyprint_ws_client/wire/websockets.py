@@ -40,7 +40,7 @@ from simplyprint_ws_client.wire.messages import (
 )
 from simplyprint_ws_client.wire.errors import ErrorCode
 from simplyprint_ws_client.wire.policy import RetryPolicy
-from simplyprint_ws_client.wire.reconnect import Reconnecting
+from simplyprint_ws_client.wire.reconnect import Reconnecting, redacted
 from simplyprint_ws_client.wire.transport import (
     TransientError,
     WsTransport,
@@ -161,7 +161,9 @@ class Websockets(WsTransport, Reconnecting):
         try:
             await socket.close()
         except Exception:  # noqa: BLE001 -- aclose must never break supervision
-            self.logger.debug("websocket %s close failed", self.url, exc_info=True)
+            self.logger.debug(
+                "websocket %s close failed", redacted(self.url), exc_info=True
+            )
 
 
 def as_frame(message: Union[str, bytes, bytearray, memoryview]) -> Union[str, bytes]:

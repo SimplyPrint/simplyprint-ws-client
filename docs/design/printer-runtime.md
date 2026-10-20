@@ -25,8 +25,8 @@ The inherited authoring surface is roughly 1,500 lines before an integration
 author writes a printer. The live device message path is also too long:
 
 ```text
-Paho callback
-  -> Paho courier/events
+MQTT stream (asyncio protocol)
+  -> AsyncMqtt events
   -> pool endpoint
   -> lease courier/events
   -> lease driver
@@ -70,7 +70,7 @@ Runtime
 │   └── PrinterRuntime
 │       ├── PrinterAdapter             brand-owned, shallow public API
 │       ├── PersistentConnection       one desired-state supervisor
-│       │   └── TransportSession       Paho, WebSocket or poll implementation
+│       │   └── TransportSession       AsyncMqtt, WebSocket or poll implementation
 │       ├── PrintLifecycle
 │       │   └── print/file capabilities
 │       └── CameraService
@@ -194,9 +194,11 @@ The rules are simple:
   transport's one supported reconnect path with deterministic bounded backoff.
 - Application-level silence reports device inactivity and continues probing. It
   never closes an otherwise healthy transport.
-- Paho retains one client. Paho owns ordinary socket reconnects; the surrounding
-  worker only catches `loop_forever()` exiting or raising and re-enters it on the
-  same client. A worker failure cannot silently end supervision.
+- MQTT runs on the same supervised `Reconnecting` loop as the WebSocket wire
+  (`AsyncMqtt`): one task per broker on the event loop, no network thread. A
+  socket is only ever touched by its loop, so a publish can't race the reader
+  (the TLS race the old threaded Paho wire had). It re-asserts its
+  subscriptions on every connection.
 - A config change fences the old generation, closes it, and starts the new spec.
 - Stale events from an old generation are ignored.
 - Parser/adapter failure is reported without killing supervision.

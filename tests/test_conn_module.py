@@ -1,12 +1,13 @@
 """Brand-free tests for the new connection library (``device.connection``).
 
-Every wire is faked and injected -- no real broker, socket, or wire library is
-touched. The fakes satisfy the same seams production wires do:
+Every wire but MQTT's is faked and injected. The fakes satisfy the same seams
+production wires do:
 
 * a tiny :class:`FakeTransport` for pool refcounting and lease delivery;
 * a :class:`Reconnecting` subclass driven by a queue for the supervised
   reconnect loop;
-* a fake paho client injected into :class:`Paho` for MQTT multi-topic routing;
+* the real :class:`AsyncMqtt` wire against a loopback broker
+  (``tests/mqtt_broker.py``) for MQTT multi-topic routing and the front door;
 * a fake ``websockets`` socket injected into :class:`Websockets` for WS broadcast.
 
 These pin the library contract: one shared transport per endpoint, the
@@ -17,11 +18,11 @@ routing, and the two front doors.
 from __future__ import annotations
 
 import asyncio
-import queue
-import threading
+import ssl
 from typing import Any, List, Optional
 
 import pytest
+import pytest_asyncio
 import yarl
 
 from simplyprint_ws_client.events import EventBus
@@ -61,17 +62,18 @@ from simplyprint_ws_client.wire.transport import (
 )
 
 from simplyprint_ws_client.wire import mqtt
-from simplyprint_ws_client.wire import paho as paho_wire
+from simplyprint_ws_client.wire import mqtt_codec as codec
 from simplyprint_ws_client.wire import websocket as ws
 from simplyprint_ws_client.wire.mqtt import (
     MqttBroker,
     MqttMessage,
     mqtt_message_route,
 )
-from simplyprint_ws_client.wire.paho import Paho
+from simplyprint_ws_client.wire.async_mqtt import AsyncMqtt
 from simplyprint_ws_client.wire.websocket import WsMessage
 from simplyprint_ws_client.wire.websockets import Websockets
 from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
+from tests.mqtt_broker import Broker
 
 
 # --------------------------------------------------------------------------- #
@@ -761,109 +763,46 @@ async def test_lease_transport_awaits_live_connection():
 
 
 # --------------------------------------------------------------------------- #
-# MQTT routing: multi-topic on one conn; per-broker scoping; via a fake client.
+# MQTT routing: multi-topic on one conn; per-broker scoping; over a real
+# loopback broker (``tests/mqtt_broker.py``) and the production AsyncMqtt wire.
 # --------------------------------------------------------------------------- #
 
 
-class FakePahoClient:
-    """A Paho-shaped client whose public network loop is test-driven."""
-
-    def __init__(self) -> None:
-        self.on_pre_connect = None
-        self.on_connect = None
-        self.on_connect_fail = None
-        self.on_message = None
-        self.on_disconnect = None
-        self.connected = False
-        self.subscribed: List[str] = []
-        self.unsubscribed: List[str] = []
-        self.published: List[tuple] = []
-        self.connect_calls: List[tuple] = []
-        self.loop_runs = 0
-        self.loop_entered = threading.Event()
-        self.loop_outcomes: queue.Queue[object] = queue.Queue()
-
-    def username_pw_set(self, *_args, **_kwargs) -> None:
-        pass
-
-    def connect_async(self, host, port, keepalive) -> None:
-        self.connect_calls.append((host, port, keepalive))
-
-    def loop_forever(self, timeout=1.0, retry_first_connection=False) -> int:
-        self.loop_runs += 1
-        self.loop_entered.set()
-        outcome = self.loop_outcomes.get()
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return int(outcome)
-
-    def disconnect(self) -> None:
-        self.connected = False
-        self.loop_outcomes.put(4)
-
-    def is_connected(self) -> bool:
-        return self.connected
-
-    def subscribe(self, topic: str) -> tuple[int, int]:
-        self.subscribed.append(topic)
-        return 0, len(self.subscribed)
-
-    def unsubscribe(self, topic: str) -> tuple[int, int]:
-        self.unsubscribed.append(topic)
-        return 0, len(self.unsubscribed)
-
-    def publish(self, topic, payload, qos=0, retain=False):
-        self.published.append((topic, payload, qos, retain))
-
-        class Info:
-            rc = 0
-
-            @staticmethod
-            def wait_for_publish(timeout=None) -> None:
-                pass
-
-            @staticmethod
-            def is_published() -> bool:
-                return True
-
-        return Info()
-
-    def fire_connect(self, reason_code: int = 0) -> None:
-        self.connected = reason_code == 0
-        self.on_connect(self, None, {}, reason_code, None)
-
-    def fire_message(self, message: object) -> None:
-        self.on_message(self, None, message)
-
-    def crash(self, error: BaseException) -> None:
-        self.connected = False
-        self.loop_outcomes.put(error)
+@pytest_asyncio.fixture
+async def mqtt_server():
+    server = await Broker().start()
+    yield server
+    await server.stop()
 
 
-class WireMqttMessage:
-    """A paho message stand-in routed by ``.topic``."""
-
-    def __init__(self, topic: str, payload: bytes, qos: int = 0, retain: bool = False):
-        self.topic = topic
-        self.payload = payload
-        self.qos = qos
-        self.retain = retain
+@pytest_asyncio.fixture
+async def mqtts_server():
+    server = await Broker(tls=True).start()
+    yield server
+    await server.stop()
 
 
-def build_mqtt_pool(clients: List[FakePahoClient]) -> Pool:
-    """A broker-keyed Paho pool wired to one fake client per endpoint."""
+def push(server: Broker, topic: str, payload: bytes = b"") -> None:
+    """Deliver a PUBLISH to every session whatever it subscribed to.
 
-    def factory(url, logger):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
+    The broker itself filters by subscription; this bypasses it so the lease's
+    own topic routing is what decides delivery.
+    """
+    for session in server.sessions:
+        session.send(codec.encode_publish(topic, payload))
 
-    def build(url: yarl.URL, params: object):
-        return Paho(
+
+def build_mqtt_pool(transports: List[AsyncMqtt]) -> Pool:
+    """A broker-keyed pool of real AsyncMqtt wires, recording each it builds."""
+
+    def build(url: yarl.URL, params: object) -> AsyncMqtt:
+        transport = AsyncMqtt(
             url,
-            provider=current_provider(),
-            client_factory=factory,
+            current_provider(),
+            policy=RetryPolicy(backoff=ConstantBackoff(0.01)),
         )
+        transports.append(transport)
+        return transport
 
     def key(url: yarl.URL, params: object):
         return params if isinstance(params, MqttBroker) else MqttBroker.from_url(url)
@@ -877,11 +816,15 @@ def build_mqtt_pool(clients: List[FakePahoClient]) -> Pool:
     )
 
 
+def server_url(server: Broker, query: str = "") -> yarl.URL:
+    return yarl.URL(f"{server.url}/{query}")
+
+
 @pytest.mark.asyncio
-async def test_mqtt_multi_topic_on_one_connection():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
+async def test_mqtt_multi_topic_on_one_connection(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
 
     lease = pool.connect(url, MqttBroker.from_url(url))
     got: List[str] = []
@@ -889,92 +832,123 @@ async def test_mqtt_multi_topic_on_one_connection():
 
     lease.subscribe("a")
     lease.subscribe("b")
-    await wait_for(lambda: bool(clients))
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
-    assert len(clients) == 1  # one shared socket
-    client = clients[0]
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions and mqtt_server.sessions[0].subscriptions == {"a", "b"}
+    )
+    assert len(transports) == 1 and len(mqtt_server.connects) == 1  # one socket
 
-    client.fire_message(WireMqttMessage("a", b"1"))
-    client.fire_message(WireMqttMessage("b", b"2"))
-    client.fire_message(WireMqttMessage("c", b"3"))  # not subscribed
+    push(mqtt_server, "a", b"1")
+    push(mqtt_server, "b", b"2")
+    push(mqtt_server, "c", b"3")  # not subscribed
 
     await wait_for(lambda: len(got) >= 2)
-    await asyncio.sleep(0.02)  # give a stray 'c' a chance to (wrongly) arrive
+    await asyncio.sleep(0.05)  # give a stray 'c' a chance to (wrongly) arrive
     assert sorted(got) == ["a", "b"]  # c is filtered out by the lease's topics
 
     await lease.close()
 
-@pytest.mark.asyncio
-async def test_successful_connack_asserts_topics_before_becoming_ready():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    lease = pool.connect(yarl.URL("mqtt://broker/"), MqttBroker("broker", 1883))
-    lease.subscribe("device/SN/report")
-    await wait_for(lambda: bool(clients))
 
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
-    assert clients[0].subscribed == ["device/SN/report"]
+@pytest.mark.asyncio
+async def test_successful_connack_asserts_topics_before_becoming_ready(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
+    lease = pool.connect(url, MqttBroker.from_url(url))
+    lease.subscribe("device/SN/report")
+
+    async def hello_on_ready(_event: Connected) -> None:
+        await lease.send(MqttMessage("device/SN/request", b"hello"))
+
+    lease.event_bus.on(Connected, hello_on_ready)
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(lambda: mqtt_server.published)
+
+    # Anything sent once the lease is ready reaches the broker after the
+    # SUBSCRIBE, so the printer's answer to it is already routed back to us.
+    kinds = [
+        kind
+        for kind, _flags, _body in mqtt_server.received
+        if kind in (codec.CONNECT, codec.SUBSCRIBE, codec.PUBLISH)
+    ]
+    assert kinds == [codec.CONNECT, codec.SUBSCRIBE, codec.PUBLISH]
+    assert mqtt_server.sessions[0].subscriptions == {"device/SN/report"}
     await lease.close()
 
 
 @pytest.mark.asyncio
-async def test_rejected_connack_stays_down_and_same_client_can_recover():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    lease = pool.connect(yarl.URL("mqtt://broker/"), MqttBroker("broker", 1883))
+async def test_rejected_connack_stays_down_and_same_transport_can_recover(mqtt_server):
+    mqtt_server.connack_code = 5
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
+    lease = pool.connect(url, MqttBroker.from_url(url))
     lease.subscribe("device/SN/report")
     rejected: List[Disconnected] = []
     lease.event_bus.on(Disconnected, lambda event: rejected.append(event))
-    await wait_for(lambda: len(clients) == 1)
 
-    clients[0].fire_connect(5)
-    await wait_for(lambda: bool(rejected))
+    await wait_for(lambda: bool(rejected), timeout=5)
     assert any(isinstance(event.code, AuthenticationError) for event in rejected)
+    assert rejected[0].code.code == 5
     assert not lease.connected
-    assert len(clients) == 1
+    assert len(transports) == 1
 
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
+    mqtt_server.connack_code = 0
+    assert await lease.ready(timeout=5)
     assert lease.generation == 1
+    assert len(transports) == 1
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions
+        and mqtt_server.sessions[0].subscriptions == {"device/SN/report"}
+    )
     await lease.close()
 
 
 @pytest.mark.asyncio
-async def test_p1_parser_crash_restarts_loop_on_the_same_client(monkeypatch):
-    monkeypatch.setattr(paho_wire, "WORKER_RESTART_DELAY", 0.001)
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    lease = pool.connect(yarl.URL("mqtt://broker/"), MqttBroker("broker", 1883))
-    await wait_for(lambda: len(clients) == 1)
-    first = clients[0]
-    first.fire_connect()
-    await wait_for(lambda: lease.connected)
-
-    first.crash(KeyError(100))
-    await wait_for(lambda: first.loop_runs == 2)
-    assert not lease.connected
-    assert len(clients) == 1
-
-    first.fire_connect()
-    await wait_for(lambda: lease.connected and lease.generation == 2)
-    await lease.close()
-
-
-@pytest.mark.asyncio
-async def test_paho_thread_ingress_is_bounded_without_reconnecting(
-    monkeypatch,
-):
-    monkeypatch.setattr(paho_wire, "EVENT_CAPACITY", 8)
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    lease = pool.connect(yarl.URL("mqtt://broker/"), MqttBroker("broker", 1883))
+async def test_malformed_broker_packet_reconnects_on_the_same_transport(mqtt_server):
+    """A packet the codec rejects ends the attempt; the same transport
+    reconnects and re-subscribes (the pool never rebuilds it)."""
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
+    lease = pool.connect(url, MqttBroker.from_url(url))
     lease.subscribe("device/SN/report")
-    await wait_for(lambda: len(clients) == 1)
-    first = clients[0]
-    first.fire_connect()
-    await wait_for(lambda: lease.connected)
+    drops: List[Disconnected] = []
+    lease.event_bus.on(Disconnected, drops.append)
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(lambda: mqtt_server.sessions)
+
+    # A remaining-length field longer than the 4 bytes MQTT allows.
+    mqtt_server.sessions[0].send(bytes((0x30, 0xFF, 0xFF, 0xFF, 0xFF)))
+
+    await wait_for(lambda: bool(drops), timeout=5)
+    assert isinstance(drops[0].code, TransientError)
+    assert "malformed" in str(drops[0].code)
+    await wait_for(lambda: lease.connected and lease.generation == 2, timeout=5)
+    assert len(transports) == 1
+    assert len(mqtt_server.connects) == 2
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions
+        and mqtt_server.sessions[0].subscriptions == {"device/SN/report"}
+    )
+    await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_burst_is_delivered_in_order_without_reconnecting(
+    mqtt_server, monkeypatch
+):
+    """The wire reads on the loop, so an inbound burst takes no cross-thread
+    hop at all, loses nothing, arrives in order, and keeps the link up."""
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
+    lease = pool.connect(url, MqttBroker.from_url(url))
+    lease.subscribe("device/SN/report")
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions and mqtt_server.sessions[0].subscriptions
+    )
 
     received: List[bytes] = []
     lease.event_bus.on(MessageReceived, lambda event: received.append(event.message.payload))
@@ -989,30 +963,23 @@ async def test_paho_thread_ingress_is_bounded_without_reconnecting(
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", count_wake)
 
-    def flood() -> None:
-        for value in range(100):
-            first.fire_message(
-                WireMqttMessage("device/SN/report", bytes((value,)))
-            )
+    payloads = [value.to_bytes(2, "big") for value in range(1000)]
+    for payload in payloads:
+        mqtt_server.publish("device/SN/report", payload)
 
-    producer = threading.Thread(target=flood)
-    producer.start()
-    producer.join(timeout=2)
-    assert not producer.is_alive()
-    assert cross_thread_wakes < 16
-
-    await wait_for(lambda: bool(received))
-    assert received[-1] == b"\x63"
-    assert len(clients) == 1
-    assert lease.connected
+    await wait_for(lambda: len(received) == len(payloads), timeout=5)
+    assert received == payloads
+    assert cross_thread_wakes == 0
+    assert lease.connected and lease.generation == 1
+    assert len(mqtt_server.connects) == 1
     await lease.close()
 
 
 @pytest.mark.asyncio
-async def test_mqtt_two_leases_each_get_only_their_topic():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
+async def test_mqtt_two_leases_each_get_only_their_topic(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
     broker = MqttBroker.from_url(url)
 
     first = pool.connect(url, broker)
@@ -1026,17 +993,18 @@ async def test_mqtt_two_leases_each_get_only_their_topic():
 
     first.subscribe("alpha")
     second.subscribe("beta")
-    await wait_for(lambda: bool(clients))
-    clients[0].fire_connect()
-    await wait_for(lambda: first.connected)
-    assert len(clients) == 1  # one paho client built for the shared socket
+    assert await first.ready(timeout=5)
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions
+        and mqtt_server.sessions[0].subscriptions == {"alpha", "beta"}
+    )
+    assert len(transports) == 1 and len(mqtt_server.connects) == 1
 
-    client = clients[0]
-    client.fire_message(WireMqttMessage("alpha", b"a"))
-    client.fire_message(WireMqttMessage("beta", b"b"))
+    mqtt_server.publish("alpha", b"a")
+    mqtt_server.publish("beta", b"b")
 
     await wait_for(lambda: got_first and got_second)
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
     assert got_first == ["alpha"]  # each lease sees only its own topic
     assert got_second == ["beta"]
 
@@ -1046,30 +1014,20 @@ async def test_mqtt_two_leases_each_get_only_their_topic():
 
 @pytest.mark.asyncio
 async def test_silent_shared_route_does_not_reconnect_healthy_broker_siblings(
-    monkeypatch,
+    mqtt_server,
 ):
-    clients: List[FakePahoClient] = []
-
-    def factory(_url, _logger, **_kwargs):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
     pool = mqtt.pool_for(PoolRegistry(), current_provider())
     first = mqtt.connect(
-        "mqtt://broker/?topic=device/one/report",
+        server_url(mqtt_server, "?topic=device/one/report"),
         pool=pool,
     )
     second = mqtt.connect(
-        "mqtt://broker/?topic=device/two/report",
+        server_url(mqtt_server, "?topic=device/two/report"),
         pool=pool,
     )
 
     assert first.transport is second.transport
-    await wait_for(lambda: len(clients) == 1)
-    clients[0].fire_connect()
-    await wait_for(lambda: first.connected and second.connected)
+    assert await first.ready(timeout=5) and await second.ready(timeout=5)
 
     timeouts: List[ActivityTimeout] = []
     sibling_drops: List[Disconnected] = []
@@ -1084,48 +1042,43 @@ async def test_silent_shared_route_does_not_reconnect_healthy_broker_siblings(
         )
     )
 
-    await wait_for(lambda: bool(timeouts), timeout=0.2)
+    await wait_for(lambda: bool(timeouts), timeout=0.5)
     probes_at_timeout = len(probes)
-    await wait_for(lambda: len(probes) >= probes_at_timeout + 2, timeout=0.2)
-    assert len(clients) == 1
+    await wait_for(lambda: len(probes) >= probes_at_timeout + 2, timeout=0.5)
+    assert len(mqtt_server.connects) == 1
     assert first.connected and second.connected
     assert len(timeouts) == 1
     assert sibling_drops == []
 
     first.note_activity()
-    await wait_for(lambda: len(timeouts) == 2, timeout=0.2)
+    await wait_for(lambda: len(timeouts) == 2, timeout=0.5)
     assert first.connected and second.connected
     assert sibling_drops == []
+    assert len(mqtt_server.connects) == 1
 
     await first.close()
     await second.close()
 
 
 @pytest.mark.asyncio
-async def test_dynamic_subscription_keeps_the_shared_client(monkeypatch):
-    clients: List[FakePahoClient] = []
-
-    def factory(_url, _logger, **_kwargs):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+async def test_dynamic_subscription_keeps_the_shared_client(mqtt_server):
     pool = mqtt.pool_for(PoolRegistry(), current_provider())
     options = ConnectionOptions(retry=RetryPolicy(backoff=ConstantBackoff(0)))
     first = mqtt.connect(
-        "mqtt://broker/?topic=device/one/report", pool=pool, options=options
+        server_url(mqtt_server, "?topic=device/one/report"), pool=pool, options=options
     )
-    await wait_for(lambda: len(clients) == 1)
-    clients[0].fire_connect()
-    await wait_for(lambda: first.connected)
+    assert await first.ready(timeout=5)
 
     second = mqtt.connect(
-        "mqtt://broker/?topic=device/two/report", pool=pool, options=options
+        server_url(mqtt_server, "?topic=device/two/report"), pool=pool, options=options
     )
     assert first.transport is second.transport
-    await wait_for(lambda: "device/two/report" in clients[0].subscribed)
-    assert len(clients) == 1
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions
+        and mqtt_server.sessions[0].subscriptions
+        == {"device/one/report", "device/two/report"}
+    )
+    assert len(mqtt_server.connects) == 1  # the live session took the new topic
     assert first.connected and second.connected
 
     await first.close()
@@ -1133,25 +1086,25 @@ async def test_dynamic_subscription_keeps_the_shared_client(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mqtt_wildcard_subscription_routes():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/")
+async def test_mqtt_wildcard_subscription_routes(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server)
     lease = pool.connect(url, MqttBroker.from_url(url))
     got: List[str] = []
     lease.event_bus.on(MessageReceived, lambda e: got.append(e.message.topic))
 
     lease.subscribe("device/#")
-    await wait_for(lambda: bool(clients))
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
-    client = clients[0]
-    client.fire_message(WireMqttMessage("device/temp", b"1"))
-    client.fire_message(WireMqttMessage("device", b"2"))
-    client.fire_message(WireMqttMessage("other", b"3"))
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions and mqtt_server.sessions[0].subscriptions
+    )
+    push(mqtt_server, "device/temp", b"1")
+    push(mqtt_server, "device", b"2")
+    push(mqtt_server, "other", b"3")
 
     await wait_for(lambda: len(got) >= 2)
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
     assert sorted(got) == ["device", "device/temp"]  # 'other' filtered out
 
     await lease.close()
@@ -1351,46 +1304,46 @@ async def test_lease_event_bus_does_not_drop_message_bursts():
 
 
 @pytest.mark.asyncio
-async def test_mqtt_connect_returns_lease_and_applies_url_topics():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/?topic=foo/%23")  # foo/# url-encoded
+async def test_mqtt_connect_returns_lease_and_applies_url_topics(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server, "?topic=foo/%23")  # foo/# url-encoded
 
     lease = mqtt.connect(url, pool=pool)
-    assert isinstance(lease, MqttLease)
     assert isinstance(lease, MqttLease)
 
     # The URL's ?topic= is recorded on the lease synchronously for routing,
     # and asserted on the shared socket once it comes up.
     assert "foo/#" in lease.topics
-    await wait_for(lambda: bool(clients))
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
-    await wait_for(lambda: "foo/#" in clients[0].subscribed)
+    assert await lease.ready(timeout=5)
+    await mqtt_server.wait_for(
+        lambda: mqtt_server.sessions
+        and mqtt_server.sessions[0].subscriptions == {"foo/#"}
+    )
 
     got: List[str] = []
     lease.event_bus.on(MessageReceived, lambda e: got.append(e.message.topic))
-    clients[0].fire_message(WireMqttMessage("foo/bar", b"x"))
-    clients[0].fire_message(WireMqttMessage("nope", b"y"))
+    push(mqtt_server, "foo/bar", b"x")
+    push(mqtt_server, "nope", b"y")
     await wait_for(lambda: got == ["foo/bar"])  # wildcard routes, 'nope' filtered
+    await asyncio.sleep(0.05)
+    assert got == ["foo/bar"]
 
     await lease.close()
 
 
 @pytest.mark.asyncio
-async def test_mqtt_connect_bare_bytes_uses_default_topic():
-    clients: List[FakePahoClient] = []
-    pool = build_mqtt_pool(clients)
-    url = yarl.URL("mqtt://broker/?topic=cmd")
+async def test_mqtt_connect_bare_bytes_uses_default_topic(mqtt_server):
+    transports: List[AsyncMqtt] = []
+    pool = build_mqtt_pool(transports)
+    url = server_url(mqtt_server, "?topic=cmd")
 
     lease = mqtt.connect(url, pool=pool)
-    await wait_for(lambda: bool(clients))
-    clients[0].fire_connect()
-    await wait_for(lambda: lease.connected)
+    assert await lease.ready(timeout=5)
 
     await lease.send(b"payload")  # bare bytes -> wrapped onto the URL's first topic
-    await wait_for(lambda: clients[0].published)
-    topic, payload, _qos, _retain = clients[0].published[0]
+    await mqtt_server.wait_for(lambda: mqtt_server.published)
+    topic, payload, _qos, _retain = mqtt_server.published[0]
     assert topic == "cmd"
     assert payload == b"payload"
 
@@ -1405,54 +1358,54 @@ async def test_mqtt_connect_rejects_url_without_host():
 
 
 @pytest.mark.asyncio
-async def test_context_registries_do_not_share_mqtt_transports(monkeypatch):
-    clients: List[FakePahoClient] = []
-
-    def factory(url, logger, **_kwargs):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+async def test_context_registries_do_not_share_mqtt_transports(mqtt_server):
     first = ClientContext()
     second = ClientContext()
     first_pool = mqtt.pool_for(first.mqtt_pools, current_provider())
     second_pool = mqtt.pool_for(second.mqtt_pools, current_provider())
-    first_lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=first_pool)
-    second_lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=second_pool)
+    first_lease = mqtt.connect(server_url(mqtt_server), pool=first_pool)
+    second_lease = mqtt.connect(server_url(mqtt_server), pool=second_pool)
 
-    assert isinstance(first_lease.transport, Paho)
-    assert isinstance(second_lease.transport, Paho)
+    assert isinstance(first_lease.transport, AsyncMqtt)
+    assert isinstance(second_lease.transport, AsyncMqtt)
     assert first_lease.transport is not second_lease.transport
-    await wait_for(lambda: len(clients) == 2)
-    assert len(clients) == 2
+    assert await first_lease.ready(timeout=5)
+    assert await second_lease.ready(timeout=5)
+    assert len(mqtt_server.connects) == 2  # one socket per owner
 
     await first_lease.close()
     await second_lease.close()
 
 
 @pytest.mark.asyncio
-async def test_incompatible_mqtt_tls_settings_do_not_share_a_transport(monkeypatch):
-    clients: List[FakePahoClient] = []
-
-    def factory(_url, _logger, **_kwargs):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+async def test_incompatible_mqtt_tls_settings_do_not_share_a_transport(mqtts_server):
+    """One host:port, three wire settings, three sockets. Over a TLS broker with
+    a self-signed certificate each behaves as its settings say: plain MQTT
+    can't speak to it, unverified TLS connects, verified TLS refuses the
+    certificate -- so none of them can be riding another's session."""
     pool = mqtt.pool_for(PoolRegistry(), current_provider())
-    plain = mqtt.connect("mqtt://broker:1883", pool=pool)
-    secure = mqtt.connect("mqtts://broker:1883", pool=pool)
+    port = mqtts_server.port
+    plain = mqtt.connect(f"mqtt://127.0.0.1:{port}", pool=pool)
+    secure = mqtt.connect(f"mqtts://127.0.0.1:{port}", pool=pool)
     verified = mqtt.connect(
-        "mqtts://broker:1883",
+        f"mqtts://127.0.0.1:{port}",
         pool=pool,
         options=ConnectionOptions(verify_tls=True),
     )
+    drops = {"plain": [], "verified": []}
+    plain.event_bus.on(Disconnected, drops["plain"].append)
+    verified.event_bus.on(Disconnected, drops["verified"].append)
 
     assert plain.transport is not secure.transport
     assert secure.transport is not verified.transport
-    await wait_for(lambda: len(clients) == 3)
+    assert plain.transport is not verified.transport
+    assert await secure.ready(timeout=5)
+    await wait_for(lambda: drops["plain"] and drops["verified"], timeout=5)
+    assert not plain.connected and not verified.connected
+    assert isinstance(
+        drops["verified"][0].code.transport_error, ssl.SSLCertVerificationError
+    )
+    assert len(mqtts_server.connects) == 1  # only the unverified TLS session
 
     await plain.close()
     await secure.close()
@@ -1460,50 +1413,40 @@ async def test_incompatible_mqtt_tls_settings_do_not_share_a_transport(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_mqtt_uses_configured_wire_keepalive(monkeypatch):
-    client = FakePahoClient()
-
-    def factory(_url, _logger, **_kwargs):
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+async def test_mqtt_uses_configured_wire_keepalive(mqtt_server):
     pool = mqtt.pool_for(
         PoolRegistry(),
         current_provider(),
         WireKeepalive(interval=20),
     )
-    lease = mqtt.connect(yarl.URL("mqtt://broker/"), pool=pool)
+    lease = mqtt.connect(server_url(mqtt_server), pool=pool)
 
-    await wait_for(lambda: bool(client.connect_calls))
-    assert client.connect_calls == [("broker", 1883, 20)]
+    await mqtt_server.wait_for(lambda: mqtt_server.connects)
+    assert mqtt_server.connects[0].keepalive == 20
 
     await lease.close()
 
 
 @pytest.mark.asyncio
-async def test_mqtt_worker_failure_keeps_supervision_on_one_client(monkeypatch):
-    monkeypatch.setattr(paho_wire, "WORKER_RESTART_DELAY", 0.001)
-    clients: List[FakePahoClient] = []
-
-    def factory(_url, _logger, **_kwargs):
-        client = FakePahoClient()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(mqtt, "default_paho_client", factory)
+async def test_mqtt_wire_failure_keeps_supervision_on_one_transport(mqtt_server):
+    """The broker drops the socket: the same transport keeps supervising, is
+    down until it reconnects, and the pool never builds a second one."""
     pool = mqtt.pool_for(PoolRegistry(), current_provider())
-    lease = mqtt.connect(
-        yarl.URL("mqtt://broker/"),
-        pool=pool,
-        options=ConnectionOptions(open_timeout=0.01),
-    )
+    lease = mqtt.connect(server_url(mqtt_server), pool=pool)
+    transport = lease.transport
+    drops: List[Disconnected] = []
+    lease.event_bus.on(Disconnected, drops.append)
+    assert await lease.ready(timeout=5)
 
-    await wait_for(lambda: len(clients) == 1 and clients[0].loop_runs == 1)
-    clients[0].crash(RuntimeError("network parser stopped"))
-    await wait_for(lambda: clients[0].loop_runs == 2)
-    assert lease.transport.supervising()
+    mqtt_server.drop_all()
+    await wait_for(lambda: bool(drops), timeout=5)
+    assert isinstance(drops[0].code, TransientError)
+    assert transport.supervising()
     assert not lease.connected
-    assert len(clients) == 1
+
+    await wait_for(lambda: lease.connected and lease.generation == 2, timeout=10)
+    assert lease.transport is transport
+    assert len(mqtt_server.connects) == 2
 
     await lease.close()
 

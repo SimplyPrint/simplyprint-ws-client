@@ -43,7 +43,12 @@ from simplyprint_ws_client.wire.transport import (
     Transport,
 )
 
-__all__ = ["Reconnecting"]
+__all__ = ["Reconnecting", "redacted"]
+
+
+def redacted(url: yarl.URL) -> yarl.URL:
+    """``url`` safe to log: a password (e.g. a printer's access code) masked."""
+    return url.with_password("<redacted>") if url.password else url
 
 
 class Reconnecting(Transport):
@@ -153,7 +158,7 @@ class Reconnecting(Transport):
             spawn()
         else:
             # ``create_task`` is not thread-safe; off-loop callers (sync front
-            # doors, the paho thread) hop home first.
+            # doors, worker threads) hop home first.
             loop.call_soon_threadsafe(spawn)
 
     def _log_supervise_death(self, task: "asyncio.Task") -> None:
@@ -162,7 +167,7 @@ class Reconnecting(Transport):
         error = task.exception()
         if error is not None:
             self.logger.error(
-                "wire %s supervision died unexpectedly", self.url, exc_info=error
+                "wire %s supervision died unexpectedly", redacted(self.url), exc_info=error
             )
 
     async def stop(self) -> None:
@@ -256,7 +261,7 @@ class Reconnecting(Transport):
                     raise
                 except Exception as error:  # noqa: BLE001 -- supervised: any error retries
                     code = self.transport_error(error)
-                    self.logger.debug("wire %s dropped: %s", self.url, error)
+                    self.logger.debug("wire %s dropped: %s", redacted(self.url), error)
                 finally:
                     self.live = False
                     self._tripped = None
@@ -288,7 +293,7 @@ class Reconnecting(Transport):
             # supervision task (a silent, permanent outage) nor count as a wire
             # drop (churning a healthy link). Log it and keep supervising.
             self.logger.exception(
-                "wire %s %s listener failed", self.url, type(event).__name__
+                "wire %s %s listener failed", redacted(self.url), type(event).__name__
             )
 
     async def mark_connecting(self) -> None:
@@ -366,4 +371,4 @@ class Reconnecting(Transport):
         try:
             await self.aclose()
         except Exception:  # noqa: BLE001 -- aclose must never break supervision
-            self.logger.debug("wire %s aclose failed", self.url, exc_info=True)
+            self.logger.debug("wire %s aclose failed", redacted(self.url), exc_info=True)

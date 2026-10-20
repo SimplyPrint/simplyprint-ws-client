@@ -16,6 +16,7 @@ from typing import List
 import pytest
 import yarl
 
+from simplyprint_ws_client.common.utils.backoff import ConstantBackoff
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.wire.events import (
@@ -24,10 +25,12 @@ from simplyprint_ws_client.wire.events import (
     WireEvent,
 )
 from simplyprint_ws_client.wire.keepalive import Keepalive, ConnectionKeepalive
+from simplyprint_ws_client.wire.async_mqtt import AsyncMqtt
 from simplyprint_ws_client.wire.lease import MqttLease
+from simplyprint_ws_client.wire.messages import MqttMessage, QoS
 from simplyprint_ws_client.wire.mqtt import MqttBroker
+from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Pool
-from simplyprint_ws_client.wire.paho import default_paho_client
 from simplyprint_ws_client.wire.pools import PoolRegistry
 from simplyprint_ws_client.wire.state import ConnectionState
 from simplyprint_ws_client.wire.transport import (
@@ -37,18 +40,75 @@ from simplyprint_ws_client.wire.transport import (
     is_wildcard_filter,
     topic_matches,
 )
+from tests.mqtt_broker import Broker
 
 
 def current_provider() -> EventLoopProvider:
     return EventLoopProvider(factory=asyncio.get_running_loop)
 
 
-def test_default_paho_client_does_not_attach_packet_logger() -> None:
-    client = default_paho_client(
-        yarl.URL("mqtt://printer.local"), logging.getLogger("test.mqtt")
+@pytest.mark.asyncio
+async def test_mqtt_wire_does_not_log_packets(caplog) -> None:
+    """No packet logger on the MQTT wire: a full session (CONNECT with
+    credentials, SUBSCRIBE, publishes both ways, DISCONNECT) logged at DEBUG
+    leaks neither the password nor any payload."""
+    broker = await Broker().start()
+    transport = AsyncMqtt(
+        yarl.URL(f"mqtt://bblp:hunter2-access-code@127.0.0.1:{broker.port}"),
+        EventLoopProvider(asyncio.get_running_loop()),
+        logger=logging.getLogger("test.mqtt"),
     )
+    transport.subscribe("device/SN/report")
+    received: List[bytes] = []
+    transport.events.on(MessageReceived, lambda e: received.append(e.message.payload))
+    try:
+        with caplog.at_level(logging.DEBUG):
+            transport.start()
+            await broker.wait_for(
+                lambda: broker.sessions and broker.sessions[0].subscriptions
+            )
+            await transport.send(
+                MqttMessage("device/SN/request", b"secret-command", QoS.AT_LEAST_ONCE)
+            )
+            broker.publish("device/SN/report", b"secret-report", 1)
+            for _ in range(200):
+                if received:
+                    break
+                await asyncio.sleep(0.01)
+            await transport.stop()
+        assert received == [b"secret-report"]
+        assert broker.published == [("device/SN/request", b"secret-command", 1, False)]
+        for needle in ("hunter2-access-code", "secret-command", "secret-report"):
+            assert needle not in caplog.text
+    finally:
+        await transport.stop()
+        await broker.stop()
 
-    assert client.on_log is None
+
+@pytest.mark.asyncio
+async def test_a_dropped_mqtt_link_logs_no_credentials(caplog) -> None:
+    """Drops and refusals are logged, but by host, never with the URL's
+    password (for printers it is the LAN access code)."""
+    broker = await Broker().start()
+    transport = AsyncMqtt(
+        yarl.URL(f"mqtt://bblp:hunter2-access-code@127.0.0.1:{broker.port}"),
+        EventLoopProvider(asyncio.get_running_loop()),
+        policy=RetryPolicy(ConstantBackoff(0.01)),
+        logger=logging.getLogger("test.mqtt"),
+    )
+    try:
+        with caplog.at_level(logging.DEBUG):
+            transport.start()
+            await broker.wait_for(lambda: broker.sessions)
+            broker.connack_code = 5
+            broker.drop_all()  # one drop, then refusals
+            await broker.wait_for(lambda: len(broker.connects) >= 3)
+            await transport.stop()
+        assert "127.0.0.1" in caplog.text  # the drops were logged ...
+        assert "hunter2-access-code" not in caplog.text  # ... without the secret
+    finally:
+        await transport.stop()
+        await broker.stop()
 
 
 class FakeTransport(Transport):

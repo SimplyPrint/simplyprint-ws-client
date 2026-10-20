@@ -13,8 +13,8 @@ It also drives the public ``ws.connect`` front door end to end (front door ->
 :class:`Pool` -> framed lease) over the same real server, including pooled
 socket-sharing across two leases on one endpoint.
 
-MQTT is not exercised here; the fake-injected Paho path lives in the sibling
-unit suites.
+MQTT is not exercised here; the AsyncMqtt wire runs against a real loopback
+broker in ``test_async_mqtt`` and ``test_conn_module``.
 """
 
 from __future__ import annotations
@@ -1004,14 +1004,14 @@ async def test_messages_after_reconnect_carry_new_generation_only(
 
 
 def test_importing_conn_package_loads_no_wire_library() -> None:
-    """Importing the wire package must not load websockets or paho."""
+    """Importing the wire package must not load the websockets library."""
     import subprocess
     import sys
 
     code = (
         "import sys\n"
         "import simplyprint_ws_client.wire as conn\n"
-        "leaked = [m for m in ('websockets', 'paho')\n"
+        "leaked = [m for m in ('websockets',)\n"
         "          if m in sys.modules]\n"
         "assert not leaked, leaked\n"
         "print('clean')\n"

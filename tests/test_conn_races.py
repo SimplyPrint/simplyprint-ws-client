@@ -6,8 +6,8 @@ lives: the pool refcount, a lease's ``send`` racing a generation flip, concurren
 subscribe/unsubscribe across leases against one refcounted broker socket, and
 ``stop`` landing mid-open / mid-consume. None of this touches a real broker or
 socket: every wire is an injected fake satisfying the same seam production wires
-do -- a :class:`Reconnecting` subclass driven by queues, a paho-shaped fake
-behind :class:`Paho`, and a Websockets-shaped fake.
+do -- a :class:`Reconnecting` subclass driven by queues and a
+Websockets-shaped fake.
 
 The single asyncio loop does NOT make these tests trivial: every ``await`` is a
 scheduling point where another task can interleave, so the dict mutations, the
@@ -18,8 +18,7 @@ is never torn, the generation is strictly monotonic, no message lands on a wrong
 generation, and the asyncio task count returns to baseline (no leaks, no orphaned
 transports).
 
-paho is not required; every MQTT test injects a fake client through the wire's
-``client_factory`` seam, so nothing imports the real wire library.
+No wire library is imported; every wire is a fake behind the real pool.
 """
 
 from __future__ import annotations
@@ -575,23 +574,6 @@ async def test_rapid_restart_after_stop_starts_exactly_one_task():
 
     await settle()
     assert live_tasks() - baseline == set(), "leaked supervision task after restarts"
-
-
-# --------------------------------------------------------------------------- #
-# MQTT message stand-in shared by the Paho adapter tests below.
-# --------------------------------------------------------------------------- #
-
-
-class WireMqttMessage:
-    """A paho message stand-in routed by ``.topic``."""
-
-    def __init__(
-        self, topic: str, payload: bytes, qos: int = 0, retain: bool = False
-    ) -> None:
-        self.topic = topic
-        self.payload = payload
-        self.qos = qos
-        self.retain = retain
 
 
 # --------------------------------------------------------------------------- #

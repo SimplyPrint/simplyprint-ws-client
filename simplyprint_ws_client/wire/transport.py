@@ -5,7 +5,7 @@ A :class:`Transport` is a supervised link to ONE endpoint that the
 owns the whole reliability story -- connect, reconnect, state, generation -- and
 publishes :class:`~simplyprint_ws_client.wire.events.WireEvent` s on
 its :attr:`~Transport.events` bus so a consumer drives it by events, never by a
-thread. Where the work runs (a paho network thread, an asyncio task) is the
+thread. Where the work runs (today: always a task on the event loop) is the
 transport's private business and never leaks across this seam.
 
 :class:`MqttTransport` adds topic subscription; MQTT routing belongs to the pool

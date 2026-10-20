@@ -1,6 +1,6 @@
 """Brand-free tests for the :class:`Courier` dispatch primitive.
 
-The courier is the one seam that carries items from a producer world (a paho
+The courier is the one seam that carries items from a producer world (a worker
 thread, a camera reader) onto the SimplyPrint loop. These tests pin the
 properties everything else relies on: coalescing (a burst is one loop wakeup),
 strict FIFO delivery, every overflow policy, sync *and* async sinks, no

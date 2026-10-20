@@ -33,7 +33,7 @@ from simplyprint_ws_client.wire.mqtt_probe import (
     probe_mqtt,
 )
 from simplyprint_ws_client.wire.options import ConnectionOptions, WireKeepalive
-from simplyprint_ws_client.wire.paho import Paho
+from simplyprint_ws_client.wire.async_mqtt import AsyncMqtt
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.pool import Endpoint, Pool
 from simplyprint_ws_client.wire.pools import PoolRegistry
@@ -78,7 +78,7 @@ __all__ = [
     "MqttProbeResult",
     "MqttTransport",
     "NotConnected",
-    "Paho",
+    "AsyncMqtt",
     "Pool",
     "PoolRegistry",
     "QoS",

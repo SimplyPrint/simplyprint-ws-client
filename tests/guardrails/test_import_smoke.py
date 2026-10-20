@@ -30,7 +30,7 @@ def test_library_modules_import():
         try:
             importlib.import_module(module_name)
         except ModuleNotFoundError as exc:
-            # Heavy optional backends (paho-mqtt, ...) may be absent in
+            # Heavy optional backends may be absent in
             # the test environment; anything else is a real failure.
             if (
                 exc.name

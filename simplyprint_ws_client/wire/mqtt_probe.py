@@ -10,7 +10,7 @@ import yarl
 
 from simplyprint_ws_client._compat import StrEnum
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.wire.errors import ErrorCode
+from simplyprint_ws_client.wire.errors import AuthenticationError, ErrorCode
 from simplyprint_ws_client.wire.events import Connected, Disconnected, MessageReceived
 from simplyprint_ws_client.wire.messages import MqttMessage
 from simplyprint_ws_client.wire.mqtt import connect, pool_for
@@ -38,7 +38,6 @@ class MqttProbeResult:
     reason_code: Optional[ErrorCode] = None
 
 
-_AUTH_FAILURE_REASON_CODES = frozenset((134, 135, 140))
 
 
 async def probe_mqtt(
@@ -97,9 +96,10 @@ async def probe_mqtt(
         if isinstance(edge, Disconnected):
             reason = str(edge.code) if edge.code is not None else None
             reason_code = edge.code.code if edge.code is not None else None
+            # The wire knows which refusals mean "wrong credentials".
             outcome = (
                 MqttProbeOutcome.AUTH_FAILED
-                if reason_code in _AUTH_FAILURE_REASON_CODES
+                if isinstance(edge.code, AuthenticationError)
                 else MqttProbeOutcome.CONNECT_FAILED
             )
             return MqttProbeResult(outcome, reason=reason, reason_code=reason_code)

@@ -14,9 +14,8 @@ means a 1:1 wire and reaches every lease). The per-lease bounded, QoS-governed
 delivery of those events to async handlers lives in :mod:`connection`.
 
 The pool is pure sync bookkeeping: ``connect`` and lease release only touch a
-refcounted dict under one lock and never do I/O. On a sync wire (paho) the
-transport already couriers its events onto the loop before they reach the pool, so
-the pool stays thread-free either way.
+refcounted dict under one lock and never do I/O. Every wire runs on the event
+loop and emits its events there, so the pool stays thread-free.
 """
 
 from __future__ import annotations

@@ -34,7 +34,7 @@ class TlsClientAuth:
 class WireKeepalive:
     """Transport-native ping/keepalive knobs.
 
-    The front doors map these to paho MQTT's CONNECT keepalive and websockets'
+    The front doors map these to MQTT's CONNECT keepalive and websockets'
     ``ping_interval`` / ``ping_timeout``. Unsupported values are ignored by
     transports that cannot use them.
     """

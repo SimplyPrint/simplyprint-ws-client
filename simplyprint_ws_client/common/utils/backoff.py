@@ -60,7 +60,10 @@ class ExponentialBackoff(Backoff):
         if interval > self.reset_time:
             self.reset()
 
-        self.exp += 1
+        # Stop growing once past the cap: an endless outage must never
+        # overflow the float (2**1024) and end the caller's retry loop.
+        if self.exp < 64 and self.base * (2**self.exp) < self.max_delay:
+            self.exp += 1
 
         # The 'ideal' exponential factor
         ideal = self.base * (2**self.exp)

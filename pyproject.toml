@@ -42,6 +42,8 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 
+# paho is not a runtime dependency: it is the reference client the test broker
+# is checked against (tests/test_mqtt_broker_conformance.py).
 mqtt = [
     "paho-mqtt>=2.1.0",
 ]
