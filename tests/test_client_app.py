@@ -17,9 +17,6 @@ from simplyprint_ws_client.core.client import (
     ClientConfigChangedEvent,
     ClientStateChangeEvent,
 )
-from simplyprint_ws_client.integration.camera.pool import (
-    DEFAULT_CAMERA_PROCESS_WORKERS,
-)
 from simplyprint_ws_client.integration.discovery import DiscoveryService
 from simplyprint_ws_client.integration.spec import ProductMetadata
 
