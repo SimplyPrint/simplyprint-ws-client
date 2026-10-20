@@ -23,6 +23,7 @@ from typing import (
     Union,
     no_type_check,
     cast,
+    Tuple,
 )
 
 from pydantic import BaseModel, PrivateAttr
@@ -190,15 +191,14 @@ class ReactiveModel(BaseModel, Synchronized):
 
         changed_fields = set(self.model_self_changed_fields.keys())
 
-        for field_name, model_field in self.__class__.model_fields.items():
+        tracked = _tracked_fields(self.__class__)
+        for field_name in self.__class__.__pydantic_fields__:
             field_value = self.__dict__[field_name]
 
             if isinstance(field_value, ReactiveModel) and field_value.model_has_changed:
                 changed_fields.add(field_name)
 
-            if field_value and self.is_pydantic_change_detect_annotation(
-                field_info=model_field
-            ):
+            if field_value and field_name in tracked:
                 if isinstance(field_value, (list, tuple)):
                     field_value_list = list(enumerate(field_value))
                 elif isinstance(field_value, dict):
@@ -224,12 +224,11 @@ class ReactiveModel(BaseModel, Synchronized):
             nonlocal changed_fields
             changed_fields[field] = max(changed_fields.get(field, -1), change_id)
 
-        for field_name, model_field in self.__class__.model_fields.items():
-            field_value = self.__dict__[field_name]
+        values = self.__dict__
+        for field_name in _tracked_fields(self.__class__):
+            field_value = values[field_name]
 
-            if not field_value or not self.is_pydantic_change_detect_annotation(
-                field_info=model_field
-            ):
+            if not field_value:
                 continue
 
             # Handle direct nested state models.
@@ -289,7 +288,7 @@ class ReactiveModel(BaseModel, Synchronized):
 
         # Ensure all fields exists
         for name in fields:
-            if name not in self.__class__.model_fields:
+            if name not in self.__class__.__pydantic_fields__:
                 raise AttributeError(f"Field {name} not available in this model")
 
         return any(name in self.model_self_changed_fields for name in fields)
@@ -299,7 +298,7 @@ class ReactiveModel(BaseModel, Synchronized):
 
         # Ensure all fields exists
         for name in fields:
-            if name not in self.__class__.model_fields:
+            if name not in self.__class__.__pydantic_fields__:
                 raise AttributeError(f"Field {name} not available in this model")
 
         ctx = self.ctx()
@@ -333,7 +332,7 @@ class ReactiveModel(BaseModel, Synchronized):
 
     @no_type_check
     def __setattr__(self, name, value) -> None:  # noqa: ANN001
-        field_info = self.__class__.model_fields.get(name)
+        field_info = self.__class__.__pydantic_fields__.get(name)
 
         # Private attributes do not need to be handled
         # Same for non-model fields, or untracked fields.
@@ -439,3 +438,24 @@ class ReactiveModel(BaseModel, Synchronized):
             clone, "model_self_changed_fields", self.model_self_changed_fields.copy()
         )
         return clone
+
+
+#: ``class -> (fields, tracked field names)``: the fields the changeset walk
+#: recurses into (``is_pydantic_change_detect_annotation``), in field order.
+#: Computed once per class; the field dict is kept so a ``model_rebuild``
+#: (which swaps it) invalidates the entry.
+_TRACKED_FIELDS: Dict[type, Tuple[Any, Dict[str, None]]] = {}
+
+
+def _tracked_fields(cls: Type["ReactiveModel"]) -> Dict[str, None]:
+    fields = cls.__pydantic_fields__
+    entry = _TRACKED_FIELDS.get(cls)
+    if entry is not None and entry[0] is fields:
+        return entry[1]
+    tracked = dict.fromkeys(
+        name
+        for name, field_info in fields.items()
+        if cls.is_pydantic_change_detect_annotation(field_info=field_info)
+    )
+    _TRACKED_FIELDS[cls] = (fields, tracked)
+    return tracked
