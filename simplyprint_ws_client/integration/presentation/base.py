@@ -12,14 +12,14 @@ internals. The integration projects its spec into one
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Union
 
 from simplyprint_ws_client._compat import StrEnum
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.core.config import PrinterConfig
 
-EditableValue = str | int | float | bool | None
+EditableValue = Union[str, int, float, bool, None]
 EditableWriter = Callable[[EditableValue], None]
 
 

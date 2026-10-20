@@ -3,7 +3,7 @@ __all__ = ["Config", "PrinterConfig"]
 import json
 import uuid
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from pydantic import BaseModel
 
@@ -179,7 +179,7 @@ class PrinterConfig(BaseModel, Config):
         """The preferred non-empty device address, if the integration has one."""
         return next((address for address in self.network_addresses() if address), None)
 
-    def set_webcam_url(self, value: str | int | float | bool | None) -> None:
+    def set_webcam_url(self, value: Union[str, int, float, bool, None]) -> None:
         """Set or clear the user-supplied camera override."""
 
         self.custom_webcam_url = None if value is None or value == "" else str(value)

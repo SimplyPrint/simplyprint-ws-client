@@ -154,7 +154,7 @@ def _field_version(
     model: ReactiveModel,
     field: str,
     nested: Iterable[ReactiveModel] = (),
-) -> int | None:
+) -> Optional[int]:
     """Latest change for one explicit state branch."""
     versions = []
     if field in model.model_self_changed_fields:
@@ -167,7 +167,7 @@ def _field_version(
 
 def _message_changes(
     state: PrinterState,
-) -> Iterable[tuple[type[ClientMsg], Iterable[int | None]]]:
+) -> Iterable[tuple[type[ClientMsg], Iterable[Optional[int]]]]:
     """Messages affected by the concrete branches of this state tree."""
     yield MachineDataMsg, (_field_version(state, "info", (state.info,)),)
     yield WebcamStatusMsg, (_field_version(state.webcam_info, "connected"),)

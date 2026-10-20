@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from simplyprint_ws_client._compat import StrEnum
+from simplyprint_ws_client._compat import AsyncLock, StrEnum
 from typing import Awaitable, Callable, Mapping, Optional
 
 from simplyprint_ws_client.integration.discovery.device import JsonValue
@@ -184,7 +184,7 @@ class NetworkScanContext:
 
     def __init__(self, port_checker: PortChecker = tcp_port_open) -> None:
         self._port_checker = port_checker
-        self._lock = asyncio.Lock()
+        self._lock = AsyncLock()
         self._port_results: dict[
             tuple[str, int], tuple[bool, Optional[str], float]
         ] = {}

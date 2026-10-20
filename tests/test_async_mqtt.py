@@ -468,6 +468,10 @@ async def test_an_unacknowledged_unsubscribe_keeps_its_packet_id(broker, started
 async def test_a_qos2_resend_queued_before_its_pubrel_is_still_deduplicated(broker):
     """Round 2: the PUBREL must not overtake a queued duplicate and clear the
     dedupe state early (which delivered it twice)."""
+    # The test sends the one PUBREL itself: an automatic one answering the first
+    # PUBREC could land before the re-send (timing-dependent) and legitimately
+    # end the exchange there.
+    broker.release_qos2 = False
     transport = make(broker)
     events = Events(transport)
     release = asyncio.Event()

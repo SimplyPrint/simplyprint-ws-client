@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from typing import Optional
 
 import pytest
 from unittest.mock import AsyncMock
@@ -30,7 +31,7 @@ class SecondClient(Client[PrinterConfig]): ...
 
 
 class SecondConfig(PrinterConfig):
-    marker: str | None = None
+    marker: Optional[str] = None
 
 
 _METADATA = ProductMetadata(

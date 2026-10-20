@@ -3,6 +3,8 @@ import multiprocessing
 import threading
 from typing import Optional
 
+from simplyprint_ws_client._compat import AsyncEvent
+
 
 class SyncStoppable:
     def __init__(self) -> None:
@@ -23,7 +25,7 @@ class SyncStoppable:
 
 class AsyncStoppable:
     def __init__(self) -> None:
-        self._stop_event = asyncio.Event()
+        self._stop_event = AsyncEvent()
 
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()

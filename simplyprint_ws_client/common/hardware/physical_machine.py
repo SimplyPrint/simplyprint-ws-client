@@ -313,15 +313,15 @@ class PhysicalMachine:
 def make_host_telemetry_reader(
     *,
     min_interval: float = 5.0,
-    read_usage: Callable[[], Mapping[str, int | None]] = PhysicalMachine.get_usage,
+    read_usage: Callable[[], Mapping[str, Optional[int]]] = PhysicalMachine.get_usage,
     clock: Callable[[], float] = time.monotonic,
-) -> Callable[[], Awaitable[Mapping[str, int | None]]]:
+) -> Callable[[], Awaitable[Mapping[str, Optional[int]]]]:
     """Build one app-owned, throttled asynchronous host-usage reader."""
 
     snapshot: Mapping[str, int | None] = {}
     read_at = 0.0
 
-    async def read() -> Mapping[str, int | None]:
+    async def read() -> Mapping[str, Optional[int]]:
         nonlocal snapshot, read_at
         now = clock()
         if not snapshot or now - read_at >= min_interval:

@@ -75,6 +75,8 @@ class Broker:
         self.refuse_topics: Set[str] = set()
         self.answer_pings = True
         self.ack_publishes = True
+        #: Answer a client PUBREC with PUBREL (off: the test sends PUBREL itself).
+        self.release_qos2 = True
         self.pubacks: Dict[int, int] = {}
         self._next_id = 0
         self.changed = asyncio.Event()
@@ -216,8 +218,9 @@ class Broker:
             if publish.qos == 1 and self.ack_publishes:
                 session.send(codec.encode_ack(codec.PUBACK, publish.packet_id))
         elif kind == codec.PUBREC:
-            packet_id = codec.decode_packet_id(packet.body)
-            session.send(codec.encode_ack(codec.PUBREL, packet_id))
+            if self.release_qos2:
+                packet_id = codec.decode_packet_id(packet.body)
+                session.send(codec.encode_ack(codec.PUBREL, packet_id))
         elif kind in (codec.PUBACK, codec.PUBCOMP):
             packet_id = codec.decode_packet_id(packet.body)
             self.pubacks[packet_id] = kind

@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
 
+from simplyprint_ws_client._compat import AsyncEvent
 from simplyprint_ws_client.core.client import Client, ClientState
 from simplyprint_ws_client.core.manager import (
     ClientConnectionManager,
@@ -83,7 +84,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             transport_factory=transport_factory,
         )
         self.logger = logger
-        self._wake_event = asyncio.Event()
+        self._wake_event = AsyncEvent()
         self._tasks = {}
         self._last_ticked = {}
         self._tick_timeout_reported = set()
@@ -211,7 +212,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                     async with tick_timeout(TICK_TIMEOUT_SECONDS):
                         await client.tick(delta_tick)
                     self._tick_timeout_reported.discard(client.unique_id)
-                except asyncio.TimeoutError as e:
+                except (asyncio.TimeoutError, TimeoutError) as e:
                     # A stalled device or ping can time out on every scheduler
                     # slice. Report one compact warning per failure streak;
                     # a successful tick rearms it. Repeated tracebacks for the

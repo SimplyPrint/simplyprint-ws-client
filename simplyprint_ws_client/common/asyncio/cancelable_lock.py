@@ -2,8 +2,10 @@ import asyncio
 import collections
 from typing import Optional
 
+from simplyprint_ws_client._compat import AsyncLock
 
-class CancelableLock(asyncio.Lock):
+
+class CancelableLock(AsyncLock):
     _waiters: Optional[collections.deque]
 
     def __len__(self) -> int:

@@ -27,6 +27,8 @@ try:
 except ImportError:  # pragma: no cover -- Python 3.9/3.10 compatibility
     from async_timeout import timeout
 
+from simplyprint_ws_client._compat import AsyncQueue
+
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -94,7 +96,7 @@ class BoundedAsyncDispatcher(Generic[T]):
         self._idle_timeout = idle_timeout
         self._on_overflow = on_overflow
         self._on_error = on_error
-        self._queue: asyncio.Queue[T] = asyncio.Queue(maxsize=maxsize)
+        self._queue: asyncio.Queue[T] = AsyncQueue(maxsize=maxsize)
         self._workers: Set[asyncio.Task] = set()
         self._closed = False
         self._overflowed = False

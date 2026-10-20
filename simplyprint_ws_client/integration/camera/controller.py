@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Optional, final
 
 from yarl import URL
 
+from simplyprint_ws_client._compat import AsyncEvent, AsyncQueue
 from simplyprint_ws_client.integration.camera.handle import CameraHandle
 from simplyprint_ws_client.integration.camera.pool import CameraPool
 from simplyprint_ws_client.common.asyncio.cancelable_lock import CancelableLock
@@ -98,7 +99,7 @@ class CameraController:
         self._camera_uri = None
         self._camera_handle = None
         self._stream_lock = CancelableLock()
-        self._stream_setup = asyncio.Event()
+        self._stream_setup = AsyncEvent()
         self._camera_pause_timeout = pause_timeout
         self._camera_max_cache_age = max_cache_age
         self._camera_debug = (
@@ -108,7 +109,7 @@ class CameraController:
         self._camera_logger.setLevel(
             logging.DEBUG if self._camera_debug else logging.INFO
         )
-        self._camera_work_queue = asyncio.Queue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
+        self._camera_work_queue = AsyncQueue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
         self._request_count = 0
         self._last_stream_frame_at = None
         self._camera_worker_task = None
