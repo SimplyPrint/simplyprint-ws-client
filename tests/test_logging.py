@@ -671,6 +671,62 @@ def test_rotation_can_be_left_uncompressed(tmp_path):
     handler.close()
 
 
+@pytest.mark.asyncio
+async def test_post_logs_uploads_the_plain_live_file_after_a_rotation(
+    tmp_path, monkeypatch
+):
+    # send_logs uploads the live files, opened as text; rotation compresses only
+    # the backups, so the upload is unchanged.
+    from simplyprint_ws_client.core.api import simplyprint_api
+    from simplyprint_ws_client.core.api.url_builder import TESTING_ENDPOINTS
+
+    config = LoggingConfig(log_dir=tmp_path, max_bytes=400, backup_count=2)
+    handler = RoutingHandler(config)
+    for index in range(40):
+        handler.emit(_record(printer_logger_name("p7", "mqtt"), f"line {index:03d}"))
+    handler.close()
+    live = tmp_path / "p7" / "mqtt.log"
+    assert (tmp_path / "p7" / "mqtt.log.1").read_bytes()[:2] == b"\x1f\x8b"
+
+    uploaded = {}
+
+    class Response:
+        status = 200
+
+        async def json(self):
+            return {"status": True}
+
+    class Post:
+        def __init__(self, data):
+            uploaded.update({key: value.read() for key, value in data.items()
+                             if hasattr(value, "read")})
+
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, _url, data, **_kwargs):
+            return Post(data)
+
+    monkeypatch.setattr(simplyprint_api.aiohttp, "ClientSession", Session)
+    api = simplyprint_api.SimplyPrintApi(TESTING_ENDPOINTS)
+
+    result = await api.post_logs(1, "token", serial_log_file=str(live))
+
+    assert result == {"status": True}
+    assert uploaded["serial_log"] == live.read_text()
+    assert uploaded["serial_log"].rstrip().endswith("line 039")
+
+
 def test_routing_clear_file_truncates_live_file(tmp_path):
     handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
     handler.emit(_record(printer_logger_name("p7"), "first line"))
