@@ -131,9 +131,12 @@ class LoggingFacility:
 def _resolve_config(settings: "ClientSettings", config: LoggingConfig) -> LoggingConfig:
     policy = config.policy
     if settings.development:
+        # A source checkout or an unmanaged install: keep every DEBUG line on
+        # disk, as before. Production stays at the policy's INFO defaults.
         policy = replace(
             policy,
             system_file_level=logging.DEBUG,
+            printer_file_level=logging.DEBUG,
             stream_system_level=logging.DEBUG,
             live_system_level=logging.DEBUG,
         )

@@ -171,7 +171,8 @@ def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     assert "websocket info" not in system
     # Other noisy third-party roots are clamped to warnings too.
     assert "aiohttp info" not in system
-    assert "mqtt debug" in printer
+    # Production default: raw printer DEBUG never reaches disk.
+    assert "mqtt debug" not in printer
     handler.close()
 
 
@@ -256,10 +257,10 @@ def test_configure_logging_drains_records_across_batch_boundary(
     )
     logger = logging.getLogger(printer_logger_name("p7", "mqtt"))
     try:
-        logger.debug("packet 0")
+        logger.info("packet 0")
         assert entered.wait(timeout=1)
         for index in range(1, 301):
-            logger.debug("packet %d", index)
+            logger.info("packet %d", index)
         release.set()
         facility.stop()
     finally:
@@ -363,6 +364,47 @@ def test_development_policy_keeps_noisy_debug_suppressed(tmp_path):
     system = (tmp_path / "system.log").read_text()
     assert "system debug" in system
     assert "websocket debug" not in system
+
+
+def test_production_printer_files_log_info_not_debug(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    printer = logging.getLogger(printer_logger_name("p7", "mqtt"))
+    try:
+        printer.debug("mqtt debug")
+        printer.info("mqtt info")
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger("supervisor").info("system info")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    assert facility.config.policy.printer_file_level == logging.INFO
+    assert facility.config.policy.system_file_level == logging.INFO
+    mqtt = (tmp_path / "p7" / "mqtt.log").read_text()
+    system = (tmp_path / "system.log").read_text()
+    assert "mqtt info" in mqtt
+    assert "mqtt debug" not in mqtt
+    assert "system info" in system
+    assert "system debug" not in system
+
+
+def test_development_keeps_debug_on_disk(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient", development=True),
+        LoggingConfig(log_dir=tmp_path),
+    )
+    try:
+        logging.getLogger(printer_logger_name("p7", "mqtt")).debug("mqtt debug")
+        logging.getLogger("supervisor").debug("system debug")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    assert facility.config.policy.printer_file_level == logging.DEBUG
+    assert "mqtt debug" in (tmp_path / "p7" / "mqtt.log").read_text()
+    assert "system debug" in (tmp_path / "system.log").read_text()
 
 
 def _write(path, text):

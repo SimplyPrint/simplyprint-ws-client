@@ -37,13 +37,16 @@ LogTarget = Literal["file", "queue", "stream", "live"]
 class LoggingPolicy:
     """Level/filter policy for every sink the logging facility owns.
 
-    Printer loggers keep raw detail in their scoped files/live printer view, while
-    app/system channels stay operationally useful by default. Noisy third-party
-    prefixes are clamped to warnings for every target, including development mode.
+    Production defaults: every file gets INFO, so DEBUG (raw device traffic) never
+    reaches disk unless someone asks for it through ``development``
+    (``_resolve_config`` lowers the file levels). The live printer view stays
+    DEBUG: it only formats records for a scope someone is watching. Noisy
+    third-party prefixes are clamped to warnings for every target, including
+    development mode.
     """
 
     system_file_level: int = logging.INFO
-    printer_file_level: int = logging.DEBUG
+    printer_file_level: int = logging.INFO
     stream_system_level: int = logging.INFO
     stream_printer_level: int = logging.WARNING
     live_system_level: int = logging.INFO
