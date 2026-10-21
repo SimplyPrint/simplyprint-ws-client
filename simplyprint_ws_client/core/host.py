@@ -5,7 +5,10 @@ A :class:`Host` composes the things a running integration needs — the client
 fleet (:class:`~simplyprint_ws_client.core.app.ClientApp`), the discovery
 service, and each type's background services — without owning any thread
 itself: every member owns its own sanctioned lifecycle, the Host owns *order*
-(start phases forward, stop reversed) and the seams between them.
+(start phases forward, stop reversed) and the seams between them. One member
+is the Host's own: the :class:`~simplyprint_ws_client.core.loop_watchdog.LoopWatchdog`
+(:attr:`Host.loop_watchdog`), which logs when the app event loop stalls. It
+starts with the services and stops when the root scope closes.
 
 Everything an integration contributes is MOUNTED: ``host.mount(spec, parent)``
 registers it under a child :class:`~simplyprint_ws_client.core.scope.Scope` of
@@ -64,8 +67,9 @@ from typing import (
 )
 
 from simplyprint_ws_client.core.app import ClientApp
+from simplyprint_ws_client.core.loop_watchdog import LoopWatchdog
 from simplyprint_ws_client.core.registry import SpecRegistry
-from simplyprint_ws_client.core.scope import CloseReport, Scope
+from simplyprint_ws_client.core.scope import CloseReport, Scope, ScopeClosed
 from simplyprint_ws_client.core.settings import ClientSettings
 
 if TYPE_CHECKING:
@@ -118,7 +122,8 @@ class DuplicatePrinter(ValueError):
 
 
 class Host:
-    """Composes the headless runtime; owns order, not threads.
+    """Composes the headless runtime; owns order, and one thread of its own
+    (the loop watchdog's).
 
     ``service_sink`` decides who STOPS background services at :meth:`stop`:
     leave it ``None`` and the Host stops them (newest-first); inject the app's
@@ -183,6 +188,9 @@ class Host:
         )
         #: The scope every startup mount lives under; closed by :meth:`stop`.
         self.root = Scope("host", loop=self.app._app_event_loop)
+        #: Notices a stalled app event loop (host policy, not a brand's);
+        #: started with the services, stopped when :attr:`root` closes.
+        self.loop_watchdog = LoopWatchdog(self.app._app_event_loop)
         try:
             for integration in registered:
                 self.mount(integration, self.root)
@@ -434,14 +442,29 @@ class Host:
 
     def start_services(self, event_loop_provider=None) -> None:
         """Construct every mounted type's background service once (idempotent)
-        and route it to the owning sink. Later mounts build theirs at mount."""
+        and route it to the owning sink. Later mounts build theirs at mount.
+
+        Also starts the host's own :attr:`loop_watchdog` (once), stopped when
+        :attr:`root` closes. It waits quietly until the fleet's loop runs.
+        """
         with self._lock:
-            if not self._services_started:
+            first = not self._services_started
+            if first:
                 self._service_provider = event_loop_provider
                 self._services_started = True
             specs = list(self._mounts.values())
+        if first:
+            self._start_loop_watchdog()
         for spec in specs:
             self._build_service(spec)
+
+    def _start_loop_watchdog(self) -> None:
+        watchdog = self.loop_watchdog
+        try:
+            self.root.on_close(watchdog.stop, name="loop-watchdog")
+        except ScopeClosed:  # the host already stopped (the undo ran): no start
+            return
+        watchdog.start()
 
     def service_for(self, key: str) -> Optional["BackgroundService"]:
         """The background service started for type ``key``, or ``None``."""

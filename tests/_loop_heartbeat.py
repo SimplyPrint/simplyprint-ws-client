@@ -1,8 +1,9 @@
 """Test-only helper: sample app-loop wake-gaps to prove the loop stays
 responsive under a scenario.
 
-This is a *test fixture*, not a runtime component -- there is no loop monitor in
-the product. A background coroutine wakes every ``interval`` and records the gap
+This is a *test fixture*, not a runtime component: it measures millisecond
+gaps, where the product's own monitor (``core.loop_watchdog``, owned by the
+Host) only reports stalls of seconds. A background coroutine wakes every ``interval`` and records the gap
 between successive wakeups; when something blocks the loop thread, exactly one
 gap balloons to the block duration. A test asserts ``max_gap_ms`` stays near the
 interval to prove the offending work no longer runs on the loop.
