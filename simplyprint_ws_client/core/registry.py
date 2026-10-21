@@ -4,10 +4,14 @@ Applications name each shipped integration once by collecting its
 :class:`~simplyprint_ws_client.integration.spec.IntegrationSpec` value here.
 Every runtime surface then projects the corresponding explicit field; there is
 no descriptor construction or hook discovery in the registry.
+
+The map is copy-on-write: :meth:`SpecRegistry.add` and its undo swap in a new
+dict, so a reader iterating a projection never sees it change underneath it.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Tuple, Type
 
 from simplyprint_ws_client.integration.spec import IntegrationSpec
@@ -21,6 +25,7 @@ if TYPE_CHECKING:
         SubnetScanSpec,
     )
     from simplyprint_ws_client.core.client_context import ClientContext
+    from simplyprint_ws_client.core.scope import Scope
     from simplyprint_ws_client.integration.flow import Flow
     from simplyprint_ws_client.integration.spec import ProductMetadata
     from simplyprint_ws_client.integration.tasks import TaskRegistry
@@ -33,6 +38,7 @@ class SpecRegistry:
 
     def __init__(self, integrations: Iterable[IntegrationSpec] = ()) -> None:
         self._integrations: Dict[str, IntegrationSpec] = {}
+        self._lock = threading.Lock()
         for integration in integrations:
             self.register(integration)
 
@@ -41,10 +47,43 @@ class SpecRegistry:
         return cls(integrations)
 
     def register(self, integration: IntegrationSpec) -> None:
+        """Add ``integration`` for the registry's lifetime (no undo)."""
         integration_id = str(integration.id)
-        if integration_id in self._integrations:
-            raise ValueError(f"duplicate integration id: {integration_id!r}")
-        self._integrations[integration_id] = integration
+        with self._lock:
+            if integration_id in self._integrations:
+                raise ValueError(f"duplicate integration id: {integration_id!r}")
+            updated = dict(self._integrations)
+            updated[integration_id] = integration
+            self._integrations = updated
+
+    def add(self, integration: IntegrationSpec, scope: "Scope") -> None:
+        """Add ``integration`` until ``scope`` closes.
+
+        Re-adding the very spec already registered under its id adopts it: the
+        scope then owns that entry, which is how a registry built up front is
+        mounted at startup. A different spec under a taken id is rejected.
+        """
+        integration_id = str(integration.id)
+        with self._lock:
+            existing = self._integrations.get(integration_id)
+            if existing is not None and existing is not integration:
+                raise ValueError(f"duplicate integration id: {integration_id!r}")
+            if existing is None:
+                updated = dict(self._integrations)
+                updated[integration_id] = integration
+                self._integrations = updated
+        scope.on_close(
+            lambda: self._discard(integration_id, integration),
+            name=f"registry:{integration_id}",
+        )
+
+    def _discard(self, integration_id: str, integration: IntegrationSpec) -> None:
+        with self._lock:
+            if self._integrations.get(integration_id) is not integration:
+                return
+            updated = dict(self._integrations)
+            del updated[integration_id]
+            self._integrations = updated
 
     def integrations(self) -> Mapping[str, IntegrationSpec]:
         return dict(self._integrations)

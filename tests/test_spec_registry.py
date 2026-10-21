@@ -255,3 +255,88 @@ def test_add_printer_assigns_slot_id_once_and_rejects_duplicates(host):
     third.unique_id = "existing-slot"
     host.add_printer("alpha", third)
     assert third.unique_id == "existing-slot"
+
+
+# ---------------------------------------------------------------------------
+# SpecRegistry.add: scoped, copy-on-write
+# ---------------------------------------------------------------------------
+
+
+def test_add_registers_until_the_scope_closes():
+    from simplyprint_ws_client.core.scope import Scope
+
+    registry = SpecRegistry.of(ALPHA)
+    scope = Scope("beta")
+    registry.add(BETA, scope)
+
+    assert registry.ids() == ("alpha", "beta")
+    assert registry.get("beta") is BETA
+
+    assert scope.close("unload").ok
+    assert registry.ids() == ("alpha",)
+    assert registry.get("beta") is None
+
+
+def test_add_is_copy_on_write_for_readers():
+    from simplyprint_ws_client.core.scope import Scope
+
+    registry = SpecRegistry.of(ALPHA)
+    before = registry.integrations()
+    scope = Scope("beta")
+    snapshot = registry._integrations
+    registry.add(BETA, scope)
+
+    assert registry._integrations is not snapshot
+    assert list(snapshot) == ["alpha"]  # a reader's view never changes
+    assert list(before) == ["alpha"]
+    scope.close("unload")
+
+
+def test_add_rejects_another_spec_under_a_taken_id():
+    import dataclasses
+
+    from simplyprint_ws_client.core.scope import Scope
+
+    registry = SpecRegistry.of(ALPHA)
+    impostor = dataclasses.replace(ALPHA, name="other")
+    with pytest.raises(ValueError, match="duplicate integration id"):
+        registry.add(impostor, Scope("x"))
+    assert registry.get("alpha") is ALPHA
+
+
+def test_add_adopts_the_spec_already_registered():
+    from simplyprint_ws_client.core.scope import Scope
+
+    registry = SpecRegistry.of(ALPHA, BETA)
+    scope = Scope("root")
+    registry.add(ALPHA, scope)
+
+    assert registry.ids() == ("alpha", "beta")
+    scope.close("stop")
+    assert registry.ids() == ("beta",)
+
+
+def test_the_undo_leaves_a_replacement_alone():
+    import dataclasses
+
+    from simplyprint_ws_client.core.scope import Scope
+
+    registry = SpecRegistry()
+    old = Scope("old")
+    registry.add(BETA, old)
+    # An update path that already swapped in a new spec must not lose it to
+    # the old scope's late undo.
+    replacement = dataclasses.replace(BETA, name="v2")
+    registry._discard("beta", BETA)
+    registry.add(replacement, Scope("new"))
+
+    old.close("late")
+    assert registry.get("beta") is replacement
+
+
+def test_register_still_works_without_a_scope():
+    registry = SpecRegistry()
+    registry.register(ALPHA)
+    assert registry.ids() == ("alpha",)
+    with pytest.raises(ValueError):
+        registry.register(ALPHA)
