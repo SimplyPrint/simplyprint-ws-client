@@ -81,6 +81,9 @@ class LoggingConfig:
     system_log_stem: Optional[str] = "system"
     max_bytes: int = DEFAULT_MAX_BYTES
     backup_count: int = DEFAULT_BACKUP_COUNT
+    #: Gzip each backup as it rotates (``gzip_rotator``); the live file stays
+    #: plain text.
+    compress_rotated: bool = True
     text_format: str = DEFAULT_TEXT_FORMAT
     date_format: str = DEFAULT_DATE_FORMAT
     json_output: bool = False
@@ -104,14 +107,18 @@ class LoggingConfig:
     def make_file_handler(self, path: Path) -> logging.handlers.RotatingFileHandler:
         from simplyprint_ws_client.common.logging.routing import (
             BatchedRotatingFileHandler,
+            gzip_rotator,
         )
 
-        return BatchedRotatingFileHandler(
+        handler = BatchedRotatingFileHandler(
             path,
             maxBytes=self.max_bytes,
             backupCount=self.backup_count,
             delay=True,
         )
+        if self.compress_rotated:
+            handler.rotator = gzip_rotator
+        return handler
 
     def formatter_for(self, kind: FormatterKind) -> logging.Formatter:
         from simplyprint_ws_client.common.logging.routing import JsonLogFormatter

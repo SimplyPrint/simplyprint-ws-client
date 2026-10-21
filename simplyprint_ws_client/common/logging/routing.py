@@ -9,11 +9,14 @@ destinations can coexist in one process.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import logging.handlers
 import os
 import queue
+import shutil
+import tempfile
 import threading
 from typing import TYPE_CHECKING, Dict
 
@@ -31,6 +34,7 @@ __all__ = [
     "JsonLogFormatter",
     "PassthroughQueueHandler",
     "BatchedRotatingFileHandler",
+    "gzip_rotator",
 ]
 
 logger = logging.getLogger(__name__)
@@ -89,6 +93,57 @@ class PassthroughQueueHandler(logging.handlers.QueueHandler):
             self.queue.put_nowait(record)
         except queue.Full:
             pass
+
+
+#: zlib's default: text logs shrink about 8-10x. Level 1 is faster but leaves
+#: noticeably more on disk, and disk wear is what this is for.
+_ROTATE_COMPRESSLEVEL = 6
+
+
+def gzip_rotator(source: str, dest: str) -> None:
+    """``RotatingFileHandler.rotator``: move ``source`` to ``dest`` gzipped.
+
+    ``dest`` keeps its ``<stem>.log.N`` name; only the content is gzip. That is
+    the layout :class:`~simplyprint_ws_client.common.logging.store.LogStore`
+    already reads (it sniffs the gzip magic) and that its
+    ``compress_rotated_files`` produces. A ``.gz`` namer would orphan the
+    backups written before it, which the handler would then never rotate out.
+
+    Runs inside ``emit``, so on the queue-listener thread, never the event loop.
+    The listener waits while a full file compresses (estimated: well under a
+    second for 30 MB on x86, several seconds on a Pi Zero 2W); records queue up
+    meanwhile. The active file stays plain text.
+
+    Compress first, then delete, so a crash or a full disk never loses the
+    backup: on any error it falls back to the plain rename the stock handler
+    does, and the periodic ``compress_rotated_files`` compresses it later.
+    """
+    if not os.path.exists(source):
+        return
+    directory = os.path.dirname(dest) or "."
+    # The temporary name has no ".log" in it, so LogStore never lists it.
+    fd, tmp = tempfile.mkstemp(prefix=".rotate-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                fileobj=raw,
+                compresslevel=_ROTATE_COMPRESSLEVEL,
+                mtime=0,
+            ) as compressed:
+                with open(source, "rb") as plain:
+                    shutil.copyfileobj(plain, compressed, 1024 * 1024)
+        os.replace(tmp, dest)
+        os.remove(source)
+    except OSError:
+        logger.debug("could not gzip %s; keeping it plain", source, exc_info=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if os.path.exists(source):
+            os.replace(source, dest)
 
 
 class BatchedRotatingFileHandler(logging.handlers.RotatingFileHandler):

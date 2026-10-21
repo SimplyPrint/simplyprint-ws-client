@@ -615,6 +615,62 @@ def test_logstore_prune_and_compress(tmp_path):
         assert handle.read(2) == b"\x1f\x8b"
 
 
+def test_rotation_gzips_backups_and_keeps_the_live_file_plain(tmp_path):
+    config = LoggingConfig(log_dir=tmp_path, max_bytes=400, backup_count=2)
+    handler = RoutingHandler(config)
+    for index in range(40):
+        handler.emit(_record(printer_logger_name("p7"), f"line {index:03d}"))
+    handler.flush()
+    handler.close()
+
+    folder = tmp_path / "p7"
+    live = (folder / "main.log").read_bytes()
+    assert not live.startswith(b"\x1f\x8b")
+    assert live.decode().rstrip().endswith("line 039")
+    for name in ("main.log.1", "main.log.2"):
+        raw = (folder / name).read_bytes()
+        assert raw[:2] == b"\x1f\x8b"
+        assert b"line " in gzip.decompress(raw)
+    # Backups keep their ".log.N" names (what LogStore reads); the backup count
+    # still holds and no temporary file is left behind.
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "main.log",
+        "main.log.1",
+        "main.log.2",
+    ]
+
+    store = LogStore(config)
+    assert [f.compressed for f in store.list_files("p7")] == [False, True, True]
+    assert "line " in store.read_text("p7", "main.log.1")
+
+
+def test_rotation_falls_back_to_a_plain_backup_when_gzip_fails(
+    tmp_path, monkeypatch
+):
+    from simplyprint_ws_client.common.logging import routing
+
+    def broken(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(routing.gzip, "GzipFile", broken)
+    source = tmp_path / "main.log"
+    source.write_text("kept\n")
+
+    routing.gzip_rotator(str(source), str(tmp_path / "main.log.1"))
+
+    assert not source.exists()
+    assert (tmp_path / "main.log.1").read_text() == "kept\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["main.log.1"]
+
+
+def test_rotation_can_be_left_uncompressed(tmp_path):
+    handler = LoggingConfig(compress_rotated=False).make_file_handler(
+        tmp_path / "main.log"
+    )
+    assert not callable(handler.rotator)
+    handler.close()
+
+
 def test_routing_clear_file_truncates_live_file(tmp_path):
     handler = RoutingHandler(LoggingConfig(log_dir=tmp_path))
     handler.emit(_record(printer_logger_name("p7"), "first line"))

@@ -400,7 +400,11 @@ class LogStore:
 
     def compress_rotated_files(self) -> None:
         """Gzip every uncompressed ``*.log.N`` backup in place (idempotent),
-        keeping the name so the rotator's backup count still holds."""
+        keeping the name so the rotator's backup count still holds.
+
+        The file handlers already gzip at rotation (``gzip_rotator``); this
+        catches backups from before that, from ``compress_rotated=False``, and
+        any the rotator had to leave plain."""
         if not self._root.exists():
             return
 
