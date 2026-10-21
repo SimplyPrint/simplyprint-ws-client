@@ -27,7 +27,17 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_future
 
@@ -78,18 +88,23 @@ class DiscoveryService:
     ) -> None:
         self.logger = logging.getLogger("discovery")
         self.event_bus = EventBus()
+        #: Per listener key, the callbacks every sighting is handed to
+        #: (``watch``). Swapped whole, like the backend maps.
+        self._watchers: Dict[str, Tuple[Callable[[Any], None], ...]] = {}
         self._multicast = {}
         for spec in multicast_specs:
             if spec.brand in self._multicast:
                 raise ValueError(f"duplicate multicast discovery spec: {spec.brand}")
             self._multicast[spec.brand] = MulticastDiscoveryBackend(
-                spec, self.event_bus
+                spec, self.event_bus, on_record=self._sighted
             )
         self._mdns = {}
         for spec in mdns_specs:
             if spec.brand in self._mdns:
                 raise ValueError(f"duplicate mdns discovery spec: {spec.brand}")
-            self._mdns[spec.brand] = MDNSDiscoveryBackend(spec, self.event_bus)
+            self._mdns[spec.brand] = MDNSDiscoveryBackend(
+                spec, self.event_bus, on_record=self._sighted
+            )
         #: Brand-owned always-on listeners (``add_listener`` / ``listeners``).
         self._listeners: Dict[str, ListenerDiscoveryBackend] = {}
         #: Raw datagram families, swept on demand (``sweep``).
@@ -119,12 +134,14 @@ class DiscoveryService:
         """
         integration_id = str(spec.id)
         multicast = (
-            MulticastDiscoveryBackend(spec.multicast, self.event_bus)
+            MulticastDiscoveryBackend(
+                spec.multicast, self.event_bus, on_record=self._sighted
+            )
             if spec.multicast is not None
             else None
         )
         mdns = (
-            MDNSDiscoveryBackend(spec.mdns, self.event_bus)
+            MDNSDiscoveryBackend(spec.mdns, self.event_bus, on_record=self._sighted)
             if spec.mdns is not None
             else None
         )
@@ -133,7 +150,9 @@ class DiscoveryService:
         if datagram is not None and datagram.always_on:
             listener_specs.append(datagram_listener(datagram))
         listeners = [
-            ListenerDiscoveryBackend(listener, self.event_bus)
+            ListenerDiscoveryBackend(
+                listener, self.event_bus, on_record=self._sighted
+            )
             for listener in listener_specs
         ]
         subnet = spec.subnet
@@ -199,7 +218,9 @@ class DiscoveryService:
         closing the scope stops it, waits for it on the host loop and drops
         its cache. Raises on a listener key already taken.
         """
-        backend = ListenerDiscoveryBackend(spec, self.event_bus)
+        backend = ListenerDiscoveryBackend(
+            spec, self.event_bus, on_record=self._sighted
+        )
         with self._lock:
             self._check_listener_keys([backend])
             self._listeners = {**self._listeners, spec.brand: backend}
@@ -210,6 +231,52 @@ class DiscoveryService:
             lambda: self._remove([backend], None, {}),
             name=f"discovery-listener:{spec.brand}",
         )
+
+    def watch(
+        self, key: str, callback: Callable[[Any], None], scope: "Scope"
+    ) -> None:
+        """Hand every sighting of the always-on listener ``key`` to
+        ``callback(record)`` until ``scope`` closes.
+
+        Called on the discovery host loop, after the record is cached and
+        before the listener's event is emitted; it must not block. A watcher
+        that raises is logged and the others still run. ``key`` need not be
+        contributed yet (a later ``add`` of it is watched too).
+        """
+        with self._lock:
+            current = self._watchers.get(key, ())
+            self._watchers = {**self._watchers, key: current + (callback,)}
+
+        def unwatch() -> None:
+            with self._lock:
+                remaining = tuple(
+                    c for c in self._watchers.get(key, ()) if c is not callback
+                )
+                watchers = {k: v for k, v in self._watchers.items() if k != key}
+                if remaining:
+                    watchers[key] = remaining
+                self._watchers = watchers
+
+        scope.on_close(unwatch, name=f"discovery-watch:{key}")
+
+    def _sighted(self, key: str, record: Any) -> None:
+        for callback in self._watchers.get(key, ()):
+            try:
+                callback(record)
+            except Exception:
+                self.logger.error(
+                    "discovery watcher for %s failed", key, exc_info=True
+                )
+
+    @staticmethod
+    def listener_keys_of(spec: "IntegrationSpec") -> List[str]:
+        """The always-on listener keys ``spec`` contributes (what ``watch``
+        takes), in the order ``add`` registers them."""
+        keys = [s.brand for s in (spec.multicast, spec.mdns) if s is not None]
+        keys.extend(listener.brand for listener in spec.listeners)
+        if spec.datagram is not None and spec.datagram.always_on:
+            keys.append(spec.datagram.brand)
+        return keys
 
     def _check_listener_keys(
         self, listeners: List[Any], reserved: Iterable[str] = ()

@@ -87,6 +87,7 @@ TConfigFactory = Union[Type[TAnyPrinterConfig], Callable[..., TAnyPrinterConfig]
 
 Discoverer = Callable[["DiscoveryService", float], Awaitable[List["DiscoveredDevice"]]]
 DiscoveryRefiner = Callable[["DiscoveredDevice"], Optional["DiscoveredDevice"]]
+Rediscoverer = Callable[[Any], Optional["DiscoveredDevice"]]
 CameraProtocolsFactory = Callable[[], Tuple[Type["BaseCameraProtocol"], ...]]
 BackgroundServiceFactory = Callable[[Any], "BackgroundService"]
 AccountProviderFactory = Callable[["ConfigManagerType"], "AccountProvider"]
@@ -182,6 +183,11 @@ class IntegrationSpec:
     listeners: Tuple["ListenerSpec", ...] = ()
     #: A raw (non-SSDP) UDP datagram family: swept on demand, or always on.
     datagram: Optional["DatagramSpec"] = None
+    #: Follow moved printers: maps a record from this spec's always-on
+    #: listeners to a device (or ``None``). When set, the host routes every
+    #: sighting to the running printer of this integration with the same
+    #: hardware identity (``Client.apply_discovered``).
+    rediscover: Optional[Rediscoverer] = None
 
     add_printer_flow_factory: Optional[FlowFactory] = None
     account_login_flow_factory: Optional[FlowFactory] = None

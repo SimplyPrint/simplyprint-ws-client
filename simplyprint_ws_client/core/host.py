@@ -23,7 +23,8 @@ printers first, the registry entry last):
 3. the background service (built now if services already started, else by
    :meth:`Host.start_services`);
 4. the camera protocols (when the settings did not fix them);
-5. discovery;
+5. discovery, plus (with ``IntegrationSpec.rediscover``) a watch on its
+   always-on listeners that routes each sighting to the printer it identifies;
 6. tasks, under a ``"<id>."`` prefix, once a task scheduler is attached;
 7. the optional ``setup`` hook;
 8. the printers, through :meth:`ClientApp.mount_domain`.
@@ -235,8 +236,10 @@ class Host:
             pool = self.app.camera_pool
             if self._mount_cameras and pool is not None:
                 pool.add_protocols(spec.camera_protocols(), scope)
-            # 5. discovery
+            # 5. discovery (and, with ``rediscover``, its sightings routed
+            # to the printer that moved)
             self.discovery.add(spec, scope)
+            self._mount_rediscovery(spec, scope)
             # 6. tasks
             self._mount_tasks(spec, scope)
             # 7. setup
@@ -264,6 +267,24 @@ class Host:
             if self._scopes.get(key) is scope:
                 self._scopes = {k: v for k, v in self._scopes.items() if k != key}
             self._reserved.discard(key)
+
+    def _mount_rediscovery(self, spec: "IntegrationSpec", scope: Scope) -> None:
+        """Watch ``spec``'s always-on listeners and route each sighting, as a
+        device, to the running printer with its identity (see
+        :meth:`ClientApp.route_discovered`). Nothing without ``rediscover``."""
+        convert = spec.rediscover
+        if convert is None:
+            return
+        key = str(spec.id)
+        app = self.app
+
+        def route(record) -> None:
+            device = convert(record)
+            if device is not None:
+                app.route_discovered(key, device)
+
+        for listener_key in self.discovery.listener_keys_of(spec):
+            self.discovery.watch(listener_key, route, scope)
 
     def _mount_account_provider(self, spec: "IntegrationSpec", scope: Scope) -> None:
         factory = spec.account_provider_factory

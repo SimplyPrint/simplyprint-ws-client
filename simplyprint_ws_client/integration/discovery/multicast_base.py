@@ -18,6 +18,7 @@ import socket
 import struct
 import sys
 from abc import abstractmethod
+from typing import Any, Callable, Optional
 
 from simplyprint_ws_client.events import EventBus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
@@ -38,12 +39,21 @@ class MulticastListenerBase(
     #: Label used in the bind-retry warning.
     port_label = "discovery"
 
-    def __init__(self, spec, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        spec,
+        event_bus: EventBus,
+        *,
+        on_record: Optional[Callable[[str, Any], None]] = None,
+    ) -> None:
         AsyncStoppable.__init__(self)
         EventLoopProvider.__init__(self)
 
         self.spec = spec
         self.event_bus = event_bus
+        #: Called with ``(spec.brand, record)`` for every cached sighting, on
+        #: the host loop (the service's rediscovery watchers).
+        self._on_record = on_record
         self.logger = logging.getLogger("discovery")
         self.devices = ExpiringDict(ttl=DEVICE_TTL)
         # blocking=True -> the async ``emit`` (the wrapped callable is awaited in
@@ -61,7 +71,15 @@ class MulticastListenerBase(
         return self.devices.values()
 
     async def _publish(self, record) -> None:
-        """Hand on one cached sighting: the spec's event, when it has one."""
+        """Hand on one cached sighting: to the watchers, then as the spec's
+        event when it has one. A failing watcher does not stop the event."""
+        if self._on_record is not None:
+            try:
+                self._on_record(self.spec.brand, record)
+            except Exception:
+                self.logger.error(
+                    "discovery watcher failed for %s", self.spec.brand, exc_info=True
+                )
         if self._emit is not None:
             await self._emit(record)
 

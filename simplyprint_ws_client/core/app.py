@@ -43,6 +43,7 @@ from simplyprint_ws_client.common.utils.stoppable import SyncStoppable
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.integration.accounts import AccountProvider
+    from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
     from simplyprint_ws_client.integration.discovery.service import DiscoveryService
 
 
@@ -365,6 +366,53 @@ class ClientApp(SyncStoppable):
         """Ids of the domains currently mounted, in mount order."""
         with self._app_lock:
             return tuple(self._domain_scopes)
+
+    def route_discovered(self, integration_id: str, device: "DiscoveredDevice") -> int:
+        """Hand a passive sighting to this integration's running printer(s)
+        with the same hardware identity; return how many changed.
+
+        One identity lookup per sighting instead of every printer filtering
+        every announcement. A device with no stable identity (nor a resolvable
+        MAC) matches nothing: it cannot be followed across an address change.
+        The match's ``apply_discovered`` re-checks identity and lets the brand
+        update its address (``Driver.discovered`` behind the v0 bridge). Runs
+        on the caller's thread (the discovery host loop for watchers); a
+        printer that raises is logged and the others still run.
+        """
+        from simplyprint_ws_client.integration.discovery.reconcile import (
+            DeviceReconciler,
+        )
+
+        identity = DeviceReconciler.resolved_hardware_identity(device)
+        if identity is None:
+            return 0
+        with self._app_lock:
+            candidates = [
+                client
+                for unique_id, domain in self._client_domains.items()
+                if domain == integration_id
+                and (client := self.client_list.get(unique_id)) is not None
+            ]
+        changed = 0
+        for client in candidates:
+            config_identity = DeviceReconciler.normalize_identity(
+                client.config.hardware_identity()
+            )
+            if config_identity != identity:
+                continue
+            apply = getattr(client, "apply_discovered", None)
+            if apply is None:
+                continue
+            try:
+                if apply(device):
+                    changed += 1
+            except Exception:
+                self.logger.warning(
+                    "printer %s failed to follow a rediscovery",
+                    client.unique_id,
+                    exc_info=True,
+                )
+        return changed
 
     def context_for(self, integration_id: str) -> ClientContext:
         """Return this integration's explicitly scoped runtime dependencies."""

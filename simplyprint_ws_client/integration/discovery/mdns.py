@@ -17,7 +17,7 @@ import errno
 import socket
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import dns.flags
 import dns.message
@@ -316,15 +316,21 @@ class MDNSDiscoveryBackend(MulticastListenerBase):
     listen_label = "mdns discovery"
     port_label = "mdns"
 
-    def __init__(self, spec: MDNSSpec, event_bus: EventBus) -> None:
-        super().__init__(spec, event_bus)
+    def __init__(
+        self,
+        spec: MDNSSpec,
+        event_bus: EventBus,
+        *,
+        on_record: Optional[Callable[[str, Any], None]] = None,
+    ) -> None:
+        super().__init__(spec, event_bus, on_record=on_record)
         # TTL'd like the device cache: a name can be re-queried once its
         # entry expires, and the set cannot grow for process lifetime.
         self._queried = ExpiringDict(ttl=DEVICE_TTL)
 
     def protocol_factory(self) -> _MDNSProtocol:
         return _MDNSProtocol(
-            self.spec, self.devices, self._emit, self.logger, self._queried
+            self.spec, self.devices, self._publish, self.logger, self._queried
         )
 
     async def bind_socket(self, sock: socket.socket) -> None:

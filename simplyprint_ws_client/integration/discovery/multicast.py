@@ -110,7 +110,7 @@ class MulticastDiscoveryBackend(MulticastListenerBase):
     spec: MulticastSpec
 
     def protocol_factory(self) -> _MulticastProtocol:
-        return _MulticastProtocol(self.spec, self.devices, self._emit, self.logger)
+        return _MulticastProtocol(self.spec, self.devices, self._publish, self.logger)
 
     async def bind_socket(self, sock: socket.socket) -> None:
         # Active specs search from an ephemeral port; passive specs bind the fixed
