@@ -40,11 +40,19 @@ class SQLiteConfigManager(ConfigManager):
                     return
 
                 for config in self.get_all():
-                    # Do not flush blank configs
-                    if config.is_empty():
-                        continue
+                    # One row per printer: a config that cannot serialize keeps
+                    # its previous row, and the others are still saved.
+                    try:
+                        # Do not flush blank configs
+                        if config.is_empty():
+                            continue
 
-                    self._flush_single(config)
+                        self._flush_single(config)
+                    except Exception:
+                        self.logger.exception(
+                            "could not save printer config %s; keeping its row",
+                            getattr(config, "unique_id", None),
+                        )
 
                 self._remove_detached()
             finally:
@@ -60,9 +68,14 @@ class SQLiteConfigManager(ConfigManager):
                 """
             ).fetchall()
 
-        for config in configs:
-            kwargs = json.loads(config[2])
-            self.persist(self.config_t.from_dict(kwargs))
+        self.unreadable = []
+        for pk, sk, data in configs:
+            try:
+                raw = json.loads(data)
+            except ValueError:
+                # Unparseable row text: still isolate it and keep the row.
+                raw = data
+            self._load_entry(raw, key=(pk, sk))
 
     def delete_storage(self):
         with self._db_lock:
@@ -120,9 +133,15 @@ class SQLiteConfigManager(ConfigManager):
             """
         ).fetchall()
 
+        # Rows we could not read are not "detached": they stay untouched so
+        # the printer comes back once a build (or a fix) can read them.
+        kept = {entry.key for entry in self.unreadable}
+
         # Loop over all configs
         for config in configs:
             # If the config is not in the manager
+            if (config[0], config[1]) in kept:
+                continue
             if self.by_key(config[0], config[1]) is None:
                 # Remove it from the database
                 self.db.execute(

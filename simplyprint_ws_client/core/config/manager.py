@@ -1,19 +1,54 @@
-__all__ = ["ConfigManager"]
+__all__ = ["ConfigManager", "UnreadableConfig"]
 
+import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, List, Optional, Type, TypeVar, Set
+from typing import Any, Generic, List, Optional, Set, Tuple, Type, TypeVar
 
 from simplyprint_ws_client.core.config import Config, PrinterConfig
 from simplyprint_ws_client.const import APP_DIRS
 
 TConfig = TypeVar("TConfig", bound=Config)
 
+_logger = logging.getLogger("config")
+
+
+@dataclass(frozen=True)
+class UnreadableConfig:
+    """One stored printer entry that could not be turned into a config.
+
+    ``raw`` is the entry exactly as it was read from storage. Stores write it
+    back verbatim (or leave its row alone), so a schema change or a hand-edit
+    gone wrong never costs the user that printer's registration -- a later build
+    that understands it, or a fixed file, brings the printer back.
+    """
+
+    raw: Any
+    error: str
+    #: The entry's ``unique_id`` when the raw data carries one, else ``None``.
+    unique_id: Optional[str] = None
+    #: The storage key, for stores that address rows by it (SQLite).
+    key: Optional[Tuple[Any, Any]] = None
+
+    @property
+    def label(self) -> str:
+        """The best identifier for logs and failure lists."""
+        if self.unique_id is not None:
+            return self.unique_id
+        if self.key is not None:
+            return "key:%s/%s" % self.key
+        return "unreadable"
+
 
 class ConfigManager(ABC, Generic[TConfig]):
     name: str
     config_t: Type[TConfig]
     configurations: Set[TConfig]
+    #: Stored entries that failed to parse on the last :meth:`load`. Kept so the
+    #: store never drops them and so the app can report them; see
+    #: :class:`UnreadableConfig`.
+    unreadable: List[UnreadableConfig]
     base_directory: Path
 
     def __init__(
@@ -32,6 +67,7 @@ class ConfigManager(ABC, Generic[TConfig]):
 
         self.config_t = config_t
         self.configurations = set()
+        self.unreadable = []
 
         # Default to user config directory if not specified
         self.base_directory = Path(base_directory or APP_DIRS.user_config_dir)
@@ -74,6 +110,37 @@ class ConfigManager(ABC, Generic[TConfig]):
 
     def remove(self, config: TConfig):
         self.configurations.remove(config)
+
+    def _load_entry(
+        self, raw: Any, key: Optional[Tuple[Any, Any]] = None
+    ) -> Optional[TConfig]:
+        """Parse and persist one stored entry, isolating its failure.
+
+        One bad entry (corrupt, written by a newer or older build, rejected by a
+        brand's validator) must not stop every other printer from loading. It is
+        logged once and kept in :attr:`unreadable` for the store to preserve.
+        Returns the loaded config, or ``None`` when the entry was unreadable.
+        """
+        try:
+            config = self.config_t.from_dict(raw)
+            self.persist(config)
+            return config
+        except Exception as e:
+            unique_id = raw.get("unique_id") if isinstance(raw, dict) else None
+            entry = UnreadableConfig(
+                raw=raw,
+                error="%s: %s" % (type(e).__name__, e),
+                unique_id=unique_id if isinstance(unique_id, str) else None,
+                key=key,
+            )
+            self.unreadable.append(entry)
+            _logger.error(
+                "%s: skipping unreadable printer config %s (kept in storage): %s",
+                self.name,
+                entry.label,
+                entry.error,
+            )
+            return None
 
     def get_all(self) -> List[TConfig]:
         return list(self.configurations)

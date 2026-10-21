@@ -55,6 +55,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
     _tasks: Dict[str, ContinuousTask]
     _last_ticked: Dict[str, datetime]
     _tick_timeout_reported: Set[str]
+    _dispatch_error_reported: Set[str]
     _tick_rate_delta: timedelta
     _to_delete: Set[str]
     _schedule_task: ContinuousTask
@@ -88,6 +89,8 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         self._tasks = {}
         self._last_ticked = {}
         self._tick_timeout_reported = set()
+        #: Clients whose scheduling dispatch raised; logged once per streak.
+        self._dispatch_error_reported = set()
         self._tick_rate_delta = timedelta(seconds=self.settings.tick_rate)
         self._to_delete = set()
         self._schedule_task = ContinuousTask(self._schedule_loop, provider=self)
@@ -125,6 +128,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         self._tasks.pop(client.unique_id, None)
         self._last_ticked.pop(client.unique_id, None)
         self._tick_timeout_reported.discard(client.unique_id)
+        self._dispatch_error_reported.discard(client.unique_id)
         self._to_delete.discard(client.unique_id)
         self.signal()
 
@@ -269,21 +273,35 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         now = datetime.now()
 
         for unique_id, client in list(self.client_list.items()):
-            # Optimization: Skip clients that do not need to be scheduled.
-            if not self._should_schedule_client(client, now):
-                continue
+            # Per client: _should_schedule_client reads client properties a
+            # subclass may override. If one raised here unguarded, the loop
+            # would abort and every client after it would never be scheduled.
+            try:
+                self._dispatch_client(unique_id, client, now)
+                self._dispatch_error_reported.discard(unique_id)
+            except Exception as e:
+                if unique_id not in self._dispatch_error_reported:
+                    self._dispatch_error_reported.add(unique_id)
+                    client.logger.error(
+                        "Error while dispatching client %s", unique_id, exc_info=e
+                    )
 
-            if unique_id not in self._tasks:
-                self._tasks[unique_id] = ContinuousTask(
-                    self._schedule_client, provider=self
-                )
+    def _dispatch_client(self, unique_id: str, client: Client, now: datetime):
+        # Optimization: Skip clients that do not need to be scheduled.
+        if not self._should_schedule_client(client, now):
+            return
 
-            task = self._tasks[unique_id]
+        if unique_id not in self._tasks:
+            self._tasks[unique_id] = ContinuousTask(
+                self._schedule_client, provider=self
+            )
 
-            if task.done():
-                task.discard()
+        task = self._tasks[unique_id]
 
-            task.schedule(client)
+        if task.done():
+            task.discard()
+
+        task.schedule(client)
 
     def _process_to_delete(self):
         """Process to_delete set."""
@@ -300,25 +318,37 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 self._to_delete.discard(client_id)
                 continue
 
-            if client.active or client.state > ClientState.NOT_CONNECTED:
-                continue
+            try:
+                if client.active or client.state > ClientState.NOT_CONNECTED:
+                    continue
+            except Exception as e:
+                # A client whose state cannot be read is deleted anyway: it
+                # is leaving, and must not block the rest of this pass.
+                client.logger.error(
+                    "Error reading state of client %s pending deletion",
+                    client_id,
+                    exc_info=e,
+                )
 
             self._delete(client)
             # SAFETY: The client will never be considered for this again
             # so this spawns a single task per added client.
-            task = self.event_loop.create_task(client.teardown())
+            task = self.event_loop.create_task(self._teardown_client(client))
             self._teardown_tasks.add(task)
-            task.add_done_callback(self._on_teardown_task_done)
+            task.add_done_callback(self._teardown_tasks.discard)
 
-    def _on_teardown_task_done(self, task) -> None:
-        self._teardown_tasks.discard(task)
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            self.logger.warning(
-                "client teardown failed",
-                exc_info=(type(error), error, error.__traceback__),
+    @staticmethod
+    async def _teardown_client(client: Client) -> None:
+        """Run one client's teardown, containing its failure.
+
+        A raising teardown is that printer's problem: it is logged against the
+        printer, and never aborts the shutdown of the others.
+        """
+        try:
+            await client.teardown()
+        except Exception as e:
+            client.logger.warning(
+                "Teardown of client %s failed", client.unique_id, exc_info=e
             )
 
     async def _teardown(self):
@@ -328,8 +358,11 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         for task in self._tasks.values():
             task.discard()
 
+        # Each teardown contains its own failure (see _teardown_client), so
+        # one raising client can neither abort this gather nor leave the other
+        # teardowns running unawaited on a loop that is about to close.
         await asyncio.gather(
-            *(client.teardown() for client in self.client_list.values())
+            *(self._teardown_client(client) for client in self.client_list.values())
         )
         await asyncio.gather(
             *(

@@ -1,11 +1,11 @@
-__all__ = ["ClientApp"]
+__all__ = ["ClientApp", "ClientStartFailure"]
 
 import asyncio
 import atexit
 import logging
 import threading
-from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, Mapping, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 from simplyprint_ws_client.core.client import (
     Client,
@@ -45,6 +45,24 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.integration.discovery.service import DiscoveryService
 
 
+@dataclass(frozen=True)
+class ClientStartFailure:
+    """Why one stored printer is not running.
+
+    One printer's broken driver or bad config must never stop the others, so
+    the app skips it, keeps its config on disk, and records it here for the UI
+    and diagnostics to show.
+    """
+
+    unique_id: str
+    integration_id: str
+    #: ``"config"``: the stored entry could not be parsed (retried on restart).
+    #: ``"build"``: persisting it or ``client_factory`` raised (retried on the
+    #: next ``add`` of this printer, e.g. after a config edit, or on restart).
+    stage: str
+    error: str
+
+
 class ClientApp(SyncStoppable):
     settings: ClientSettings
     client_list: ClientList
@@ -60,6 +78,9 @@ class ClientApp(SyncStoppable):
     #: blocking call off the loop. Created unconditionally, shut down last.
     offload: Offload
     client_context: ClientContext
+    #: Printers that could not be started, by unique id. Written under
+    #: ``_app_lock``; read it through :meth:`failed_client_ids` or copy it.
+    failed_clients: Dict[str, ClientStartFailure]
     _background_services: Mapping[str, BackgroundService]
     _account_providers: Mapping[str, "AccountProvider"]
     logger: logging.Logger
@@ -99,6 +120,7 @@ class ClientApp(SyncStoppable):
         )
         self.settings = settings
         self.client_list = ClientList()
+        self.failed_clients = {}
         self.scheduler = Scheduler(
             self.client_list,
             self.settings,
@@ -167,10 +189,16 @@ class ClientApp(SyncStoppable):
 
     async def run(self):
         try:
-            # On start, load all current configs.
+            # On start, load all current configs. Each printer starts on its
+            # own: a failure is logged and recorded by add() (or by the config
+            # store, for an entry it could not read) and the rest carry on.
             for integration_id, manager in self.config_managers.items():
+                self._record_unreadable_configs(integration_id, manager)
                 for config in manager.get_all():
-                    self.add(config, integration_id=integration_id)
+                    try:
+                        self.add(config, integration_id=integration_id)
+                    except Exception:
+                        continue  # add() logged it once and recorded it
 
             await self.scheduler.block_until_stopped()
         except Exception as e:
@@ -188,6 +216,25 @@ class ClientApp(SyncStoppable):
             self.client_context.mqtt_pools.close(),
             self.client_context.websocket_pools.close(),
         )
+
+    def _record_unreadable_configs(
+        self, integration_id: str, manager: ConfigManager[PrinterConfig]
+    ) -> None:
+        # The store already logged each entry once on load; only record them.
+        with self._app_lock:
+            for entry in manager.unreadable:
+                self.failed_clients[entry.label] = ClientStartFailure(
+                    unique_id=entry.label,
+                    integration_id=integration_id,
+                    stage="config",
+                    error=entry.error,
+                )
+
+    def failed_client_ids(self) -> List[str]:
+        """Unique ids of the stored printers that are not running because they
+        failed to load or build. Their configs are untouched on disk."""
+        with self._app_lock:
+            return sorted(self.failed_clients)
 
     def _close_unstarted_loop(self) -> None:
         """Close resources for an app whose owned loop never ran."""
@@ -270,6 +317,14 @@ class ClientApp(SyncStoppable):
     def add(
         self, config: PrinterConfig, integration_id: Optional[str] = None
     ) -> Client:
+        """Build, wire and schedule the client for ``config``.
+
+        The config is persisted first and stays persisted even if building the
+        client fails: a broken driver must not cost the user the printer's
+        registration. On failure the error is logged once, recorded in
+        :attr:`failed_clients`, and re-raised to this caller; nothing has been
+        registered, so calling ``add`` again (after a fix) retries cleanly.
+        """
         integration = self._get_integration(integration_id)
         resolved_id = str(integration.id)
         config_manager = self.config_managers[resolved_id]
@@ -278,13 +333,34 @@ class ClientApp(SyncStoppable):
             if config.unique_id in self.client_list:
                 return self.client_list[config.unique_id]
 
-            config_manager.persist(config)
-            config_manager.flush(config)
+            try:
+                config_manager.persist(config)
+                config_manager.flush(config)
+                client = integration.client_factory(
+                    config,
+                    context=self.context_for(resolved_id),
+                )
+            except Exception as e:
+                self.failed_clients[str(config.unique_id)] = ClientStartFailure(
+                    unique_id=str(config.unique_id),
+                    integration_id=resolved_id,
+                    stage="build",
+                    error="%s: %s" % (type(e).__name__, e),
+                )
+                self.logger.error(
+                    "Printer %s (%s) failed to start; its config is kept and "
+                    "the other printers are unaffected",
+                    config.unique_id,
+                    resolved_id,
+                    exc_info=e,
+                )
+                raise
 
-            client = integration.client_factory(
-                config,
-                context=self.context_for(resolved_id),
-            )
+            self.failed_clients.pop(str(config.unique_id), None)
+
+            # From here on nothing can fail per printer: listener registration
+            # is plain bookkeeping, and submit() is the single commit point
+            # that makes the client visible to the scheduler.
 
             # Coalesce + offload the chatty change flush; trigger() is a cheap,
             # thread-safe "mark dirty" (covers emits from device threads).
@@ -315,6 +391,14 @@ class ClientApp(SyncStoppable):
             client = self.client_list.get(config.unique_id)
 
             if client is None:
+                # A printer that failed to start has a stored config but no
+                # client; removing it must still delete what the user asked
+                # to delete. ``contains`` is identity-based, so this only
+                # touches this exact stored config.
+                self.failed_clients.pop(str(config.unique_id), None)
+                if config_manager.contains(config):
+                    config_manager.remove(config)
+                    config_manager.flush(config)
                 return
 
             # Do not persist further changes to the config.

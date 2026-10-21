@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from simplyprint_ws_client.core.config.manager import ConfigManager
 from simplyprint_ws_client.core.config import Config
@@ -15,20 +15,47 @@ from simplyprint_ws_client.core.files.file_backup import FileBackup
 
 class JsonConfigManager(ConfigManager):
     _file_lock: threading.Lock
+    #: The last dict each config serialized to; written in its place when a
+    #: config later fails to serialize (see flush).
+    _last_good: Dict[Config, Any]
 
     def __init__(self, *args, **kwargs):
         self._file_lock = threading.Lock()
+        self._last_good = {}
         super().__init__(*args, **kwargs)
 
     def flush(self, config: Optional[Config] = None):
         self._ensure_json_file()
 
         with self._file_lock:
-            data = [
-                json.loads(config.as_json())
-                for config in self.get_all()
-                if not config.is_empty()
-            ]
+            data = []
+            last_good: Dict[Config, Any] = {}
+            for config in self.get_all():
+                # One file holds every printer, so one config that cannot
+                # serialize must not stop the rest from being saved. It keeps
+                # its last good form: what it was loaded from, or last saved as.
+                # (A config added at runtime that never serialized was never on
+                # disk, so leaving it out loses nothing stored.)
+                try:
+                    if config.is_empty():
+                        continue
+                    entry = json.loads(config.as_json())
+                except Exception:
+                    logging.exception(
+                        "%s: could not serialize printer config %s; "
+                        "keeping its last saved form",
+                        self.name,
+                        getattr(config, "unique_id", None),
+                    )
+                    entry = self._last_good.get(config)
+                    if entry is None:
+                        continue
+                last_good[config] = entry
+                data.append(entry)
+            self._last_good = last_good
+            # Write unreadable entries back verbatim: rewriting the file from
+            # parsed configs alone would silently delete them.
+            data.extend(entry.raw for entry in self.unreadable)
             # Atomic + collision-proof: a unique temp file in the same dir is
             # replaced onto the target, so a crash mid-write can never destroy
             # the printer registry and two writers can never race on a shared
@@ -60,8 +87,18 @@ class JsonConfigManager(ConfigManager):
                     )
                 data = []
 
-            for config in data:
-                self.persist(self.config_t.from_dict(config))
+            if not isinstance(data, list):
+                # Valid JSON, but not the registry's list. Treat the whole
+                # value as one unreadable entry: it is kept (inside the list
+                # flush writes) instead of crashing the load.
+                data = [data]
+
+            self.unreadable = []
+            for raw in data:
+                config = self._load_entry(raw)
+                if config is not None:
+                    # Its on-disk form is its first "last good" one.
+                    self._last_good[config] = raw
 
     def delete_storage(self):
         with self._file_lock:
