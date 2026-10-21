@@ -24,6 +24,10 @@ thread-based scheduler was) while remaining ``async`` -- tasks are coroutines,
 blocking work offloads via ``asyncio.to_thread``, and on-demand triggers from
 another loop marshal across with ``run_coroutine_threadsafe``. APScheduler is
 imported lazily so importing this module stays dependency-light.
+
+Tasks can also be added live with :meth:`SchedulerService.add` under a
+:class:`~simplyprint_ws_client.core.scope.Scope`, before or after start; closing
+the scope removes the job, cancels the task's in-flight runs and forgets it.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from simplyprint_ws_client.core.status.registry import (
     StatusEntry,
@@ -46,6 +50,9 @@ from simplyprint_ws_client.common.asyncio.offload import install_default_executo
 from simplyprint_ws_client.integration.tasks.context import TaskContext
 from simplyprint_ws_client.integration.tasks.registry import TaskRegistry
 from simplyprint_ws_client.integration.tasks.spec import TaskSpec
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.core.scope import Scope
 
 logger = logging.getLogger("simplyprint.tasks")
 
@@ -80,6 +87,9 @@ class SchedulerService:
         self._wake_backstop: Optional[asyncio.TimerHandle] = None
         self._ready = threading.Event()
         self._started = False
+        # Guards the registry and the started/loop pair against a live add or
+        # removal racing start/shutdown from another thread.
+        self._lock = threading.Lock()
         # Single-flight: the in-flight run per (task name, key). Only ever touched
         # on the scheduler loop, so a plain dict needs no extra locking.
         self._inflight: Dict[Tuple[str, str], asyncio.Future] = {}
@@ -89,11 +99,12 @@ class SchedulerService:
     def start(self) -> None:
         """Spin up the scheduler loop/thread, register every enabled scheduled
         spec, and begin firing. Idempotent; blocks until the scheduler is up."""
-        if self._started:
-            return
-        self._started = True
-        self._ready.clear()
-        self._loop = asyncio.new_event_loop()
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._ready.clear()
+            self._loop = asyncio.new_event_loop()
         install_default_executor(
             self._loop,
             workers=2,
@@ -118,10 +129,11 @@ class SchedulerService:
     def shutdown(self) -> None:
         """Stop firing and tear down the loop/thread. Idempotent. In-flight runs
         are cancelled past a short join grace."""
-        if not self._started or self._loop is None:
-            return
-        self._started = False
-        loop = self._loop
+        with self._lock:
+            if not self._started or self._loop is None:
+                return
+            self._started = False
+            loop = self._loop
 
         def _stop() -> None:
             if self._scheduler is not None and self._scheduler.running:
@@ -190,26 +202,123 @@ class SchedulerService:
     def _schedule_all(self) -> None:
         assert self._scheduler is not None
         startup_index = 0
-        for spec in self._registry.specs():
+        with self._lock:
+            specs = list(self._registry.specs())
+        for spec in specs:
             if not spec.enabled or spec.on_demand_only:
                 continue
-
-            trigger, trigger_kwargs = self._trigger_for(spec)
-            job_kwargs: Dict[str, Any] = {
-                "id": spec.name,
-                "name": spec.name,
-                "args": [spec.name],
-                "max_instances": spec.max_instances,
-                "coalesce": spec.coalesce,
-                "misfire_grace_time": spec.misfire_grace_time,
-            }
+            next_run_time = None
             if spec.run_at_startup:
-                job_kwargs["next_run_time"] = (
+                next_run_time = (
                     datetime.now() + _STARTUP_DELAY + _STARTUP_STAGGER * startup_index
                 )
                 startup_index += 1
+            self._add_job(spec, next_run_time)
 
-            self._scheduler.add_job(self._fire, trigger, **trigger_kwargs, **job_kwargs)
+    def _add_job(self, spec: TaskSpec, next_run_time: Optional[datetime]) -> None:
+        assert self._scheduler is not None
+        trigger, trigger_kwargs = self._trigger_for(spec)
+        job_kwargs: Dict[str, Any] = {
+            "id": spec.name,
+            "name": spec.name,
+            "args": [spec.name],
+            "max_instances": spec.max_instances,
+            "coalesce": spec.coalesce,
+            "misfire_grace_time": spec.misfire_grace_time,
+        }
+        if next_run_time is not None:
+            job_kwargs["next_run_time"] = next_run_time
+        self._scheduler.add_job(self._fire, trigger, **trigger_kwargs, **job_kwargs)
+
+    # ----------------------------------------------------------- live add/remove
+
+    def add(self, task: TaskSpec, scope: "Scope") -> None:
+        """Register ``task`` until ``scope`` closes; works before or after start.
+
+        Before start the task is scheduled with the rest when the scheduler
+        comes up; after start it goes on the timer at once (a ``run_at_startup``
+        task first fires after the usual startup delay). Closing the scope
+        removes the job, cancels the task's in-flight runs and waits for them,
+        then forgets the spec. Raises on a duplicate name.
+        """
+        with self._lock:
+            self._registry.register(task)
+            loop = self._loop if self._started else None
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._schedule_live, task)
+            except RuntimeError:  # the loop closed under us: start reschedules it
+                pass
+        scope.on_close(lambda: self._unregister(task), name="task:%s" % task.name)
+
+    def _schedule_live(self, spec: TaskSpec) -> None:
+        """On the scheduler loop: put a live-added spec on the timer once."""
+        if self._scheduler is None or not spec.enabled or spec.on_demand_only:
+            return
+        with self._lock:
+            current = self._registry.specs_by_name().get(spec.name)
+        if current is not spec or self._scheduler.get_job(spec.name) is not None:
+            return  # removed meanwhile, or _schedule_all already picked it up
+        next_run_time = datetime.now() + _STARTUP_DELAY if spec.run_at_startup else None
+        self._add_job(spec, next_run_time)
+
+    def _unregister(self, task: TaskSpec):
+        with self._lock:
+            loop = self._loop if self._started else None
+            if loop is None:
+                self._registry.remove(task)
+                return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._unschedule(task), loop)
+        except RuntimeError:  # the loop closed under us
+            with self._lock:
+                self._registry.remove(task)
+            return None
+
+        async def wait() -> None:
+            await await_concurrent_future(future)
+
+        return wait()
+
+    async def _unschedule(self, task: TaskSpec) -> None:
+        """On the scheduler loop: drop the job, cancel and await in-flight runs."""
+        with self._lock:
+            owned = self._registry.remove(task)
+        if not owned:
+            return
+        if self._scheduler is not None and self._scheduler.get_job(task.name):
+            self._scheduler.remove_job(task.name)
+        runs = [
+            run for (name, _key), run in list(self._inflight.items()) if name == task.name
+        ]
+        for run in runs:
+            run.cancel()
+        if runs:
+            await asyncio.gather(*runs, return_exceptions=True)
+        self._health.pop(task.name, None)
+
+    def job_ids(self) -> Tuple[str, ...]:
+        """The ids of the jobs currently on the timer (empty when not started)."""
+        loop = self._loop
+        if not self._started or loop is None or self._scheduler is None:
+            return ()
+        scheduler = self._scheduler
+
+        def collect() -> Tuple[str, ...]:
+            return tuple(job.id for job in scheduler.get_jobs())
+
+        if loop.is_running() and threading.current_thread() is not self._thread:
+            future: concurrent.futures.Future = concurrent.futures.Future()
+
+            def run() -> None:
+                try:
+                    future.set_result(collect())
+                except BaseException as error:  # noqa: BLE001
+                    future.set_exception(error)
+
+            loop.call_soon_threadsafe(run)
+            return future.result(timeout=10)
+        return collect()
 
     @staticmethod
     def _trigger_for(spec: TaskSpec) -> Tuple[Any, Dict[str, Any]]:

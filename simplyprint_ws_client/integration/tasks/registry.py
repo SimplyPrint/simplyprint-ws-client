@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
-from typing import Callable, Dict, Optional, ValuesView
+from typing import TYPE_CHECKING, Callable, Dict, Optional, ValuesView
 
 from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.core.scope import Scope
+    from simplyprint_ws_client.integration.tasks.scheduler import SchedulerService
+
+__all__ = ["ScopedTaskRegistry", "TaskRegistry"]
 
 
 class TaskRegistry:
@@ -63,12 +70,56 @@ class TaskRegistry:
         flat global namespace so on-demand triggers and logs are unambiguous."""
         if spec.name in self._specs:
             raise ValueError(f"duplicate task name: {spec.name!r}")
-        self._specs[spec.name] = spec
+        # Copy-on-write: the scheduler iterates specs() while a live add or
+        # removal may land from another thread.
+        specs = dict(self._specs)
+        specs[spec.name] = spec
+        self._specs = specs
+
+    def remove(self, spec: TaskSpec) -> bool:
+        """Drop ``spec`` if it is the one registered under its name."""
+        if self._specs.get(spec.name) is not spec:
+            return False
+        specs = dict(self._specs)
+        del specs[spec.name]
+        self._specs = specs
+        return True
 
     def get(self, name: str) -> TaskSpec:
         """The spec registered under ``name`` (``KeyError`` if absent)."""
         return self._specs[name]
 
+    def specs_by_name(self) -> Dict[str, TaskSpec]:
+        """A snapshot of ``{name: spec}``."""
+        return dict(self._specs)
+
     def specs(self) -> ValuesView[TaskSpec]:
         """Every registered spec, in registration order."""
         return self._specs.values()
+
+
+class ScopedTaskRegistry(TaskRegistry):
+    """The registrar one mounted domain sees.
+
+    Every task registered through it goes straight onto ``scheduler`` under
+    ``scope`` (live, before or after start) and is removed when the scope
+    closes. Names are qualified as ``"<prefix>.<name>"`` so two domains cannot
+    collide; a name that already starts with ``"<prefix>."`` is kept as is.
+    """
+
+    def __init__(
+        self, scheduler: "SchedulerService", scope: "Scope", *, prefix: str
+    ) -> None:
+        super().__init__()
+        self._scheduler = scheduler
+        self._scope = scope
+        self._prefix = prefix
+
+    def qualify(self, name: str) -> str:
+        head = self._prefix + "."
+        return name if name.startswith(head) else head + name
+
+    def register(self, spec: TaskSpec) -> None:
+        scoped = replace(spec, name=self.qualify(spec.name))
+        self._scheduler.add(scoped, self._scope)
+        super().register(scoped)

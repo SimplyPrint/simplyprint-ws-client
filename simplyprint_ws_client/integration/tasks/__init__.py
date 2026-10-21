@@ -35,7 +35,10 @@ Example -- a producer codes against this contract::
 """
 
 from simplyprint_ws_client.integration.tasks.context import TaskContext
-from simplyprint_ws_client.integration.tasks.registry import TaskRegistry
+from simplyprint_ws_client.integration.tasks.registry import (
+    ScopedTaskRegistry,
+    TaskRegistry,
+)
 from simplyprint_ws_client.integration.tasks.scheduler import SchedulerService
 from simplyprint_ws_client.integration.tasks.spec import TaskFn, TaskSpec
 
@@ -43,6 +46,7 @@ __all__ = [
     "TaskSpec",
     "TaskFn",
     "TaskRegistry",
+    "ScopedTaskRegistry",
     "TaskContext",
     "SchedulerService",
 ]

@@ -4,6 +4,12 @@ Where a camera runs follows its protocol (see :meth:`CameraPool._route`): an asy
 protocol is a task on the consumer loop, a sync one runs in the shared worker
 processes of :class:`WorkerPool` -- a thread each, spread over at most one
 process per core, with no limit on the number of cameras.
+
+Protocols come from two places: the plain ``protocols`` list (fixed for the
+pool's life) and :meth:`CameraPool.add_protocols`, which contributes a group
+under a :class:`~simplyprint_ws_client.core.scope.Scope` and removes exactly
+that group, by token, when the scope closes. Cameras already created keep
+their protocol instance; removal only affects which protocol new cameras get.
 """
 
 from __future__ import annotations
@@ -15,7 +21,17 @@ import os
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Type, final
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    final,
+)
 
 from yarl import URL
 
@@ -32,6 +48,9 @@ from simplyprint_ws_client.common.utils.stoppable import ProcessStoppable
 from simplyprint_ws_client.common.utils.synchronized import Synchronized
 from simplyprint_ws_client.common.worker.context import ExecutionContext
 from simplyprint_ws_client.common.worker.pool import WorkerHandle, WorkerPool
+
+if TYPE_CHECKING:
+    from simplyprint_ws_client.core.scope import Scope
 
 
 #: Frames queued for the loop per camera. Latest wins: a newer frame replaces
@@ -300,6 +319,10 @@ class CameraPool(ProcessStoppable, Synchronized):
         Synchronized.__init__(self)
 
         self.protocols = []
+        # (token, protocols) groups contributed under a scope; copy-on-write.
+        self._scoped_protocols: Tuple[
+            Tuple[object, Tuple[Type[BaseCameraProtocol], ...]], ...
+        ] = ()
         self.allocations = {}
         self._provider = event_loop_provider or EventLoopProvider.default()
         if process_workers < 0:
@@ -315,6 +338,36 @@ class CameraPool(ProcessStoppable, Synchronized):
         )
         self.process_workers = self._workers.max_processes
         self._id_counter = 0
+
+    def add_protocols(
+        self, protocols: Iterable[Type[BaseCameraProtocol]], scope: "Scope"
+    ) -> None:
+        """Offer ``protocols`` to new cameras until ``scope`` closes.
+
+        They are tried after the ones already present, in the given order. The
+        undo removes this group by token, so the same class contributed by two
+        scopes (or equal to one already listed) stays until its own scope goes.
+        """
+        group = tuple(protocols)
+        if not group:
+            return
+        token = object()
+        with self:
+            self._scoped_protocols = self._scoped_protocols + ((token, group),)
+        scope.on_close(lambda: self._remove_protocols(token), name="camera-protocols")
+
+    def _remove_protocols(self, token: object) -> None:
+        with self:
+            self._scoped_protocols = tuple(
+                entry for entry in self._scoped_protocols if entry[0] is not token
+            )
+
+    def all_protocols(self) -> Tuple[Type[BaseCameraProtocol], ...]:
+        """Every protocol a new camera may get, in the order they are tried."""
+        scoped = self._scoped_protocols
+        return tuple(self.protocols) + tuple(
+            protocol for _token, group in scoped for protocol in group
+        )
 
     def _release(self, camera_id: int) -> None:
         with self:
@@ -334,7 +387,7 @@ class CameraPool(ProcessStoppable, Synchronized):
         return bool(result)
 
     def _select_protocol(self, uri: URL) -> Optional[BaseCameraProtocol]:
-        for protocol_cls in self.protocols:
+        for protocol_cls in self.all_protocols():
             if self._matches(protocol_cls, uri):
                 return protocol_cls(uri)
         return None
