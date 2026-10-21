@@ -15,7 +15,7 @@ dependencies = [
     # The open printer SDK. The merge-and-diff models (common.model) and the
     # G-code parser (common.utils.gcode_parser) are re-exported from it, so the
     # framework and the brands share one copy of each class.
-    "simplyprint-sdk[pydantic]>=0.1.0,<0.2",
+    "simplyprint-sdk[pydantic]>=0.1.1,<0.2",
     "psutil>=6.0.0,<7",
     "netifaces-plus==0.12.4",
     "sentry-sdk>=2.35.1,<3",
