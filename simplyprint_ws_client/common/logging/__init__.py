@@ -12,6 +12,11 @@ rendered differently per destination.
 Two entry points: :func:`setup_logging` (the low-level primitive; returns the
 listener ``stop``) and :func:`configure_logging` (adds a :class:`LogStore` for
 browsing/retention, returned together as a :class:`LoggingFacility`).
+
+Where levels are decided: :class:`LoggingPolicy` (per sink, printer vs system),
+lowered for development in :func:`_resolve_config`, and opened up at runtime
+through :meth:`LoggingFacility.set_debug`. Where records go: the routing rules
+in :class:`LoggingConfig`.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import logging
 import logging.handlers
 import queue
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Tuple
 
 from simplyprint_ws_client.common.logging.config import LoggingConfig, RoutingRule
 from simplyprint_ws_client.common.logging.naming import (
@@ -36,6 +41,8 @@ from simplyprint_ws_client.common.logging.policy import (
     LOG_TARGET_LIVE,
     LOG_TARGET_QUEUE,
     LOG_TARGET_STREAM,
+    DEBUG_ALL,
+    DebugOverrides,
     LoggingPolicy,
     LoggingPolicyFilter,
 )
@@ -58,6 +65,8 @@ __all__ = [
     "LoggingConfig",
     "LoggingPolicy",
     "LoggingPolicyFilter",
+    "DEBUG_ALL",
+    "DebugOverrides",
     "LOG_TARGET_FILE",
     "LOG_TARGET_LIVE",
     "LOG_TARGET_QUEUE",
@@ -126,6 +135,26 @@ class LoggingFacility:
     store: LogStore
     stop: Callable[[], None]
     config: LoggingConfig
+
+    def set_debug(self, entries: Mapping[str, Optional[float]]) -> None:
+        """Turn DEBUG on at runtime, replacing any earlier overrides.
+
+        ``entries`` maps :data:`DEBUG_ALL` (the whole process) or a printer
+        ``unique_id`` to a wall-clock expiry (``time.time()`` seconds) or
+        ``None`` (until turned off); ``{}`` turns runtime debugging off. Takes
+        effect for the next record: the policy every sink reads is updated and
+        the logger thresholds are lowered in place.
+        """
+        self.config.policy.debug.set(entries)
+        self.config.policy.refresh_logger_levels()
+
+    def expire_debug(self) -> None:
+        """Drop expired overrides and raise the logger thresholds back.
+
+        Expired overrides already stop matching on their own; call this
+        periodically so the loggers also stop *creating* the DEBUG records."""
+        if self.config.policy.debug.expire():
+            self.config.policy.refresh_logger_levels()
 
 
 def _resolve_config(settings: "ClientSettings", config: LoggingConfig) -> LoggingConfig:

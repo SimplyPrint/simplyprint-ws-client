@@ -17,6 +17,12 @@ import pytest
 from simplyprint_ws_client import ClientSettings
 from simplyprint_ws_client.common.logging import (
     configure_logging,
+    DEBUG_ALL,
+    DebugOverrides,
+    LOG_TARGET_FILE,
+    LOG_TARGET_LIVE,
+    LOG_TARGET_STREAM,
+    LoggingPolicy,
     LoggingConfig,
     LogNotFound,
     LogStore,
@@ -405,6 +411,122 @@ def test_development_keeps_debug_on_disk(tmp_path):
     assert facility.config.policy.printer_file_level == logging.DEBUG
     assert "mqtt debug" in (tmp_path / "p7" / "mqtt.log").read_text()
     assert "system debug" in (tmp_path / "system.log").read_text()
+
+
+def test_runtime_debug_for_one_printer_reaches_its_files_only(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    p7 = logging.getLogger(printer_logger_name("p7", "mqtt"))
+    p8 = logging.getLogger(printer_logger_name("p8", "mqtt"))
+    try:
+        p7.debug("before")
+        # No restart, no reconfigure: the same handlers pick it up.
+        facility.set_debug({"p7": None})
+        p7.debug("during")
+        p8.debug("other printer debug")
+        p8.info("other printer info")
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger("supervisor").info("system info")
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    p7_log = (tmp_path / "p7" / "mqtt.log").read_text()
+    assert "during" in p7_log
+    assert "before" not in p7_log
+    assert "other printer debug" not in (tmp_path / "p8" / "mqtt.log").read_text()
+    assert "system debug" not in (tmp_path / "system.log").read_text()
+
+
+def test_runtime_debug_process_wide_lowers_the_root_level_in_place(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    try:
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+        facility.set_debug({DEBUG_ALL: None})
+        assert logging.getLogger().getEffectiveLevel() == logging.DEBUG
+        # Noisy third-party loggers stay clamped even then.
+        assert (
+            logging.getLogger("websockets.client").getEffectiveLevel()
+            == logging.WARNING
+        )
+        logging.getLogger("supervisor").debug("system debug")
+        logging.getLogger(printer_logger_name("p7", "mqtt")).debug("mqtt debug")
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+    assert "system debug" in (tmp_path / "system.log").read_text()
+    assert "mqtt debug" in (tmp_path / "p7" / "mqtt.log").read_text()
+
+
+def test_runtime_debug_off_raises_the_root_level_back(tmp_path):
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"), LoggingConfig(log_dir=tmp_path)
+    )
+    try:
+        facility.set_debug({DEBUG_ALL: None})
+        facility.set_debug({})
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+        assert facility.config.policy.debug.active() == {}
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+
+def test_runtime_debug_expires():
+    now = [1000.0]
+    overrides = DebugOverrides(clock=lambda: now[0])
+    policy = LoggingPolicy(debug=overrides)
+    overrides.set({"a.b": 1060.0})  # a dotted uid is one logger-name segment
+    covered = _record(printer_logger_name("a.b", "mqtt"), level=logging.DEBUG)
+    other = _record(printer_logger_name("p8", "mqtt"), level=logging.DEBUG)
+
+    assert policy.allows(covered, LOG_TARGET_FILE)
+    assert policy.allows(covered, LOG_TARGET_LIVE)
+    assert not policy.allows(covered, LOG_TARGET_STREAM)  # never the console
+    assert not policy.allows(other, LOG_TARGET_FILE)
+    assert overrides.active() == {"a.b": 1060.0}
+
+    now[0] = 1060.0
+    assert not policy.allows(covered, LOG_TARGET_FILE)  # stops matching at once
+    assert overrides.active() == {}
+    assert overrides.expire() is True
+    assert overrides.expire() is False
+
+
+def test_runtime_debug_set_drops_entries_already_expired():
+    overrides = DebugOverrides(clock=lambda: 1000.0)
+    overrides.set({DEBUG_ALL: 999.0, "p7": None})
+    assert overrides.active() == {"p7": None}
+    assert not overrides.covers_all()
+
+
+def test_expire_debug_raises_logger_levels_back(tmp_path):
+    now = [1000.0]
+    policy = LoggingPolicy(debug=DebugOverrides(clock=lambda: now[0]))
+    facility = configure_logging(
+        ClientSettings(name="BambuClient"),
+        LoggingConfig(log_dir=tmp_path, policy=policy),
+    )
+    try:
+        facility.set_debug({DEBUG_ALL: 1060.0})
+        assert logging.getLogger().getEffectiveLevel() == logging.DEBUG
+        now[0] = 1061.0
+        facility.expire_debug()
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+    finally:
+        facility.stop()
+        logging.basicConfig(handlers=[], force=True)
+
+
+def test_debug_overrides_do_not_change_policy_equality():
+    # The frozen policy is an lru_cache key; the mutable switch stays out of it.
+    assert LoggingPolicy() == LoggingPolicy()
+    assert hash(LoggingPolicy()) == hash(LoggingPolicy())
 
 
 def _write(path, text):
