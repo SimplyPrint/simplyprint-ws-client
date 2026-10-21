@@ -13,9 +13,17 @@ from typing import Any, Dict, List, Optional
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
-from simplyprint_ws_client.common.model import Atomic, ExtraInfo, SimpleUpdateModel
+from simplyprint_sdk.pydantic import _MERGE_PLANS  # the engine's own plan cache
+
+from simplyprint_ws_client.common.model import (
+    Atomic,
+    ExtraInfo,
+    SimpleUpdateModel,
+    updated_fields_pretty_print,
+    updated_fields_substitute_new,
+)
 from simplyprint_ws_client.common.model.annotations import is_extra
-from simplyprint_ws_client.common.model.diff import UpdatedField, _MERGE_PLANS
+from simplyprint_ws_client.common.model.diff import UpdatedField
 
 from tests._reference_update_model import reference_update_model
 
@@ -255,6 +263,78 @@ def test_temperature_only_report_merges_like_the_reference():
     for temp in (200.0, 201.0, 201.0, 199.5):
         report = _Root(print=_Print(nozzle_temper=temp, t_utc=1))
         assert _merge_both(fast, ref, report)
+
+
+def test_a_bambu_like_session_merges_like_the_reference():
+    """A full push, temperature ticks, an AMS swap, list growth and shrink, an
+    equal atomic value, and an overridden merge, in the order a printer sends
+    them. (From the client's former SDK-vs-framework parity test.)"""
+    full = _Root(
+        print=_Print(
+            nozzle_temper=200.0,
+            bed_temper=60.0,
+            gcode_state="RUNNING",
+            stage="printing",
+            ams=_Ams(
+                ams=[
+                    _Unit(
+                        id="0",
+                        tray=[_Tray(id="0", color="FF0000") for _ in range(4)],
+                    )
+                ],
+                tray_now="0",
+            ),
+            hms=[{"attr": 1}],
+            lights=[_Cam(url="a", on=True)],
+            t_utc=1,
+        ),
+        seq=1,
+    )
+    reports = [
+        full,
+        _Root(print=_Print(nozzle_temper=201.0, t_utc=2)),
+        _Root(print=_Print(nozzle_temper=201.0, t_utc=3)),  # no change
+        _Root(
+            print=_Print(
+                ams=_Ams(ams=[_Unit(tray=[_Tray(), _Tray(color="00FF00")])])
+            )
+        ),
+        _Root(print=_Print(ams=_Ams(ams=[_Unit(id="0"), _Unit(id="1")]))),  # grows
+        _Root(print=_Print(ams=_Ams(ams=[]))),  # shrinks
+        _Root(print=_Print(hms=[{"attr": 1}])),  # atomic, equal value
+        _Root(print=_Print(hms=[])),
+        _Root(print=_Print(lights=[_Cam(on=False)], gcode_state="FINISH")),
+        _Root(print=_Print(custom=_Custom(seen=3)), info=_Cam(url="b")),
+    ]
+    fast = _Root(print=_Print())
+    ref = copy.deepcopy(fast)
+    for report in reports:
+        assert _merge_both(fast, ref, report)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_change_set_helpers_drop_what_did_not_change(seed):
+    """``updated_fields_substitute_new`` keeps exactly the leaves whose value
+    changed, as their new value; ``pretty_print`` is its ``repr``."""
+    rng = random.Random(2000 + seed)
+    state = _Root(print=_Print())
+
+    def expected(diff):
+        if isinstance(diff, UpdatedField):
+            return diff.new if diff.old != diff.new else None
+        if isinstance(diff, list):
+            return [expected(v) for v in diff]
+        if isinstance(diff, dict):
+            kept = {k: expected(v) for k, v in diff.items()}
+            return {k: v for k, v in kept.items() if v is not None} or None
+        return diff
+
+    for _ in range(10):
+        diff = _run(type(state).update_model, state, _report(rng))
+        if isinstance(diff, Exception):
+            return
+        assert updated_fields_substitute_new(diff) == expected(diff)
+        assert updated_fields_pretty_print(diff) == repr(expected(diff))
 
 
 def test_self_merge_matches_the_reference():

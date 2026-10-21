@@ -12,6 +12,12 @@ are the spots where a union is evaluated on import:
 * ``isinstance`` / ``issubclass`` with a union.
 
 Use ``typing.Optional`` / ``typing.Union`` there instead.
+
+The merge-and-diff engine and the G-code parser are re-exported from
+``simplyprint_sdk`` (a dependency), so their source is no longer scanned here:
+the SDK holds the same 3.9 floor with its own guard (its
+``tests/test_python39.py``, run on 3.9 in its CI). The 3.9 CI job here imports
+them on a real 3.9 all the same.
 """
 
 import ast

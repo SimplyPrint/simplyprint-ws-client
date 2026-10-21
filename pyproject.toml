@@ -12,6 +12,10 @@ keywords = [
     "client",
 ]
 dependencies = [
+    # The open printer SDK. The merge-and-diff models (common.model) and the
+    # G-code parser (common.utils.gcode_parser) are re-exported from it, so the
+    # framework and the brands share one copy of each class.
+    "simplyprint-sdk[pydantic]>=0.1.0,<0.2",
     "psutil>=6.0.0,<7",
     "netifaces-plus==0.12.4",
     "sentry-sdk>=2.35.1,<3",
@@ -53,6 +57,10 @@ websocket-client = [
 uvloop = [
     "uvloop>=0.21.0",
 ]
+
+[tool.uv.sources]
+# Local development: the SDK's own checkout, editable, until it is published.
+simplyprint-sdk = { path = "/root/stuff/work/simplyprint-sdk", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
