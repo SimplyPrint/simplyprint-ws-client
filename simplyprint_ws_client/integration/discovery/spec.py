@@ -18,6 +18,7 @@ from simplyprint_ws_client.events import Event
 from simplyprint_ws_client.integration.discovery.ssdp import SSDPRequest
 
 if TYPE_CHECKING:
+    from simplyprint_ws_client.integration.discovery.listener import ListenerProtocol
     from simplyprint_ws_client.integration.discovery.network import HostProbeContext
     from simplyprint_ws_client.integration.discovery.mdns import MDNSResponse
 
@@ -124,3 +125,32 @@ class MDNSSpec(Generic[DiscoveredRecord]):
     port: int = 5353
     query_interval: float = 30.0
     multicast_ttl: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ListenerSpec(Generic[DiscoveredRecord]):
+    """A brand-owned always-on datagram listener, hosted sans-I/O.
+
+    The host binds one UDP socket as described here, on the discovery host's
+    shared loop, and drives a fresh ``protocol()`` (a
+    :class:`~simplyprint_ws_client.integration.discovery.listener.ListenerProtocol`)
+    with its datagrams and timers. ``brand`` is the listener's key: unique
+    among every always-on listener (multicast, mDNS and these), so a brand
+    that also has an SSDP or mDNS listener names this one apart (for example
+    ``"<id>.broadcast"``).
+    """
+
+    brand: str
+    #: A fresh protocol per run (a relaunched listener starts clean).
+    protocol: Callable[[], "ListenerProtocol"]
+    #: Stable cache key for a sighted record.
+    key: Callable[[DiscoveredRecord], str]
+    #: Port to bind; ``0`` binds an ephemeral one (hears replies only).
+    port: int = 0
+    #: Multicast group to join, if any.
+    group: Optional[str] = None
+    #: Allow sends to a broadcast address.
+    broadcast: bool = False
+    multicast_ttl: Optional[int] = None
+    #: Event emitted for each sighting; ``None`` only caches.
+    event_type: Optional[type[Event]] = None

@@ -14,6 +14,13 @@ the supervisor can shut discovery down like any other background service.
 :class:`~simplyprint_ws_client.core.scope.Scope`, live: its listeners join the
 running host loop, and closing the scope stops them and drops its subnet and
 service entries. The maps are copy-on-write, so readers never lock.
+
+:meth:`DiscoveryService.add_listener` (or ``IntegrationSpec.listeners``)
+does the same for a brand-owned always-on listener: a
+:class:`~simplyprint_ws_client.integration.discovery.spec.ListenerSpec`
+whose sans-I/O protocol the host feeds from a socket it owns (see
+:mod:`~simplyprint_ws_client.integration.discovery.listener`). Every
+always-on listener shares one key space.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_fut
 from simplyprint_ws_client.events import EventBus
 
 from simplyprint_ws_client.integration.discovery.host import DiscoveryServiceHost
+from simplyprint_ws_client.integration.discovery.listener import (
+    ListenerDiscoveryBackend,
+)
 from simplyprint_ws_client.integration.discovery.mdns import MDNSDiscoveryBackend
 from simplyprint_ws_client.integration.discovery.multicast import (
     MulticastDiscoveryBackend,
@@ -39,6 +49,7 @@ from simplyprint_ws_client.integration.discovery.network import (
     service_diagnostic_check,
 )
 from simplyprint_ws_client.integration.discovery.spec import (
+    ListenerSpec,
     MDNSSpec,
     MulticastSpec,
     NetworkServiceSpec,
@@ -74,6 +85,8 @@ class DiscoveryService:
             if spec.brand in self._mdns:
                 raise ValueError(f"duplicate mdns discovery spec: {spec.brand}")
             self._mdns[spec.brand] = MDNSDiscoveryBackend(spec, self.event_bus)
+        #: Brand-owned always-on listeners (``add_listener`` / ``listeners``).
+        self._listeners: Dict[str, ListenerDiscoveryBackend] = {}
         self._restart_interval = restart_interval
         self._host: DiscoveryServiceHost | None = None
         self._subnet = {spec.brand: spec for spec in subnet_specs}
@@ -107,6 +120,10 @@ class DiscoveryService:
             if spec.mdns is not None
             else None
         )
+        listeners = [
+            ListenerDiscoveryBackend(listener, self.event_bus)
+            for listener in spec.listeners
+        ]
         subnet = spec.subnet
         services: Dict[str, Any] = {}
         if spec.network_services:
@@ -121,6 +138,10 @@ class DiscoveryService:
                 )
             if mdns is not None and mdns.spec.brand in self._mdns:
                 raise ValueError(f"duplicate mdns discovery spec: {mdns.spec.brand}")
+            self._check_listener_keys(
+                listeners,
+                reserved=[b.spec.brand for b in (multicast, mdns) if b is not None],
+            )
             if subnet is not None and subnet.brand in self._subnet:
                 raise ValueError(f"duplicate subnet discovery spec: {subnet.brand}")
             services = {
@@ -132,12 +153,17 @@ class DiscoveryService:
                 self._multicast = {**self._multicast, multicast.spec.brand: multicast}
             if mdns is not None:
                 self._mdns = {**self._mdns, mdns.spec.brand: mdns}
+            if listeners:
+                self._listeners = {
+                    **self._listeners,
+                    **{backend.spec.brand: backend for backend in listeners},
+                }
             if subnet is not None:
                 self._subnet = {**self._subnet, subnet.brand: subnet}
             if services:
                 self._network_services = {**self._network_services, **services}
             host = self._host if not self._stopped else None
-            backends = [b for b in (multicast, mdns) if b is not None]
+            backends = [b for b in (multicast, mdns) if b is not None] + listeners
             if host is not None:
                 for backend in backends:
                     host.add_backend(backend)
@@ -146,6 +172,41 @@ class DiscoveryService:
             lambda: self._remove(backends, subnet, services),
             name=f"discovery:{integration_id}",
         )
+
+    def add_listener(self, spec: ListenerSpec, scope: "Scope") -> None:
+        """Run the brand-owned listener ``spec`` until ``scope`` closes.
+
+        The host binds its socket on the shared discovery loop (at once when
+        running, else at start) and drives a fresh ``spec.protocol()``;
+        closing the scope stops it, waits for it on the host loop and drops
+        its cache. Raises on a listener key already taken.
+        """
+        backend = ListenerDiscoveryBackend(spec, self.event_bus)
+        with self._lock:
+            self._check_listener_keys([backend])
+            self._listeners = {**self._listeners, spec.brand: backend}
+            host = self._host if not self._stopped else None
+            if host is not None:
+                host.add_backend(backend)
+        scope.on_close(
+            lambda: self._remove([backend], None, {}),
+            name=f"discovery-listener:{spec.brand}",
+        )
+
+    def _check_listener_keys(
+        self, listeners: List[Any], reserved: Iterable[str] = ()
+    ) -> None:
+        """Raise when a new listener's key is taken: every always-on listener
+        (multicast, mDNS, brand-owned) shares the host's key space. Called
+        under the lock."""
+        taken = (
+            set(self._multicast) | set(self._mdns) | set(self._listeners)
+        ) | set(reserved)
+        for backend in listeners:
+            key = backend.spec.brand
+            if key in taken:
+                raise ValueError(f"duplicate discovery listener key: {key}")
+            taken.add(key)
 
     def _remove(
         self,
@@ -159,6 +220,9 @@ class DiscoveryService:
             }
             mdns = {k: v for k, v in self._mdns.items() if v not in backends}
             self._multicast, self._mdns = multicast, mdns
+            self._listeners = {
+                k: v for k, v in self._listeners.items() if v not in backends
+            }
             if subnet is not None and self._subnet.get(subnet.brand) is subnet:
                 self._subnet = {
                     k: v for k, v in self._subnet.items() if k != subnet.brand
@@ -188,8 +252,9 @@ class DiscoveryService:
         return wait()
 
     def backend_keys(self) -> List[str]:
-        """Keys of the multicast and mDNS listeners currently contributed."""
-        return list(self._multicast) + list(self._mdns)
+        """Keys of the always-on listeners currently contributed (multicast,
+        mDNS, then brand-owned)."""
+        return list(self._multicast) + list(self._mdns) + list(self._listeners)
 
     def subnet_keys(self) -> List[str]:
         return list(self._subnet)
@@ -215,7 +280,9 @@ class DiscoveryService:
             if self._host is not None and not self._stopped:
                 return
             self._host = DiscoveryServiceHost(
-                list(self._multicast.values()) + list(self._mdns.values()),
+                list(self._multicast.values())
+                + list(self._mdns.values())
+                + list(self._listeners.values()),
                 restart_interval=self._restart_interval,
                 logger=self.logger,
             )
@@ -227,8 +294,12 @@ class DiscoveryService:
         return self._stopped
 
     def snapshot(self, brand: str) -> list:
-        """Devices currently in a brand's passive cache (empty if none)."""
-        backend = self._multicast.get(brand) or self._mdns.get(brand)
+        """Devices currently in a listener's passive cache (empty if none)."""
+        backend = (
+            self._multicast.get(brand)
+            or self._mdns.get(brand)
+            or self._listeners.get(brand)
+        )
         return list(backend.get_devices()) if backend is not None else []
 
     async def scan(self, brand: str, timeout: float = 5.0) -> list:

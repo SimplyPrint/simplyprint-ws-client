@@ -48,10 +48,22 @@ class MulticastListenerBase(
         self.devices = ExpiringDict(ttl=DEVICE_TTL)
         # blocking=True -> the async ``emit`` (the wrapped callable is awaited in
         # the backend loop); identical to the per-brand services this replaces.
-        self._emit = event_bus.emit_wrap(spec.event_type, blocking=True)
+        # A spec without an event class (a brand-owned listener may have none)
+        # only caches.
+        event_type = getattr(spec, "event_type", None)
+        self._emit = (
+            event_bus.emit_wrap(event_type, blocking=True)
+            if event_type is not None
+            else None
+        )
 
     def get_devices(self) -> list:
         return self.devices.values()
+
+    async def _publish(self, record) -> None:
+        """Hand on one cached sighting: the spec's event, when it has one."""
+        if self._emit is not None:
+            await self._emit(record)
 
     @abstractmethod
     def protocol_factory(self) -> asyncio.DatagramProtocol: ...
