@@ -5,7 +5,7 @@ import logging
 import sys
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set
+from typing import Dict, Iterable, Optional, Set
 
 from simplyprint_ws_client._compat import AsyncEvent
 from simplyprint_ws_client.core.client import Client, ClientState
@@ -99,6 +99,12 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         #: Keeps in-flight client teardown tasks alive (asyncio holds tasks
         #: weakly) and reports their failures.
         self._teardown_tasks = set()
+        #: The in-flight removal teardown per client id, for until_removed.
+        self._teardowns: Dict[str, asyncio.Task] = {}
+        #: Woken whenever a removal teardown finishes (loop-only).
+        self._removal_waiters: Set[asyncio.Future] = set()
+        #: Set once the stop teardown has run for every client.
+        self._torn_down = False
 
     def submit(self, client: Client):
         if client.unique_id in self.client_list:
@@ -122,6 +128,53 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         client.active = False
         self._to_delete.add(client.unique_id)
         self.signal()
+
+    def forget(self, client: Client) -> None:
+        """Drop a client that was submitted but never scheduled.
+
+        Only for while the loop is not running (nothing has run ``init`` yet, so
+        there is nothing to tear down); a running scheduler removes clients
+        through :meth:`remove`.
+        """
+        if client.unique_id in self.client_list:
+            self._delete(client)
+
+    async def until_removed(self, unique_ids: Iterable[str]) -> None:
+        """On the loop: wait until each client is deleted and torn down.
+
+        Returns at once for ids that are not scheduled, and once the stop
+        teardown has run, which tears every client down.
+        """
+        ids = set(unique_ids)
+        loop = asyncio.get_running_loop()
+        while not self._torn_down:
+            if not any(
+                uid in self.client_list or uid in self._teardowns for uid in ids
+            ):
+                return
+            waiter = loop.create_future()
+            self._removal_waiters.add(waiter)
+            try:
+                # The tick-rate timeout is only a backstop for a missed wake.
+                await asyncio.wait_for(
+                    asyncio.shield(waiter), timeout=self.settings.tick_rate
+                )
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                self._removal_waiters.discard(waiter)
+
+    def _wake_removal_waiters(self) -> None:
+        waiters, self._removal_waiters = self._removal_waiters, set()
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _teardown_finished(self, client_id: str, task: asyncio.Task) -> None:
+        self._teardown_tasks.discard(task)
+        if self._teardowns.get(client_id) is task:
+            del self._teardowns[client_id]
+        self._wake_removal_waiters()
 
     def _delete(self, client: Client):
         self.client_list.remove(client)
@@ -335,7 +388,10 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             # so this spawns a single task per added client.
             task = self.event_loop.create_task(self._teardown_client(client))
             self._teardown_tasks.add(task)
-            task.add_done_callback(self._teardown_tasks.discard)
+            self._teardowns[client_id] = task
+            task.add_done_callback(
+                lambda done, cid=client_id: self._teardown_finished(cid, done)
+            )
 
     @staticmethod
     async def _teardown_client(client: Client) -> None:
@@ -372,6 +428,8 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             ),
             return_exceptions=True,  # stopped engines wind down via CancelledError
         )
+        self._torn_down = True
+        self._wake_removal_waiters()
 
     async def _schedule_loop(self):
         if self._schedule_task.task != asyncio.current_task():

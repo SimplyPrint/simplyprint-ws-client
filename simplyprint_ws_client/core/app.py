@@ -5,7 +5,7 @@ import atexit
 import logging
 import threading
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Set, Tuple
 
 from simplyprint_ws_client.core.client import (
     Client,
@@ -25,6 +25,7 @@ from simplyprint_ws_client.core.protocol.connection import (
     default_transport_factory,
 )
 from simplyprint_ws_client.core.scheduler import Scheduler
+from simplyprint_ws_client.core.scope import Scope
 from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.common.asyncio.event_loop_runner import Runner
 from simplyprint_ws_client.common.asyncio.offload import (
@@ -59,6 +60,8 @@ class ClientStartFailure:
     #: ``"config"``: the stored entry could not be parsed (retried on restart).
     #: ``"build"``: persisting it or ``client_factory`` raised (retried on the
     #: next ``add`` of this printer, e.g. after a config edit, or on restart).
+    #: ``"plugin"``: its integration was unmounted (unloaded or being updated);
+    #: ``error`` holds the reason. Cleared when the domain is mounted again.
     stage: str
     error: str
 
@@ -84,6 +87,10 @@ class ClientApp(SyncStoppable):
     _background_services: Mapping[str, BackgroundService]
     _account_providers: Mapping[str, "AccountProvider"]
     logger: logging.Logger
+
+    #: The app's own scope: ``run()`` mounts every integration a host has not
+    #: already mounted under it. Closed by :meth:`stop`.
+    scope: Scope
 
     _app_event_loop: asyncio.AbstractEventLoop
     _app_instance: Optional[threading.Thread] = None
@@ -127,29 +134,39 @@ class ClientApp(SyncStoppable):
             loop=self._app_event_loop,
             transport_factory=transport_factory,
         )
+        # The single owner of every blocking-call hop off the app loop.
+        self.offload = Offload()
+        # Domain maps are swapped whole (copy-on-write) under ``_app_lock`` when
+        # a domain is mounted or unmounted, so readers never see one change.
         self.integrations = {
             str(integration.id): integration for integration in integrations
         }
         self.config_managers = {
-            str(integration.id): (
-                integration.config_manager_t or settings.config_manager_t
-            )(
-                name=integration.storage_name(
-                    settings.name, multiple=len(integrations) > 1
-                ),
-                config_t=integration.config_factory,
+            str(integration.id): self._new_config_manager(
+                integration, multiple=len(integrations) > 1
             )
             for integration in integrations
         }
         self.config_manager = next(iter(self.config_managers.values()))
-        # The single owner of every blocking-call hop off the app loop.
-        self.offload = Offload()
         # Coalesce the chatty config-change flush off the loop (registration in
         # add/remove still flushes directly -- see below).
         self.config_flushers = {
             key: ConfigFlusher(manager, self.offload, loop=self._app_event_loop)
             for key, manager in self.config_managers.items()
         }
+        #: Which domain each client belongs to, so unmounting a domain stops
+        #: every client it has at that moment, including ones added late.
+        self._client_domains: Dict[str, str] = {}
+        #: The scope each mounted domain lives under.
+        self._domain_scopes: Dict[str, Scope] = {}
+        #: Domains whose stored configs were replayed into clients.
+        self._replayed: Set[str] = set()
+        #: True once run() started: a domain mounted from then on replays now.
+        self._live = False
+        #: Config managers of unmounted domains, kept so a remount reuses the
+        #: same storage (and, for an unchanged config type, the same manager).
+        self._parked_managers: Dict[str, ConfigManager[PrinterConfig]] = {}
+        self.scope = Scope("app", loop=self._app_event_loop)
         self.logger = logger
         self._background_services = (
             background_services if background_services is not None else {}
@@ -179,6 +196,176 @@ class ClientApp(SyncStoppable):
             host_telemetry=self.host_telemetry,
         )
 
+    def _new_config_manager(
+        self, integration: IntegrationSpec, *, multiple: bool
+    ) -> ConfigManager[PrinterConfig]:
+        manager_t = integration.config_manager_t or self.settings.config_manager_t
+        return manager_t(
+            name=integration.storage_name(self.settings.name, multiple=multiple),
+            config_t=integration.config_factory,
+        )
+
+    def mount_domain(
+        self, spec: IntegrationSpec, scope: Scope
+    ) -> List[ClientStartFailure]:
+        """Host ``spec``'s printers until ``scope`` closes.
+
+        Builds the domain's config manager and flusher (the ones built at
+        construction are reused for the configured integrations), then replays
+        its stored configs, each printer isolated as in :meth:`add`. Before
+        :meth:`run` the replay is left to ``run``. Returns the printers that
+        did not start.
+
+        Closing the scope stops every client of the domain at that moment,
+        waits for their teardown, and drains the flusher. Their configs are
+        kept, and each printer is recorded in :attr:`failed_clients` with stage
+        ``"plugin"`` and the close reason, until the domain is mounted again.
+        """
+        key = str(spec.id)
+        with self._app_lock:
+            if key in self._domain_scopes:
+                raise ValueError(f"domain {key!r} is already mounted")
+            existing = self.integrations.get(key)
+            # Equal, not only identical: settings may carry an equal copy.
+            if existing is not None and existing != spec:
+                raise ValueError(f"another integration is registered as {key!r}")
+        manager: Optional[ConfigManager[PrinterConfig]] = None
+        flusher: Optional[ConfigFlusher] = None
+        if existing is None:
+            # Outside the lock: a store may read its file.
+            manager = self._manager_for_mount(spec)
+            flusher = ConfigFlusher(manager, self.offload, loop=self._app_event_loop)
+        with self._app_lock:
+            current = self.integrations.get(key)
+            if key in self._domain_scopes or (current is not None and current != spec):
+                raise ValueError(f"domain {key!r} is already mounted")
+            if current is None:
+                if manager is None or flusher is None:
+                    raise RuntimeError(f"domain {key!r} changed while mounting")
+                self.integrations = {**self.integrations, key: spec}
+                self.config_managers = {**self.config_managers, key: manager}
+                self.config_flushers = {**self.config_flushers, key: flusher}
+                self._parked_managers.pop(key, None)
+            self._domain_scopes[key] = scope
+            live = self._live
+        scope.on_close(
+            lambda: self._unmount_domain(key, scope),
+            loop=self._app_event_loop,
+            name=f"clients:{key}",
+        )
+        return self._replay_domain(key) if live else []
+
+    def _manager_for_mount(
+        self, spec: IntegrationSpec
+    ) -> ConfigManager[PrinterConfig]:
+        key = str(spec.id)
+        with self._app_lock:
+            parked = self._parked_managers.get(key)
+        manager_t = spec.config_manager_t or self.settings.config_manager_t
+        if parked is None:
+            # A domain new to this app always gets its own storage name, never
+            # the app's bare one.
+            return self._new_config_manager(spec, multiple=True)
+        if (
+            parked.config_t is spec.config_factory
+            and type(parked) is manager_t.get_class()
+        ):
+            return parked
+        # Same storage, new config type (an updated plugin): reload from it.
+        return manager_t(name=parked.name, config_t=spec.config_factory)
+
+    def _replay_domain(self, key: str) -> List[ClientStartFailure]:
+        with self._app_lock:
+            if key in self._replayed or key not in self._domain_scopes:
+                return []
+            self._replayed.add(key)
+            manager = self.config_managers[key]
+        # On start, load all current configs. Each printer starts on its own: a
+        # failure is logged and recorded by add() (or by the config store, for
+        # an entry it could not read) and the rest carry on.
+        self._record_unreadable_configs(key, manager)
+        ids = {entry.label for entry in manager.unreadable}
+        for config in list(manager.get_all()):
+            ids.add(str(config.unique_id))
+            try:
+                self.add(config, integration_id=key)
+            except Exception:
+                continue  # add() logged it once and recorded it
+        with self._app_lock:
+            return [
+                failure
+                for unique_id, failure in self.failed_clients.items()
+                if unique_id in ids and failure.integration_id == key
+            ]
+
+    def _unmount_domain(self, key: str, scope: Scope):
+        """The domain's undo: on the app loop while it runs, else inline."""
+        reason = scope.close_reason or "unmounted"
+        with self._app_lock:
+            if self._domain_scopes.get(key) is not scope:
+                return None
+            del self._domain_scopes[key]
+            self._replayed.discard(key)
+            if self.is_stopped():
+                # The app's own stop already tore every printer down and wrote
+                # pending config; leave its maps as they were at stop.
+                return None
+            removed: List[Tuple[str, Client]] = []
+            for unique_id, domain in list(self._client_domains.items()):
+                if domain != key:
+                    continue
+                del self._client_domains[unique_id]
+                client = self.client_list.get(unique_id)
+                if client is None:
+                    continue
+                # No more config writes or scheduler wake-ups from it.
+                client.event_bus.clear(ClientConfigChangedEvent, ClientStateChangeEvent)
+                removed.append((unique_id, client))
+                self.failed_clients[unique_id] = ClientStartFailure(
+                    unique_id=unique_id,
+                    integration_id=key,
+                    stage="plugin",
+                    error=reason,
+                )
+            flusher = self.config_flushers.get(key)
+            manager = self.config_managers.get(key)
+            if manager is not None:
+                self._parked_managers[key] = manager
+            self.integrations = {
+                k: v for k, v in self.integrations.items() if k != key
+            }
+            self.config_managers = {
+                k: v for k, v in self.config_managers.items() if k != key
+            }
+            self.config_flushers = {
+                k: v for k, v in self.config_flushers.items() if k != key
+            }
+
+        if not self.scheduler.event_loop_is_running():
+            # Nothing was scheduled yet: no init ran, nothing to tear down.
+            for _unique_id, client in removed:
+                self.scheduler.forget(client)
+            if flusher is not None:
+                flusher.flush_now_if_dirty()
+            return None
+
+        for _unique_id, client in removed:
+            self.scheduler.remove(client)
+        return self._finish_unmount([uid for uid, _client in removed], flusher)
+
+    async def _finish_unmount(
+        self, unique_ids: List[str], flusher: Optional[ConfigFlusher]
+    ) -> None:
+        if unique_ids:
+            await self.scheduler.until_removed(unique_ids)
+        if flusher is not None:
+            await flusher.aclose()
+
+    def mounted_domains(self) -> Tuple[str, ...]:
+        """Ids of the domains currently mounted, in mount order."""
+        with self._app_lock:
+            return tuple(self._domain_scopes)
+
     def context_for(self, integration_id: str) -> ClientContext:
         """Return this integration's explicitly scoped runtime dependencies."""
         return replace(
@@ -189,16 +376,19 @@ class ClientApp(SyncStoppable):
 
     async def run(self):
         try:
-            # On start, load all current configs. Each printer starts on its
-            # own: a failure is logged and recorded by add() (or by the config
-            # store, for an entry it could not read) and the rest carry on.
-            for integration_id, manager in self.config_managers.items():
-                self._record_unreadable_configs(integration_id, manager)
-                for config in manager.get_all():
-                    try:
-                        self.add(config, integration_id=integration_id)
-                    except Exception:
-                        continue  # add() logged it once and recorded it
+            # Startup is mounting: every configured integration a host has not
+            # already mounted is mounted under the app's own scope, then each
+            # mounted domain replays its stored configs.
+            for integration in list(self.integrations.values()):
+                with self._app_lock:
+                    mounted = str(integration.id) in self._domain_scopes
+                if not mounted:
+                    self.mount_domain(integration, self.scope)
+            with self._app_lock:
+                self._live = True
+                domains = list(self._domain_scopes)
+            for key in domains:
+                self._replay_domain(key)
 
             await self.scheduler.block_until_stopped()
         except Exception as e:
@@ -357,6 +547,7 @@ class ClientApp(SyncStoppable):
                 raise
 
             self.failed_clients.pop(str(config.unique_id), None)
+            self._client_domains[str(config.unique_id)] = resolved_id
 
             # From here on nothing can fail per printer: listener registration
             # is plain bookkeeping, and submit() is the single commit point
@@ -389,6 +580,7 @@ class ClientApp(SyncStoppable):
 
         with self._app_lock:
             client = self.client_list.get(config.unique_id)
+            self._client_domains.pop(str(config.unique_id), None)
 
             if client is None:
                 # A printer that failed to start has a stored config but no
@@ -448,4 +640,6 @@ class ClientApp(SyncStoppable):
             # join the blocking-work lanes so teardown leaks no executor threads.
             self.offload.shutdown(wait=True)
 
-            self.logger.info("Stopped.")
+        # The app is stopped, so each domain's undo only forgets its scope.
+        self.scope.close("app stopped")
+        self.logger.info("Stopped.")
