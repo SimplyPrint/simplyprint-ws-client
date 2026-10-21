@@ -169,3 +169,29 @@ For discovery, guided onboarding, cameras, accounts, or background services,
 set the corresponding optional field on `IntegrationSpec`. See
 [`example/headless_vendor.py`](../example/headless_vendor.py) for a complete
 headless composition with discovery and an add-printer flow.
+
+The discovery fields, all optional and all contributed under the mount's
+scope:
+
+- `multicast` (`MulticastSpec`): SSDP announcements or an M-SEARCH, parsed
+  for you; `mdns` (`MDNSSpec`): DNS-SD queries and responses.
+- `subnet` (`SubnetScanSpec`) and `network_services`: an on-demand scan of
+  the local subnets, gated on the declared ports.
+- `datagram` (`DatagramSpec`): a raw UDP exchange. The payload goes to a
+  broadcast address, a group or a host on each port, and every raw reply is
+  passed to your `parse(data, (host, port))`. `DiscoveryService.sweep(id,
+  timeout)` runs it on demand. With an `interval` (or no payload) it also
+  stays on as a listener.
+- `listeners` (`ListenerSpec`), or `DiscoveryService.add_listener(spec,
+  scope)`: a listener you write as a sans-I/O protocol. The host binds the
+  socket on its discovery loop and feeds your `handle(event)`
+  `ListenerStarted`, `DatagramReceived` and `ListenerTick`. It acts on what
+  you return: `SendTo`, `WakeAfter`, `Sighted` and `Forget`. Closing the
+  scope stops it.
+- `rediscover`: maps a record from your always-on listeners to a
+  `DiscoveredDevice`. The host then routes each sighting to the running
+  printer with the same hardware identity (`Client.apply_discovered`), so a
+  printer whose DHCP address changed is followed.
+
+`DiscoveryService.watch(key, callback, scope)` sees every sighting of one
+always-on listener. It is the primitive `rediscover` is built on.
