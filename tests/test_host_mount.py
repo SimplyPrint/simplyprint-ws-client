@@ -325,7 +325,11 @@ def test_a_mount_whose_discovery_clashes_is_undone_before_discovery(running):
     with pytest.raises(ValueError, match="duplicate subnet"):
         host.mount(clash, host.root)
 
-    assert _leftovers(host, tasks, "two") == _NOTHING
+    # "one" still owns its _Cam (every test spec shares the class): only the
+    # failed mount's own registration may be gone.
+    left = _leftovers(host, tasks, "two")
+    assert left["cameras"] == [_Cam]
+    assert {**left, "cameras": []} == _NOTHING
     assert host.discovery.subnet_keys().count("one") == 1
     assert first.close("done", timeout=15).ok
 
