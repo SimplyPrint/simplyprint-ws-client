@@ -58,9 +58,12 @@ uvloop = [
     "uvloop>=0.21.0",
 ]
 
-[tool.uv.sources]
-# Local development: the SDK's own checkout, editable, until it is published.
-simplyprint-sdk = { path = "/root/stuff/work/simplyprint-sdk", editable = true }
+# simplyprint-sdk resolves from PyPI, like every other dependency, so CI and
+# users install the published release. To develop against a local SDK checkout,
+# see "Developing against a local SDK" in README.md; do not commit a path source
+# here or a uv.lock that records one.
+# [tool.uv.sources]
+# simplyprint-sdk = { path = "../simplyprint-sdk", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

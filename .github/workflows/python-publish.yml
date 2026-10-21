@@ -32,6 +32,15 @@ jobs:
           python -m pip install build
           python -m build . --outdir dist
 
+      # Resolve the built wheel's requirements from PyPI the way a user's pip
+      # does, so a release whose simplyprint-sdk pin has no published match
+      # fails here instead of after it reaches PyPI.
+      - name: Install the wheel from PyPI dependencies
+        run: |
+          python -m venv /tmp/release-smoke
+          /tmp/release-smoke/bin/pip install dist/*.whl
+          /tmp/release-smoke/bin/python -c "import simplyprint_sdk.pydantic, simplyprint_ws_client"
+
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:
