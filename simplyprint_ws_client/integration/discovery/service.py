@@ -33,6 +33,10 @@ from simplyprint_ws_client.common.asyncio.concurrent import await_concurrent_fut
 
 from simplyprint_ws_client.events import EventBus
 
+from simplyprint_ws_client.integration.discovery.datagram import (
+    datagram_listener,
+    sweep as sweep_datagrams,
+)
 from simplyprint_ws_client.integration.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.integration.discovery.listener import (
     ListenerDiscoveryBackend,
@@ -49,6 +53,7 @@ from simplyprint_ws_client.integration.discovery.network import (
     service_diagnostic_check,
 )
 from simplyprint_ws_client.integration.discovery.spec import (
+    DatagramSpec,
     ListenerSpec,
     MDNSSpec,
     MulticastSpec,
@@ -87,6 +92,8 @@ class DiscoveryService:
             self._mdns[spec.brand] = MDNSDiscoveryBackend(spec, self.event_bus)
         #: Brand-owned always-on listeners (``add_listener`` / ``listeners``).
         self._listeners: Dict[str, ListenerDiscoveryBackend] = {}
+        #: Raw datagram families, swept on demand (``sweep``).
+        self._datagram: Dict[str, DatagramSpec] = {}
         self._restart_interval = restart_interval
         self._host: DiscoveryServiceHost | None = None
         self._subnet = {spec.brand: spec for spec in subnet_specs}
@@ -104,9 +111,10 @@ class DiscoveryService:
     def add(self, spec: "IntegrationSpec", scope: "Scope") -> None:
         """Contribute ``spec``'s discovery until ``scope`` closes.
 
-        Adds its multicast and mDNS listeners (launched on the running host loop
-        at once, or with the rest at start), its subnet scan and its network
-        services. Closing the scope stops the listeners on the host loop and
+        Adds its multicast, mDNS and brand-owned listeners (launched on the
+        running host loop at once, or with the rest at start), its subnet scan,
+        its raw datagram sweep (plus its listener when ``always_on``) and its
+        network services. Closing the scope stops the listeners on the host loop and
         waits for them, then drops the entries. Raises on a key already taken.
         """
         integration_id = str(spec.id)
@@ -120,9 +128,13 @@ class DiscoveryService:
             if spec.mdns is not None
             else None
         )
+        datagram = spec.datagram
+        listener_specs = list(spec.listeners)
+        if datagram is not None and datagram.always_on:
+            listener_specs.append(datagram_listener(datagram))
         listeners = [
             ListenerDiscoveryBackend(listener, self.event_bus)
-            for listener in spec.listeners
+            for listener in listener_specs
         ]
         subnet = spec.subnet
         services: Dict[str, Any] = {}
@@ -144,6 +156,10 @@ class DiscoveryService:
             )
             if subnet is not None and subnet.brand in self._subnet:
                 raise ValueError(f"duplicate subnet discovery spec: {subnet.brand}")
+            if datagram is not None and datagram.brand in self._datagram:
+                raise ValueError(
+                    f"duplicate datagram discovery spec: {datagram.brand}"
+                )
             services = {
                 key: value
                 for key, value in services.items()
@@ -160,6 +176,8 @@ class DiscoveryService:
                 }
             if subnet is not None:
                 self._subnet = {**self._subnet, subnet.brand: subnet}
+            if datagram is not None:
+                self._datagram = {**self._datagram, datagram.brand: datagram}
             if services:
                 self._network_services = {**self._network_services, **services}
             host = self._host if not self._stopped else None
@@ -169,7 +187,7 @@ class DiscoveryService:
                     host.add_backend(backend)
 
         scope.on_close(
-            lambda: self._remove(backends, subnet, services),
+            lambda: self._remove(backends, subnet, services, datagram),
             name=f"discovery:{integration_id}",
         )
 
@@ -213,8 +231,13 @@ class DiscoveryService:
         backends: List[Any],
         subnet: Optional[SubnetScanSpec],
         services: Mapping[str, Any],
+        datagram: Optional[DatagramSpec] = None,
     ):
         with self._lock:
+            if datagram is not None and self._datagram.get(datagram.brand) is datagram:
+                self._datagram = {
+                    k: v for k, v in self._datagram.items() if k != datagram.brand
+                }
             multicast = {
                 k: v for k, v in self._multicast.items() if v not in backends
             }
@@ -258,6 +281,9 @@ class DiscoveryService:
 
     def subnet_keys(self) -> List[str]:
         return list(self._subnet)
+
+    def datagram_keys(self) -> List[str]:
+        return list(self._datagram)
 
     def network_service_keys(self) -> List[str]:
         return list(self._network_services)
@@ -312,6 +338,14 @@ class DiscoveryService:
             return await SubnetScanBackend(spec, context).scan(timeout)
         finally:
             self._release_scan_context(context)
+
+    async def sweep(self, brand: str, timeout: float = 5.0) -> list:
+        """Run a brand's raw datagram sweep: send its payload once, return the
+        parsed replies heard within ``timeout`` (empty if it has none)."""
+        spec = self._datagram.get(brand)
+        if spec is None:
+            return []
+        return await sweep_datagrams(spec, timeout)
 
     async def diagnose(
         self, brand: str, host: str, timeout: float = 5.0, *, run_probe: bool = True

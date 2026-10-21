@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from simplyprint_ws_client.integration.discovery.device import DiscoveredDevice
     from simplyprint_ws_client.integration.discovery.service import DiscoveryService
     from simplyprint_ws_client.integration.discovery.spec import (
+        DatagramSpec,
         ListenerSpec,
         MDNSSpec,
         MulticastSpec,
@@ -179,6 +180,8 @@ class IntegrationSpec:
     discover: Optional[Discoverer] = None
     #: Brand-owned always-on listeners (sans-I/O protocols the host drives).
     listeners: Tuple["ListenerSpec", ...] = ()
+    #: A raw (non-SSDP) UDP datagram family: swept on demand, or always on.
+    datagram: Optional["DatagramSpec"] = None
 
     add_printer_flow_factory: Optional[FlowFactory] = None
     account_login_flow_factory: Optional[FlowFactory] = None

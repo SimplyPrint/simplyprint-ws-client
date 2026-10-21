@@ -11,7 +11,11 @@ A brand whose devices speak something the shared listeners do not parse brings
 its own always-on listener as a :class:`ListenerSpec`: a sans-I/O
 :class:`ListenerProtocol` (events in, :class:`SendTo` / :class:`WakeAfter` /
 :class:`Sighted` / :class:`Forget` out) that the host drives from a socket it
-owns, under a scope (``DiscoveryService.add_listener``).
+owns, under a scope (``DiscoveryService.add_listener``). A plain
+"send this payload, parse each raw reply" exchange (a UDP broadcast, a
+non-SSDP multicast) needs no protocol: a :class:`DatagramSpec` is swept on
+demand (``DiscoveryService.sweep``) and, when ``always_on``, runs as such a
+listener (:func:`datagram_listener`).
 
 Imports are ordered by dependency (leaves first) so importing the package binds
 each name before a later module needs it.
@@ -26,6 +30,7 @@ from simplyprint_ws_client.integration.discovery.model import DiscoveredRecord
 from simplyprint_ws_client.integration.discovery.reconcile import DeviceReconciler
 from simplyprint_ws_client.integration.discovery.netif import local_subnets, scan_hosts
 from simplyprint_ws_client.integration.discovery.spec import (
+    DatagramSpec,
     ListenerSpec,
     MDNSSpec,
     MulticastSpec,
@@ -65,6 +70,10 @@ from simplyprint_ws_client.integration.discovery.listener import (
     SendTo,
     Sighted,
     WakeAfter,
+)
+from simplyprint_ws_client.integration.discovery.datagram import (
+    DatagramCollector,
+    datagram_listener,
 )
 from simplyprint_ws_client.integration.discovery.host import DiscoveryServiceHost
 from simplyprint_ws_client.integration.discovery.service import DiscoveryService
@@ -112,6 +121,9 @@ __all__ = [
     "WakeAfter",
     "Sighted",
     "Forget",
+    "DatagramSpec",
+    "DatagramCollector",
+    "datagram_listener",
     "DiscoveryServiceHost",
     "DiscoveryService",
     "DiscoveryResult",

@@ -128,6 +128,47 @@ class MDNSSpec(Generic[DiscoveredRecord]):
 
 
 @dataclass(frozen=True)
+class DatagramSpec(Generic[DiscoveredRecord]):
+    """How to discover one brand with a raw (non-SSDP) UDP datagram.
+
+    Send ``payload`` to ``address`` (a broadcast address, a multicast group or
+    one host) on each of ``ports``, collect the replies, and hand each raw
+    reply and its source address to ``parse``. All brand knowledge (payload,
+    reply format) lives in ``payload`` and ``parse``.
+
+    On demand, ``DiscoveryService.sweep(brand, timeout)`` sends once and
+    collects for ``timeout`` seconds. :attr:`always_on` specs also run as an
+    always-on listener keyed ``brand`` (re-sending every ``interval``; a
+    ``payload`` of ``None`` only listens, on ``listen_port`` and ``group``),
+    whose cache ``snapshot(brand)`` reads.
+    """
+
+    brand: str
+    #: Destination port(s); the payload goes to each in turn.
+    ports: Tuple[int, ...]
+    #: Raw reply + sender address -> a brand device record, or None.
+    parse: Callable[[bytes, "tuple[str, int]"], Optional[DiscoveredRecord]]
+    #: Stable cache key for a parsed record.
+    key: Callable[[DiscoveredRecord], str]
+    payload: Optional[bytes] = None
+    address: str = "255.255.255.255"
+    #: Re-send cadence of the always-on listener; ``None``: on demand only.
+    interval: Optional[float] = None
+    #: Port the replies arrive on; ``0`` binds an ephemeral one.
+    listen_port: int = 0
+    #: Multicast group to join while listening, if any.
+    group: Optional[str] = None
+    multicast_ttl: Optional[int] = None
+    #: Event emitted for each always-on sighting; ``None`` only caches.
+    event_type: Optional[type[Event]] = None
+
+    @property
+    def always_on(self) -> bool:
+        """True when this spec also runs as an always-on listener."""
+        return self.interval is not None or self.payload is None
+
+
+@dataclass(frozen=True)
 class ListenerSpec(Generic[DiscoveredRecord]):
     """A brand-owned always-on datagram listener, hosted sans-I/O.
 
