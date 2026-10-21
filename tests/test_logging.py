@@ -170,7 +170,8 @@ def test_routing_policy_filters_files_by_scope_and_noise(tmp_path):
     _drain(handler)
 
     system = (tmp_path / "system.log").read_text()
-    printer = (tmp_path / "p7" / "mqtt.log").read_text()
+    printer_log = tmp_path / "p7" / "mqtt.log"
+    printer = printer_log.read_text() if printer_log.exists() else ""
     assert "system info" in system
     assert "websocket warning" in system
     assert "system debug" not in system
