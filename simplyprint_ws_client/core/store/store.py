@@ -376,6 +376,9 @@ class Store:
         with self._wlock:
             self.revision = self._read_rev(conn)
             self._data_version = conn.execute("PRAGMA data_version").fetchone()[0]
+            #: ``data_version`` the hash cache was last checked against
+            #: (apart from the poll's, which publishes what changed).
+            self._hash_version = self._data_version
             for table in TABLES.values():
                 self._known[table.name] = self._scan_revs(conn, table)
         self._next_poll = clock() + poll_every
@@ -481,6 +484,15 @@ class Store:
             raise RuntimeError("store %s is closed" % self.path)
         self._wconn.execute("BEGIN IMMEDIATE")
         try:
+            # Another process may have written since the last poll (every
+            # 2 s): the cached hashes would then call a real change
+            # "unchanged" and skip it. ``data_version`` changes only for
+            # other connections' commits, and we hold the write lock now, so
+            # one check here keeps the cache true for this transaction.
+            version = self._wconn.execute("PRAGMA data_version").fetchone()[0]
+            if version != self._hash_version:
+                self._hashes.clear()
+                self._hash_version = version
             return Txn(self, self._wconn)
         except BaseException:
             self._rollback_locked()
