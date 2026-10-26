@@ -272,6 +272,40 @@ def test_a_file_an_old_build_changed_is_imported_again_without_losing_fields(
     assert len([f for f in state.legacy_files() if f["name"] == path.name]) == 2
 
 
+def test_a_re_import_over_an_upgraded_row_does_not_mix_config_versions(
+    config_dir, stores
+):
+    # The row was upgraded to config version 2 (a migration renamed "name"
+    # to "label"); an old build, after a rollback, rewrote the file at
+    # version 1. The re-imported row must be version-1 data only, so the
+    # upgrade runs once on what it was written for, never over fields it
+    # already produced.
+    state, cache = stores
+    _importer(config_dir).run(state, cache)
+    uid = "6f1d2c3b-4a59-4e8f-9a0b-1c2d3e4f5a6b"
+    stored = state.get("printers", uid)
+    upgraded = dict(stored["data"])
+    upgraded["label"] = upgraded.pop("name", "x")
+    with state.transaction() as txn:
+        txn.put(
+            "printers",
+            uid,
+            {**{c: stored[c] for c in ("store", "pk", "sk", "state", "error")},
+             "data": upgraded, "schema": 2},
+        )  # fmt: skip
+
+    path = config_dir / "BambuDevice-bambu.json"
+    entries = json.loads(path.read_text())
+    entries[0]["name"] = "Renamed by the old build"
+    path.write_text(json.dumps(entries, indent=4))
+    _importer(config_dir).run(state, cache)
+
+    row = state.get("printers", uid)
+    assert row["schema"] == 1
+    assert row["data"]["name"] == "Renamed by the old build"
+    assert "label" not in row["data"]
+
+
 def test_a_file_is_converted_when_its_plugin_mounts(config_dir, stores):
     state, cache = stores
     _importer(config_dir).run(state, cache)
