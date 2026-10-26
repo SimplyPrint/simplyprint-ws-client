@@ -345,6 +345,7 @@ class Store:
                 snapshots=snapshots_in(self.backups, self.path.stem)
                 if durability == "durable"
                 else (),
+                steps=migrations,
             )
         try:
             apply_steps(conn, migrations, app_version=app_version)

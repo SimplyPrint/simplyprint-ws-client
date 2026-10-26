@@ -26,10 +26,17 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
-from simplyprint_ws_client.core.store.schema import TABLES
+from simplyprint_ws_client.core.store.schema import (
+    TABLES,
+    RowTransform,
+    SchemaStep,
+    Table,
+    decode_values,
+    encode_values,
+)
 
 __all__ = ["RecoveryReport", "recover", "move_aside", "snapshots_in", "RECOVERED"]
 
@@ -103,12 +110,16 @@ def recover(
     *,
     reason: str,
     snapshots: Sequence[Path] = (),
+    steps: Sequence[SchemaStep] = (),
 ) -> RecoveryReport:
-    """Fill ``fresh`` (already at the current schema) from ``damaged``, then
-    from the first snapshot that opens. Rows already present are never
-    overwritten: the damaged file's rows are newer than any snapshot's."""
+    """Fill ``fresh`` (already at the current schema, ``steps``) from
+    ``damaged``, then from the first snapshot that opens. Rows already
+    present are never overwritten: the damaged file's rows are newer than
+    any snapshot's."""
     report = RecoveryReport(reason=reason, moved_to=damaged)
-    if not _copy_from(fresh, damaged, report.from_damaged, report.unreadable_tables):
+    if not _copy_from(
+        fresh, damaged, report.from_damaged, report.unreadable_tables, steps=steps
+    ):
         report.unreadable_tables[:] = list(RECOVERED)
     # Only the tables the damaged file could not fully give are filled from
     # the snapshot. A table read to the end is complete: topping it up would
@@ -117,7 +128,7 @@ def recover(
     for snapshot in snapshots if missing else ():
         counts: Dict[str, int] = {}
         failed: List[str] = []
-        if _copy_from(fresh, snapshot, counts, failed, tables=missing):
+        if _copy_from(fresh, snapshot, counts, failed, tables=missing, steps=steps):
             report = RecoveryReport(
                 reason=report.reason,
                 moved_to=report.moved_to,
@@ -139,9 +150,15 @@ def _copy_from(
     failed: List[str],
     *,
     tables: Sequence[str] = RECOVERED,
+    steps: Sequence[SchemaStep] = (),
 ) -> bool:
     """Copy every readable row of ``tables`` of ``source`` into ``fresh``
-    (``INSERT OR IGNORE``). Returns whether ``source`` opened at all."""
+    (``INSERT OR IGNORE``). Returns whether ``source`` opened at all.
+
+    ``fresh`` is already at the newest schema, so its migrations' row
+    transforms ran over no rows: a row from a ``source`` at an older schema
+    gets the transforms of every step past that schema here, in order, as
+    :func:`~.schema.apply_steps` would have given it."""
     try:
         conn = sqlite3.connect(
             "file:%s?mode=ro" % quote(source.as_posix()),
@@ -155,13 +172,22 @@ def _copy_from(
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
         except sqlite3.Error:
             return False
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        except sqlite3.Error:
+            version = 0
+        transforms = _transforms_after(version, steps)
         for table in tables:
             columns = _columns(fresh, table)
             counts[table] = 0
+            fns = transforms.get(table, [])
+            spec = TABLES.get(table)
             try:
                 cursor = conn.execute("SELECT * FROM %s" % table)
                 names = [d[0] for d in cursor.description]
-                shared = [n for n in names if n in columns]
+                # A transform may fill value columns the old file lacks.
+                extra = [c for c in spec.columns if c not in names] if fns and spec else []
+                shared = [n for n in names + extra if n in columns]
                 insert = "INSERT OR IGNORE INTO %s (%s) VALUES (%s)" % (
                     table,
                     ", ".join(shared),
@@ -179,9 +205,22 @@ def _copy_from(
                         if row is None:
                             break
                         values = dict(zip(names, row))
+                        if fns and spec is not None:
+                            try:
+                                values.update(_migrated(spec, values, fns))
+                            except Exception:
+                                # Never silent: the row stays in the
+                                # moved-aside file, and the log says which.
+                                _logger.exception(
+                                    "recovery: %s row %r does not migrate; left in %s",
+                                    table,
+                                    [values.get(k) for k in spec.key],
+                                    source,
+                                )
+                                continue
                         try:
                             added = fresh.execute(
-                                insert, tuple(values[n] for n in shared)
+                                insert, tuple(values.get(n) for n in shared)
                             ).rowcount
                         except sqlite3.IntegrityError:
                             # A damaged row (a NULL where the schema needs a
@@ -197,6 +236,31 @@ def _copy_from(
         return True
     finally:
         conn.close()
+
+
+def _transforms_after(
+    version: int, steps: Sequence[SchemaStep]
+) -> Dict[str, List[RowTransform]]:
+    """Per table, the row transforms of the steps past ``version``, in order."""
+    found: Dict[str, List[RowTransform]] = {}
+    for step in sorted(steps, key=lambda s: s.version):
+        if step.version > version:
+            for table, transform in step.rows.items():
+                found.setdefault(table, []).append(transform)
+    return found
+
+
+def _migrated(
+    spec: Table, values: Dict[str, Any], fns: Sequence[RowTransform]
+) -> Dict[str, Any]:
+    """``values`` (one raw row) with its value columns run through ``fns``,
+    encoded back as stored."""
+    decoded = decode_values(
+        spec, [values.get(c, spec.defaults.get(c)) for c in spec.columns]
+    )
+    for fn in fns:
+        decoded = fn(dict(decoded))
+    return encode_values(spec, decoded)
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
