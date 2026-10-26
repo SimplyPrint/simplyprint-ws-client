@@ -55,17 +55,28 @@ SKIP: Any = _Skip()
 RowId = Tuple[str, Tuple[Any, ...]]
 
 
+#: The longest a row whose ``produce`` keeps failing waits between tries.
+RETRY_MAX = 60.0
+
+
 @dataclass
 class Pending:
     produce: Produce
     first: float
     last: float
     urgent: bool
+    #: Tries whose ``produce`` raised, in a row.
+    failures: int = 0
+    #: Not taken into a batch before this clock time (backing off after a
+    #: failed ``produce``); ``None`` when not backing off.
+    retry_at: Optional[float] = None
 
     def due_at(self, debounce: float, cap: float) -> float:
-        if self.urgent:
-            return self.first
-        return min(self.last + debounce, self.first + cap)
+        due = self.first if self.urgent else min(self.last + debounce, self.first + cap)
+        return due if self.retry_at is None else max(due, self.retry_at)
+
+    def ready(self, now: float) -> bool:
+        return self.retry_at is None or now >= self.retry_at
 
 
 class Writer:
@@ -115,6 +126,9 @@ class Writer:
                 pending.produce = produce
                 pending.last = now
                 pending.urgent = pending.urgent or urgent
+                # A new produce may well work: no need to wait out the
+                # backoff of the one it replaces.
+                pending.retry_at = None
         if self._wake is not None:
             self._wake()
 
@@ -144,11 +158,40 @@ class Writer:
         return (self.clock() if now is None else now) >= deadline
 
     def take(self) -> Dict[RowId, Pending]:
-        """Hand every pending row to the caller (the batch) and start a fresh
-        map; marks made while the batch is written go to the next one."""
+        """Hand every pending row to the caller (the batch), except rows
+        backing off after a failed ``produce``; marks made while the batch is
+        written go to the next one."""
+        now = self.clock()
         with self._lock:
-            batch, self._dirty = self._dirty, {}
+            batch = {row: p for row, p in self._dirty.items() if p.ready(now)}
+            if len(batch) == len(self._dirty):
+                self._dirty = {}
+            else:
+                for row in batch:
+                    del self._dirty[row]
             return batch
+
+    def retry(self, failed: Dict[RowId, Pending]) -> None:
+        """Put back rows whose ``produce`` raised in a committed batch, each
+        backing off (debounce, doubling, at most :data:`RETRY_MAX`): their
+        change is not lost, and a row that keeps failing does not spin. A
+        row marked again since keeps its newer ``produce``."""
+        if not failed:
+            return
+        now = self.clock()
+        with self._lock:
+            for row, pending in failed.items():
+                newer = self._dirty.get(row)
+                if newer is not None:
+                    newer.first = min(newer.first, pending.first)
+                    continue
+                pending.failures += 1
+                pending.retry_at = now + min(
+                    self.debounce * 2 ** pending.failures, RETRY_MAX
+                )
+                self._dirty[row] = pending
+        if self._wake is not None:
+            self._wake()
 
     def restore(self, batch: Dict[RowId, Pending]) -> None:
         """Put back a batch that failed to commit. A row marked again since

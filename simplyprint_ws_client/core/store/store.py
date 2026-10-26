@@ -562,7 +562,7 @@ class Store:
         try:
             txn = self._begin_locked()
             try:
-                self._write_batch(txn, batch)
+                failed = self._write_batch(txn, batch)
                 published = self._commit_locked(txn)
             except BaseException:
                 self._rollback_locked()
@@ -572,12 +572,15 @@ class Store:
             # wins), so a failed or interrupted batch loses nothing.
             self.writer.restore(batch)
             raise
+        self.writer.retry(failed)
         return txn, published
 
     @staticmethod
     def _write_batch(
         txn: Txn, batch: Dict[Tuple[str, Tuple[Any, ...]], Pending]
-    ) -> None:
+    ) -> Dict[Tuple[str, Tuple[Any, ...]], Pending]:
+        """Write the batch's rows; returns the ones whose produce raised."""
+        failed: Dict[Tuple[str, Tuple[Any, ...]], Pending] = {}
         for (table, key), pending in batch.items():
             try:
                 row = pending.produce()
@@ -587,17 +590,21 @@ class Store:
                     encode_values(TABLES[table], row)  # serializes, or raises
             except Exception:
                 # One row that cannot be produced keeps its stored version;
-                # the rest of the batch is still written.
+                # the rest of the batch is still written. Its mark goes back
+                # with a backoff (Writer.retry): the change is not lost.
                 _logger.exception(
-                    "store: could not produce %s %r; keeping its stored row",
+                    "store: could not produce %s %r; keeping its stored row,"
+                    " retrying later",
                     table,
                     key,
                 )
+                failed[(table, key)] = pending
                 continue
             if row is None:
                 txn.delete(table, key)
             else:
                 txn.put(table, key, row)
+        return failed
 
     # -- reading -------------------------------------------------------------
 
