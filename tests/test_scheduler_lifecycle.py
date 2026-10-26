@@ -45,7 +45,7 @@ class _RecordingClient(Client[PrinterConfig]):
 
 
 class _FakeManager:
-    """The three calls _schedule_client makes, with no network behind them."""
+    """The calls _schedule_client makes, with no network behind them."""
 
     def __init__(self):
         self.allocated = set()
@@ -54,6 +54,9 @@ class _FakeManager:
 
     def is_allocated(self, client):
         return client.unique_id in self.allocated
+
+    def is_misplaced(self, client):
+        return False
 
     async def allocate(self, client):
         self.allocate_calls += 1
