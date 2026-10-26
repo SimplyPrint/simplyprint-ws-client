@@ -12,6 +12,7 @@ from typing import (
     Optional,
 )
 
+from simplyprint_sdk.camera import FrameDemand
 from yarl import URL
 
 if TYPE_CHECKING:
@@ -61,6 +62,17 @@ class BaseCameraProtocol(ABC, Iterable[FrameT], AsyncIterable[FrameT]):
     CPU-isolated from the loop). Set ``PROCESS`` to move a CPU-heavy async camera
     off the loop too (it then runs on a worker's event loop), or ``THREAD`` to
     give a camera its own thread in this process."""
+
+    demand_driven: ClassVar[bool] = False
+    """CONTINUOUS protocols only: ``read`` makes a frame only when ``demand``
+    has a request (``FrameDemand.take``) and otherwise just keeps its source
+    warm. The pool then attaches ``demand`` in the producer before ``read`` and
+    requests one frame for every frame a client waits for; see
+    :class:`simplyprint_sdk.camera.FrameDemand`."""
+
+    demand: Optional[FrameDemand] = None
+    """Attached by the pool on a ``demand_driven`` protocol; ``None`` means no
+    signal, so every frame counts as wanted."""
 
     uri: URL
     """Configuration URI for the camera protocol, and the only input we have access to."""

@@ -27,6 +27,12 @@ on the consumer loop:
 A worker that dies takes its producers with it: each one gets a ``None`` item
 (a failed read) and then completes, so its owner can start it again. Log
 records made in a worker are forwarded to the parent's loggers.
+
+The other direction is a *signal*: a producer allocated with ``signal=True``
+gets a :class:`WorkerSignal` as its ``signal`` keyword, and the owner sets it
+with :meth:`WorkerHandle.signal`, in any context (over the worker's command
+pipe for PROCESS). A signal is state, not a queue: only the latest value
+counts. The camera pool uses it to tell a producer when a frame is wanted.
 """
 
 from __future__ import annotations
@@ -52,7 +58,7 @@ from simplyprint_ws_client.common.worker.channel import (
     SharedSlabChannel,
 )
 
-__all__ = ["WorkerPool", "WorkerHandle"]
+__all__ = ["WorkerPool", "WorkerHandle", "WorkerSignal"]
 
 _logger = logging.getLogger("worker.pool")
 
@@ -80,7 +86,49 @@ _PROCESS_DONE = object()
 # Commands sent to a worker process.
 _CMD_START = "start"
 _CMD_STOP = "stop"
+_CMD_SIGNAL = "signal"
 _CMD_SHUTDOWN = "shutdown"
+
+
+class WorkerSignal:
+    """The owner's latest word to one running producer.
+
+    The producer calls :meth:`listen` once; the owner's
+    :meth:`WorkerHandle.signal` calls :meth:`set`. Only the latest value is
+    kept, and a listener added late is called with it at once, so a value sent
+    before the producer got to listen is not lost. The listener runs on the
+    setter's thread, one call at a time, so it must be quick and thread-safe.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value: Any = None
+        self._set = False
+        self._listener: Optional[Callable[[Any], None]] = None
+
+    def set(self, value: Any) -> None:
+        # The listener runs under the lock: ``set`` and a late ``listen`` never
+        # call it twice at once, or out of order.
+        with self._lock:
+            self._value = value
+            self._set = True
+            if self._listener is not None:
+                self._listener(value)
+
+    def listen(self, listener: Callable[[Any], None]) -> None:
+        with self._lock:
+            self._listener = listener
+            if self._set:
+                listener(self._value)
+
+
+def _call_producer(
+    producer: "Producer", emit, is_stopped, args: Tuple, signal: Optional[WorkerSignal]
+):
+    """Start ``producer``; only one that asked for a signal gets the keyword."""
+    if signal is None:
+        return producer(emit, is_stopped, *args)
+    return producer(emit, is_stopped, *args, signal=signal)
 
 
 def _join_or_warn(target, name: str, logger: logging.Logger) -> None:
@@ -104,7 +152,17 @@ def _call_on_loop(provider: EventLoopProvider, callback: Callable[[], None]) -> 
 
 
 class _Backend:
+    #: The producer's signal when it asked for one (INLINE and THREAD; a
+    #: PROCESS producer's lives in its worker).
+    _signal: Optional[WorkerSignal] = None
+
     def start(self) -> None: ...
+
+    def signal(self, value: Any) -> None:
+        """Set the producer's signal. Non-blocking; a producer that asked for
+        none ignores it."""
+        if self._signal is not None:
+            self._signal.set(value)
 
     def request_stop(self) -> None:
         """Signal the producer to stop. MUST be non-blocking -- it runs on the
@@ -128,12 +186,14 @@ class _InlineBackend(_Backend):
         on_item: OnItem,
         args: Tuple,
         on_done: Callable[[], None],
+        signal: Optional[WorkerSignal] = None,
     ) -> None:
         self._provider = provider
         self._producer = producer
         self._on_item = on_item
         self._args = args
         self._on_done = on_done
+        self._signal = signal
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
 
@@ -149,7 +209,9 @@ class _InlineBackend(_Backend):
             self._on_item(payload, timestamp)  # already on the loop
 
         try:
-            await self._producer(emit, self._stop.is_set, *self._args)
+            await _call_producer(
+                self._producer, emit, self._stop.is_set, self._args, self._signal
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -189,10 +251,12 @@ class _ThreadBackend(_Backend):
         policy: OverflowPolicy,
         maxsize: int,
         on_done: Callable[[], None],
+        signal: Optional[WorkerSignal] = None,
     ) -> None:
         self._producer = producer
         self._args = args
         self._is_async = is_async
+        self._signal = signal
         self._stop = threading.Event()
         self._on_done = on_done
         self._courier: Courier = Courier(
@@ -215,12 +279,20 @@ class _ThreadBackend(_Backend):
                 loop = asyncio.new_event_loop()
                 try:
                     loop.run_until_complete(
-                        self._producer(emit, self._stop.is_set, *self._args)
+                        _call_producer(
+                            self._producer,
+                            emit,
+                            self._stop.is_set,
+                            self._args,
+                            self._signal,
+                        )
                     )
                 finally:
                     loop.close()
             else:
-                self._producer(emit, self._stop.is_set, *self._args)
+                _call_producer(
+                    self._producer, emit, self._stop.is_set, self._args, self._signal
+                )
         except Exception:  # noqa: BLE001
             _logger.exception("threaded producer failed")
         finally:
@@ -281,10 +353,11 @@ def _install_log_forwarding(channel: SharedSlabChannel, level: int) -> None:
 
 
 class _WorkerProducer:
-    __slots__ = ("stop", "task", "thread")
+    __slots__ = ("signal", "stop", "task", "thread")
 
-    def __init__(self) -> None:
+    def __init__(self, signal: Optional[WorkerSignal]) -> None:
         self.stop = threading.Event()
+        self.signal = signal
         self.thread: Optional[threading.Thread] = None
         self.task: Optional[asyncio.Task] = None
 
@@ -306,14 +379,16 @@ class _WorkerRuntime:
 
     def start(self, producer_id: int, blob: bytes) -> None:
         try:
-            producer, args, is_async = pickle.loads(blob)
+            producer, args, is_async, wants_signal = pickle.loads(blob)
         except Exception:  # noqa: BLE001 -- report it as a failed producer
             self._logger.exception("could not load producer %d", producer_id)
             self._channel.send(producer_id, None, time.time())
             self._channel.send_done(producer_id, time.time())
             return
 
-        entry = _WorkerProducer()
+        # Made before the producer starts, so a signal that arrives right
+        # behind the start command is kept for its ``listen``.
+        entry = _WorkerProducer(WorkerSignal() if wants_signal else None)
         with self._lock:
             self._producers[producer_id] = entry
 
@@ -343,6 +418,12 @@ class _WorkerRuntime:
         if self._loop is not None and entry.thread is None:
             self._loop.call_soon_threadsafe(self._cancel_task, entry)
 
+    def signal(self, producer_id: int, value: Any) -> None:
+        with self._lock:
+            entry = self._producers.get(producer_id)
+        if entry is not None and entry.signal is not None:
+            entry.signal.set(value)
+
     def shutdown(self) -> None:
         with self._lock:
             entries = list(self._producers.values())
@@ -370,7 +451,7 @@ class _WorkerRuntime:
 
     def _run_sync(self, producer_id, entry, producer, args, emit) -> None:
         try:
-            producer(emit, entry.stop.is_set, *args)
+            _call_producer(producer, emit, entry.stop.is_set, args, entry.signal)
         except Exception:  # noqa: BLE001
             self._logger.exception("process producer %d failed", producer_id)
         finally:
@@ -379,7 +460,9 @@ class _WorkerRuntime:
     def _spawn_task(self, producer_id, entry, producer, args, emit) -> None:
         async def run() -> None:
             try:
-                await producer(emit, entry.stop.is_set, *args)
+                await _call_producer(
+                    producer, emit, entry.stop.is_set, args, entry.signal
+                )
             except asyncio.CancelledError:
                 pass
             except Exception:  # noqa: BLE001
@@ -421,6 +504,8 @@ def _worker_main(commands, child_args: tuple, log_level: int) -> None:
                 runtime.start(command[1], command[2])
             elif command[0] == _CMD_STOP:
                 runtime.stop(command[1])
+            elif command[0] == _CMD_SIGNAL:
+                runtime.signal(command[1], command[2])
             else:
                 break
     finally:
@@ -466,10 +551,12 @@ class _ProcessBackend(_Backend):
         policy: OverflowPolicy,
         maxsize: int,
         on_done: Callable[[], None],
+        signal: bool = False,
     ) -> None:
         self.id = -1  # assigned by the pool before start()
-        # Pickled here so an unpicklable producer fails the allocate call.
-        self._blob = pickle.dumps((producer, args, is_async))
+        # Pickled here so an unpicklable producer fails the allocate call. The
+        # producer's signal is made in the worker; ``signal`` only says to.
+        self._blob = pickle.dumps((producer, args, is_async, signal))
         self._pool = pool
         self._provider = provider
         self._on_item = on_item
@@ -487,6 +574,13 @@ class _ProcessBackend(_Backend):
     def start(self) -> None:
         self._group = self._pool._place(self)
         self._group.send((_CMD_START, self.id, self._blob))
+
+    def signal(self, value: Any) -> None:
+        # Behind the start command on the same pipe, so the worker always has
+        # the producer (and its signal) by the time this arrives.
+        group = self._group
+        if group is not None:
+            group.send((_CMD_SIGNAL, self.id, value))
 
     def receive(self, lease: SlabLease) -> None:
         """Called by the worker's reader, on the loop or the reader thread."""
@@ -789,6 +883,14 @@ class WorkerHandle:
     def _backend_done(self) -> None:
         self.stop()
 
+    def signal(self, value: Any) -> None:
+        """Set the producer's :class:`WorkerSignal` (allocated with
+        ``signal=True``) to ``value``, which must pickle. Non-blocking; a
+        stopped producer drops it."""
+        if self.stopped:
+            return
+        self._backend.signal(value)
+
     def stop(self) -> None:
         """Stop the worker WITHOUT blocking: signal the producer, hand the
         backend to the pool's reaper for its join, and release the slot. Safe to
@@ -873,12 +975,15 @@ class WorkerPool:
         is_async: Optional[bool] = None,
         overflow: Optional[OverflowPolicy] = None,
         maxsize: Optional[int] = None,
+        signal: bool = False,
     ) -> WorkerHandle:
         """Run ``producer`` in ``context``, routing each item to ``on_item``.
 
         ``on_item(payload, timestamp)`` always fires on the consumer loop.
         ``is_async`` is inferred from ``producer`` when omitted. ``overflow`` and
         ``maxsize`` bound the items queued for the loop (THREAD and PROCESS).
+        ``signal``: the producer is called with a ``signal`` keyword, a
+        :class:`WorkerSignal` that :meth:`WorkerHandle.signal` sets.
         """
         if self._stopped:
             raise RuntimeError("worker pool is stopped")
@@ -897,7 +1002,12 @@ class WorkerPool:
             if not is_async:
                 raise ValueError("INLINE requires an async producer")
             backend: _Backend = _InlineBackend(
-                self._provider, producer, on_item, args, on_done
+                self._provider,
+                producer,
+                on_item,
+                args,
+                on_done,
+                signal=WorkerSignal() if signal else None,
             )
         elif context is ExecutionContext.THREAD:
             backend = _ThreadBackend(
@@ -909,6 +1019,7 @@ class WorkerPool:
                 policy=policy,
                 maxsize=bound,
                 on_done=on_done,
+                signal=WorkerSignal() if signal else None,
             )
         elif context is ExecutionContext.PROCESS:
             backend = _ProcessBackend(
@@ -921,6 +1032,7 @@ class WorkerPool:
                 policy=policy,
                 maxsize=bound,
                 on_done=on_done,
+                signal=signal,
             )
         else:  # pragma: no cover -- exhaustive
             raise ValueError(f"unknown execution context {context!r}")

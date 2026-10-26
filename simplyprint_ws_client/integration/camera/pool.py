@@ -10,6 +10,13 @@ pool's life) and :meth:`CameraPool.add_protocols`, which contributes a group
 under a :class:`~simplyprint_ws_client.core.scope.Scope` and removes exactly
 that group, by token, when the scope closes. Cameras already created keep
 their protocol instance; removal only affects which protocol new cameras get.
+
+A continuous camera keeps running for ``pause_timeout`` after the last request,
+whether or not anyone still waits. A ``demand_driven`` protocol is told when a
+frame is wanted: every poll (one per ``CameraHandle.receive_frame``) bumps a
+request count that the backend sends through the worker's signal, and the
+producer turns each new count into ``FrameDemand.request()`` on the protocol.
+So such a camera can stay connected while it makes no frames for nobody.
 """
 
 from __future__ import annotations
@@ -47,7 +54,12 @@ from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopPr
 from simplyprint_ws_client.common.utils.stoppable import ProcessStoppable
 from simplyprint_ws_client.common.utils.synchronized import Synchronized
 from simplyprint_ws_client.common.worker.context import ExecutionContext
-from simplyprint_ws_client.common.worker.pool import WorkerHandle, WorkerPool
+from simplyprint_ws_client.common.worker.pool import (
+    WorkerHandle,
+    WorkerPool,
+    WorkerSignal,
+)
+from simplyprint_sdk.camera import FrameDemand
 
 if TYPE_CHECKING:
     from simplyprint_ws_client.core.scope import Scope
@@ -65,9 +77,36 @@ async def _resolve_aiter(protocol: BaseCameraProtocol):
     return result
 
 
-def _sync_camera_producer(
-    emit, is_stopped, protocol: BaseCameraProtocol, continuous: bool
+def _attach_demand(
+    protocol: BaseCameraProtocol, signal: Optional[WorkerSignal]
 ) -> None:
+    """Give a demand-driven protocol its :class:`FrameDemand`, fed by the
+    owner's signal: the count of frames requested so far. A count above the
+    last one seen is a new request (several requests between two looks are one
+    request: one frame serves every waiter)."""
+    if signal is None:
+        return
+    demand = FrameDemand()
+    protocol.demand = demand
+    seen = [0]
+
+    def on_count(count: int) -> None:
+        # Called one at a time (WorkerSignal holds its lock), so no race on seen.
+        if count > seen[0]:
+            seen[0] = count
+            demand.request()
+
+    signal.listen(on_count)
+
+
+def _sync_camera_producer(
+    emit,
+    is_stopped,
+    protocol: BaseCameraProtocol,
+    continuous: bool,
+    signal: Optional[WorkerSignal] = None,
+) -> None:
+    _attach_demand(protocol, signal)
     try:
         for frame in protocol:
             if is_stopped():
@@ -83,8 +122,13 @@ def _sync_camera_producer(
 
 
 async def _async_camera_producer(
-    emit, is_stopped, protocol: BaseCameraProtocol, continuous: bool
+    emit,
+    is_stopped,
+    protocol: BaseCameraProtocol,
+    continuous: bool,
+    signal: Optional[WorkerSignal] = None,
 ) -> None:
+    _attach_demand(protocol, signal)
     try:
         aiter = await _resolve_aiter(protocol)
         async for frame in aiter:
@@ -187,6 +231,8 @@ class CameraWorkerBackend:
         self._lock = threading.Lock()
         self._desired = _Desired.PAUSED
         self._oneshot = False  # a one-shot (ON_DEMAND) poll is pending
+        #: Frames requested so far (demand-driven protocols): the signal value.
+        self._requested = 0
         self._generation = 0
         self._reconcile = CoalescingTask(self._reconcile_once, provider=provider)
 
@@ -194,13 +240,32 @@ class CameraWorkerBackend:
     def _continuous(self) -> bool:
         return self._protocol.polling_mode == CameraProtocolPollingMode.CONTINUOUS
 
+    @property
+    def _demand_driven(self) -> bool:
+        return self._continuous and self._protocol.demand_driven
+
     def poll(self) -> None:
+        """A client waits for a frame (``CameraHandle.receive_frame``): every
+        snapshot, live-stream frame, timelapse shot or detection pass."""
         if self._continuous:
             self.start()
+            if self._demand_driven:
+                self._request_frame()
             return
         with self._lock:
             self._oneshot = True
         self._reconcile.trigger()
+
+    def _request_frame(self) -> None:
+        """Tell the running producer one more frame is wanted. Without a worker
+        yet (or while one is replaced) the reconcile sends the count to the
+        new worker instead."""
+        with self._lock:
+            self._requested += 1
+            count = self._requested
+            worker = self._worker
+        if worker is not None:
+            worker.signal(count)
 
     def start(self) -> None:
         if not self._continuous:
@@ -266,13 +331,20 @@ class CameraWorkerBackend:
             )
             self._handle.deliver_frame(None, time.time())  # fail waiters now
             return
+        installed: Optional[WorkerHandle] = None
         with self._lock:
             if self._generation == generation:
-                self._worker = worker
+                self._worker = installed = worker
                 worker = None  # installed
+            count = self._requested
         if worker is not None:
             # A newer reconcile superseded us mid-allocate; retire the orphan.
             worker.stop()
+        elif installed is not None and count and self._demand_driven:
+            # A request may have gone to the retired worker, or come while no
+            # worker ran: the new one makes a frame for it. At worst that is one
+            # frame nobody waits for, once per worker start, never a lost one.
+            installed.signal(count)
 
     def _allocate(self, *, continuous: bool, generation: int) -> WorkerHandle:
         producer = (
@@ -291,6 +363,9 @@ class CameraWorkerBackend:
             args=(self._protocol, continuous),
             is_async=self._protocol.is_async,
             maxsize=_FRAME_QUEUE,
+            # A continuous worker of a demand-driven protocol hears each
+            # request; a one-shot read makes its one frame regardless.
+            signal=continuous and self._demand_driven,
         )
 
     def _refresh_timer(self) -> None:
