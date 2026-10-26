@@ -534,6 +534,9 @@ class _Held(NamedTuple):
     #: The job id its build released (``releases_job_id``), to restore if the
     #: frame never left; ``None`` if it released none.
     released_job_id: Optional[int]
+    #: Handed over by :meth:`Client.take_held_edge`: its markers are already
+    #: reset and its job id stays released; the taker resends it if need be.
+    taken: bool = False
 
 
 class Client(
@@ -930,9 +933,39 @@ class Client(
         id their build released has to come back.
         """
         for held in self._held.values():
-            if held.released_job_id is not None and self.printer.current_job_id is None:
+            if (
+                not held.taken
+                and held.released_job_id is not None
+                and self.printer.current_job_id is None
+            ):
                 self.printer.current_job_id = held.released_job_id
         self._held.clear()
+
+    def take_held_edge(self, msg_kind: Type[ClientMsg]) -> Optional[ClientMsg]:
+        """Hand over the edge of ``msg_kind`` a send is writing right now.
+
+        For an integration about to overwrite what an in-flight edge was built
+        from (a newer edge, a new job id). Its markers stay set until the write
+        settles, so it looks unsent: a copy of it would go out a second time
+        once the write lands, and leaving it to :meth:`settle` would lose it if
+        the frame never left, the state having moved on.
+
+        Taken, its markers are reset now (as for a written frame), the job id
+        it released stays released (it travels in the frame; restoring it
+        could put an old run's id on the next one), and :meth:`settle` leaves
+        it to the caller: queue it, and drop it once it counts as sent.
+        ``None`` if no such edge is in flight (or it was taken already).
+        """
+        for key, held in self._held.items():
+            msg = held.msg
+            if held.taken or not isinstance(msg, msg_kind) or not msg.carries_edge():
+                continue
+            job_id = self.printer.current_job_id
+            msg.reset_changes(self.printer, v=held.v)
+            self.printer.current_job_id = job_id
+            self._held[key] = held._replace(taken=True)
+            return msg
+        return None
 
     def settle(self, msg: ClientMsg) -> None:
         """After the write of a message built by ``consume``: reset or keep.
@@ -945,13 +978,21 @@ class Client(
           acknowledgements); a value is kept, since resending it is harmless;
         - cannot be serialized: reset, so it does not retry forever.
 
-        Messages ``consume`` did not build (an integration's own) are ignored.
+        Messages ``consume`` did not build (an integration's own) are ignored,
+        and so is one handed over by :meth:`take_held_edge`: it is the taker's.
         """
         held = self._held.pop(id(msg), None)
         if held is None:
             return
 
         outcome = msg.write_outcome
+        if held.taken:
+            # Handed over (take_held_edge): reset then, resent by the taker.
+            # Only the record of what the server was sent is still ours.
+            if msg.counts_as_sent() and outcome != WriteOutcome.UNSENDABLE:
+                self._sent_kinds.add(type(msg))
+            return
+
         if not msg.counts_as_sent():
             if held.released_job_id is not None and self.printer.current_job_id is None:
                 self.printer.current_job_id = held.released_job_id

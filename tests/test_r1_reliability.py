@@ -24,6 +24,7 @@ import yarl
 from simplyprint_ws_client import Client, PrinterStatus
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
+from simplyprint_ws_client.core.protocol.messages import JobInfoMsg
 from simplyprint_ws_client.core.protocol.models import WriteOutcome
 from simplyprint_ws_client.core.state.models import FilamentSensorEnum, Intervals
 from simplyprint_ws_client.wire.errors import NotConnected
@@ -256,6 +257,44 @@ async def test_a_reconnect_resends_every_value_the_server_was_sent(clock):
     # invented from defaults now.
     assert '{"type":"temps","data":{"bed":[60],"tool0":[200]}}' in after
     assert '{"type":"state_change","data":{"new":"operational"}}' in after
+
+
+@pytest.mark.asyncio
+async def test_an_edge_taken_over_mid_write_is_the_takers():
+    # An integration about to overwrite what an in-flight edge was built from
+    # takes it over: reset at once, its job id stays released, and its
+    # outcome is left to the taker (here: nobody resends it).
+    wire, client = await _connected()
+    printer = client.printer
+    printer.current_job_id = 42
+    printer.status = PrinterStatus.PRINTING
+    printer.job_info.started = True
+    await wire.schedule(client)
+
+    socket = wire.socket(client)
+    original = socket.write
+    taken: List[object] = []
+
+    async def write(data: object) -> None:
+        if '"finished":true' in str(data):
+            taken.append(client.take_held_edge(JobInfoMsg))
+            assert client.take_held_edge(JobInfoMsg) is None  # taken once
+            raise NotConnected("the link died before the write")
+        await original(data)
+
+    socket.write = write
+    printer.job_info.finished = True
+    await wire.schedule(client)
+
+    (msg,) = taken
+    assert isinstance(msg, JobInfoMsg) and msg.data["finished"] is True
+    assert msg.write_outcome is WriteOutcome.NOT_SENT
+    assert not printer.job_info.model_has_changes("finished")
+    assert printer.current_job_id is None  # not restored over the taker's
+
+    before = len(socket.sent)
+    await wire.schedule(client)
+    assert not any('"finished":true' in f for f in socket.sent[before:])
 
 
 # -- 4. a write on a socket the library already knows is closed ----------------
