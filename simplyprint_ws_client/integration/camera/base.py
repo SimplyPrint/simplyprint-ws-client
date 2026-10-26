@@ -68,7 +68,10 @@ class BaseCameraProtocol(ABC, Iterable[FrameT], AsyncIterable[FrameT]):
     has a request (``FrameDemand.take``) and otherwise just keeps its source
     warm. The pool then attaches ``demand`` in the producer before ``read`` and
     requests one frame for every frame a client waits for; see
-    :class:`simplyprint_sdk.camera.FrameDemand`."""
+    :class:`simplyprint_sdk.camera.FrameDemand`. Such a ``read`` yields
+    nothing while nobody watches, so the pool stops it through the demand:
+    once stopped, ``pending``/``take``/``wait`` raise, and the read must ask
+    its demand between packets and while idle for the stop to land."""
 
     demand: Optional[FrameDemand] = None
     """Attached by the pool on a ``demand_driven`` protocol; ``None`` means no

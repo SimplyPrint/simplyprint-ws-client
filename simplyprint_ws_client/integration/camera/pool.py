@@ -77,16 +77,71 @@ async def _resolve_aiter(protocol: BaseCameraProtocol):
     return result
 
 
+class _CameraStopped(Exception):
+    """Raised from a stopped camera's :class:`_StoppableDemand`, inside its
+    ``read``: the camera's ``finally`` closes its stream, and the producer
+    ends quietly (a stop is not a failed read)."""
+
+
+class _StoppableDemand(FrameDemand):
+    """The pool's :class:`FrameDemand`, which also carries the stop.
+
+    The producer checks ``is_stopped()`` only when the camera yields, and a
+    demand-driven camera nobody watches yields nothing: its RTSP demux or
+    WebRTC loop would run on after the pool stopped it, holding the stream
+    session (Bambu printers then refuse the next one) and keeping the worker
+    busy. Such a camera asks its demand between packets and while idle
+    (``DemandDecoder.push`` does on every packet), so the demand checks the
+    stop there and raises :class:`_CameraStopped`."""
+
+    #: How often :meth:`wait` looks at the stop: nothing notifies it.
+    STOP_CHECK = 0.2
+
+    def __init__(self, is_stopped: Callable[[], bool]) -> None:
+        super().__init__()
+        self._is_stopped = is_stopped
+
+    def _check_stopped(self) -> None:
+        if self._is_stopped():
+            raise _CameraStopped()
+
+    @property
+    def pending(self) -> bool:
+        self._check_stopped()
+        return super().pending
+
+    def take(self) -> bool:
+        self._check_stopped()
+        return super().take()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        # In slices of STOP_CHECK, so a camera sleeping here sees the stop.
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            self._check_stopped()
+            step = self.STOP_CHECK
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return super().pending
+                step = min(step, left)
+            if super().wait(step):
+                return True
+
+
 def _attach_demand(
-    protocol: BaseCameraProtocol, signal: Optional[WorkerSignal]
+    protocol: BaseCameraProtocol,
+    signal: Optional[WorkerSignal],
+    is_stopped: Callable[[], bool],
 ) -> None:
     """Give a demand-driven protocol its :class:`FrameDemand`, fed by the
     owner's signal: the count of frames requested so far. A count above the
     last one seen is a new request (several requests between two looks are one
-    request: one frame serves every waiter)."""
+    request: one frame serves every waiter). It also ends the camera's read
+    once the producer is stopped (:class:`_StoppableDemand`)."""
     if signal is None:
         return
-    demand = FrameDemand()
+    demand = _StoppableDemand(is_stopped)
     protocol.demand = demand
     seen = [0]
 
@@ -106,7 +161,7 @@ def _sync_camera_producer(
     continuous: bool,
     signal: Optional[WorkerSignal] = None,
 ) -> None:
-    _attach_demand(protocol, signal)
+    _attach_demand(protocol, signal, is_stopped)
     try:
         for frame in protocol:
             if is_stopped():
@@ -114,6 +169,8 @@ def _sync_camera_producer(
             emit(frame, time.time())
             if not continuous:
                 break
+    except _CameraStopped:
+        pass  # stopped while it made no frame: its read already cleaned up
     except (CameraProtocolConnectionError, CameraProtocolInvalidState):
         emit(None, time.time())
     except Exception as e:  # noqa: BLE001
@@ -128,7 +185,7 @@ async def _async_camera_producer(
     continuous: bool,
     signal: Optional[WorkerSignal] = None,
 ) -> None:
-    _attach_demand(protocol, signal)
+    _attach_demand(protocol, signal, is_stopped)
     try:
         aiter = await _resolve_aiter(protocol)
         async for frame in aiter:
@@ -139,6 +196,8 @@ async def _async_camera_producer(
                 break
     except asyncio.CancelledError:
         raise
+    except _CameraStopped:
+        pass  # an async camera on a worker's own loop: same as the sync one
     except (CameraProtocolConnectionError, CameraProtocolInvalidState):
         emit(None, time.time())
     except Exception as e:  # noqa: BLE001
