@@ -4,6 +4,7 @@ __all__ = [
     "PeripheralAction",
     "ClientMsgType",
     "DispatchMode",
+    "WriteOutcome",
 ]
 
 from enum import IntEnum
@@ -146,3 +147,22 @@ class DispatchMode(IntEnum):
     DISPATCH = 0
     RATELIMIT = 1
     CANCEL = 2
+
+
+class WriteOutcome(IntEnum):
+    """What became of one outbound frame, as the protocol's send saw it.
+
+    v0 has no acknowledgements, so this is the most the client can know. The
+    distinction that matters is whether a frame *provably* never left: only
+    then is sending it again safe for a one-shot edge (at-most-once).
+    """
+
+    #: The socket took the whole frame.
+    WRITTEN = 0
+    #: It never reached the socket (no live link, a stale connection version,
+    #: the transport refused before writing). Sending it again is safe.
+    NOT_SENT = 1
+    #: The socket failed under the write: the frame may or may not have left.
+    MAYBE_SENT = 2
+    #: It can never be sent (it does not serialize); retrying cannot help.
+    UNSENDABLE = 3

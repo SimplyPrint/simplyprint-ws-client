@@ -118,6 +118,7 @@ from typing import (
 from pydantic import (
     BaseModel,
     Field,
+    PrivateAttr,
     field_validator,
     RootModel,
     model_serializer,
@@ -130,6 +131,7 @@ from simplyprint_ws_client.core.protocol.models import (
     DemandMsgType,
     DispatchMode,
     PeripheralAction,
+    WriteOutcome,
 )
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import (
@@ -610,8 +612,41 @@ TClientMsgDataGenerator = Generator[Tuple[str, Any], None, None]
 
 # Outgoing Msgs from the client
 class ClientMsg(Msg[TMsgType, Optional[dict]]):
+    #: Set by the protocol's send; ``None`` until something reports. Private,
+    #: so it is never part of the frame.
+    _write_outcome: Optional[WriteOutcome] = PrivateAttr(default=None)
+
     def __init__(self, data: Optional[dict] = None, **kwargs):
         super().__init__(type=self.msg_type(), data=data, **kwargs)
+
+    @property
+    def write_outcome(self) -> Optional[WriteOutcome]:
+        """What became of this message's frame (``None``: nobody reported)."""
+        return self._write_outcome
+
+    def record_write(self, outcome: WriteOutcome) -> None:
+        """The write path reports what became of the frame."""
+        self._write_outcome = outcome
+
+    def carries_edge(self) -> bool:
+        """Whether this frame carries a one-shot edge rather than a value.
+
+        A value can be sent again harmlessly (the newest wins). An edge cannot:
+        without acknowledgements a frame that *may* have left is never resent
+        (sending ``finished`` twice could start AutoPrint twice).
+        """
+        return False
+
+    def releases_job_id(self, state: PrinterState) -> bool:
+        """Whether sending this message ends the printer's current job id.
+
+        Part of :meth:`reset_changes` (the default path clears the id there);
+        the client also asks it at build time when the reset waits for the
+        socket write, because later messages of the same send must be built
+        without the id, exactly as before.
+        """
+        _ = state
+        return False
 
     @classmethod
     def msg_type(cls) -> TMsgType:
@@ -628,6 +663,10 @@ class ClientMsg(Msg[TMsgType, Optional[dict]]):
         Custom reset logic for the message, typically used to
         fully reset some state, but optionally comparing and only
         resetting state when it has not been changed further.
+
+        With ``v``, only changes up to ``v`` (the newest this message was built
+        from) are reset: the reset runs after the socket write, and a change
+        made while the frame was in flight must stay pending for the next send.
         """
         pass
 
@@ -687,7 +726,7 @@ class MachineDataMsg(ClientMsg[Literal[ClientMsgType.INFO]]):
         yield from state.info.model_dump(mode="json", exclude_none=True).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.info.model_reset_changed()
+        state.info.model_reset_changed(v=v)
 
 
 class WebcamStatusMsg(ClientMsg[Literal[ClientMsgType.WEBCAM_STATUS]]):
@@ -708,7 +747,7 @@ class WebcamMsg(ClientMsg[Literal[ClientMsgType.WEBCAM]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.webcam_settings.model_reset_changed()
+        state.webcam_settings.model_reset_changed(v=v)
 
 
 class InstalledPluginsMsg(ClientMsg[Literal[ClientMsgType.INSTALLED_PLUGINS]]): ...
@@ -741,7 +780,7 @@ class FirmwareMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE]]):
         yield "fw", data
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.firmware.model_reset_changed()
+        state.firmware.model_reset_changed(v=v)
 
 
 class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
@@ -753,7 +792,7 @@ class FirmwareWarningMsg(ClientMsg[Literal[ClientMsgType.FIRMWARE_WARNING]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.firmware_warning.model_reset_changed()
+        state.firmware_warning.model_reset_changed(v=v)
 
 
 class ToolMsg(ClientMsg[Literal[ClientMsgType.TOOL]]):
@@ -786,14 +825,14 @@ class TemperatureMsg(ClientMsg[Literal[ClientMsgType.TEMPERATURES]]):
             yield f"tool{i}", tool.temperature.to_list()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.bed.model_reset_changed("temperature")
-        state.bed.temperature.model_reset_changed()
-        state.chamber.model_reset_changed("temperature")
-        state.chamber.temperature.model_reset_changed()
+        state.bed.model_reset_changed("temperature", v=v)
+        state.bed.temperature.model_reset_changed(v=v)
+        state.chamber.model_reset_changed("temperature", v=v)
+        state.chamber.temperature.model_reset_changed(v=v)
 
         for tool in state.tools:
-            tool.model_reset_changed("temperature")
-            tool.temperature.model_reset_changed()
+            tool.model_reset_changed("temperature", v=v)
+            tool.temperature.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
         # If any target has been set, we need to send the message.
@@ -819,7 +858,7 @@ class AmbientTemperatureMsg(ClientMsg[Literal[ClientMsgType.AMBIENT]]):
         yield "new", state.ambient_temperature.ambient
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.ambient_temperature.model_reset_changed()
+        state.ambient_temperature.model_reset_changed(v=v)
 
 
 class ConnectionMsg(ClientMsg[Literal[ClientMsgType.CONNECTION]]): ...
@@ -833,12 +872,15 @@ class StateChangeMsg(ClientMsg[Literal[ClientMsgType.STATUS]]):
 
         yield "new", state.status
 
-    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+    def releases_job_id(self, state: PrinterState) -> bool:
         # When the printer goes operational, we can clear the current job id.
-        if state.status == PrinterStatus.OPERATIONAL:
+        return state.status == PrinterStatus.OPERATIONAL
+
+    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+        if self.releases_job_id(state):
             state.current_job_id = None
 
-        state.model_reset_changed("status")
+        state.model_reset_changed("status", v=v)
 
 
 class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
@@ -867,15 +909,23 @@ class JobInfoMsg(ClientMsg[Literal[ClientMsgType.JOB_INFO]]):
 
             yield key, value
 
-    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+    def carries_edge(self) -> bool:
+        # started/finished/cancelled/failed: one-shot, only ever sent as true.
+        data = self.data or {}
+        return any(data.get(f) for f in JobInfoState.MUTUALLY_EXCLUSIVE_FIELDS)
+
+    def releases_job_id(self, state: PrinterState) -> bool:
         # When an ended field has been changed to true, we can clear the current job id.
         ended_fields = {"cancelled", "failed", "finished"}
-        if state.job_info.model_has_changes(*ended_fields) and (
+        return state.job_info.model_has_changes(*ended_fields) and bool(
             state.job_info.cancelled or state.job_info.failed or state.job_info.finished
-        ):
+        )
+
+    def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
+        if self.releases_job_id(state):
             state.current_job_id = None
 
-        state.job_info.model_reset_changed()
+        state.job_info.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
         # Check if there is an intersection between the changed fields and the boolean fields
@@ -912,7 +962,7 @@ class LatencyMsg(ClientMsg[Literal[ClientMsgType.LATENCY]]):
         yield "ms", state.latency.get_latency()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.latency.model_reset_changed()
+        state.latency.model_reset_changed(v=v)
 
 
 class FileProgressMsg(ClientMsg[Literal[ClientMsgType.FILE_PROGRESS]]):
@@ -937,6 +987,15 @@ class FileProgressMsg(ClientMsg[Literal[ClientMsgType.FILE_PROGRESS]]):
         ):
             yield "percent", state.file_progress.percent
 
+    #: The states that end a file transfer: one-shot, like a job edge.
+    TERMINAL_STATES: ClassVar[Set[FileProgressStateEnum]] = {
+        FileProgressStateEnum.READY,
+        FileProgressStateEnum.ERROR,
+    }
+
+    def carries_edge(self) -> bool:
+        return (self.data or {}).get("state") in self.TERMINAL_STATES
+
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         state.file_progress.model_reset_changed(v=v)
 
@@ -947,7 +1006,7 @@ class FilamentSensorMsg(ClientMsg[Literal[ClientMsgType.FILAMENT_SENSOR]]):
         yield "state", state.filament_sensor.state
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.filament_sensor.model_reset_changed()
+        state.filament_sensor.model_reset_changed(v=v)
 
 
 class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
@@ -956,7 +1015,7 @@ class PowerControllerMsg(ClientMsg[Literal[ClientMsgType.PSU]]):
         yield "on", state.psu_info
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.psu_info.model_reset_changed()
+        state.psu_info.model_reset_changed(v=v)
 
 
 class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
@@ -968,7 +1027,7 @@ class CpuInfoMsg(ClientMsg[Literal[ClientMsgType.CPU_INFO]]):
         ).items()
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
-        state.cpu_info.model_reset_changed()
+        state.cpu_info.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
         return state.intervals.dispatch_mode(Interval.CPU)
@@ -1138,7 +1197,13 @@ class NotificationMsg(ClientMsg[Literal[ClientMsgType.NOTIFICATION]]):
 
     def reset_changes(self, state: PrinterState, v: Optional[int] = None) -> None:
         for event_id, notification in list(state.notifications.notifications.items()):
-            if notification.resolved_at is not None:
+            # A resolution made after this frame was built has not been sent:
+            # keep the event until a later frame carries it.
+            sent_all = v is None or all(
+                change <= v
+                for change in notification.model_self_changed_fields.values()
+            )
+            if notification.resolved_at is not None and sent_all:
                 state.notifications.remove(event_id)
                 continue
 

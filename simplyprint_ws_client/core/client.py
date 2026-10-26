@@ -8,19 +8,26 @@ __all__ = [
 ]
 
 import asyncio
+import contextlib
 import logging
+import random
 import re
 import weakref
 from datetime import timedelta, datetime
 from enum import IntEnum
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     Generic,
     Iterable,
+    Iterator,
     Literal,
     NamedTuple,
     Optional,
+    Set,
+    Tuple,
+    Type,
     TypeVar,
     Union,
     cast,
@@ -93,7 +100,9 @@ from simplyprint_ws_client.core.protocol.models import (
     ClientMsgType,
     DispatchMode,
     DemandMsgType,
+    WriteOutcome,
 )
+from simplyprint_ws_client.core.state.models import FileProgressStateEnum
 
 from simplyprint_ws_client.events import EventBus, Event
 from simplyprint_ws_client.events.event import sync_only
@@ -242,6 +251,140 @@ def _message_changes(
     )
 
 
+def _mark_present(model: ReactiveModel, *fields: str) -> None:
+    """Mark the fields of ``model`` that hold a value as changed."""
+    present = [field for field in fields if getattr(model, field) is not None]
+    if present:
+        model.model_set_changed(*present)
+
+
+def _resend_job_info(state: PrinterState) -> None:
+    # Only a running job's values; the edges are one-shot and never re-marked.
+    if state.is_printing():
+        _mark_present(
+            state.job_info,
+            "progress",
+            "initial_estimate",
+            "layer",
+            "time",
+            "filament",
+            "filename",
+            "delay",
+            "skipped_objects",
+        )
+
+
+def _resend_file_progress(state: PrinterState) -> None:
+    # A transfer in progress is a value; a terminal state is an edge.
+    if state.file_progress.state in (
+        FileProgressStateEnum.DOWNLOADING,
+        FileProgressStateEnum.STARTED,
+        FileProgressStateEnum.PENDING,
+    ):
+        state.file_progress.model_set_changed("state")
+
+
+def _resend_tools(state: PrinterState) -> None:
+    for tool in state.tools:
+        _mark_present(tool, "active_material")
+
+
+def _resend_temperatures(state: PrinterState) -> None:
+    for temperature in (
+        state.bed.temperature,
+        state.chamber.temperature,
+        *(tool.temperature for tool in state.tools),
+    ):
+        _mark_present(temperature, "actual")
+
+
+def _resend_materials(state: PrinterState) -> None:
+    _mark_present(state.bed, "type")
+    for tool in state.tools:
+        tool.model_set_changed("nozzle")
+        for material in tool.materials:
+            material.model_set_changed("ext")
+    if state.mms_layout:
+        state.model_set_changed("mms_layout")
+
+
+def _resend_peripherals(state: PrinterState) -> None:
+    for peripheral in state.peripherals.entries.values():
+        _mark_present(peripheral, "value", "available", "updated")
+
+
+#: How a reconnect re-marks each value-type message so its next build carries
+#: the full current value (the inverse of :func:`_message_changes`). Status,
+#: ``sp_version`` and the firmware name are re-marked unconditionally by
+#: ``mark_common_fields_as_changed``, as on every connect, between the two
+#: tables.
+#:
+#: Not here: latency (a measurement of the dead link) and notifications
+#: (events, not values; re-issuing them is not known to be harmless).
+_Resend = Tuple[Tuple[Type[ClientMsg], Callable[[PrinterState], None]], ...]
+
+#: Re-marked before the status: a job edge still pending in job info must be
+#: built while the job id is there, before a resent `operational` releases it.
+_RESEND_BEFORE_STATUS: _Resend = (
+    (JobInfoMsg, _resend_job_info),
+    (FileProgressMsg, _resend_file_progress),
+)
+
+_RESEND_AFTER_STATUS: _Resend = (
+    (
+        MachineDataMsg,
+        lambda s: _mark_present(s.info, *type(s.info).model_fields),
+    ),
+    (WebcamStatusMsg, lambda s: s.webcam_info.model_set_changed("connected")),
+    (
+        WebcamMsg,
+        lambda s: s.webcam_settings.model_set_changed("flipH", "flipV", "rotate90"),
+    ),
+    (
+        FirmwareMsg,
+        lambda s: _mark_present(s.firmware, *type(s.firmware).model_fields),
+    ),
+    (
+        FirmwareWarningMsg,
+        lambda s: _mark_present(
+            s.firmware_warning, "check_name", "warning_type", "severity", "url"
+        ),
+    ),
+    (ToolMsg, _resend_tools),
+    (TemperatureMsg, _resend_temperatures),
+    (
+        AmbientTemperatureMsg,
+        lambda s: s.ambient_temperature.model_set_changed("ambient"),
+    ),
+    (FilamentSensorMsg, lambda s: _mark_present(s.filament_sensor, "state")),
+    (PowerControllerMsg, lambda s: s.psu_info.model_set_changed("on")),
+    (CpuInfoMsg, lambda s: _mark_present(s.cpu_info, "usage", "temp", "memory")),
+    (MaterialDataMsg, _resend_materials),
+    (PeripheralMsg, _resend_peripherals),
+)
+
+#: After a hub (re)opens, its printers' adds are spread over this many seconds
+#: per printer on it: a full hub of 32 re-adds over ~1.6 s, not in one burst,
+#: while a single printer waits at most 50 ms.
+ADD_SPREAD_PER_PRINTER_S = 0.05
+
+
+def _jitter(upper: float) -> float:
+    """A uniform delay in ``[0, upper)``. Module-level so tests can pin it."""
+    return random.uniform(0, upper) if upper > 0 else 0.0
+
+
+class _Held(NamedTuple):
+    """A message built by :meth:`Client.consume` whose reset waits for its write."""
+
+    msg: ClientMsg
+    #: The newest change it was built from: the reset clears up to this.
+    v: int
+    #: The job id its build released (``releases_job_id``), to restore if the
+    #: frame never left; ``None`` if it released none.
+    released_job_id: Optional[int]
+
+
 class Client(
     Generic[TConfig],
     EventLoopProvider[asyncio.AbstractEventLoop],
@@ -296,6 +439,24 @@ class Client(
         self.v = -1
         self.msg_id = -1
         self.last_msg_id = -1
+        #: Changes the last send left pending without a new change to wake the
+        #: scheduler: rate-limited messages, frames that never left. The
+        #: scheduler retries them on its next pass (see ``has_deferred``).
+        self._deferred = False
+        #: While set, ``consume`` leaves each message's reset to ``settle``,
+        #: after the frame's write (the scheduler's path).
+        self._settle_on_write = False
+        self._held: Dict[int, _Held] = {}
+        #: Message kinds the server has been sent at least once. A reconnect
+        #: resends these in full; a kind never sent stays as it was (nothing
+        #: is invented from defaults the server never saw).
+        self._sent_kinds: Set[type] = set()
+        #: Armed when an added printer loses its link; the next ``connected``
+        #: then resends the full current state instead of the common fields.
+        self._resend_state = False
+        #: For the first send after that resend: one-shot edges kept from the
+        #: dead link go out before the state.
+        self._edges_first = False
         self._should_be_allocated = True
         self.initialized = False
         self.offload = context.offload
@@ -390,7 +551,18 @@ class Client(
 
     @property
     def has_changes(self) -> bool:
+        """A change was made since the last ``consume``."""
         return self.msg_id > self.last_msg_id
+
+    @property
+    def has_deferred(self) -> bool:
+        """The last send left changes pending (rate limited, or not written).
+
+        Kept apart from :attr:`has_changes` on purpose: the scheduler wakes
+        for new changes at once, but retries deferred ones only on its
+        tick-rate pass, so a rate-limited printer is not rebuilt on every wake.
+        """
+        return self._deferred
 
     def next_msg_id(self):
         self.msg_id += 1
@@ -463,8 +635,16 @@ class Client(
         self.event_bus.emit_sync(ClientStateChangeEvent)
 
     def consume(self) -> list:
-        """Consume and return the list of pending messages."""
+        """Consume and return the list of pending messages.
+
+        Each message's change markers are reset as it is built, unless
+        :meth:`settling_on_write` is active: then the reset waits for
+        :meth:`settle`, after the frame's write, so a change whose frame never
+        left stays pending. Either way the messages built are the same.
+        """
         self.last_msg_id = self.msg_id
+        self._deferred = False
+        self._release_held()
 
         msg_kinds = {}
 
@@ -493,13 +673,115 @@ class Client(
             msg = msg_kind(data)
 
             # Skip over messages that are not supposed to be sent.
-            if msg.dispatch_mode(self.printer) != DispatchMode.DISPATCH:
+            dispatch_mode = msg.dispatch_mode(self.printer)
+            if dispatch_mode != DispatchMode.DISPATCH:
+                # A rate-limited change keeps its markers. Without a new change
+                # nothing would wake the scheduler, and the last value of a
+                # burst would go stale; deferred, the next pass sends it.
+                if dispatch_mode == DispatchMode.RATELIMIT:
+                    self._deferred = True
                 continue
 
             msgs.append(msg)
-            msg.reset_changes(self.printer, v=highest)
+            if self._settle_on_write:
+                self._hold(msg, highest)
+            else:
+                msg.reset_changes(self.printer, v=highest)
+                self._sent_kinds.add(msg_kind)
+
+        if self._edges_first:
+            # The first send after a reconnect: edges kept from the dead link
+            # go before the full-state resend, so a resent status cannot start
+            # the server's job-disruption clock ahead of a kept `finished`.
+            self._edges_first = False
+            msgs.sort(key=lambda m: not m.carries_edge())  # stable
 
         return msgs
+
+    @contextlib.contextmanager
+    def settling_on_write(self) -> Iterator[None]:
+        """Within: ``consume`` defers each reset to :meth:`settle`.
+
+        A context rather than a ``consume`` argument, so a subclass that
+        overrides ``consume()`` (and calls ``super()``) keeps working.
+        """
+        self._settle_on_write = True
+        try:
+            yield
+        finally:
+            self._settle_on_write = False
+
+    def _hold(self, msg: ClientMsg, v: int) -> None:
+        released = None
+        if msg.releases_job_id(self.printer):
+            # The default path clears the job id in reset_changes, before the
+            # next message is built; doing it here keeps every later message
+            # of this send built exactly as before.
+            released = self.printer.current_job_id
+            self.printer.current_job_id = None
+        self._held[id(msg)] = _Held(msg, v, released)
+
+    def _release_held(self) -> None:
+        """Forget messages a previous send never settled (it was aborted).
+
+        Their markers are still pending, so the state resends them; only a job
+        id their build released has to come back.
+        """
+        for held in self._held.values():
+            if held.released_job_id is not None and self.printer.current_job_id is None:
+                self.printer.current_job_id = held.released_job_id
+        self._held.clear()
+
+    def settle(self, msg: ClientMsg) -> None:
+        """After the write of a message built by ``consume``: reset or keep.
+
+        - written (or nobody reported, as for a sink that is not the protocol):
+          reset, as the default path does at build time;
+        - never left: keep pending, so it goes out on the next send. For an edge
+          this is what makes it survive a dead socket;
+        - may have left: an edge is reset (at-most-once: no resend without
+          acknowledgements); a value is kept, since resending it is harmless;
+        - cannot be serialized: reset, so it does not retry forever.
+
+        Messages ``consume`` did not build (an integration's own) are ignored.
+        """
+        held = self._held.pop(id(msg), None)
+        if held is None:
+            return
+
+        outcome = msg.write_outcome
+        sent = outcome in (None, WriteOutcome.WRITTEN, WriteOutcome.UNSENDABLE) or (
+            outcome == WriteOutcome.MAYBE_SENT and msg.carries_edge()
+        )
+
+        if not sent:
+            if held.released_job_id is not None and self.printer.current_job_id is None:
+                self.printer.current_job_id = held.released_job_id
+            self._deferred = True
+            return
+
+        # The job id was settled when the message was built (see _hold); a
+        # newer one may have been set while the frame was in flight.
+        job_id = self.printer.current_job_id
+        msg.reset_changes(self.printer, v=held.v)
+        self.printer.current_job_id = job_id
+        if outcome != WriteOutcome.UNSENDABLE:
+            self._sent_kinds.add(type(msg))
+
+    async def write(self, msg: ClientMsg) -> None:
+        """The scheduler's send of one message built by ``consume``: write it,
+        then :meth:`settle` it on what became of the frame."""
+        try:
+            await self.send(msg, skip_dispatch=True)
+        except BaseException:
+            if msg.write_outcome is None:
+                # Failed before it reached the protocol: it never left.
+                msg.record_write(WriteOutcome.NOT_SENT)
+            self.settle(msg)
+            # The rest of this send is not written either.
+            self._deferred = True
+            raise
+        self.settle(msg)
 
     # internal methods
 
@@ -536,10 +818,45 @@ class Client(
 
         if self.state == ClientState.CONNECTING:
             self.state = ClientState.NOT_CONNECTED
+            if event.hub_size is not None:
+                self.spread_add(event.hub_size)
+
+    def spread_add(self, hub_size: int) -> None:
+        """Hold this printer's next add for a random share of the hub's window.
+
+        A hub that (re)opens would otherwise send all its adds in one burst;
+        spread over ``ADD_SPREAD_PER_PRINTER_S`` per printer they stay well
+        under the server's add limits. Never shortens a longer wait already
+        set (a server ``Retry-After``).
+        """
+        delay = _jitter(ADD_SPREAD_PER_PRINTER_S * hub_size)
+        if delay <= 0:
+            return
+
+        now = datetime.now()
+        if self._pending_action_ts != datetime.min:
+            remaining = self._pending_action_delay - (now - self._pending_action_ts)
+            if remaining.total_seconds() >= delay:
+                return
+
+        self._pending_action_ts = now
+        self._pending_action_delay = timedelta(seconds=delay)
+        # Wake the scheduler when the hold ends, not at its next tick.
+        try:
+            asyncio.get_running_loop().call_later(delay, self.signal)
+        except RuntimeError:
+            pass  # no loop (sync tests): the scheduler's tick picks it up
 
     def _on_connection_lost(self, event: SimplyPrintConnectionLostEvent):
         if self.v > event.v:
             return
+
+        # An added printer losing its link is a failure: the server may have
+        # missed anything since, so the next `connected` resends the full
+        # state. A deliberate removal (deallocate of an inactive printer) is
+        # not: it is removed first, or inactive.
+        if self.active and self.state == ClientState.CONNECTED:
+            self._resend_state = True
 
         # handle connection lost.
         self.v = event.v
@@ -589,9 +906,29 @@ class Client(
         self.signal()
 
     async def _on_connected_state(self, _msg: ConnectedMsg):
-        self.printer.mark_common_fields_as_changed()
+        if self._resend_state:
+            self._resend_state = False
+            self._mark_full_state()
+        else:
+            self.printer.mark_common_fields_as_changed()
         self.state = ClientState.CONNECTED
         self.signal()
+
+    def _mark_full_state(self) -> None:
+        """A reconnect: re-mark every value-type message the server has been
+        sent, so the next send carries the full current state (newest wins).
+
+        Edges are never re-marked: one still pending never left the dead link
+        and goes first (``_edges_first``); one that may have left stays sent.
+        """
+        for kind, mark in _RESEND_BEFORE_STATUS:
+            if kind in self._sent_kinds:
+                mark(self.printer)
+        self.printer.mark_common_fields_as_changed()
+        for kind, mark in _RESEND_AFTER_STATUS:
+            if kind in self._sent_kinds:
+                mark(self.printer)
+        self._edges_first = True
 
     async def send(self, msg: ClientMsg[ClientMsgType], skip_dispatch=False):
         """External send method (applies dispatch mode)."""

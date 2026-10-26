@@ -20,7 +20,9 @@ from simplyprint_ws_client.core.protocol.messages import (
     Msg,
     ServerMsg,
 )
+from simplyprint_ws_client.core.protocol.models import WriteOutcome
 from simplyprint_ws_client.wire import TransportError
+from simplyprint_ws_client.wire.errors import NotConnected
 from simplyprint_ws_client.wire.events import (
     Connected,
     Disconnected,
@@ -182,25 +184,50 @@ class SimplyPrintProtocol:
     async def send(
         self, msg: ClientMsg[ClientMsgType], v: Optional[int] = None
     ) -> None:
+        """Write ``msg`` and record on it what became of the frame.
+
+        Failures are not raised (the reconnect loop owns recovery); the
+        recorded :class:`WriteOutcome` is how the client learns whether the
+        change it carried went out, so it resets its markers only then.
+        """
         transport = self.transport
         if transport is None or not transport.connected:
             self.logger.warning("Dropped message %s, not connected.", msg)
+            msg.record_write(WriteOutcome.NOT_SENT)
             return
 
         if v is not None and self.v != v:
             self.logger.warning(
                 "Dropped message %s, version mismatch. %d != %d", msg, self.v, v
             )
+            msg.record_write(WriteOutcome.NOT_SENT)
             return
 
         try:
             data = msg.model_dump_json()
             await transport.send(data)
-            self._message_logger(msg).debug(
-                "sent %s", data if len(data) < 1024 else msg.msg_type()
-            )
         except (PydanticSerializationError, UnicodeError) as e:
             self.logger.error("Serialization error.", exc_info=e)
-        except WsConnectionErrors as e:
-            # The reconnect loop owns recovery; the dropped send is only logged.
+            msg.record_write(WriteOutcome.UNSENDABLE)
+            return
+        except NotConnected as e:
+            # Raised before the transport touches the socket (the link died
+            # after the check above): provably never left.
             self.logger.debug("send of %s dropped: %s", msg.msg_type(), e)
+            msg.record_write(WriteOutcome.NOT_SENT)
+            return
+        except WsConnectionErrors as e:
+            # The socket failed under the write; part or all of the frame may
+            # have left. The reconnect loop owns recovery.
+            self.logger.debug("send of %s dropped: %s", msg.msg_type(), e)
+            msg.record_write(WriteOutcome.MAYBE_SENT)
+            return
+        except BaseException:
+            # Cancelled (or worse) mid-write: it may have left. Re-raised.
+            msg.record_write(WriteOutcome.MAYBE_SENT)
+            raise
+
+        msg.record_write(WriteOutcome.WRITTEN)
+        self._message_logger(msg).debug(
+            "sent %s", data if len(data) < 1024 else msg.msg_type()
+        )

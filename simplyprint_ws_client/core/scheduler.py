@@ -310,13 +310,18 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             ):
                 return
 
-            if not client.has_changes:
+            # Deferred changes (rate limited, or a frame that never left) have
+            # no new change to announce them; this pass is their retry.
+            if not (client.has_changes or client.has_deferred):
                 return
 
-            msgs = client.consume()
+            # Each message's change markers are reset only once its frame is
+            # written (Client.write -> settle), so a dead socket loses nothing.
+            with client.settling_on_write():
+                msgs = client.consume()
 
             for msg in msgs:
-                await client.send(msg, skip_dispatch=True)
+                await client.write(msg)
 
         except Exception as e:
             client.logger.error("Error while scheduling client", exc_info=e)
