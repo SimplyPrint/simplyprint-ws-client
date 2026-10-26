@@ -750,7 +750,7 @@ def test_readable_rows_are_kept_before_the_snapshot_is_used(tmp_path, monkeypatc
     try:
         report = s.recovery
         assert report.from_damaged["printers"] == 2
-        assert report.from_snapshot["printers"] == 0  # nothing was missing
+        assert report.from_snapshot.get("printers", 0) == 0  # nothing was missing
         assert {r["unique_id"] for r in s.rows("printers")} == {"old", "new"}
         assert "quick_check" in report.reason
     finally:

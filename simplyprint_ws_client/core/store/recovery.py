@@ -7,8 +7,10 @@ Never silent and never destructive (docs/persistence-design.md, 3,
    ``<name>.corrupt-<ts>`` (nothing is deleted);
 2. a fresh database gets every row that can still be read from the damaged
    one, table by table, row by row;
-3. rows still missing are filled from the newest snapshot (the daily
-   ``VACUUM INTO``);
+3. the tables that could not be read to the end (all of them, when the file
+   does not open) are filled from the newest snapshot (the daily ``VACUUM
+   INTO``); a table read completely is not, or rows deleted since the
+   snapshot would come back;
 4. the :class:`RecoveryReport` says what came from where. The store keeps it
    as ``Store.recovery`` for the host to raise a persistent fault, and logs it.
 
@@ -106,11 +108,16 @@ def recover(
     from the first snapshot that opens. Rows already present are never
     overwritten: the damaged file's rows are newer than any snapshot's."""
     report = RecoveryReport(reason=reason, moved_to=damaged)
-    _copy_from(fresh, damaged, report.from_damaged, report.unreadable_tables)
-    for snapshot in snapshots:
+    if not _copy_from(fresh, damaged, report.from_damaged, report.unreadable_tables):
+        report.unreadable_tables[:] = list(RECOVERED)
+    # Only the tables the damaged file could not fully give are filled from
+    # the snapshot. A table read to the end is complete: topping it up would
+    # bring back every row deleted since the snapshot (a removed printer).
+    missing = [t for t in RECOVERED if t in report.unreadable_tables]
+    for snapshot in snapshots if missing else ():
         counts: Dict[str, int] = {}
         failed: List[str] = []
-        if _copy_from(fresh, snapshot, counts, failed):
+        if _copy_from(fresh, snapshot, counts, failed, tables=missing):
             report = RecoveryReport(
                 reason=report.reason,
                 moved_to=report.moved_to,
@@ -130,9 +137,11 @@ def _copy_from(
     source: Path,
     counts: Dict[str, int],
     failed: List[str],
+    *,
+    tables: Sequence[str] = RECOVERED,
 ) -> bool:
-    """Copy every readable row of ``source`` into ``fresh`` (``INSERT OR
-    IGNORE``). Returns whether ``source`` opened at all."""
+    """Copy every readable row of ``tables`` of ``source`` into ``fresh``
+    (``INSERT OR IGNORE``). Returns whether ``source`` opened at all."""
     try:
         conn = sqlite3.connect(
             "file:%s?mode=ro" % quote(source.as_posix()),
@@ -146,7 +155,7 @@ def _copy_from(
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
         except sqlite3.Error:
             return False
-        for table in RECOVERED:
+        for table in tables:
             columns = _columns(fresh, table)
             counts[table] = 0
             try:
