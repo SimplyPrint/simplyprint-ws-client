@@ -1,0 +1,12 @@
+[
+    {
+        "id": 777,
+        "token": "e1e9000e1e9000e1e9000e1e9000e1e9",
+        "name": "Centauri Carbon",
+        "unique_id": "9d8c7b6a-5f4e-4d3c-9b2a-190807060504",
+        "host": "192.168.1.70",
+        "mainboard_id": "abcdef0123456789"
+    },
+    "a stray string entry",
+    42
+]

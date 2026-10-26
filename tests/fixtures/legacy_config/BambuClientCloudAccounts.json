@@ -1,0 +1,14 @@
+[
+    {
+        "uid": 1234567890,
+        "region": "eu",
+        "email": "farm@example.com",
+        "access_token": "AAB.example-access-token",
+        "refresh_token": "AAB.example-refresh-token",
+        "expires_at": 1793016000
+    },
+    {
+        "region": "us",
+        "email": "no-uid@example.com"
+    }
+]

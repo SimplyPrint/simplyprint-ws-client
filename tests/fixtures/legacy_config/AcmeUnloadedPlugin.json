@@ -1,0 +1,9 @@
+[
+    {
+        "id": 1001,
+        "token": "acme0000acme0000acme0000acme0000",
+        "name": "Acme printer whose plugin failed to load",
+        "unique_id": "acacacac-acac-4cac-8cac-acacacacacac",
+        "acme_host": "192.168.1.99"
+    }
+]

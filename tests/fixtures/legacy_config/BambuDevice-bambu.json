@@ -1,0 +1,40 @@
+[
+    {
+        "id": 31337,
+        "token": "f3b0c2a9e8d7465f9a1b2c3d4e5f6071",
+        "name": "X1C Workshop",
+        "in_setup": false,
+        "short_id": null,
+        "public_ip": "203.0.113.17",
+        "unique_id": "6f1d2c3b-4a59-4e8f-9a0b-1c2d3e4f5a6b",
+        "mac": null,
+        "custom_webcam_url": null,
+        "serial": "00M09A350100123",
+        "device_type": "X1C",
+        "lan_only_mode": false,
+        "developer_mode": null,
+        "ssdp_last_seen": 1761480000,
+        "cloud_account": null,
+        "host": "192.168.1.50",
+        "access_code": "12345678",
+        "field_from_a_newer_build": {"kept": true}
+    },
+    {
+        "id": 31338,
+        "token": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "name": "P1S Garage",
+        "in_setup": false,
+        "short_id": null,
+        "public_ip": "203.0.113.17",
+        "mac": null,
+        "custom_webcam_url": null,
+        "serial": "01P00A400200456",
+        "device_type": "P1S",
+        "lan_only_mode": true,
+        "developer_mode": null,
+        "ssdp_last_seen": null,
+        "cloud_account": null,
+        "host": "192.168.1.51",
+        "access_code": "87654321"
+    }
+]

@@ -1,0 +1,12 @@
+[
+    {
+        "id": 610,
+        "token": "prusa000prusa000prusa000prusa000",
+        "name": "MK4",
+        "unique_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "host": "192.168.1.80",
+        "api_key": "prusalink-key"
+    },
+    {
+        "id": 611,
+        "tok

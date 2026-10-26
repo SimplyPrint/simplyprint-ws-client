@@ -22,6 +22,10 @@ __all__ = [
     "RecoveryReport",
     "SECRET_NAMESPACES",
     "plan",
+    "LegacyImporter",
+    "LegacyFile",
+    "LegacyImportError",
+    "AccountFormat",
 ]
 
 from simplyprint_ws_client.core.store.recovery import RecoveryReport
@@ -42,3 +46,9 @@ from simplyprint_ws_client.core.store.store import (
     Txn,
 )
 from simplyprint_ws_client.core.store.writer import SKIP, Writer
+from simplyprint_ws_client.core.store.legacy import (
+    AccountFormat,
+    LegacyFile,
+    LegacyImporter,
+    LegacyImportError,
+)
