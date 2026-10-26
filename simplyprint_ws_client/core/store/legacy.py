@@ -440,12 +440,26 @@ def _split(name: str) -> Tuple[str, str]:
 
 def _apply(txn: Any, puts: Iterable[Put]) -> int:
     """Write ``puts``. A printer or account already stored keeps the fields
-    the file does not have (the file came from an older build)."""
+    the file does not have (the file came from an older build), unless the
+    stored printer is at a newer config version than the file's."""
     changed = 0
     for put in puts:
         row = dict(put.row)
         if put.table in ("printers", "accounts") and isinstance(row.get("data"), dict):
             stored = txn.get(put.table, put.key)
+            if (
+                put.table == "printers"
+                and stored is not None
+                and (stored.get("schema") or 1) != (row.get("schema") or 1)
+            ):
+                # The stored data was upgraded past the file's config version
+                # (legacy files are version 1). Mixed, the row would hold
+                # fields of two versions under one number, and the upgrade
+                # would run again over fields it already produced. The file
+                # is the newer edit (an old build wrote it), so its data goes
+                # in alone, at its own version, and is upgraded once when
+                # read; the replaced row stays in row_archive.
+                stored = None
             if stored is not None and isinstance(stored.get("data"), dict):
                 row["data"] = {**stored["data"], **row["data"]}
         changed += int(txn.put(put.table, put.key, row))
