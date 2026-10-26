@@ -306,6 +306,25 @@ def test_a_re_import_over_an_upgraded_row_does_not_mix_config_versions(
     assert "label" not in row["data"]
 
 
+def test_a_minted_printer_keeps_its_stored_identity_after_a_token_change(
+    config_dir, stores
+):
+    # An entry without a unique_id: its id is minted from (name, id, token).
+    # An old build re-tokens it after a rollback; it is the same printer.
+    state, cache = stores
+    path = config_dir / "BambuDevice-prusa.json"
+    path.write_text(json.dumps([{"id": 555, "token": "first", "name": "MK4"}]))
+    _importer(config_dir).run(state, cache)
+    [before] = state.rows("printers", store="BambuDevice-prusa")
+
+    path.write_text(json.dumps([{"id": 555, "token": "second", "name": "MK4"}]))
+    _importer(config_dir).run(state, cache)
+
+    [after] = state.rows("printers", store="BambuDevice-prusa")
+    assert after["unique_id"] == before["unique_id"]
+    assert after["sk"] == "second"
+
+
 def test_a_file_is_converted_when_its_plugin_mounts(config_dir, stores):
     state, cache = stores
     _importer(config_dir).run(state, cache)
