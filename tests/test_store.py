@@ -1,8 +1,11 @@
 """The SQLite store: schema migrations, coalesced writes, the change feed,
 crash safety, concurrency and recovery (docs/persistence-design.md)."""
 
+import os
 import sqlite3
+import stat
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -699,6 +702,48 @@ def test_a_snapshot_is_a_complete_database(store, tmp_path):
         assert copy.get("kv", ("d", "plugin", "k"))["value"] == 1
     finally:
         copy.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX file modes")
+def test_every_copy_is_private_to_the_user(store, tmp_path):
+    # Copies hold printer tokens and account tokens: never world-readable,
+    # whatever the umask.
+    old = os.umask(0o022)
+    try:
+        target = store.snapshot_to(tmp_path / "copies" / "copy.db")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_opening_removes_stale_copy_leftovers_and_keeps_three_damaged_files(tmp_path):
+    path, backups = tmp_path / "state.db", tmp_path / "backups"
+    Store.open(path, start=False, backups=backups).close()
+    backups.mkdir(exist_ok=True)
+    stale = [
+        tmp_path / "..state-export-ab12.db.4242.tmp",  # an export copy's temp
+        backups / ".state-2026-10-01.db.4242.tmp",  # a daily snapshot's temp
+    ]
+    fresh = backups / ".state-2026-10-02.db.4343.tmp"  # maybe being written now
+    for leftover in (*stale, fresh):
+        leftover.write_bytes(b"partial")
+    old = time.time() - 2 * 3600
+    for leftover in stale:
+        os.utime(leftover, (old, old))
+    corrupt = []
+    for n in range(5):
+        moved = tmp_path / ("state.db.corrupt-2026100%d-000000" % n)
+        moved.write_bytes(b"damaged")
+        Path(str(moved) + "-wal").write_bytes(b"wal")
+        corrupt.append(moved)
+
+    Store.open(path, start=False, backups=backups).close()
+
+    assert not any(p.exists() for p in stale)
+    assert fresh.exists()
+    assert [p.exists() for p in corrupt] == [False, False, True, True, True]
+    assert not Path(str(corrupt[0]) + "-wal").exists()
+    assert Path(str(corrupt[4]) + "-wal").exists()
 
 
 def test_export_and_import_round_trip_without_secrets(tmp_path):
