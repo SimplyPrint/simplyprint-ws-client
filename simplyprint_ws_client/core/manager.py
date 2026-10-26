@@ -36,12 +36,15 @@ __all__ = [
 ]
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import logging
 import random
+import threading
+import time
 from datetime import timedelta
-from typing import Union, Dict, Mapping
+from typing import Iterator, Union, Dict, Mapping
 from typing import final, Optional, Set, cast, Iterable, MutableSet, Hashable
 
 from yarl import URL
@@ -98,6 +101,13 @@ MAX_HUBS = 32
 #: A new hub's first open is delayed by up to this much when there is more
 #: than one hub, so a farm's hubs do not all open in the same instant.
 HUB_OPEN_JITTER_S = 2.0
+
+#: The hub count shrinks only once the lower count has held this long, so a
+#: printer removed and re-added (an edit, a plugin update) moves nobody.
+HUB_SHRINK_GRACE_S = 60.0
+
+#: The clock of that grace. Module-level so tests can drive it.
+_monotonic = time.monotonic
 
 
 def hub_count(printers: int, per_hub: int = PRINTERS_PER_HUB) -> int:
@@ -378,6 +388,13 @@ class ClientConnectionManager(
         self._hubs: Dict[int, ClientView] = {}
         #: stable_key per unique_id (a blake2b each pass would be waste).
         self._keys: Dict[TUniqueId, int] = {}
+        #: MULTI: the hub count in force (see hub_count); None before the first.
+        self._hub_count: Optional[int] = None
+        #: When the wanted count first fell below the one in force.
+        self._shrink_since: Optional[float] = None
+        #: Replays in progress (replaying), from any thread.
+        self._replays = 0
+        self._replays_lock = threading.Lock()
         self.logger = logger
         self.transport_factory = transport_factory
         self._next_connection_id = 0
@@ -443,15 +460,56 @@ class ClientConnectionManager(
     # -- hub assignment (MULTI) ---------------------------------------------
 
     def hub_count(self) -> int:
-        """Hubs for the printers scheduled now: ``clamp(ceil(n / 32), 1, 32)``.
+        """The hubs in force: ``clamp(ceil(n / 32), 1, 32)`` for the printers
+        scheduled, active or not (a printer going offline and back moves
+        nobody).
 
-        Counted over every scheduled printer, active or not, so a printer going
-        offline and back does not change the count (and move others).
+        Every change of the count moves printers, each move costing an add
+        from a burst that never refills and a full-state resend, so it is
+        kept steady: it grows at once (a farm outgrowing its hubs spreads
+        now), shrinks only once the lower count held for
+        ``HUB_SHRINK_GRACE_S`` (32 <-> 33 printers would otherwise flip 1 <->
+        2 hubs, moving half of them each time), and does not follow a replay
+        in progress (its partial list would move printers at each
+        intermediate count; see :meth:`replaying`).
         """
-        return hub_count(
+        wanted = hub_count(
             len(self.client_list),
             self.max_clients_per_connection or PRINTERS_PER_HUB,
         )
+        current = self._hub_count
+        if self.is_replaying:
+            return wanted if current is None else current
+        if current is None or wanted > current:
+            self._hub_count, self._shrink_since = wanted, None
+        elif wanted == current:
+            self._shrink_since = None  # back up: the grace starts over
+        elif self._shrink_since is None:
+            self._shrink_since = _monotonic()
+        elif _monotonic() - self._shrink_since >= HUB_SHRINK_GRACE_S:
+            self._hub_count, self._shrink_since = wanted, None
+        return self._hub_count
+
+    @property
+    def is_replaying(self) -> bool:
+        """A replay of stored printers is in progress (:meth:`replaying`)."""
+        return self._replays > 0
+
+    @contextlib.contextmanager
+    def replaying(self) -> Iterator[None]:
+        """Within: stored printers are being added in bulk. The hub count
+        stays as it was, and the scheduler places no printer, until the last
+        replay ends; then the count follows the whole list in one step.
+
+        Any thread (a domain mounted while the app runs replays on its
+        caller's thread)."""
+        with self._replays_lock:
+            self._replays += 1
+        try:
+            yield
+        finally:
+            with self._replays_lock:
+                self._replays -= 1
 
     def hub_index(self, unique_id: TUniqueId) -> int:
         """The hub slot of ``unique_id``: a consistent hash, the same across

@@ -1,11 +1,12 @@
 __all__ = ["Scheduler"]
 
 import asyncio
+import contextlib
 import logging
 import sys
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, Optional, Set
+from typing import Dict, Iterable, Iterator, Optional, Set
 
 from simplyprint_ws_client._compat import AsyncEvent
 from simplyprint_ws_client.core.client import Client, ClientState
@@ -133,6 +134,18 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         client.active = False
         self._to_delete.add(client.unique_id)
         self.signal()
+
+    @contextlib.contextmanager
+    def replaying(self) -> Iterator[None]:
+        """Within: stored printers are being submitted in bulk. None is placed
+        on a hub until the last replay ends, so the hub count is taken from
+        the whole list once (:meth:`ClientConnectionManager.replaying`); the
+        scheduler is woken then to place them."""
+        try:
+            with self.manager.replaying():
+                yield
+        finally:
+            self.signal()
 
     def forget(self, client: Client) -> None:
         """Drop a client that was submitted but never scheduled.
@@ -316,6 +329,11 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 was_allocated = False
 
             if not was_allocated:
+                if self.manager.is_replaying:
+                    # Placed now, it would be hashed on a partial list and
+                    # moved again once the rest arrived; the pass after the
+                    # replay places it (see Scheduler.replaying).
+                    return
                 await self.manager.allocate(client)
 
             # Progress inner client state until we reach CONNECTED state.

@@ -286,12 +286,16 @@ class ClientApp(SyncStoppable):
         # an entry it could not read) and the rest carry on.
         self._record_unreadable_configs(key, manager)
         ids = {entry.label for entry in manager.unreadable}
-        for config in list(manager.get_all()):
-            ids.add(str(config.unique_id))
-            try:
-                self.add(config, integration_id=key)
-            except Exception:
-                continue  # add() logged it once and recorded it
+        # One hub count for the whole replay, not one per printer added (a
+        # domain mounted while the app runs would otherwise move printers at
+        # each intermediate count).
+        with self.scheduler.replaying():
+            for config in list(manager.get_all()):
+                ids.add(str(config.unique_id))
+                try:
+                    self.add(config, integration_id=key)
+                except Exception:
+                    continue  # add() logged it once and recorded it
         with self._app_lock:
             return [
                 failure
