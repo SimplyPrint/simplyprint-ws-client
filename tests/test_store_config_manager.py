@@ -178,6 +178,51 @@ def test_removing_a_printer_commits_at_once(store, tmp_path):
     assert not store.writer.dirty
 
 
+@pytest.mark.asyncio
+async def test_on_the_event_loop_registration_never_waits_for_the_write_lock(
+    tmp_path,
+):
+    # The daily VACUUM INTO or the weekly integrity_check holds the write
+    # lock for seconds; adding, removing or loading on the loop must not wait
+    # for it (nor for an fsync). The writer thread commits right after.
+    import asyncio
+    import threading
+    import time
+
+    s = Store.open(tmp_path / "state.db")
+    try:
+        manager = _manager(s, tmp_path)
+        config = PrinterConfig(id=1, token="t", unique_id="u1")
+        release = threading.Event()
+        held = threading.Event()
+
+        def maintenance():
+            with s._wlock:
+                held.set()
+                release.wait(5)
+
+        threading.Thread(target=maintenance, daemon=True).start()
+        assert held.wait(5)
+        started = time.monotonic()
+        manager.persist(config)
+        manager.flush(config)  # app.add
+        manager.load()  # an account kind following the store
+        manager.remove(config)
+        manager.flush(config)  # app.remove
+        assert time.monotonic() - started < 1.0
+        release.set()
+        # Registration is an urgent mark: the writer thread commits it.
+        manager.persist(config)
+        manager.flush(config)
+        for _ in range(500):
+            if s.get("printers", "u1") is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert s.get("printers", "u1")["data"]["id"] == 1
+    finally:
+        s.close()
+
+
 class _Record(Config):
     """An account record, as the client's HostedAccountStore keeps them."""
 
