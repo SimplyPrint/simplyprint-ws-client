@@ -58,12 +58,11 @@ uvloop = [
     "uvloop>=0.21.0",
 ]
 
-# simplyprint-sdk resolves from PyPI, like every other dependency, so CI and
-# users install the published release. To develop against a local SDK checkout,
-# see "Developing against a local SDK" in README.md; do not commit a path source
-# here or a uv.lock that records one.
-# [tool.uv.sources]
-# simplyprint-sdk = { path = "../simplyprint-sdk", editable = true }
+# The open SDK is a sibling checkout: clone simplyprint-sdk next to this repo
+# and `uv sync` works with no overrides (CI does the same). Published wheels
+# keep the plain requirement, so users install the SDK from PyPI.
+[tool.uv.sources]
+simplyprint-sdk = { path = "../simplyprint-sdk", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

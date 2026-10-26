@@ -149,16 +149,30 @@ def _drive_detached(awaitable: Awaitable[Any], name: str) -> concurrent.futures.
 
 
 def _create_task(
-    loop: asyncio.AbstractEventLoop, coro: Coroutine[Any, Any, Any], name: str
+    loop: asyncio.AbstractEventLoop,
+    coro: Coroutine[Any, Any, Any],
+    name: str,
+    on_done: Optional[Callable[["asyncio.Task[Any]"], None]] = None,
 ) -> "asyncio.Task[Any]":
+    """Create ``coro``'s task on ``loop``, from any thread. ``on_done`` is
+    attached on the loop's own thread as the task is created:
+    ``add_done_callback`` is not thread-safe, and attached from another thread
+    after a quick task finished it may only run when the loop next wakes."""
+
+    def make() -> "asyncio.Task[Any]":
+        task = loop.create_task(coro, name=name)
+        if on_done is not None:
+            task.add_done_callback(on_done)
+        return task
+
     if _running_on(loop):
-        return loop.create_task(coro, name=name)
+        return make()
     if loop.is_closed():
         coro.close()
         raise RuntimeError("cannot spawn %r: its loop is closed" % name)
     if not loop.is_running():
         # The loop has not started yet (startup): the task runs once it does.
-        task = loop.create_task(coro, name=name)
+        task = make()
         try:
             loop.call_soon_threadsafe(lambda: None)  # wake it if it just started
         except RuntimeError:
@@ -169,7 +183,7 @@ def _create_task(
 
     def create() -> None:
         try:
-            created.set_result(loop.create_task(coro, name=name))
+            created.set_result(make())
         except BaseException as error:  # noqa: BLE001 -- handed to the caller
             created.set_exception(error)
 
@@ -241,16 +255,16 @@ class Scope:
         if self.closed:
             coro.close()
             raise ScopeClosed("scope %r is closed; %r was not spawned" % (self.name, name))
-        task = _create_task(loop, coro, name)
-        entry = _Spawned(name, task)
+        task = _create_task(loop, coro, name, on_done=self._discard_task)
         with self._lock:
             accepted = self._state == _OPEN
-            if accepted:
-                self._entries.append(entry)
+            # A task that already finished was discarded (or never needs
+            # tracking): its done callback ran before this, under the lock.
+            if accepted and not task.done():
+                self._entries.append(_Spawned(name, task))
         if not accepted:
             loop.call_soon_threadsafe(task.cancel)
             raise ScopeClosed("scope %r closed while spawning %r" % (self.name, name))
-        task.add_done_callback(lambda _task: self._discard(entry))
         return task
 
     def child(self, name: str) -> "Scope":
@@ -279,6 +293,12 @@ class Scope:
         sub = Scope(name, loop=self.loop)
         sub._parent = self
         return sub
+
+    def _discard_task(self, task: "asyncio.Task[Any]") -> None:
+        with self._lock:
+            self._entries[:] = [
+                e for e in self._entries if not (isinstance(e, _Spawned) and e.task is task)
+            ]
 
     def _discard(self, entry: _Entry) -> None:
         with self._lock:

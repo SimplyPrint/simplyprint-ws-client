@@ -2,7 +2,7 @@ name: Python Package Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feat/asyncio-mqtt ]
   pull_request:
     branches: [ main ]
 
@@ -22,6 +22,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      # The open SDK is a sibling checkout ([tool.uv.sources] ../simplyprint-sdk).
+      - name: Check out simplyprint-sdk next to this repo
+        run: git clone --quiet https://github.com/SimplyPrint/simplyprint-sdk.git "$GITHUB_WORKSPACE/../simplyprint-sdk"
       - name: Set up UV ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@v5
         with:
