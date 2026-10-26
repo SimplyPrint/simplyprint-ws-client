@@ -698,6 +698,13 @@ class Client(
 
         return msgs
 
+    @property
+    def settles_on_write(self) -> bool:
+        """Inside :meth:`settling_on_write`: whatever ``consume`` hands out is
+        settled after its write. A subclass queueing its own messages commits
+        them in its :meth:`settle` override then, and at once otherwise."""
+        return self._settle_on_write
+
     @contextlib.contextmanager
     def settling_on_write(self) -> Iterator[None]:
         """Within: ``consume`` defers each reset to :meth:`settle`.
@@ -750,11 +757,7 @@ class Client(
             return
 
         outcome = msg.write_outcome
-        sent = outcome in (None, WriteOutcome.WRITTEN, WriteOutcome.UNSENDABLE) or (
-            outcome == WriteOutcome.MAYBE_SENT and msg.carries_edge()
-        )
-
-        if not sent:
+        if not msg.counts_as_sent():
             if held.released_job_id is not None and self.printer.current_job_id is None:
                 self.printer.current_job_id = held.released_job_id
             self._deferred = True

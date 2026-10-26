@@ -628,6 +628,19 @@ class ClientMsg(Msg[TMsgType, Optional[dict]]):
         """The write path reports what became of the frame."""
         self._write_outcome = outcome
 
+    def counts_as_sent(self) -> bool:
+        """Whether the sender may forget this message after its write.
+
+        Written, or nobody reported (a sink that is not the protocol): yes.
+        Unsendable: yes, retrying cannot help. Never left: no, send it again.
+        May have left: an edge yes (at-most-once), a value no (resending it is
+        harmless).
+        """
+        outcome = self._write_outcome
+        return outcome in (None, WriteOutcome.WRITTEN, WriteOutcome.UNSENDABLE) or (
+            outcome == WriteOutcome.MAYBE_SENT and self.carries_edge()
+        )
+
     def carries_edge(self) -> bool:
         """Whether this frame carries a one-shot edge rather than a value.
 
