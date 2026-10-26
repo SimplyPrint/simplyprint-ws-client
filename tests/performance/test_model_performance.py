@@ -36,7 +36,7 @@ class _Ctx:
         self._id += 1
         return self._id
 
-    def attached(self, model: ReactiveModel) -> None:
+    def state_attached(self, model: ReactiveModel) -> None:
         pass
 
     def signal(self) -> None:

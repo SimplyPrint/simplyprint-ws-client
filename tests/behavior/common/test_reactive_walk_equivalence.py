@@ -143,7 +143,7 @@ class _Ctx:
     def stamp_change(self, model: ReactiveModel, field: str) -> int:
         return self.next_msg_id()
 
-    def attached(self, model: ReactiveModel) -> None:
+    def state_attached(self, model: ReactiveModel) -> None:
         pass
 
     def signal(self) -> None:

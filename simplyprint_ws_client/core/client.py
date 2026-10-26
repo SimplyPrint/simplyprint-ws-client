@@ -103,6 +103,32 @@ from simplyprint_ws_client.core.protocol.models import (
     WriteOutcome,
 )
 from simplyprint_ws_client.core.state.models import FileProgressStateEnum
+from simplyprint_ws_client.core.state.notifications import (
+    NotificationEventPayload,
+    NotificationsState,
+)
+from simplyprint_ws_client.core.state.printer import (
+    AmbientTemperatureState,
+    BedState,
+    ChamberState,
+    CpuInfoState,
+    FileProgressState,
+    JobInfoState,
+    MaterialEntry,
+    MaterialLayoutEntry,
+    PeripheralsState,
+    PeripheralState,
+    PingPongState,
+    PrinterFilamentSensorState,
+    PrinterFirmwareState,
+    PrinterFirmwareWarning,
+    PrinterInfoState,
+    PSUState,
+    TemperatureState,
+    ToolState,
+    WebcamSettings,
+    WebcamState,
+)
 
 from simplyprint_ws_client.events import EventBus, Event
 from simplyprint_ws_client.events.event import sync_only
@@ -174,81 +200,206 @@ def _field_version(
     return latest
 
 
-def _message_changes(
-    state: PrinterState,
-) -> Iterable[tuple[type[ClientMsg], Iterable[Optional[int]]]]:
-    """Messages affected by the concrete branches of this state tree."""
-    yield MachineDataMsg, (_field_version(state, "info", (state.info,)),)
-    yield WebcamStatusMsg, (_field_version(state.webcam_info, "connected"),)
-    yield (
+_Versions = Callable[[PrinterState], Iterable[Optional[int]]]
+
+#: Every message kind built from the printer state, in build order (a tie in
+#: version goes to the earlier kind), with the versions of the concrete state
+#: branches it is built from (``None``: that branch has no change).
+_MESSAGE_KINDS: Tuple[Tuple[Type[ClientMsg], _Versions], ...] = (
+    (MachineDataMsg, lambda s: (_field_version(s, "info", (s.info,)),)),
+    (WebcamStatusMsg, lambda s: (_field_version(s.webcam_info, "connected"),)),
+    (
         WebcamMsg,
-        (_field_version(state, "webcam_settings", (state.webcam_settings,)),),
-    )
-    yield FirmwareMsg, (_field_version(state, "firmware", (state.firmware,)),)
-    yield (
+        lambda s: (_field_version(s, "webcam_settings", (s.webcam_settings,)),),
+    ),
+    (FirmwareMsg, lambda s: (_field_version(s, "firmware", (s.firmware,)),)),
+    (
         FirmwareWarningMsg,
-        (_field_version(state, "firmware_warning", (state.firmware_warning,)),),
-    )
-    yield ToolMsg, (_field_version(tool, "active_material") for tool in state.tools)
-    yield (
+        lambda s: (_field_version(s, "firmware_warning", (s.firmware_warning,)),),
+    ),
+    (
+        ToolMsg,
+        lambda s: (_field_version(tool, "active_material") for tool in s.tools),
+    ),
+    (
         TemperatureMsg,
-        (
-            _field_version(state.bed, "temperature", (state.bed.temperature,)),
-            _field_version(state.chamber, "temperature", (state.chamber.temperature,)),
+        lambda s: (
+            _field_version(s.bed, "temperature", (s.bed.temperature,)),
+            _field_version(s.chamber, "temperature", (s.chamber.temperature,)),
             *(
                 _field_version(tool, "temperature", (tool.temperature,))
-                for tool in state.tools
+                for tool in s.tools
             ),
         ),
-    )
-    yield AmbientTemperatureMsg, (_field_version(state.ambient_temperature, "ambient"),)
-    yield StateChangeMsg, (_field_version(state, "status"),)
-    yield JobInfoMsg, (_field_version(state, "job_info", (state.job_info,)),)
-    yield LatencyMsg, (_field_version(state.latency, "pong"),)
-    yield (
+    ),
+    (
+        AmbientTemperatureMsg,
+        lambda s: (_field_version(s.ambient_temperature, "ambient"),),
+    ),
+    (StateChangeMsg, lambda s: (_field_version(s, "status"),)),
+    (JobInfoMsg, lambda s: (_field_version(s, "job_info", (s.job_info,)),)),
+    (LatencyMsg, lambda s: (_field_version(s.latency, "pong"),)),
+    (
         FileProgressMsg,
-        (_field_version(state, "file_progress", (state.file_progress,)),),
-    )
-    yield (
+        lambda s: (_field_version(s, "file_progress", (s.file_progress,)),),
+    ),
+    (
         FilamentSensorMsg,
-        (_field_version(state, "filament_sensor", (state.filament_sensor,)),),
-    )
-    yield PowerControllerMsg, (_field_version(state, "psu_info", (state.psu_info,)),)
-    yield CpuInfoMsg, (_field_version(state, "cpu_info", (state.cpu_info,)),)
-    yield (
+        lambda s: (_field_version(s, "filament_sensor", (s.filament_sensor,)),),
+    ),
+    (PowerControllerMsg, lambda s: (_field_version(s, "psu_info", (s.psu_info,)),)),
+    (CpuInfoMsg, lambda s: (_field_version(s, "cpu_info", (s.cpu_info,)),)),
+    (
         MaterialDataMsg,
-        (
-            *(
-                _field_version(tool, "materials", tool.materials)
-                for tool in state.tools
-            ),
-            *(_field_version(tool, "size") for tool in state.tools),
-            *(_field_version(tool, "type") for tool in state.tools),
-            *(_field_version(tool, "volume_type") for tool in state.tools),
-            _field_version(state.bed, "type"),
-            _field_version(state, "mms_layout", state.mms_layout),
+        lambda s: (
+            *(_field_version(tool, "materials", tool.materials) for tool in s.tools),
+            *(_field_version(tool, "size") for tool in s.tools),
+            *(_field_version(tool, "type") for tool in s.tools),
+            *(_field_version(tool, "volume_type") for tool in s.tools),
+            _field_version(s.bed, "type"),
+            _field_version(s, "mms_layout", s.mms_layout),
         ),
-    )
-    yield (
+    ),
+    (
         NotificationMsg,
-        (
+        lambda s: (
             _field_version(
-                state.notifications,
-                "notifications",
-                state.notifications.notifications.values(),
+                s.notifications, "notifications", s.notifications.notifications.values()
             ),
         ),
-    )
-    yield (
+    ),
+    (
         PeripheralMsg,
-        (
-            _field_version(
-                state.peripherals,
-                "entries",
-                state.peripherals.entries.values(),
-            ),
+        lambda s: (
+            _field_version(s.peripherals, "entries", s.peripherals.entries.values()),
         ),
-    )
+    ),
+)
+
+
+def _message_changes(
+    state: PrinterState,
+) -> Iterable[Tuple[Type[ClientMsg], Iterable[Optional[int]]]]:
+    """Messages affected by the concrete branches of this state tree.
+
+    The full scan, every kind: the spec. ``consume`` reads only the kinds a
+    change can have reached (:func:`_affected`), which tests hold to this.
+    """
+    for kind, versions in _MESSAGE_KINDS:
+        yield kind, versions(state)
+
+
+#: One bit per message kind, in ``_MESSAGE_KINDS`` order.
+_KIND_BIT: Dict[Type[ClientMsg], int] = {
+    kind: 1 << index for index, (kind, _) in enumerate(_MESSAGE_KINDS)
+}
+_ALL_KINDS = (1 << len(_MESSAGE_KINDS)) - 1
+
+_Kinds = Tuple[Type[ClientMsg], ...]
+
+#: The inverse of ``_MESSAGE_KINDS``, per state model class: the kinds a change
+#: to *any* of its fields can affect (the class sits inside a branch whose whole
+#: subtree is read), and the kinds a change to *one* field can affect (that
+#: field is read on its own). A field in neither feeds no message.
+#:
+#: Read by class, so it relies on each state model sitting where its annotation
+#: puts it. A subclass inherits its bases' entries; a model class with no entry
+#: (an integration's own) affects every kind: unknown costs a full scan, never
+#: a missed message.
+_AFFECTS: Dict[type, Tuple[_Kinds, Dict[str, _Kinds]]] = {
+    PrinterState: (
+        (),
+        {
+            "status": (StateChangeMsg,),
+            "info": (MachineDataMsg,),
+            "webcam_settings": (WebcamMsg,),
+            "firmware": (FirmwareMsg,),
+            "firmware_warning": (FirmwareWarningMsg,),
+            "job_info": (JobInfoMsg,),
+            "file_progress": (FileProgressMsg,),
+            "filament_sensor": (FilamentSensorMsg,),
+            "psu_info": (PowerControllerMsg,),
+            "cpu_info": (CpuInfoMsg,),
+            "mms_layout": (MaterialDataMsg,),
+            # Read through the child only, but a swapped-in child brings the
+            # changes it carries.
+            "bed": (TemperatureMsg, MaterialDataMsg),
+            "chamber": (TemperatureMsg,),
+            "tools": (ToolMsg, TemperatureMsg, MaterialDataMsg),
+            "ambient_temperature": (AmbientTemperatureMsg,),
+            "latency": (LatencyMsg,),
+            "notifications": (NotificationMsg,),
+            "peripherals": (PeripheralMsg,),
+            "webcam_info": (WebcamStatusMsg,),
+        },
+    ),
+    PrinterInfoState: ((MachineDataMsg,), {}),
+    WebcamState: ((), {"connected": (WebcamStatusMsg,)}),
+    WebcamSettings: ((WebcamMsg,), {}),
+    PrinterFirmwareState: ((FirmwareMsg,), {}),
+    PrinterFirmwareWarning: ((FirmwareWarningMsg,), {}),
+    TemperatureState: ((TemperatureMsg,), {}),
+    BedState: ((), {"temperature": (TemperatureMsg,), "type": (MaterialDataMsg,)}),
+    ChamberState: ((), {"temperature": (TemperatureMsg,)}),
+    ToolState: (
+        (),
+        {
+            "active_material": (ToolMsg,),
+            "temperature": (TemperatureMsg,),
+            "materials": (MaterialDataMsg,),
+            "size": (MaterialDataMsg,),
+            "type": (MaterialDataMsg,),
+            "volume_type": (MaterialDataMsg,),
+        },
+    ),
+    MaterialEntry: ((MaterialDataMsg,), {}),
+    MaterialLayoutEntry: ((MaterialDataMsg,), {}),
+    AmbientTemperatureState: ((), {"ambient": (AmbientTemperatureMsg,)}),
+    JobInfoState: ((JobInfoMsg,), {}),
+    PingPongState: ((), {"pong": (LatencyMsg,)}),
+    FileProgressState: ((FileProgressMsg,), {}),
+    PrinterFilamentSensorState: ((FilamentSensorMsg,), {}),
+    PSUState: ((PowerControllerMsg,), {}),
+    CpuInfoState: ((CpuInfoMsg,), {}),
+    NotificationsState: ((), {"notifications": (NotificationMsg,)}),
+    NotificationEvent: ((NotificationMsg,), {}),
+    NotificationEventPayload: ((NotificationMsg,), {}),
+    PeripheralsState: ((), {"entries": (PeripheralMsg,)}),
+    PeripheralState: ((PeripheralMsg,), {}),
+}
+
+#: ``(class, field)`` -> kind bits; computed on first use.
+_AFFECTED: Dict[Tuple[type, Optional[str]], int] = {}
+
+
+def _affected(cls: type, field: Optional[str]) -> int:
+    """The kinds (bits) a change to ``field`` of a ``cls`` model can affect.
+
+    ``field=None``: a change anywhere in such a model's subtree (a bind).
+    """
+    key = (cls, field)
+    bits = _AFFECTED.get(key)
+    if bits is None:
+        bits = _AFFECTED[key] = _compute_affected(cls, field)
+    return bits
+
+
+def _compute_affected(cls: type, field: Optional[str]) -> int:
+    known = [base for base in cls.__mro__ if base in _AFFECTS]
+    if not known:
+        return _ALL_KINDS
+    bits = 0
+    for base in known:
+        any_field, by_field = _AFFECTS[base]
+        kinds = list(any_field)
+        if field is None:
+            for field_kinds in by_field.values():
+                kinds.extend(field_kinds)
+        else:
+            kinds.extend(by_field.get(field, ()))
+        for kind in kinds:
+            bits |= _KIND_BIT[kind]
+    return bits
 
 
 def _mark_present(model: ReactiveModel, *fields: str) -> None:
@@ -447,6 +598,14 @@ class Client(
         #: after the frame's write (the scheduler's path).
         self._settle_on_write = False
         self._held: Dict[int, _Held] = {}
+        #: Kinds (``_KIND_BIT``) a change since the last ``consume`` can have
+        #: affected, and kinds that still had a change at the last one. Every
+        #: kind with a change is in one of them, so ``consume`` reads only
+        #: these instead of scanning the whole tree for every kind.
+        self._touched_kinds = _ALL_KINDS
+        self._pending_kinds = 0
+        #: The tree those describe: a replaced ``printer`` is scanned in full.
+        self._scanned_printer: Optional[PrinterState] = None
         #: Message kinds the server has been sent at least once. A reconnect
         #: resends these in full; a kind never sent stays as it was (nothing
         #: is invented from defaults the server never saw).
@@ -570,10 +729,13 @@ class Client(
 
     def stamp_change(self, model: ReactiveModel, field: str) -> int:
         """The printer state's change to ``model.field``: its message id."""
+        self._touched_kinds |= _affected(type(model), field)
         return self.next_msg_id()
 
-    def attached(self, model: ReactiveModel) -> None:
-        """A state subtree was bound to this client (``provide_context``)."""
+    def state_attached(self, model: ReactiveModel) -> None:
+        """A state subtree was bound to this client (``provide_context``): any
+        change it already carries is now in the tree."""
+        self._touched_kinds |= _affected(type(model), None)
 
     # coordination methods
 
@@ -653,12 +815,7 @@ class Client(
         self._deferred = False
         self._release_held()
 
-        msg_kinds = {}
-
-        # Build a unique map of message kinds together with their highest version.
-        for msg_kind, candidates in _message_changes(self.printer):
-            if versions := tuple(v for v in candidates if v is not None):
-                msg_kinds[msg_kind] = (min(versions), max(versions))
+        msg_kinds = self._changed_kinds()
 
         is_pending = self.printer.config.is_pending()
 
@@ -704,6 +861,37 @@ class Client(
             msgs.sort(key=lambda m: not m.carries_edge())  # stable
 
         return msgs
+
+    def _changed_kinds(self) -> Dict[Type[ClientMsg], Tuple[int, int]]:
+        """Each message kind with a change: its lowest and highest version.
+
+        What the full scan (:func:`_message_changes`) finds, in its order, but
+        read only for the kinds a change since the last call can have reached
+        and the kinds that still had a change then (rate limited, held, built
+        empty, never reset). Any other kind had none and gained none, so after
+        one temperature change this reads the temperatures, not the tree.
+        """
+        printer = self.printer
+        bits = self._touched_kinds | self._pending_kinds
+        if printer is not self._scanned_printer:
+            bits = _ALL_KINDS
+            self._scanned_printer = printer
+        self._touched_kinds = 0
+
+        msg_kinds = {}
+        pending = 0
+        while bits:
+            bit = bits & -bits  # the lowest: kinds stay in scan order
+            bits ^= bit
+            msg_kind, candidates = _MESSAGE_KINDS[bit.bit_length() - 1]
+            if versions := tuple(v for v in candidates(printer) if v is not None):
+                msg_kinds[msg_kind] = (min(versions), max(versions))
+                pending |= bit
+
+        # Kept until a later call finds them clear: whether this send resets
+        # them is up to its build, dispatch and settle.
+        self._pending_kinds = pending
+        return msg_kinds
 
     @property
     def settles_on_write(self) -> bool:

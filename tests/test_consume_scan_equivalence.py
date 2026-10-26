@@ -11,12 +11,15 @@ and a ``_ScanClient`` side by side; after every step both must agree exactly:
 - every change marker left in the tree, the message ids, ``has_changes``,
   ``has_deferred`` and the current job id.
 
-So any shortcut ``consume`` takes is held to what the plain scan would do.
+So the shortcut ``consume`` takes (reading only the kinds a change can have
+reached) is held to what the plain scan does; the kinds it read as changed are
+checked against the scan's directly too, versions and order included.
 """
 
 import datetime
 import random
 import uuid
+import weakref
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 import pytest
@@ -191,6 +194,25 @@ class _ScanClient(Client):
         return msgs
 
 
+def _reference_kinds(state: PrinterState) -> Dict[Type[ClientMsg], Tuple[int, int]]:
+    """The kinds the scan finds changed, with (lowest, highest), in its order."""
+    kinds = {}
+    for kind, candidates in _reference_message_changes(state):
+        if versions := tuple(v for v in candidates if v is not None):
+            kinds[kind] = (min(versions), max(versions))
+    return kinds
+
+
+class _FastClient(Client):
+    """The client under test, keeping what its consume read as changed."""
+
+    read_kinds: Optional[Dict[Type[ClientMsg], Tuple[int, int]]] = None
+
+    def _changed_kinds(self) -> Dict[Type[ClientMsg], Tuple[int, int]]:
+        self.read_kinds = super()._changed_kinds()
+        return self.read_kinds
+
+
 # -- observation ---------------------------------------------------------------
 
 
@@ -210,6 +232,19 @@ def _markers(model: ReactiveModel, path: str = "printer") -> Dict[str, Dict]:
                 if isinstance(item, ReactiveModel):
                     out.update(_markers(item, f"{path}.{name}[{key}]"))
     return out
+
+
+def _models(model: ReactiveModel) -> Iterable[ReactiveModel]:
+    yield model
+    for name in type(model).model_fields:
+        value = getattr(model, name)
+        if isinstance(value, ReactiveModel):
+            yield from _models(value)
+        elif isinstance(value, (list, tuple, dict)):
+            items = value.values() if isinstance(value, dict) else value
+            for item in items:
+                if isinstance(item, ReactiveModel):
+                    yield from _models(item)
 
 
 def _observe(client: Client) -> tuple:
@@ -431,7 +466,9 @@ def _notification(rng: random.Random) -> _Apply:
 
 
 def _structure(rng: random.Random) -> _Apply:
-    action = rng.choice(["tools", "materials", "layout", "settings"])
+    action = rng.choice(
+        ["tools", "materials", "layout", "settings", "detach", "reattach", "replace"]
+    )
     count = rng.randint(1, 3)
     nozzle = rng.randrange(3)
     layout = [
@@ -454,8 +491,24 @@ def _structure(rng: random.Random) -> _Apply:
                     for n, mms, chains in layout
                 ]
             )
-        else:
+        elif action == "settings":
             p.settings = PrinterSettings(has_psu=bool(count % 2))
+        elif action == "detach":
+            # A tool leaves the tree with whatever changes it carries...
+            if len(p.tools) > 1:
+                c.__dict__.setdefault("_detached", []).append(p.tools.pop())
+        elif action == "reattach":
+            # ...and comes back, bound again: those changes count again.
+            detached = c.__dict__.get("_detached")
+            if detached and len(p.tools) < 3:
+                tool = detached.pop()
+                p.tools.append(tool)
+                tool.provide_context(p)
+        else:
+            # As PrinterClient.reset_printer_state: a new tree, bound.
+            c.printer = PrinterState(config=c.config)
+            c.printer.provide_context(weakref.ref(c))
+            c.printer.tool_count = count
 
     return apply
 
@@ -512,9 +565,9 @@ def _consume(c: Client, mode: str, outcomes, cut: int) -> List[ClientMsg]:
     return msgs
 
 
-def _pair() -> Tuple[Client, Client]:
+def _pair() -> Tuple[_FastClient, Client]:
     clients = []
-    for cls in (Client, _ScanClient):
+    for cls in (_FastClient, _ScanClient):
         c = cls(PrinterConfig.get_new(), context=ClientContext())
         c.config.id = 1
         c.config.in_setup = False
@@ -539,8 +592,14 @@ def test_consume_matches_the_full_scan(seed, monkeypatch):
         if roll < 0.2:
             mode, outcomes, cut = _send(rng)
             assert _spec(fast.printer) == _reference_spec(fast.printer), step
+            for model in _models(fast.printer):
+                changes = model.model_recursive_changeset.values()
+                assert model.model_latest_change() == max(changes, default=None)
+            want_kinds = _reference_kinds(fast.printer)
             got = _consume(fast, mode, outcomes, cut)
             want = _consume(scan, mode, outcomes, cut)
+            # What consume read as changed: the scan's kinds, versions, order.
+            assert list(fast.read_kinds.items()) == list(want_kinds.items())
             assert _wire(got) == _wire(want), (seed, step, mode)
         elif roll < 0.27:
             clock[0] += rng.choice([0, 100, 1_000, 3_000, 6_000, 40_000])

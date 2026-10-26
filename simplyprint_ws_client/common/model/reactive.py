@@ -50,7 +50,7 @@ class ReactiveContext(Protocol):
         """A tracked change to ``model.field``: its id (increasing)."""
         ...
 
-    def attached(self, model: "ReactiveModel") -> None:
+    def state_attached(self, model: "ReactiveModel") -> None:
         """``model``'s subtree was bound to this context by ``provide_context``.
 
         Changes it already carries are now part of the tree.
@@ -159,7 +159,7 @@ class ReactiveModel(BaseModel, Synchronized):
         # already carries (one moved back into the tree) must not go unseen.
         live = self.ctx()
         if live is not None:
-            live.attached(self)
+            live.state_attached(self)
 
     def _bind_context(
         self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
