@@ -352,6 +352,38 @@ def test_close_writes_what_is_pending(tmp_path):
         again.close()
 
 
+def test_a_held_writer_writes_pending_first_then_nothing_until_released(tmp_path):
+    # A restore holds the writer from before its commit until the running
+    # code follows; a mark queued meanwhile produces after the hold, so it
+    # reads memory as it is then, never as it was before the restore.
+    s = Store.open(tmp_path / "state.db", backups=tmp_path / "b")
+    key = ("d", "plugin", "k")
+    memory = {"value": "before"}
+    try:
+        s.writer.mark("kv", key, lambda: _kv(memory["value"]))
+        with s.writes_held():
+            assert s.get("kv", key)["value"] == "before"  # pending went first
+            s.writer.mark("kv", key, lambda: _kv(memory["value"]), urgent=True)
+            waited = threading.Event()
+
+            def needs_it_on_disk():
+                s.writer.flush_now()
+                waited.set()
+
+            threading.Thread(target=needs_it_on_disk, daemon=True).start()
+            # Neither the store's thread nor flush_now writes during the hold.
+            assert not waited.wait(0.3)
+            # A transaction (the restore's own write) still goes through.
+            with s.transaction() as txn:
+                txn.put("kv", key, _kv("restored"))
+            memory["value"] = "restored"  # the running code followed
+            assert s.get("kv", key)["value"] == "restored"
+        assert waited.wait(5)
+        assert s.get("kv", key)["value"] == "restored"
+    finally:
+        s.close()
+
+
 # -- crash safety ---------------------------------------------------------------
 
 

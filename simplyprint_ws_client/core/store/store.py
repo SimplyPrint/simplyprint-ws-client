@@ -355,6 +355,10 @@ class Store:
         self._rconn = self._connect(reader=True)
         self._wlock = threading.Lock()
         self._rlock = threading.Lock()
+        #: How many :meth:`writes_held` blocks are open; while any is, no
+        #: batch is written. ``_resumed`` wakes the batches that wait for it.
+        self._held = 0
+        self._resumed = threading.Condition(self._wlock)
         self._closed = False
         #: Last-written hashes, for the unchanged-write check.
         self._hashes: Dict[Tuple[str, Tuple[Any, ...]], Optional[bytes]] = {}
@@ -511,29 +515,64 @@ class Store:
             published.append(self._changeset(table, rows, "local", txn.rev))
         return published
 
+    @contextlib.contextmanager
+    def writes_held(self) -> Iterator[None]:
+        """Hold the coalescing writer for the block: what is pending is
+        written first, then marks are only queued, and a
+        :meth:`Writer.flush_now` from another thread waits for the block to
+        end. :meth:`transaction` still works inside it.
+
+        Why: a restore replaces rows that running code holds in memory. A
+        mark's ``produce`` reads memory when the batch is written, so a batch
+        written after the restore commits but before the running code took
+        the restored rows would put the old values back. The restore holds
+        the writer from before its commit until memory follows; the marks
+        queued meanwhile then produce the restored values."""
+        published: List[ChangeSet] = []
+        with self._wlock:
+            if not self._held:
+                published = self._write_pending_locked()[1]
+            self._held += 1
+        self._publish(published)
+        try:
+            yield
+        finally:
+            with self._wlock:
+                self._held -= 1
+                self._resumed.notify_all()
+            self._wake.set()
+
     def _flush_pending(self) -> int:
         """Write every pending mark as one transaction (the writer's batch)."""
         with self._wlock:
-            if self._closed:
-                raise RuntimeError("store %s is closed" % self.path)
-            batch = self.writer.take()
-            if not batch:
-                return 0
-            try:
-                txn = self._begin_locked()
-                try:
-                    self._write_batch(txn, batch)
-                    published = self._commit_locked(txn)
-                except BaseException:
-                    self._rollback_locked()
-                    raise
-            except BaseException:
-                # Not committed: the rows go back to the queue (a newer mark
-                # wins), so a failed or interrupted batch loses nothing.
-                self.writer.restore(batch)
-                raise
+            # A held writer (a restore in progress) writes nothing; a caller
+            # that needs its rows on disk waits for the hold to end.
+            while self._held and not self._stopping:
+                self._resumed.wait()
+            txn, published = self._write_pending_locked()
         self._publish(published)
-        return txn.changed
+        return 0 if txn is None else txn.changed
+
+    def _write_pending_locked(self) -> Tuple[Optional[Txn], List[ChangeSet]]:
+        if self._closed:
+            raise RuntimeError("store %s is closed" % self.path)
+        batch = self.writer.take()
+        if not batch:
+            return None, []
+        try:
+            txn = self._begin_locked()
+            try:
+                self._write_batch(txn, batch)
+                published = self._commit_locked(txn)
+            except BaseException:
+                self._rollback_locked()
+                raise
+        except BaseException:
+            # Not committed: the rows go back to the queue (a newer mark
+            # wins), so a failed or interrupted batch loses nothing.
+            self.writer.restore(batch)
+            raise
+        return txn, published
 
     @staticmethod
     def _write_batch(
@@ -831,7 +870,8 @@ class Store:
         while not self._stopping:
             now = self._clock()
             deadlines = [self._next_poll, self._next_maintenance]
-            pending = self.writer.next_deadline()
+            # A held writer has no deadline: the hold's end wakes the thread.
+            pending = None if self._held else self.writer.next_deadline()
             if pending is not None:
                 deadlines.append(pending)
             self._wake.wait(max(0.0, min(deadlines) - now))
@@ -840,7 +880,8 @@ class Store:
                 break
             # Each duty on its own: a failing poll must not stop writes.
             try:
-                if self.writer.is_due():
+                # Never wait for a hold here: the poll and maintenance go on.
+                if not self._held and self.writer.is_due():
                     self._flush_pending()
             except Exception:
                 _logger.exception("store %s: write failed; will retry", self.path)
@@ -867,6 +908,9 @@ class Store:
             return
         self._stopping = True
         self._wake.set()
+        with self._wlock:
+            # Batches waiting for a hold go through: the process is stopping.
+            self._resumed.notify_all()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=30)
         try:
