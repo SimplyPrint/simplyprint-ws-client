@@ -978,9 +978,17 @@ class Client(
           acknowledgements); a value is kept, since resending it is harmless;
         - cannot be serialized: reset, so it does not retry forever.
 
-        Messages ``consume`` did not build (an integration's own) are ignored,
-        and so is one handed over by :meth:`take_held_edge`: it is the taker's.
+        Messages ``consume`` did not build (an integration's own) are left to
+        the integration, and so is one handed over by :meth:`take_held_edge`.
+        Any frame that does not count as sent still asks for the retry pass.
         """
+        sent = msg.counts_as_sent()
+        if not sent:
+            # Also for messages this class did not build: the integration that
+            # queued one keeps it (the v0 outbox does), and with no change in
+            # the state nothing else would bring the scheduler back for it.
+            self._deferred = True
+
         held = self._held.pop(id(msg), None)
         if held is None:
             return
@@ -989,14 +997,13 @@ class Client(
         if held.taken:
             # Handed over (take_held_edge): reset then, resent by the taker.
             # Only the record of what the server was sent is still ours.
-            if msg.counts_as_sent() and outcome != WriteOutcome.UNSENDABLE:
+            if sent and outcome != WriteOutcome.UNSENDABLE:
                 self._sent_kinds.add(type(msg))
             return
 
-        if not msg.counts_as_sent():
+        if not sent:
             if held.released_job_id is not None and self.printer.current_job_id is None:
                 self.printer.current_job_id = held.released_job_id
-            self._deferred = True
             return
 
         # The job id was settled when the message was built (see _hold); a
