@@ -300,6 +300,16 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
                 await client.halt()
                 return
 
+            if was_allocated and self.manager.is_misplaced(client):
+                # The hub count changed and this printer's slot moved. Re-add
+                # it on its new hub; the server's newest-wins supersession
+                # retires the old child. The loss arms a full-state resend.
+                client.logger.info(
+                    "Moving to hub %d", self.manager.hub_index(client.unique_id)
+                )
+                await self.manager.deallocate(client)
+                was_allocated = False
+
             if not was_allocated:
                 await self.manager.allocate(client)
 

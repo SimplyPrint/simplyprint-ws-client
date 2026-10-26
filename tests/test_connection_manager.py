@@ -57,6 +57,9 @@ class _RecordingConnection:
 
 
 class _DummyView:
+    index = None  # a SINGLE link: no hub slot
+    opening = None
+
     def __init__(self, client: Client, connection: _DummyConnection):
         self._clients = {client.unique_id}
         self.connection = connection
@@ -77,6 +80,30 @@ def _client_list(count: int):
     for client in clients:
         client_list.add(client)
 
+    return client_list, clients
+
+
+def _client_list_on_distinct_hubs(count: int):
+    """``count`` clients whose unique ids hash to ``count`` different hub
+    slots when there are ``count`` hubs (fixed ids: deterministic)."""
+    chosen = {}
+    i = 0
+    while len(chosen) < count:
+        uid = f"printer-{i}"
+        slot = connection_manager_module.jump_hash(
+            connection_manager_module.stable_key(uid), count
+        )
+        chosen.setdefault(slot, uid)
+        i += 1
+
+    client_list = ClientList()
+    clients = []
+    for uid in chosen.values():
+        config = PrinterConfig.get_new()
+        config.unique_id = uid
+        client = Client(config, context=ClientContext())
+        client_list.add(client)
+        clients.append(client)
     return client_list, clients
 
 
@@ -174,7 +201,9 @@ async def test_multi_mode_without_capacity_reuses_one_view(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_multi_mode_capacity_spreads_clients_across_views(monkeypatch):
+async def test_multi_mode_capacity_sets_the_hub_count(monkeypatch):
+    # R1: the per-hub size sets the hub count (ceil(5 / 2) = 3); each printer
+    # goes to its hash slot, not to the least loaded hub.
     connections = _fake_connections(monkeypatch)
     client_list, clients = _client_list(5)
     manager = ClientConnectionManager(
@@ -187,10 +216,12 @@ async def test_multi_mode_capacity_spreads_clients_across_views(monkeypatch):
     for client in clients:
         await manager.allocate(client)
 
-    assert len(manager.views) == 3
-    assert len(connections) == 3
-    assert sorted(len(view) for view in manager.views) == [1, 2, 2]
-    assert all(len(view) <= 2 for view in manager.views)
+    assert manager.hub_count() == 3
+    assert 1 <= len(manager.views) <= 3
+    assert len(connections) == len(manager.views)
+    for client in clients:
+        view = manager.client_views[client.unique_id]
+        assert view.index == manager.hub_index(client.unique_id)
     assert all(
         hint.mode is ConnectionMode.MULTI
         for connection in connections
@@ -225,33 +256,30 @@ async def test_deallocate_removes_empty_view(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_multi_mode_reuses_partially_free_view(monkeypatch):
+async def test_multi_mode_reallocation_returns_to_the_same_live_hub(monkeypatch):
+    # R1: a printer's hub is its slot's, so leaving and coming back while the
+    # hub still has others reuses that hub's connection.
     connections = _fake_connections(monkeypatch)
     client_list, clients = _client_list(3)
-    manager = ClientConnectionManager(
-        ConnectionMode.MULTI,
-        client_list,
-        _WS,
-        max_clients_per_connection=2,
-    )
+    manager = ClientConnectionManager(ConnectionMode.MULTI, client_list, _WS)
 
-    await manager.allocate(clients[0])
-    await manager.allocate(clients[1])
+    for client in clients:
+        await manager.allocate(client)
     first_connection = manager.get_connection_for_client(clients[0])
 
     await manager.deallocate(clients[0])
-    await manager.allocate(clients[2])
+    await manager.allocate(clients[0])
 
     assert len(manager.views) == 1
     assert len(connections) == 1
-    assert manager.get_connection_for_client(clients[2]) is first_connection
-    assert sorted(len(view) for view in manager.views) == [2]
+    assert manager.get_connection_for_client(clients[0]) is first_connection
+    assert sorted(len(view) for view in manager.views) == [3]
 
 
 @pytest.mark.asyncio
 async def test_multi_mode_outgoing_messages_use_assigned_connection(monkeypatch):
     _fake_connections(monkeypatch)
-    client_list, clients = _client_list(2)
+    client_list, clients = _client_list_on_distinct_hubs(2)
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,
@@ -286,7 +314,7 @@ async def test_multi_mode_incoming_messages_route_only_inside_assigned_view(
     monkeypatch,
 ):
     _fake_connections(monkeypatch)
-    client_list, clients = _client_list(2)
+    client_list, clients = _client_list_on_distinct_hubs(2)
     manager = ClientConnectionManager(
         ConnectionMode.MULTI,
         client_list,

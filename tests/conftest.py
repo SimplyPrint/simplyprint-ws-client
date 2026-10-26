@@ -13,8 +13,10 @@ def _no_connection_jitter(monkeypatch):
     jitter to zero so every open and add happens when the test drives it;
     the jitter tests patch it back to something they control."""
     import simplyprint_ws_client.core.client as client_module
+    import simplyprint_ws_client.core.manager as manager_module
 
     monkeypatch.setattr(client_module, "_jitter", lambda upper: 0.0)
+    monkeypatch.setattr(manager_module, "_jitter", lambda upper: 0.0)
 
 
 @pytest.fixture

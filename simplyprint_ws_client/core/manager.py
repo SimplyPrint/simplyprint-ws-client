@@ -26,11 +26,20 @@ logic, which is the test for whether things are the same (they are not):
   disconnected (``engine.stop()``) -- the refcount/lease lifecycle, protocol-side.
 """
 
-__all__ = ["ClientConnectionManager", "ClientList", "ClientView"]
+__all__ = [
+    "ClientConnectionManager",
+    "ClientList",
+    "ClientView",
+    "hub_count",
+    "jump_hash",
+    "stable_key",
+]
 
 import asyncio
 import functools
+import hashlib
 import logging
+import random
 from datetime import timedelta
 from typing import Union, Dict, Mapping
 from typing import final, Optional, Set, cast, Iterable, MutableSet, Hashable
@@ -77,6 +86,53 @@ TUniqueId = Union[str, int]
 #: Minimum age of the newest stored connectivity report before another
 #: connectivity test suite is run.
 CONNECTIVITY_REPORT_MIN_INTERVAL = timedelta(minutes=20)
+
+#: About this many printers share one MULTI hub. The backend pins a hub and
+#: all its children to one of its workers, so a large farm must spread across
+#: hubs to use more than one; a small install keeps a single hub.
+PRINTERS_PER_HUB = 32
+
+#: Production runs 32 workers: more hubs than that buy nothing.
+MAX_HUBS = 32
+
+#: A new hub's first open is delayed by up to this much when there is more
+#: than one hub, so a farm's hubs do not all open in the same instant.
+HUB_OPEN_JITTER_S = 2.0
+
+
+def hub_count(printers: int, per_hub: int = PRINTERS_PER_HUB) -> int:
+    """``clamp(ceil(printers / per_hub), 1, MAX_HUBS)``."""
+    return max(1, min(MAX_HUBS, -(-printers // per_hub)))
+
+
+def stable_key(unique_id: TUniqueId) -> int:
+    """A 64-bit key for ``unique_id`` that is the same in every process.
+
+    ``hash()`` is salted per process, so it would move printers on restart.
+    """
+    digest = hashlib.blake2b(str(unique_id).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+def jump_hash(key: int, buckets: int) -> int:
+    """Lamping and Veach's jump consistent hash: ``key`` -> ``[0, buckets)``.
+
+    Going from ``n`` to ``n + 1`` buckets moves only the ~``1/(n + 1)`` of the
+    keys that land in the new bucket; every other key stays where it was. That
+    is what keeps a hub-count change to the fewest moves (each move costs an
+    add, and the server's add burst never refills).
+    """
+    b, j = -1, 0
+    while j < buckets:
+        b = j
+        key = (key * 2862933555777941757 + 1) & 0xFFFFFFFFFFFFFFFF
+        j = int((b + 1) * (float(1 << 31) / float((key >> 33) + 1)))
+    return b
+
+
+def _jitter(upper: float) -> float:
+    """A uniform delay in ``[0, upper)``. Module-level so tests can pin it."""
+    return random.uniform(0, upper) if upper > 0 else 0.0
 
 
 class ClientList(Mapping[Union[TUniqueId, Client, PrinterConfig], Client]):
@@ -132,12 +188,17 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
         connection: SimplyPrintConnection,
         client_list: ClientList,
         logger=logging.getLogger(__name__),
+        index: Optional[int] = None,
     ):
         self.mode = mode
         self.connection = connection
         self.client_list = client_list
         self.clients = set()
         self.logger = logger
+        #: The hub slot this view serves (MULTI); ``None`` for a SINGLE link.
+        self.index = index
+        #: The jittered first open of a new hub, while it is pending.
+        self.opening: Optional[asyncio.Task] = None
 
     async def _emit_all(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
         # Iterate over a stable snapshot so mutations to view/client maps during awaits
@@ -184,7 +245,10 @@ class ClientView(Emitter, MutableSet[Client], Hashable):
                     "Converted base ConnectedMsg to SimplyPrintConnectionEstablishedEvent with v: %d.",
                     v,
                 )
-                await self._emit_all(SimplyPrintConnectionEstablishedEvent(v))
+                # The hub size lets each printer spread its add over the hub.
+                await self._emit_all(
+                    SimplyPrintConnectionEstablishedEvent(v, hub_size=len(self))
+                )
                 return
 
             # We can get a routing hint from the message directly.
@@ -304,9 +368,16 @@ class ClientConnectionManager(
         self.mode = mode
         self.client_list = client_list
         self.websocket_base = websocket_base
+        #: MULTI: the target printers per hub (default PRINTERS_PER_HUB). It
+        #: sets the hub count; a hub may hold a few more or fewer, since the
+        #: assignment is a hash, not a fill.
         self.max_clients_per_connection = max_clients_per_connection
         self.client_views = {}
         self.views = set()
+        #: MULTI: the live hub for each slot.
+        self._hubs: Dict[int, ClientView] = {}
+        #: stable_key per unique_id (a blake2b each pass would be waste).
+        self._keys: Dict[TUniqueId, int] = {}
         self.logger = logger
         self.transport_factory = transport_factory
         self._next_connection_id = 0
@@ -369,13 +440,50 @@ class ClientConnectionManager(
         finally:
             self._connectivity_report_inflight = False
 
-    def _allocate_new_connection(self) -> ClientView:
+    # -- hub assignment (MULTI) ---------------------------------------------
+
+    def hub_count(self) -> int:
+        """Hubs for the printers scheduled now: ``clamp(ceil(n / 32), 1, 32)``.
+
+        Counted over every scheduled printer, active or not, so a printer going
+        offline and back does not change the count (and move others).
+        """
+        return hub_count(
+            len(self.client_list),
+            self.max_clients_per_connection or PRINTERS_PER_HUB,
+        )
+
+    def hub_index(self, unique_id: TUniqueId) -> int:
+        """The hub slot of ``unique_id``: a consistent hash, the same across
+        restarts, that moves the fewest printers when the hub count changes."""
+        key = self._keys.get(unique_id)
+        if key is None:
+            key = self._keys[unique_id] = stable_key(unique_id)
+        return jump_hash(key, self.hub_count())
+
+    def is_misplaced(self, client: Client) -> bool:
+        """Whether ``client`` sits on a hub its slot no longer maps to.
+
+        Only a hub-count change makes this true: a lost hub is reopened in
+        place by its connection's reconnect loop, and a new hub for an empty
+        slot is created where the slot's printers expect it. Nothing else
+        moves a printer (the server's add burst never refills).
+        """
+        if self.mode != ConnectionMode.MULTI:
+            return False
+        view = self.client_views.get(client.unique_id)
+        return view is not None and view.index != self.hub_index(client.unique_id)
+
+    def _allocate_new_connection(self, client: Client) -> ClientView:
         if self.is_stopped():
             raise RuntimeError("Cannot allocate connections when stopped.")
 
-        existing = self._select_existing_view()
-        if existing is not None:
-            return existing
+        index: Optional[int] = None
+        if self.mode == ConnectionMode.MULTI:
+            index = self.hub_index(client.unique_id)
+            existing = self._hubs.get(index)
+            if existing is not None:
+                return existing
 
         # Creating a new connection / client view pair.
         loggerName = "ws"
@@ -393,8 +501,10 @@ class ClientConnectionManager(
             logger=logging.getLogger(loggerName),
             transport_factory=self.transport_factory,
         )
-        client_view = ClientView(self.mode, connection, self.client_list)
+        client_view = ClientView(self.mode, connection, self.client_list, index=index)
         self.views.add(client_view)
+        if index is not None:
+            self._hubs[index] = client_view
 
         # Registering the connection with the client view.
         connection.event_bus.on(
@@ -423,23 +533,11 @@ class ClientConnectionManager(
 
         return client_view
 
-    def _select_existing_view(self) -> Optional[ClientView]:
-        if self.mode != ConnectionMode.MULTI or not self.views:
-            return None
-
-        if self.max_clients_per_connection is None:
-            candidates = tuple(self.views)
-        else:
-            candidates = tuple(
-                view
-                for view in self.views
-                if len(view) < self.max_clients_per_connection
-            )
-
-        if not candidates:
-            return None
-
-        return min(candidates, key=lambda view: (len(view), id(view)))
+    async def _open_later(
+        self, connection: SimplyPrintConnection, hint: ConnectionHint, delay: float
+    ) -> None:
+        await asyncio.sleep(delay)
+        await connection.connect(hint=hint)
 
     def _derive_connection_hint(self, client: Client) -> ConnectionHint:
         # Use up-to-date credentials to connect.
@@ -474,12 +572,21 @@ class ClientConnectionManager(
         if self.is_allocated(client):
             return
 
-        view = self._allocate_new_connection()
+        is_new = not (
+            self.mode == ConnectionMode.MULTI
+            and self.hub_index(client.unique_id) in self._hubs
+        )
+        view = self._allocate_new_connection(client)
         connection = view.connection
 
         if connection.connected:
             client.v = connection.v
             client.state = ClientState.NOT_CONNECTED
+            if self.mode == ConnectionMode.MULTI:
+                # Joining a live hub (startup, or a move after a hub-count
+                # change): no `connected` will announce it, so spread its add
+                # here, as the hub's own open would.
+                client.spread_add(len(view) + 1)
 
         self.client_views[client.unique_id] = view
         view.add(client)
@@ -505,7 +612,25 @@ class ClientConnectionManager(
             ),
         )
 
-        await connection.connect(hint=self._derive_connection_hint(client))
+        hint = self._derive_connection_hint(client)
+
+        if view.opening is not None and not view.opening.done():
+            return  # the hub's jittered first open will connect it
+
+        delay = (
+            _jitter(HUB_OPEN_JITTER_S)
+            if is_new and self.mode == ConnectionMode.MULTI and self.hub_count() > 1
+            else 0.0
+        )
+        if delay > 0:
+            # One of several hubs: open a little apart from the others. Held
+            # on the view so it is not collected, and cancelled if it empties.
+            view.opening = asyncio.get_running_loop().create_task(
+                self._open_later(connection, hint, delay)
+            )
+            return
+
+        await connection.connect(hint=hint)
 
     async def deallocate(self, client: Client):
         """Deallocate a connection and remove it from the client."""
@@ -525,11 +650,20 @@ class ClientConnectionManager(
 
         # Disconnect the connection if no clients are left.
         if len(client_view) == 0:
+            if client_view.opening is not None:
+                client_view.opening.cancel()
             await client_view.connection.disconnect()
             self.views.discard(client_view)
+            index = client_view.index
+            if index is not None and self._hubs.get(index) is client_view:
+                del self._hubs[index]
 
     def stop(self):
         super().stop()
+
+        for view in list(self.views):
+            if view.opening is not None:
+                view.opening.cancel()
 
         for connection in self.connections:
             connection.stop()
