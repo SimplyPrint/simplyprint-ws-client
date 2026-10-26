@@ -592,6 +592,8 @@ class Client(
         )
         self.v = -1
         self.msg_id = -1
+        #: The change id when a FILE demand last set the job id (``_hold``).
+        self._job_id_admitted_at: Optional[int] = None
         self.last_msg_id = -1
         #: Changes the last send left pending without a new change to wake the
         #: scheduler: rate-limited messages, frames that never left. The
@@ -918,7 +920,12 @@ class Client(
 
     def _hold(self, msg: ClientMsg, v: int) -> None:
         released = None
-        if msg.releases_job_id(self.printer):
+        # A job id admitted (FILE demand) after this message's change belongs
+        # to the next job, not the one this status or end edge closes. A send
+        # that stopped at a failed write builds the rest later, after such a
+        # demand may have come in; the default path never interleaves.
+        admitted = self._job_id_admitted_at
+        if msg.releases_job_id(self.printer) and (admitted is None or v > admitted):
             # The default path clears the job id in reset_changes, before the
             # next message is built; doing it here keeps every later message
             # of this send built exactly as before.
@@ -1338,6 +1345,7 @@ class Client(
     def _on_file_demand(self, data: FileDemandData):
         """Store file action_token for later use."""
         self.printer.current_job_id = data.job_id
+        self._job_id_admitted_at = self.msg_id  # see _hold
         self.printer.file_action_token = data.action_token
         self.printer.have_cleared_bed = False
 
