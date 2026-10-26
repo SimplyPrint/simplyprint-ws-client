@@ -297,6 +297,45 @@ async def test_an_edge_taken_over_mid_write_is_the_takers():
     assert not any('"finished":true' in f for f in socket.sent[before:])
 
 
+@pytest.mark.asyncio
+async def test_a_send_stops_at_the_first_frame_that_did_not_go_out():
+    # The link dies under the kept edge's write and a reconnect completes
+    # before the next write: had the send gone on, the status would reach
+    # the new socket ahead of the finished, starting the server's job-failure
+    # clock. The rest of the send waits for the next one, in its order.
+    wire, client = await _connected()
+    printer = client.printer
+    printer.current_job_id = 9
+    printer.status = PrinterStatus.PRINTING
+    printer.job_info.started = True
+    await wire.schedule(client)
+
+    socket = wire.socket(client)
+    original = socket.write
+    failed: List[str] = []
+
+    async def write(data: object) -> None:
+        if '"finished":true' in str(data) and not failed:
+            failed.append(str(data))
+            raise NotConnected("the old link died under this write")
+        await original(data)  # the new link takes the rest
+
+    socket.write = write
+    printer.job_info.finished = True
+    printer.status = PrinterStatus.OPERATIONAL
+    before = len(socket.sent)
+    await wire.schedule(client)
+
+    assert failed and socket.sent[before:] == []
+    assert client.has_deferred
+
+    await wire.schedule(client)  # the retry pass
+    assert socket.sent[before:] == [
+        '{"type":"job_info","data":{"job_id":9,"finished":true}}',
+        '{"type":"state_change","data":{"new":"operational"}}',
+    ]
+
+
 # -- 4. a write on a socket the library already knows is closed ----------------
 
 
