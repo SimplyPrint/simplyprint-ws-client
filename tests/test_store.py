@@ -757,6 +757,36 @@ def test_readable_rows_are_kept_before_the_snapshot_is_used(tmp_path, monkeypatc
         s.close()
 
 
+def test_a_table_read_completely_is_not_topped_up_from_the_snapshot(
+    tmp_path, monkeypatch
+):
+    # A printer deleted after the last snapshot must stay deleted: only a
+    # table the damaged file could not fully give is filled in.
+    path, backups = tmp_path / "state.db", tmp_path / "backups"
+    _filled(path, backups)
+    s = Store.open(path, start=False, backups=backups)
+    with s.transaction() as txn:
+        txn.delete("printers", "old")
+    s.close()
+    real = Store._check
+    calls = []
+
+    def failing_once(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.DatabaseError("quick_check: *** in database main ***")
+        real(conn)
+
+    monkeypatch.setattr(Store, "_check", staticmethod(failing_once))
+    s = Store.open(path, start=False, backups=backups)
+    try:
+        assert [r["unique_id"] for r in s.rows("printers")] == ["new"]
+        assert s.recovery.unreadable_tables == []
+        assert s.recovery.from_snapshot.get("printers", 0) == 0
+    finally:
+        s.close()
+
+
 def test_a_locked_database_is_not_treated_as_damaged(tmp_path, monkeypatch):
     path = tmp_path / "state.db"
     Store.open(path, start=False).close()
