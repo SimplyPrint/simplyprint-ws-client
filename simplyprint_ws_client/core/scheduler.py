@@ -17,6 +17,7 @@ from simplyprint_ws_client.core.protocol.connection import (
     TransportFactory,
     default_transport_factory,
 )
+from simplyprint_ws_client.core.protocol.models import WriteOutcome
 from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.common.asyncio.async_task_scope import AsyncTaskScope
 from simplyprint_ws_client.common.asyncio.continuous_task import ContinuousTask
@@ -31,6 +32,10 @@ else:
 #: Per-client budget for one ``tick``; a slow client is cut off so it cannot
 #: stall the shared scheduling loop.
 TICK_TIMEOUT_SECONDS = 5
+
+#: Outcomes that mean the link failed under a write: the send stops there.
+#: An edge that may have left counts as sent, but the link is just as dead.
+_LINK_FAILED = (WriteOutcome.NOT_SENT, WriteOutcome.MAYBE_SENT)
 
 
 class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
@@ -330,8 +335,16 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             with client.settling_on_write():
                 msgs = client.consume()
 
-            for msg in msgs:
+            for i, msg in enumerate(msgs):
                 await client.write(msg)
+                if msg.write_outcome in _LINK_FAILED:
+                    # The link failed under this frame. Writing on could put
+                    # the rest out ahead of it on a link that came back
+                    # meanwhile (a status before a kept `finished` starts the
+                    # server's job-failure clock); they go with the next send,
+                    # in its order (edges first, job info before status).
+                    client.unwritten(msgs[i + 1 :])
+                    break
 
         except Exception as e:
             client.logger.error("Error while scheduling client", exc_info=e)

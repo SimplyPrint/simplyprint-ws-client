@@ -1029,6 +1029,14 @@ class Client(
             raise
         self.settle(msg)
 
+    def unwritten(self, msgs: Iterable[ClientMsg]) -> None:
+        """The rest of a send the scheduler stopped at a failed write: none of
+        it was offered to the link. Each is settled as never sent, so it keeps
+        its markers (or its integration's queue position) for the next send."""
+        for msg in msgs:
+            msg.record_write(WriteOutcome.NOT_SENT)
+            self.settle(msg)
+
     # internal methods
 
     async def _on_connection_incoming(self, msg: ServerMsgKind, v: int):
