@@ -287,3 +287,93 @@ def test_the_add_jitter_never_shortens_a_server_retry_after(monkeypatch):
     client.spread_add(32)
 
     assert client._pending_action_delay == timedelta(seconds=249)
+
+
+# -- a stable count: grow at once, shrink after a grace, not mid-replay ----------
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The manager's monotonic clock, in seconds, advanced by hand."""
+    now = {"s": 1000.0}
+    monkeypatch.setattr(manager_module, "_monotonic", lambda: now["s"])
+    return now
+
+
+async def _allocated(monkeypatch, ids):
+    manager, clients = _manager(monkeypatch, ids)
+    for client in clients:
+        await manager.allocate(client)
+    return manager, clients
+
+
+@pytest.mark.asyncio
+async def test_the_hub_count_shrinks_only_after_staying_lower_for_the_grace(
+    monkeypatch, clock
+):
+    manager, clients = await _allocated(monkeypatch, IDS[:33])
+    assert manager.hub_count() == 2
+
+    manager.client_list.remove(clients[-1])  # 32: one hub would do
+    clock["s"] += manager_module.HUB_SHRINK_GRACE_S - 1
+    assert manager.hub_count() == 2
+    assert not any(manager.is_misplaced(c) for c in clients[:32])
+
+    clock["s"] += 1
+    assert manager.hub_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_a_printer_leaving_and_coming_back_moves_nobody(monkeypatch, clock):
+    # 32 <-> 33 used to flip 1 <-> 2 hubs, moving half the printers each time
+    # (an add from a burst that never refills, and a full-state resend).
+    manager, clients = await _allocated(monkeypatch, IDS[:33])
+    flapping = clients[-1]
+    for _ in range(3):
+        manager.client_list.remove(flapping)
+        assert manager.hub_count() == 2
+        clock["s"] += manager_module.HUB_SHRINK_GRACE_S - 1
+        manager.client_list.add(flapping)
+        assert manager.hub_count() == 2  # back before the grace ran out
+    clock["s"] += manager_module.HUB_SHRINK_GRACE_S
+    assert manager.hub_count() == 2
+    assert not any(manager.is_misplaced(c) for c in clients)
+
+
+@pytest.mark.asyncio
+async def test_growth_applies_at_once(monkeypatch, clock):
+    manager, clients = await _allocated(monkeypatch, IDS[:32])
+    manager.client_list.add(new_client(IDS[32]))
+    assert manager.hub_count() == 2
+    assert any(manager.is_misplaced(c) for c in clients)
+
+
+@pytest.mark.asyncio
+async def test_a_replay_is_counted_once_it_is_done(monkeypatch, clock):
+    manager, clients = await _allocated(monkeypatch, IDS[:20])
+    with manager.replaying():
+        for uid in IDS[20:70]:
+            manager.client_list.add(new_client(uid))
+            # Not re-hashed on a partial list (2 hubs at 33, 3 at 65...).
+            assert manager.hub_count() == 1
+            assert not any(manager.is_misplaced(c) for c in clients)
+    assert manager.hub_count() == 3  # 70 printers, in one step
+
+
+@pytest.mark.asyncio
+async def test_the_scheduler_places_nobody_while_a_replay_runs(monkeypatch):
+    from simplyprint_ws_client.core.scheduler import Scheduler
+    from simplyprint_ws_client.core.settings import ClientSettings
+
+    monkeypatch.setattr(manager_module, "SimplyPrintConnection", _Connection)
+    scheduler = Scheduler(ClientList(), ClientSettings(mode=ConnectionMode.MULTI))
+    scheduler.use_running_loop()
+    client = new_client(IDS[0])
+    scheduler.client_list.add(client)
+
+    with scheduler.replaying():
+        await scheduler._schedule_client(client)
+        assert not scheduler.manager.is_allocated(client)
+
+    await scheduler._schedule_client(client)
+    assert scheduler.manager.is_allocated(client)
