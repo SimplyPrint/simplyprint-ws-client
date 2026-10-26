@@ -38,7 +38,7 @@ from simplyprint_ws_client.wire.messages import (
     WsMessage,
     ws_message_for_payload,
 )
-from simplyprint_ws_client.wire.errors import ErrorCode
+from simplyprint_ws_client.wire.errors import ErrorCode, NotConnected
 from simplyprint_ws_client.wire.policy import RetryPolicy
 from simplyprint_ws_client.wire.reconnect import Reconnecting, redacted
 from simplyprint_ws_client.wire.transport import (
@@ -142,10 +142,20 @@ class Websockets(WsTransport, Reconnecting):
         :class:`~simplyprint_ws_client.wire.transport.TransientError`, mirroring
         :meth:`recv`, so callers see the typed wire-error family -- never the
         library's raw exception.
+
+        A socket that is gone, or that the library already knows is closing or
+        closed, raises :class:`~simplyprint_ws_client.wire.errors.NotConnected`
+        instead: nothing was written, and the sender may count on that (an
+        edge that never left is resent; one that may have left never is).
         """
         socket = self.socket
         if socket is None:
-            raise TransientError("websocket not connected")
+            raise NotConnected("websocket not connected")
+        if _closed_before_write(socket):
+            # ``websockets`` raises ConnectionClosed for this too, but before
+            # it writes a byte; no await separates this check from its own, so
+            # the two agree. Any failure past it may have put the frame out.
+            raise NotConnected("websocket closed")
         frame = as_frame(message)
         try:
             await socket.send(frame)
@@ -164,6 +174,19 @@ class Websockets(WsTransport, Reconnecting):
             self.logger.debug(
                 "websocket %s close failed", redacted(self.url), exc_info=True
             )
+
+
+def _closed_before_write(socket: object) -> bool:
+    """The library knows ``socket`` is no longer OPEN, so its ``send`` will
+    raise without writing. ``False`` when the state cannot be read (a fake or
+    another implementation): then the library's own outcome decides."""
+    state = getattr(getattr(socket, "protocol", None), "state", None)
+    if state is None:
+        return False
+    # Already imported by the live connection: a module lookup, per frame.
+    from websockets.protocol import State
+
+    return state is not State.OPEN
 
 
 def as_frame(message: Union[str, bytes, bytearray, memoryview]) -> Union[str, bytes]:
