@@ -24,12 +24,15 @@ sleeping.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 __all__ = ["Writer", "Pending", "Produce", "SKIP", "DEBOUNCE", "CAP"]
+
+_logger = logging.getLogger("store")
 
 #: Seconds a row waits after its last mark.
 DEBOUNCE = 1.0
@@ -93,6 +96,8 @@ class Writer:
         self.debounce = debounce
         self.cap = cap
         self.clock = clock
+        #: Set when the store closes: a mark after it is dropped, loudly.
+        self.closed = False
         self._lock = threading.Lock()
         self._dirty: Dict[RowId, Pending] = {}
         #: Called after a mark that may move the next deadline earlier, so a
@@ -116,6 +121,13 @@ class Writer:
         wins; the first mark's time is kept, so the cap still applies."""
         if self._key_of is not None:
             key = self._key_of(table, key)
+        if self.closed:
+            # Nothing will ever write it: say so, every time (a late flush
+            # after the store closed is a shutdown-order bug to fix).
+            _logger.error(
+                "store writer is closed; the write of %s %r is dropped", table, key
+            )
+            return
         now = self.clock()
         row = (table, key)
         with self._lock:

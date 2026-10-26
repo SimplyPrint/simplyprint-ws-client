@@ -943,6 +943,7 @@ class Store:
             except sqlite3.Error:
                 _logger.warning("store %s: checkpoint failed", self.path, exc_info=True)
             self._closed = True
+            self.writer.closed = True
             self._wconn.close()
         with self._rlock:
             self._rconn.close()

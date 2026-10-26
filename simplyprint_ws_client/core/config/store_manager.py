@@ -186,14 +186,18 @@ class StoreConfigManager(ConfigManager):
 
     @property
     def store(self) -> Store:
-        if self._store is None or (
-            self._store.closed and self._explicit_store is None
-        ):
-            self._store = (
-                self._explicit_store
-                or StoreConfigManager._bound
-                or Store.shared(self.base_directory / STORE_FILE)
-            )
+        store = self._store
+        if store is None or store.closed:
+            found = self._explicit_store or StoreConfigManager._bound
+            if found is None or found.closed:
+                if store is not None:
+                    # The store this manager used is closed (the process is
+                    # stopping) and none is bound in its place. Keep it: its
+                    # writes fail loudly. Opening the fallback file would
+                    # put them in another directory nothing reads.
+                    return store
+                found = Store.shared(self.base_directory / STORE_FILE)
+            self._store = found
         return self._store
 
     @property
