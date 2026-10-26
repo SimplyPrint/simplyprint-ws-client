@@ -315,6 +315,7 @@ async def test_the_hub_count_shrinks_only_after_staying_lower_for_the_grace(
     assert manager.hub_count() == 2
 
     manager.client_list.remove(clients[-1])  # 32: one hub would do
+    assert manager.hub_count() == 2  # the scheduler's next pass sees it
     clock["s"] += manager_module.HUB_SHRINK_GRACE_S - 1
     assert manager.hub_count() == 2
     assert not any(manager.is_misplaced(c) for c in clients[:32])

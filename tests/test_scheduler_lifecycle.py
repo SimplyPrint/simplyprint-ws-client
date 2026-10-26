@@ -47,6 +47,9 @@ class _RecordingClient(Client[PrinterConfig]):
 class _FakeManager:
     """The calls _schedule_client makes, with no network behind them."""
 
+    #: Not replaying stored printers: the scheduler may place them.
+    is_replaying = False
+
     def __init__(self):
         self.allocated = set()
         self.allocate_calls = 0

@@ -294,6 +294,9 @@ class _RecordingClient(Client[PrinterConfig]):
 
 
 class _FakeManager:
+    #: Not replaying stored printers: the scheduler may place them.
+    is_replaying = False
+
     def __init__(self, failing=()):
         self.failing = set(failing)
         self.allocated = set()
