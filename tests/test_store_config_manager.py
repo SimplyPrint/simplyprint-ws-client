@@ -223,6 +223,32 @@ async def test_on_the_event_loop_registration_never_waits_for_the_write_lock(
         s.close()
 
 
+def test_after_its_store_closed_a_manager_never_opens_another(tmp_path, caplog):
+    # Persistence.close() unbinds and closes state.db. A late flush (a
+    # flusher, a plugin teardown) must fail loudly, not open a second
+    # database in the config directory that nothing ever reads.
+    s = Store.open(tmp_path / "data" / "state.db", start=False)
+    StoreConfigManager.bind(s)
+    try:
+        manager = StoreConfigManager(
+            name="acme", config_t=PrinterConfig, base_directory=str(tmp_path / "config")
+        )
+        config = PrinterConfig(id=1, token="t", unique_id="u1")
+        manager.persist(config)
+        manager.flush(config)
+        StoreConfigManager.bind(None)
+        s.close()
+
+        config.name = "late"
+        manager.flush()  # a field change: only a mark, dropped loudly
+        with pytest.raises(RuntimeError):
+            manager.flush(config)  # registration: must be on disk, cannot be
+        assert not (tmp_path / "config" / "state.db").exists()
+        assert any("closed" in r.getMessage() for r in caplog.records)
+    finally:
+        StoreConfigManager.bind(None)
+
+
 class _Record(Config):
     """An account record, as the client's HostedAccountStore keeps them."""
 
