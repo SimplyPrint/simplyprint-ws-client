@@ -648,6 +648,27 @@ def test_an_external_change_invalidates_the_unchanged_write_check(tmp_path):
         service.close()
 
 
+def test_an_external_change_is_not_skipped_before_the_poll_sees_it(tmp_path):
+    # The poll runs every 2 s; a write in between must not trust the hash
+    # cached before another process changed the row.
+    path = tmp_path / "state.db"
+    service = Store.open(path, start=False)
+    cli = Store.open(path, start=False)
+    try:
+        key = ("d", "plugin", "k")
+        with service.transaction() as txn:
+            txn.put("kv", key, _kv("mine"))
+        with cli.transaction() as txn:
+            txn.put("kv", key, _kv("theirs"))
+        # No poll_external() here.
+        service.writer.mark("kv", key, lambda: _kv("mine"))
+        service.writer.flush_now()
+        assert service.get("kv", key)["value"] == "mine"
+    finally:
+        cli.close()
+        service.close()
+
+
 # -- snapshots, export, import ----------------------------------------------------
 
 
