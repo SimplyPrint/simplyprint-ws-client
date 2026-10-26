@@ -324,6 +324,30 @@ def test_a_row_that_cannot_be_produced_keeps_its_stored_version(store):
     assert store.get("kv", ("d", "plugin", "c"))["value"] == 3
 
 
+def test_a_row_that_failed_to_produce_is_retried_with_backoff(store, clock):
+    # The mark was taken for the batch; dropping it would lose the change
+    # for good (nothing marks the row again until it changes again).
+    key = ("d", "plugin", "a")
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("not yet")
+        return _kv("made")
+
+    store.writer.mark("kv", key, flaky, urgent=True)
+    store.writer.flush_now()
+    assert store.get("kv", key) is None
+    assert store.writer.pending() == [("kv", key)]
+    assert not store.writer.is_due()  # backing off, not spinning
+    clock.t += 60.0
+    assert store.writer.is_due()
+    store.writer.flush_now()
+    assert store.get("kv", key)["value"] == "made"
+    assert not store.writer.dirty
+
+
 def test_an_unknown_table_fails_at_mark_time(store):
     with pytest.raises(KeyError):
         store.writer.mark("nope", "k", lambda: {})
