@@ -47,6 +47,7 @@ __all__ = [
     "Put",
     "Rows",
     "ImportReport",
+    "adopt_stored_ids",
     "UPLOADS_DOMAIN",
     "SETTINGS_SECRETS",
 ]
@@ -102,6 +103,9 @@ class Put:
     table: str
     key: Union[str, Tuple[Any, ...]]
     row: Mapping[str, Any]
+    #: A printer whose ``unique_id`` the conversion minted (the entry had
+    #: none): :func:`adopt_stored_ids` may give it a stored printer's.
+    minted: bool = False
 
 
 @dataclass(frozen=True)
@@ -282,13 +286,14 @@ class LegacyImporter:
         recorded = [(f["name"], f["sha256"]) for f in state.legacy_files()]
         todo = [(f, self.convert(f)) for f in self.pending(self.scan(), recorded)]
         report = ImportReport()
+        stored = state.rows("printers") if todo else []
         with state.transaction() as txn:
             for file, rows in todo:
                 txn.put_legacy_file(
                     file.name, file.sha256, file.data, classified=rows.classified
                 )
                 report.recorded.append(file.name)
-                report.rows += _apply(txn, rows.state)
+                report.rows += _apply(txn, adopt_stored_ids(rows.state, stored))
                 self._account(report, file, rows)
         self._write_cache(cache, [rows for _, rows in todo], report)
         return report
@@ -320,9 +325,10 @@ class LegacyImporter:
         report = ImportReport()
         if not todo:
             return report
+        stored = state.rows("printers")
         with state.transaction() as txn:
             for file, rows in todo:
-                report.rows += _apply(txn, rows.state)
+                report.rows += _apply(txn, adopt_stored_ids(rows.state, stored))
                 txn.mark_legacy_classified(file.name, file.sha256)
                 self._account(report, file, rows)
         self._write_cache(cache, [rows for _, rows in todo], report)
@@ -358,12 +364,14 @@ def printer_rows(store_name: str, entries: List[Any]) -> List[Put]:
     puts: List[Put] = []
     used: Set[str] = set()
     for index, entry in enumerate(entries):
+        minted = False
         if isinstance(entry, dict):
             data = dict(entry)
             unique_id = data.get("unique_id")
             if not isinstance(unique_id, str) or not unique_id:
                 unique_id = _minted_id(store_name, data, index, used)
                 data["unique_id"] = unique_id
+                minted = True
             row = {
                 "store": store_name,
                 "pk": data.get("id"),
@@ -385,8 +393,46 @@ def printer_rows(store_name: str, entries: List[Any]) -> List[Put]:
                 "error": "entry is not a JSON object",
             }
         used.add(unique_id)
-        puts.append(Put("printers", unique_id, row))
+        puts.append(Put("printers", unique_id, row, minted=minted))
     return puts
+
+
+def adopt_stored_ids(
+    puts: Iterable[Put], stored: Iterable[Mapping[str, Any]]
+) -> List[Put]:
+    """``puts`` with each minted printer keyed as the stored printer it is.
+
+    A minted ``unique_id`` derives from the entry's id and token, so once
+    the printer was re-tokened (or keyed) since, it would name a new
+    printer: replacing the stored one would delete it, and its plugin data
+    with it. The SimplyPrint id says which printer it is; without an id,
+    the token. ``stored`` are the ``printers`` rows of the store as they
+    are now. A stored id already claimed by another entry is not reused."""
+    puts = list(puts)
+    by_id: Dict[Tuple[Any, Any], str] = {}
+    by_token: Dict[Tuple[Any, Any], str] = {}
+    for row in stored:
+        if row.get("pk"):
+            by_id.setdefault((row["store"], row["pk"]), row["unique_id"])
+        if row.get("sk"):
+            by_token.setdefault((row["store"], row["sk"]), row["unique_id"])
+    taken = {p.key for p in puts if p.table == "printers" and not p.minted}
+    adopted: List[Put] = []
+    for put in puts:
+        if put.table == "printers" and put.minted and isinstance(put.row.get("data"), dict):
+            row = put.row
+            if row.get("pk"):
+                found = by_id.get((row["store"], row["pk"]))
+            else:
+                found = by_token.get((row["store"], row.get("sk")))
+            if found is not None and found not in taken:
+                data = dict(row["data"])
+                data["unique_id"] = found
+                put = Put("printers", found, {**row, "data": data})
+        if put.table == "printers":
+            taken.add(put.key)
+        adopted.append(put)
+    return adopted
 
 
 def account_rows(
