@@ -12,6 +12,7 @@ from typing import (
     Optional,
     Dict,
     Any,
+    Iterable,
     Protocol,
     TypeVar,
     TYPE_CHECKING,
@@ -40,9 +41,21 @@ class ReactiveContext(Protocol):
 
     The tree root's context (in practice the SimplyPrint client) stamps each
     change with a message id and signals the consumer that a changeset is ready.
+    It is told *which* model and field changed, and which models were bound to
+    it, so a consumer can look only where something changed instead of walking
+    the whole tree for every changeset.
     """
 
-    def next_msg_id(self) -> int: ...
+    def stamp_change(self, model: "ReactiveModel", field: str) -> int:
+        """A tracked change to ``model.field``: its id (increasing)."""
+        ...
+
+    def attached(self, model: "ReactiveModel") -> None:
+        """``model``'s subtree was bound to this context by ``provide_context``.
+
+        Changes it already carries are now part of the tree.
+        """
+        ...
 
     def signal(self) -> None: ...
 
@@ -141,6 +154,16 @@ class ReactiveModel(BaseModel, Synchronized):
         self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
     ) -> None:
         """Give tree a reference"""
+        self._bind_context(ctx)
+        # Once per bind, for the whole subtree: a model bound with changes it
+        # already carries (one moved back into the tree) must not go unseen.
+        live = self.ctx()
+        if live is not None:
+            live.attached(self)
+
+    def _bind_context(
+        self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
+    ) -> None:
         if isinstance(ctx, ReactiveModel):
             object.__setattr__(self, "ctx", ctx.ctx)
         else:
@@ -150,15 +173,15 @@ class ReactiveModel(BaseModel, Synchronized):
             value = getattr(self, field)
 
             if isinstance(value, ReactiveModel):
-                value.provide_context(self)
+                value._bind_context(self)
             elif isinstance(value, (list, tuple)):
                 for item in value:
                     if isinstance(item, ReactiveModel):
-                        item.provide_context(self)
+                        item._bind_context(self)
             elif isinstance(value, dict):
                 for item in value.values():
                     if isinstance(item, ReactiveModel):
-                        item.provide_context(self)
+                        item._bind_context(self)
 
     def model_reset_changed(self, *keys: str, v: Optional[int] = None) -> None:
         """
@@ -219,10 +242,9 @@ class ReactiveModel(BaseModel, Synchronized):
     @property
     def model_recursive_changeset(self) -> Dict[str, int]:
         changed_fields = self.model_self_changed_fields.copy()
-
-        def set_changed_field(field: str, change_id: int) -> None:
-            nonlocal changed_fields
-            changed_fields[field] = max(changed_fields.get(field, -1), change_id)
+        # Inlined "keep the newest id per key": a nested helper here was a
+        # closure built on every call, and a call per key.
+        get = changed_fields.get
 
         values = self.__dict__
         for field_name in _tracked_fields(self.__class__):
@@ -236,9 +258,13 @@ class ReactiveModel(BaseModel, Synchronized):
                 field_value_changes := field_value.model_recursive_changeset
             ):
                 for key, value in field_value_changes.items():
-                    set_changed_field(f"{field_name}.{key}", value)
+                    key = f"{field_name}.{key}"
+                    old = get(key, -1)
+                    changed_fields[key] = value if value > old else old
 
-                set_changed_field(field_name, max(field_value_changes.values()))
+                value = max(field_value_changes.values())
+                old = get(field_name, -1)
+                changed_fields[field_name] = value if value > old else old
                 continue
 
             # Handle collection of nested state models.
@@ -257,16 +283,55 @@ class ReactiveModel(BaseModel, Synchronized):
                     inner_field_value_changes
                     := inner_field_value.model_recursive_changeset
                 ):
+                    prefix = f"{field_name}.{inner_field_index}"
                     for key, value in inner_field_value_changes.items():
-                        set_changed_field(
-                            f"{field_name}.{inner_field_index}.{key}", value
-                        )
+                        key = f"{prefix}.{key}"
+                        old = get(key, -1)
+                        changed_fields[key] = value if value > old else old
 
                     x = max(inner_field_value_changes.values())
-                    set_changed_field(f"{field_name}.{inner_field_index}", x)
-                    set_changed_field(field_name, x)
+                    for key in (prefix, field_name):
+                        old = get(key, -1)
+                        changed_fields[key] = x if x > old else old
 
         return changed_fields
+
+    def model_latest_change(self) -> Optional[int]:
+        """The newest change id in this model's subtree, ``None`` if none.
+
+        Equal to ``max(model_recursive_changeset.values())`` over the same walk,
+        without building the changeset: the client only needs the newest id of
+        a branch, and the keys (an f-string per change, per level) were most of
+        the walk's cost.
+        """
+        own = self.model_self_changed_fields
+        latest = max(own.values()) if own else None
+
+        values = self.__dict__
+        for field_name in _tracked_fields(self.__class__):
+            field_value = values[field_name]
+
+            if not field_value:
+                continue
+
+            if isinstance(field_value, ReactiveModel):
+                children: Iterable[Any] = (field_value,)
+            elif isinstance(field_value, (list, tuple)):
+                children = field_value
+            elif isinstance(field_value, dict):
+                children = field_value.values()
+            else:
+                continue
+
+            for child in children:
+                if isinstance(child, ReactiveModel):
+                    child_latest = child.model_latest_change()
+                    if child_latest is not None and (
+                        latest is None or child_latest > latest
+                    ):
+                        latest = child_latest
+
+        return latest
 
     @property
     def model_has_changed(self) -> bool:
@@ -308,11 +373,14 @@ class ReactiveModel(BaseModel, Synchronized):
 
         # Mark fields as changed
         for name in fields:
-            self.model_self_changed_fields[name] = ctx.next_msg_id()
+            self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
 
         ctx.signal()
 
     def _model_value_is_comparable_type(self, value: Any) -> bool:
+        # The most common value first (None is neither container below).
+        if value is None:
+            return True
         if isinstance(value, (list, set, tuple)):
             return all(self._model_value_is_comparable_type(i) for i in value)
         elif isinstance(value, dict):
@@ -324,7 +392,7 @@ class ReactiveModel(BaseModel, Synchronized):
                 for k, v in value.items()
             )
 
-        return value is None or isinstance(value, self.COMPARABLE_TYPES)
+        return isinstance(value, self.COMPARABLE_TYPES)
 
     @staticmethod
     def _model_value_is_actually_unchanged(value1: Any, value2: Any) -> bool:
@@ -332,17 +400,10 @@ class ReactiveModel(BaseModel, Synchronized):
 
     @no_type_check
     def __setattr__(self, name, value) -> None:  # noqa: ANN001
-        field_info = self.__class__.__pydantic_fields__.get(name)
-
-        # Private attributes do not need to be handled
-        # Same for non-model fields, or untracked fields.
-        if (
-            field_info is None
-            or _is_untracked(field_info)
-            or (
-                self.__private_attributes__ and name in self.__private_attributes__
-            )  # can be None
-        ):
+        # One cached lookup per write: tracked fields -> Exclusive. Missing:
+        # not a field (private attributes too) or an Untracked one.
+        exclusive = _write_policy(self.__class__).get(name)
+        if exclusive is None:
             super().__setattr__(name, value)
             return
 
@@ -352,25 +413,21 @@ class ReactiveModel(BaseModel, Synchronized):
         # Store changed value using pydantic
         super().__setattr__(name, value)
 
-        # Check if value has actually been changed
-        has_changed = True
-
-        # Fetch original from original_update so we don't have to check everything again
         # Don't use value parameter directly, as pydantic validation might have changed it
         # (when validate_assignment == True)
         current_value = self.__dict__[name]
 
         if (
-            not _is_exclusive(field_info)
+            not exclusive
             and self._model_value_is_comparable_type(original_value)
             and self._model_value_is_comparable_type(current_value)
             and self._model_value_is_actually_unchanged(original_value, current_value)
         ):
-            has_changed = False
+            return
 
         # Store changed state
-        if has_changed and (ctx := self.ctx()):
-            self.model_self_changed_fields[name] = ctx.next_msg_id()
+        if ctx := self.ctx():
+            self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
             ctx.signal()
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -459,3 +516,24 @@ def _tracked_fields(cls: Type["ReactiveModel"]) -> Dict[str, None]:
     )
     _TRACKED_FIELDS[cls] = (fields, tracked)
     return tracked
+
+
+#: ``class -> (fields, {tracked field name: is Exclusive})``: what
+#: ``__setattr__`` needs to know about a field, once per class instead of two
+#: cached predicate calls and a private-attribute lookup on every write.
+#: Untracked fields are absent. Keyed on the field dict like ``_TRACKED_FIELDS``.
+_WRITE_POLICY: Dict[type, Tuple[Any, Dict[str, bool]]] = {}
+
+
+def _write_policy(cls: Type["ReactiveModel"]) -> Dict[str, bool]:
+    fields = cls.__pydantic_fields__
+    entry = _WRITE_POLICY.get(cls)
+    if entry is not None and entry[0] is fields:
+        return entry[1]
+    policy = {
+        name: _is_exclusive(field_info)
+        for name, field_info in fields.items()
+        if not _is_untracked(field_info)
+    }
+    _WRITE_POLICY[cls] = (fields, policy)
+    return policy

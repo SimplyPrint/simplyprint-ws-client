@@ -126,7 +126,9 @@ def test_changeset_walks_match_the_per_field_predicate():
             client.consume()
 
         for model in _walk(printer):
-            assert model.model_recursive_changeset == _reference_changeset(model)
+            reference = _reference_changeset(model)
+            assert model.model_recursive_changeset == reference
+            assert model.model_latest_change() == max(reference.values(), default=None)
             assert model.model_changed_fields == _reference_changed_fields(model)
 
 
@@ -137,6 +139,12 @@ class _Ctx:
     def next_msg_id(self) -> int:
         self.n += 1
         return self.n
+
+    def stamp_change(self, model: ReactiveModel, field: str) -> int:
+        return self.next_msg_id()
+
+    def attached(self, model: ReactiveModel) -> None:
+        pass
 
     def signal(self) -> None:
         pass
@@ -199,7 +207,9 @@ def test_tuple_dict_and_untracked_fields_walk_like_the_predicate(cls):
                 model.model_reset_changed()
 
         for model in _walk(box):
-            assert model.model_recursive_changeset == _reference_changeset(model)
+            reference = _reference_changeset(model)
+            assert model.model_recursive_changeset == reference
+            assert model.model_latest_change() == max(reference.values(), default=None)
             assert model.model_changed_fields == _reference_changed_fields(model)
 
     tracked = set(_TRACKED_FIELDS[cls][1])

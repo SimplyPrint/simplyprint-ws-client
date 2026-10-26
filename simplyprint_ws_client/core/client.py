@@ -164,14 +164,14 @@ def _field_version(
     field: str,
     nested: Iterable[ReactiveModel] = (),
 ) -> Optional[int]:
-    """Latest change for one explicit state branch."""
-    versions = []
-    if field in model.model_self_changed_fields:
-        versions.append(model.model_self_changed_fields[field])
+    """Latest change for one explicit state branch: ``model.field``'s own
+    change, and any change in the ``nested`` subtrees."""
+    latest = model.model_self_changed_fields.get(field)
     for child in nested:
-        if changes := child.model_recursive_changeset:
-            versions.append(max(changes.values()))
-    return max(versions) if versions else None
+        child_latest = child.model_latest_change()
+        if child_latest is not None and (latest is None or child_latest > latest):
+            latest = child_latest
+    return latest
 
 
 def _message_changes(
@@ -567,6 +567,13 @@ class Client(
     def next_msg_id(self):
         self.msg_id += 1
         return self.msg_id
+
+    def stamp_change(self, model: ReactiveModel, field: str) -> int:
+        """The printer state's change to ``model.field``: its message id."""
+        return self.next_msg_id()
+
+    def attached(self, model: ReactiveModel) -> None:
+        """A state subtree was bound to this client (``provide_context``)."""
 
     # coordination methods
 

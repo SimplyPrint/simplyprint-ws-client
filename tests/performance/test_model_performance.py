@@ -32,9 +32,12 @@ class _Ctx:
     def __init__(self) -> None:
         self._id = 0
 
-    def next_msg_id(self) -> int:
+    def stamp_change(self, model: ReactiveModel, field: str) -> int:
         self._id += 1
         return self._id
+
+    def attached(self, model: ReactiveModel) -> None:
+        pass
 
     def signal(self) -> None:
         pass
