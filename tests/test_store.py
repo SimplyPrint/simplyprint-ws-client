@@ -832,6 +832,38 @@ def test_a_table_read_completely_is_not_topped_up_from_the_snapshot(
         s.close()
 
 
+def test_recovered_rows_from_an_older_schema_get_its_row_migrations(
+    tmp_path, monkeypatch
+):
+    # The damaged file (and its snapshot) are at schema 1; this build's
+    # step 2 transforms printer rows. Copied raw into the fresh database
+    # (already at 2), they would skip the transform for good.
+    path, backups = tmp_path / "state.db", tmp_path / "backups"
+    _filled(path, backups)
+
+    def mark_migrated(values):
+        return {**values, "data": {**values["data"], "migrated": True}}
+
+    steps = (SCHEMA[0], SchemaStep(2, (), rows={"printers": mark_migrated}))
+    real = Store._check
+    calls = []
+
+    def failing_once(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.DatabaseError("quick_check: *** in database main ***")
+        real(conn)
+
+    monkeypatch.setattr(Store, "_check", staticmethod(failing_once))
+    s = Store.open(path, start=False, backups=backups, migrations=steps)
+    try:
+        rows = s.rows("printers")
+        assert {r["unique_id"] for r in rows} == {"old", "new"}
+        assert all(r["data"]["migrated"] is True for r in rows)
+    finally:
+        s.close()
+
+
 def test_a_locked_database_is_not_treated_as_damaged(tmp_path, monkeypatch):
     path = tmp_path / "state.db"
     Store.open(path, start=False).close()
