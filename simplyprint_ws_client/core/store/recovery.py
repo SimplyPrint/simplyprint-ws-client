@@ -4,7 +4,8 @@ Never silent and never destructive (docs/persistence-design.md, 3,
 "Corruption"):
 
 1. the damaged database and its ``-wal`` / ``-shm`` files are moved aside to
-   ``<name>.corrupt-<ts>`` (nothing is deleted);
+   ``<name>.corrupt-<ts>`` (nothing is deleted then; opening keeps the
+   newest :data:`DAMAGED_KEPT` of them, see :func:`prune_damaged`);
 2. a fresh database gets every row that can still be read from the damaged
    one, table by table, row by row;
 3. the tables that could not be read to the end (all of them, when the file
@@ -38,13 +39,23 @@ from simplyprint_ws_client.core.store.schema import (
     encode_values,
 )
 
-__all__ = ["RecoveryReport", "recover", "move_aside", "snapshots_in", "RECOVERED"]
+__all__ = [
+    "RecoveryReport",
+    "recover",
+    "move_aside",
+    "prune_damaged",
+    "snapshots_in",
+    "RECOVERED",
+    "DAMAGED_KEPT",
+]
 
 _logger = logging.getLogger("store")
 
 #: Tables copied into the fresh database, in this order. ``row_archive`` is
 #: history and is left in the moved-aside file.
 RECOVERED = ("printers", "accounts", "settings", "kv", "legacy_files")
+#: Moved-aside damaged databases kept (the newest).
+DAMAGED_KEPT = 3
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,32 @@ def move_aside(path: Path, wall: Callable[[], float] = time.time) -> Path:
         if source.exists():
             os.replace(source, Path(str(target) + suffix))
     return target
+
+
+def prune_damaged(path: Path, keep: int = DAMAGED_KEPT) -> List[Path]:
+    """Delete all but the newest ``keep`` moved-aside copies of ``path``
+    (each with its ``-wal`` / ``-shm``); returns the ones deleted.
+
+    The newest ones are the evidence of the last recoveries and stay; older
+    ones are full copies of the database (tokens included) that would
+    otherwise pile up forever."""
+    moved = sorted(
+        (
+            p
+            for p in path.parent.glob("%s.corrupt-*" % path.name)
+            if not p.name.endswith(("-wal", "-shm"))
+        ),
+        reverse=True,  # the names carry a sortable UTC stamp
+    )
+    deleted = []
+    for old in moved[keep:]:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(old) + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        deleted.append(old)
+    return deleted
 
 
 def snapshots_in(directory: Optional[Path], stem: str) -> List[Path]:

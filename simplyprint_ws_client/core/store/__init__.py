@@ -21,6 +21,7 @@ __all__ = [
     "StoreTooNew",
     "RecoveryReport",
     "SECRET_NAMESPACES",
+    "remove_stale_copies",
     "plan",
     "LegacyImporter",
     "LegacyFile",
@@ -44,6 +45,7 @@ from simplyprint_ws_client.core.store.store import (
     Key,
     Store,
     Txn,
+    remove_stale_copies,
 )
 from simplyprint_ws_client.core.store.writer import SKIP, Writer
 from simplyprint_ws_client.core.store.legacy import (

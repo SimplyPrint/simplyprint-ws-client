@@ -56,6 +56,7 @@ from typing import Literal
 from simplyprint_ws_client.core.store.recovery import (
     RecoveryReport,
     move_aside,
+    prune_damaged,
     recover,
     snapshots_in,
 )
@@ -104,6 +105,8 @@ SNAPSHOTS_KEPT = 5
 SNAPSHOT_EVERY = 24 * 3600.0
 INTEGRITY_EVERY = 7 * 24 * 3600.0
 POLL_EVERY = 2.0
+#: A temporary copy this old (seconds) is a leftover of a dead process.
+STALE_AFTER = 3600.0
 
 
 @dataclass(frozen=True)
@@ -320,6 +323,14 @@ class Store:
         #: A problem found after opening (a failed weekly integrity check),
         #: for the host to show; ``None`` while healthy.
         self.fault: Optional[str] = None
+        # Copies hold every token: a dead process's half-written ones and
+        # old damaged files must not pile up next to the database.
+        for directory in (self.path.parent, self.backups):
+            remove_stale_copies(directory, wall=wall)
+        try:
+            prune_damaged(self.path)
+        except OSError:
+            _logger.warning("%s: could not prune old damaged copies", self.path, exc_info=True)
 
         conn = None
         try:
@@ -792,18 +803,31 @@ class Store:
         temporary = target.with_name(".%s.%d.tmp" % (target.name, os.getpid()))
         if temporary.exists():
             temporary.unlink()
-        with self._wlock:
-            try:
-                self._wconn.execute("VACUUM INTO ?", (str(temporary),))
-            except sqlite3.OperationalError:
-                # SQLite older than 3.27 has no VACUUM INTO; the backup API
-                # gives the same consistent copy.
-                destination = sqlite3.connect(str(temporary))
+        # The copy holds printer and account tokens: private to the user
+        # whatever the umask. Created empty with that mode first, so it is
+        # never readable by others, not even while it is written.
+        os.close(os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        try:
+            with self._wlock:
                 try:
-                    self._wconn.backup(destination)
-                finally:
-                    destination.close()
-        os.replace(temporary, target)
+                    self._wconn.execute("VACUUM INTO ?", (str(temporary),))
+                except sqlite3.OperationalError:
+                    # SQLite older than 3.27 has no VACUUM INTO (or one that
+                    # refuses an existing file); the backup API gives the
+                    # same consistent copy.
+                    destination = sqlite3.connect(str(temporary))
+                    try:
+                        self._wconn.backup(destination)
+                    finally:
+                        destination.close()
+            os.chmod(str(temporary), 0o600)
+            os.replace(temporary, target)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
         return target
 
     def maintain(self, now: Optional[float] = None) -> None:
@@ -952,6 +976,33 @@ class Store:
     @property
     def closed(self) -> bool:
         return self._closed
+
+
+def remove_stale_copies(
+    directory: Optional[Path],
+    pattern: str = ".*.db.*.tmp",
+    *,
+    older_than: float = STALE_AFTER,
+    wall: Callable[[], float] = time.time,
+) -> List[Path]:
+    """Delete the files in ``directory`` matching ``pattern`` (by default
+    :meth:`Store.snapshot_to`'s temporaries) last written more than
+    ``older_than`` seconds ago: leftovers of a process that died mid-copy.
+    A younger one may be another process's copy in progress and stays.
+    Returns what was deleted."""
+    if directory is None or not directory.is_dir():
+        return []
+    deleted = []
+    now = wall()
+    for leftover in directory.glob(pattern):
+        try:
+            if now - leftover.stat().st_mtime < older_than:
+                continue
+            leftover.unlink()
+        except OSError:
+            continue  # gone already, or not ours to delete: not worth failing for
+        deleted.append(leftover)
+    return deleted
 
 
 def _where(columns: Sequence[str]) -> str:
