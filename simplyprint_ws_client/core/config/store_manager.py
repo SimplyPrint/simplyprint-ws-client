@@ -15,7 +15,9 @@ the point of the move (docs/persistence-design.md):
   instead of rewriting a file. A change to fields waits out the writer's
   debounce (1 s, at most 5 s); adding or removing a printer, and
   ``flush(config)``, which the app calls on add and remove, commit before
-  returning.
+  returning, except on an event loop: there they are urgent marks the
+  store's thread commits at once, because the loop never waits for the
+  write lock or an fsync.
 
 Config versions: a config type may declare ``config_version`` (an int) and
 ``upgrade_config(data, from_version) -> dict`` (the SDK's ``DriverConfig``
@@ -34,6 +36,7 @@ All managers on one file share one :class:`~simplyprint_ws_client.core.store.Sto
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -202,8 +205,13 @@ class StoreConfigManager(ConfigManager):
 
     def load(self):
         store = self.store
-        # This process's own pending marks first, so a load reads them.
-        store.writer.flush_now()
+        # This process's own pending marks first, so a load reads them. Not
+        # on the event loop: flush_now waits for the write lock (a snapshot
+        # may hold it for seconds) and an fsync. A load there (an account
+        # kind following the store after clear()) reads what is committed;
+        # its own forgotten marks produce nothing (SKIP) anyway.
+        if not _on_event_loop():
+            store.writer.flush_now()
         rows = self._rows.stored(self)
         upgraded: List[Tuple[Key, Config]] = []
         unreadable_rows: List[Tuple[Key, Dict[str, Any]]] = []
@@ -327,16 +335,24 @@ class StoreConfigManager(ConfigManager):
             # printer comes back once a build (or a fix) can read them.
             removed = (self._stored | rekeyed) - set(desired) - self._unreadable_keys()
             added = set(desired) - self._stored
+            registration = bool(config is not None or added or removed)
             for key, held in desired.items():
                 store.writer.mark(
-                    table, key, lambda c=held, k=key: self._produce(c, k)
+                    table,
+                    key,
+                    lambda c=held, k=key: self._produce(c, k),
+                    urgent=registration,
                 )
             for key in removed:
                 store.writer.mark(table, key, _delete, urgent=True)
             self._stored = (self._stored - removed) | set(desired)
-        if config is not None or added or removed:
+        if registration and not _on_event_loop():
             # Registration (add, remove, an explicit config) must be on disk
             # before the caller moves on; field changes ride the debounce.
+            # On the event loop it is an urgent mark instead: flush_now waits
+            # for the write lock and an fsync, and the loop never waits. The
+            # store's thread commits it at once, in mark order with every
+            # other write of this process.
             store.writer.flush_now()
 
     def _produce(self, config: Config, key: Key) -> Optional[Dict[str, Any]]:
@@ -386,3 +402,13 @@ class StoreConfigManager(ConfigManager):
 
 def _delete() -> None:
     return None
+
+
+def _on_event_loop() -> bool:
+    """Whether the caller runs on an event loop (the app's, or any other):
+    there nothing may wait for the store's write lock or an fsync."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
