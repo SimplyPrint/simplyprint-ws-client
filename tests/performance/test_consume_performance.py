@@ -88,7 +88,7 @@ def test_consume_after_one_temperature_change():
     iterations = 3_000
     spent: List[int] = [0, 0]
     for i in range(iterations):
-        actual = 200.0 + (i % 2)
+        actual = 201.0 - (i % 2)  # differs from the last value every time
         for side, client in enumerate((fast, scan)):
             client.printer.tools[0].temperature.actual = actual
             start = time.thread_time_ns()

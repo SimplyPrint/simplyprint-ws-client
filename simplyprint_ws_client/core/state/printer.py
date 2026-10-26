@@ -345,7 +345,11 @@ class MaterialLayoutEntry(ReactiveModel):
 
     def get_chains(self) -> int:
         if self.mms and self.mms.can_chain:
-            return min(self.chains or 1, self.mms.max_chains)
+            # A chainable unit without a declared maximum (BoxTurtle) is not
+            # capped: min() against None raised and broke the whole layout.
+            limit = self.mms.max_chains
+            chains = self.chains or 1
+            return chains if limit is None else min(chains, limit)
         return 1
 
     @property
