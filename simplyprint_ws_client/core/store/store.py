@@ -70,7 +70,13 @@ from simplyprint_ws_client.core.store.schema import (
     dump_json,
     encode_values,
 )
-from simplyprint_ws_client.core.store.writer import CAP, DEBOUNCE, Pending, Writer
+from simplyprint_ws_client.core.store.writer import (
+    CAP,
+    DEBOUNCE,
+    SKIP,
+    Pending,
+    Writer,
+)
 
 __all__ = [
     "Store",
@@ -536,6 +542,8 @@ class Store:
         for (table, key), pending in batch.items():
             try:
                 row = pending.produce()
+                if row is SKIP:
+                    continue
                 if row is not None:
                     encode_values(TABLES[table], row)  # serializes, or raises
             except Exception:

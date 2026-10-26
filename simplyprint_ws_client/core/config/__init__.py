@@ -4,6 +4,7 @@ __all__ = [
     "MemoryConfigManager",
     "SQLiteConfigManager",
     "JsonConfigManager",
+    "StoreConfigManager",
     "Config",
     "PrinterConfig",
     "ConfigBundle",
@@ -34,12 +35,15 @@ from simplyprint_ws_client.core.config.json import JsonConfigManager
 from simplyprint_ws_client.core.config.manager import ConfigManager
 from simplyprint_ws_client.core.config.memory import MemoryConfigManager
 from simplyprint_ws_client.core.config.sqlite import SQLiteConfigManager
+from simplyprint_ws_client.core.config.store_manager import StoreConfigManager
 
 
 class ConfigManagerType(Enum):
     MEMORY = "memory"
     SQLITE = "sqlite"
     JSON = "json"
+    #: Rows in the SQLite WAL store (``core.store``), keyed by ``unique_id``.
+    STORE = "store"
 
     def __call__(self, *args, **kwargs):
         return self.get_class()(*args, **kwargs)
@@ -51,5 +55,7 @@ class ConfigManagerType(Enum):
             return SQLiteConfigManager
         elif self == ConfigManagerType.JSON:
             return JsonConfigManager
+        elif self == ConfigManagerType.STORE:
+            return StoreConfigManager
         else:
             raise ValueError("Invalid ConfigManagerType")

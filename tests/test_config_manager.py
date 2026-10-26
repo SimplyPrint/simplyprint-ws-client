@@ -1,12 +1,17 @@
+import pytest
+
 from simplyprint_ws_client import (
     ConfigManager,
     PrinterConfig,
 )
 from simplyprint_ws_client.core.config import (
+    ConfigManagerType,
     JsonConfigManager,
     MemoryConfigManager,
     SQLiteConfigManager,
+    StoreConfigManager,
 )
+from simplyprint_ws_client.core.store import Store
 
 
 def test_internal():
@@ -104,6 +109,46 @@ def _test_manager(config_manager: ConfigManager):
     assert len(config_manager) == 1
 
     config_manager.delete_storage()
+
+
+@pytest.fixture(params=["json", "sqlite", "store"])
+def manager_kind(request):
+    return request.param
+
+
+@pytest.fixture
+def isolated_manager(manager_kind, tmp_path):
+    """Each manager type, in its own directory (the store in its own file)."""
+    if manager_kind == "store":
+        store = Store.open(tmp_path / "state.db", start=False)
+        manager = StoreConfigManager(base_directory=str(tmp_path), store=store)
+        yield manager
+        store.close()
+        return
+    manager_t = JsonConfigManager if manager_kind == "json" else SQLiteConfigManager
+    yield manager_t(base_directory=str(tmp_path))
+
+
+def test_every_manager_round_trips(isolated_manager):
+    _test_manager(isolated_manager)
+    if isinstance(isolated_manager, JsonConfigManager):
+        assert not isolated_manager._json_file.exists()
+    elif isinstance(isolated_manager, SQLiteConfigManager):
+        assert not isolated_manager._database_file.exists()
+    else:
+        assert isolated_manager.store.rows("printers") == []
+
+
+def test_the_store_type_builds_a_store_manager(tmp_path):
+    store = Store.open(tmp_path / "state.db", start=False)
+    StoreConfigManager.bind(store)
+    try:
+        manager = ConfigManagerType.STORE(name="acme", config_t=PrinterConfig)
+        assert isinstance(manager, StoreConfigManager)
+        assert manager.store is store
+    finally:
+        StoreConfigManager.bind(None)
+        store.close()
 
 
 def test_json_manager():

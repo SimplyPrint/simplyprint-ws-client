@@ -13,6 +13,7 @@ __all__ = [
     "Durability",
     "Key",
     "Writer",
+    "SKIP",
     "Table",
     "TABLES",
     "SchemaStep",
@@ -40,4 +41,4 @@ from simplyprint_ws_client.core.store.store import (
     Store,
     Txn,
 )
-from simplyprint_ws_client.core.store.writer import Writer
+from simplyprint_ws_client.core.store.writer import SKIP, Writer

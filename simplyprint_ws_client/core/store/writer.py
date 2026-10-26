@@ -29,16 +29,27 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__all__ = ["Writer", "Pending", "Produce", "DEBOUNCE", "CAP"]
+__all__ = ["Writer", "Pending", "Produce", "SKIP", "DEBOUNCE", "CAP"]
 
 #: Seconds a row waits after its last mark.
 DEBOUNCE = 1.0
 #: Seconds a row waits at most after its first mark.
 CAP = 5.0
 
-#: Returns the row's value columns, or ``None`` to delete the row. Called on
-#: the writer thread, at write time, so it reads the newest value.
-Produce = Callable[[], Optional[Dict[str, Any]]]
+#: Returns the row's value columns, ``None`` to delete the row, or
+#: :data:`SKIP` to leave it as stored. Called on the writer thread, at write
+#: time, so it reads the newest value.
+Produce = Callable[[], Any]
+
+
+class _Skip:
+    def __repr__(self) -> str:
+        return "SKIP"
+
+
+#: What a ``produce`` returns when, by write time, it has nothing to say about
+#: the row (its owner forgot it): the row is neither written nor deleted.
+SKIP: Any = _Skip()
 
 #: ``(table, key)``; keys are tuples of the table's key columns.
 RowId = Tuple[str, Tuple[Any, ...]]
