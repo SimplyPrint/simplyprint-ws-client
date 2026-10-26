@@ -13,16 +13,22 @@ deterministic:
 - a reconnect resends every value-type message the server was ever sent.
 """
 
+import asyncio
 import json
-from typing import List
+from types import SimpleNamespace
+from typing import List, Optional
 
 import pytest
+import yarl
 
 from simplyprint_ws_client import Client, PrinterStatus
+from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
 from simplyprint_ws_client.core.protocol.models import WriteOutcome
 from simplyprint_ws_client.core.state.models import FilamentSensorEnum, Intervals
+from simplyprint_ws_client.wire.errors import NotConnected
 from simplyprint_ws_client.wire.transport import TransientError
+from simplyprint_ws_client.wire.websockets import Websockets
 
 from tests._wire_harness import Wire, new_client, with_for
 
@@ -250,3 +256,62 @@ async def test_a_reconnect_resends_every_value_the_server_was_sent(clock):
     # invented from defaults now.
     assert '{"type":"temps","data":{"bed":[60],"tool0":[200]}}' in after
     assert '{"type":"state_change","data":{"new":"operational"}}' in after
+
+
+# -- 4. a write on a socket the library already knows is closed ----------------
+
+
+class _LibrarySocket:
+    """A ``websockets`` connection's shape: the library's protocol state, and a
+    ``send`` that records what it was given."""
+
+    def __init__(self, state, error: Optional[Exception] = None) -> None:
+        self.protocol = SimpleNamespace(state=state)
+        self.sent: List[object] = []
+        self._error = error
+
+    async def send(self, frame: object) -> None:
+        if self._error is not None:
+            raise self._error
+        self.sent.append(frame)
+
+
+def _websockets(socket) -> Websockets:
+    transport = Websockets(
+        yarl.URL("ws://x"), provider=EventLoopProvider(loop=asyncio.get_running_loop())
+    )
+    transport.socket = socket
+    return transport
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["CLOSING", "CLOSED"])
+async def test_a_write_on_a_socket_the_library_knows_is_closed_never_left(state):
+    # websockets raises ConnectionClosed before writing anything once its
+    # state is not OPEN: the frame provably never left, so the protocol must
+    # record NOT_SENT (NotConnected), not MAYBE_SENT. Otherwise a `finished`
+    # written after the server closed, before supervise noticed, is forgotten.
+    from websockets.protocol import State
+
+    socket = _LibrarySocket(State[state])
+    with pytest.raises(NotConnected):
+        await _websockets(socket).write("frame")
+    assert socket.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_write_with_no_socket_never_left():
+    with pytest.raises(NotConnected):
+        await _websockets(None).write("frame")
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_fails_on_an_open_socket_may_have_left():
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+    from websockets.protocol import State
+
+    error = ConnectionClosedError(None, Close(1011, "keepalive ping timeout"))
+    with pytest.raises(TransientError) as raised:
+        await _websockets(_LibrarySocket(State.OPEN, error)).write("frame")
+    assert not isinstance(raised.value, NotConnected)
