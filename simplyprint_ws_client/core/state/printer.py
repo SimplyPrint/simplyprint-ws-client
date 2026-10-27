@@ -240,20 +240,25 @@ class PeripheralsState(ReactiveModel):
         entry = self.entries.get(peripheral_id)
 
         if entry is None:
-            entry = PeripheralState(id=peripheral_id)
-            entry.provide_context(self)
+            # Bound at birth (provide_context without walking a subtree: a
+            # fresh entry has none), then attached as provide_context does.
+            entry = PeripheralState(self.ctx, id=peripheral_id)
+            if (live := self.ctx()) is not None:
+                live.state_attached(entry)
             self.entries[peripheral_id] = entry
             self.model_set_changed("entries")
             entry.model_set_changed("id")
 
+        # An assignment's outcome, without pydantic's setattr dispatch: every
+        # report that moves a fan or light comes through here.
         if value is not _PERIPHERAL_UNSET:
-            entry.value = value
+            entry.model_write("value", value)
 
         if available is not _PERIPHERAL_UNSET:
-            entry.available = available
+            entry.model_write("available", available)
 
         if updated is not _PERIPHERAL_UNSET:
-            entry.updated = updated
+            entry.model_write("updated", updated)
 
         return entry
 

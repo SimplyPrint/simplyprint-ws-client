@@ -10,8 +10,11 @@ class Synchronized:
     __lock_owner: int = PrivateAttr(...)
 
     def __init__(self, *args, **kwargs):
-        self.__lock = threading.Lock()
-        self.__lock_owner = -1
+        # Stored directly: on a pydantic model an assignment would go through
+        # its ``__setattr__``, which never memoizes these (undeclared private)
+        # names, on every state model built. Where they end up is the same.
+        object.__setattr__(self, "_Synchronized__lock", threading.Lock())
+        object.__setattr__(self, "_Synchronized__lock_owner", -1)
 
     def __enter__(self):
         ident = threading.get_ident()
