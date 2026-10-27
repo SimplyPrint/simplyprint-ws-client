@@ -35,9 +35,12 @@ class CustomPrinterStateWithTime(PrinterState):
 
 
 @pytest.fixture
-def state():
+def state(monkeypatch):
     custom_time = CustomTime()
-    time.time = lambda: custom_time.time()
+    # Through monkeypatch, so the real clock is back after the test: a bare
+    # assignment left every later test on a clock near 1970 (ZIP timestamps
+    # before 1980 then broke the bundle tests, in whichever order ran them).
+    monkeypatch.setattr(time, "time", lambda: custom_time.time())
     state = CustomPrinterStateWithTime(time=custom_time)
     state.tool_count = 1
     return state

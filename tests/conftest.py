@@ -1,5 +1,6 @@
 """Shared test fixtures with proper type hints."""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,29 @@ def _no_connection_jitter(monkeypatch):
 
     monkeypatch.setattr(client_module, "_jitter", lambda upper: 0.0)
     monkeypatch.setattr(manager_module, "_jitter", lambda upper: 0.0)
+
+
+_REAL_CLOCKS = (time.time, time.monotonic)
+_last_test = ["(none)"]
+
+
+@pytest.fixture(autouse=True)
+def _clock_is_not_leaked(request):
+    """A test that replaces the process clock without restoring it breaks
+    every test after it, far from the cause. Checked as each test starts
+    (after the previous one's monkeypatch undid its own patches), naming the
+    test that leaked it."""
+    leaked = [
+        name
+        for name, f, real in zip(("time", "monotonic"), (time.time, time.monotonic), _REAL_CLOCKS)
+        if f is not real
+    ]
+    previous, _last_test[0] = _last_test[0], request.node.nodeid
+    if leaked:
+        time.time, time.monotonic = _REAL_CLOCKS
+        pytest.fail(
+            f"{previous} left time.{', time.'.join(leaked)} replaced; patch it with monkeypatch"
+        )
 
 
 @pytest.fixture
