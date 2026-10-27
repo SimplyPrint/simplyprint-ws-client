@@ -85,3 +85,77 @@ def test_model_write_many_signals_once(monkeypatch):
     assert signals == [1]
     assert client.printer.info.model_write_many([("ui", "Device")]) == 0
     assert signals == [1]
+
+
+def _fields(m):
+    state = {k: v for k, v in m.__dict__.items() if not k.startswith("_Synchronized")}
+    return (
+        list(state.items()),
+        sorted(m.__pydantic_fields_set__),
+        m.__pydantic_extra__,
+        m.__pydantic_private__,
+        m.model_self_changed_fields,
+    )
+
+
+def test_model_fresh_is_the_validated_model():
+    from simplyprint_ws_client.core.state.printer import PeripheralState
+
+    ctx = lambda: None  # noqa: E731
+    for values in ({"id": "fan:a"}, {"id": "fan:b", "value": 50, "available": True}):
+        fresh = PeripheralState.model_fresh(ctx, values)
+        built = PeripheralState(ctx, id=values["id"])
+        for name, value in values.items():
+            built.model_write(name, value)  # unbound: nothing marked
+        assert _fields(fresh) == _fields(built)
+        assert fresh.ctx is ctx
+        with fresh:  # its own lock
+            pass
+
+
+def test_model_fresh_builds_other_models_the_validated_way():
+    from simplyprint_ws_client.core.state.printer import JobInfoState, PeripheralState
+
+    # Validators or a post-init of its own: not from the template.
+    assert JobInfoState.model_fresh(lambda: None, {}).model_dump() == JobInfoState().model_dump()
+    # A required field missing: validation says so, as the constructor does.
+    try:
+        PeripheralState.model_fresh(lambda: None, {})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a missing id must fail")
+
+
+def _old_add(peripherals, peripheral_id, **fields):
+    """The entry as it was built before the template: constructed, bound,
+    attached, marked, then written field by field."""
+    from simplyprint_ws_client.core.state.printer import PeripheralState
+
+    entry = PeripheralState(peripherals.ctx, id=peripheral_id)
+    if (live := peripherals.ctx()) is not None:
+        live.state_attached(entry)
+    peripherals.entries[peripheral_id] = entry
+    peripherals.model_set_changed("entries")
+    entry.model_set_changed("id")
+    for name, value in fields.items():
+        entry.model_write(name, value)
+    return entry
+
+
+def test_new_peripheral_entry_matches_construct_then_write():
+    from simplyprint_ws_client.core.protocol.messages import PeripheralMsg
+
+    rng = random.Random(5)
+    values = {"value": [None, 0, 50, True, False], "available": [None, True, False], "updated": [None, 0, 1700000000]}
+    for i in range(300):
+        a, b = _pair()
+        fields = {name: rng.choice(options) for name, options in values.items() if rng.random() < 0.7}
+        pid = f"fan:{i}"
+        _old_add(a.printer.peripherals, pid, **fields)
+        b.printer.peripherals.update(pid, **fields)
+        old, new = a.printer.peripherals.entries[pid], b.printer.peripherals.entries[pid]
+        assert _fields(old) == _fields(new)
+        assert a.printer.peripherals.model_self_changed_fields == b.printer.peripherals.model_self_changed_fields
+        assert (a.msg_id, a._touched_kinds) == (b.msg_id, b._touched_kinds)
+        assert dict(PeripheralMsg.build(a.printer)) == dict(PeripheralMsg.build(b.printer))

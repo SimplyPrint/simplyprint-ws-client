@@ -150,6 +150,36 @@ class ReactiveModel(BaseModel, Synchronized):
         object.__setattr__(self, "ctx", ctx)
         self.model_reset_changed()
 
+    @classmethod
+    def model_fresh(
+        cls: Type[TReactiveModel], ctx: ContextRef, values: Dict[str, Any]
+    ) -> TReactiveModel:
+        """An instance with ``values`` (by field name, already of the field's
+        type) as ``cls(ctx)`` with each then written leaves it, fields set
+        included, without validation: the class's defaults are worked out once
+        (its template) and copied for each instance. For a writer that
+        creates many small entries (a printer's peripherals). A class with
+        validators, its own post-init, private attributes, extra fields or a
+        default that isn't a plain value, or ``values`` missing a required
+        field, is built the validated way."""
+        template = _FRESH.get(cls)
+        if template is None or template[0] is not cls.__pydantic_fields__:
+            template = _fresh_template(cls)
+        _, defaults, required = template
+        if defaults is None or not required.issubset(values):
+            return cls(ctx, **values)
+        m = cls.__new__(cls)
+        state = defaults.copy()  # field order, as validation leaves it
+        state.update(values)
+        object.__setattr__(m, "__dict__", state)
+        object.__setattr__(m, "__pydantic_fields_set__", set(values))
+        object.__setattr__(m, "__pydantic_extra__", None)
+        object.__setattr__(m, "__pydantic_private__", None)
+        Synchronized.__init__(m)
+        object.__setattr__(m, "ctx", ctx)
+        object.__setattr__(m, "model_self_changed_fields", {})
+        return m
+
     def provide_context(
         self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
     ) -> None:
@@ -441,8 +471,10 @@ class ReactiveModel(BaseModel, Synchronized):
         (instance dict and fields-set) and marked changed only if it differs.
         """
         cls = self.__class__
-        exclusive = _write_policy(cls).get(name)
-        if exclusive is None or exclusive or cls.model_config.get("validate_assignment"):
+        plain = _PLAIN_WRITES.get(cls)
+        if plain is None or plain[0] is not cls.__pydantic_fields__:
+            plain = _plain_writes(cls)
+        if name not in plain[1]:
             before = self.model_self_changed_fields.get(name)
             setattr(self, name, value)
             return self.model_self_changed_fields.get(name) != before
@@ -450,12 +482,15 @@ class ReactiveModel(BaseModel, Synchronized):
         original = d[name]
         d[name] = value
         self.__pydantic_fields_set__.add(name)  # as pydantic does, changed or not
-        if (
-            original == value
-            and self._model_value_is_comparable_type(original)
-            and self._model_value_is_comparable_type(value)
-        ):
-            return False
+        if original == value:
+            # The comparable-type check, without its call for the values a
+            # projection writes (numbers, strings, None).
+            scalars = plain[2]
+            if (
+                type(original) in scalars
+                or self._model_value_is_comparable_type(original)
+            ) and (type(value) in scalars or self._model_value_is_comparable_type(value)):
+                return False
         if ctx := self.ctx():
             self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
             ctx.signal()
@@ -468,22 +503,27 @@ class ReactiveModel(BaseModel, Synchronized):
         model at once (a printer's host and client facts, when it is built).
         Returns how many fields changed."""
         cls = self.__class__
-        policy = _write_policy(cls)
-        validates = cls.model_config.get("validate_assignment")
+        plain = _PLAIN_WRITES.get(cls)
+        if plain is None or plain[0] is not cls.__pydantic_fields__:
+            plain = _plain_writes(cls)
+        _, direct, scalars = plain
         d = self.__dict__
         fields_set = self.__pydantic_fields_set__
         comparable = self._model_value_is_comparable_type
         ctx = self.ctx()
         changed = 0
         for name, value in items:
-            exclusive = policy.get(name)
-            if exclusive is None or exclusive or validates:
+            if name not in direct:
                 changed += self.model_write(name, value)
                 continue
             original = d[name]
             d[name] = value
             fields_set.add(name)
-            if original == value and comparable(original) and comparable(value):
+            if (
+                original == value
+                and (type(original) in scalars or comparable(original))
+                and (type(value) in scalars or comparable(value))
+            ):
                 continue
             changed += 1
             if ctx:
@@ -599,3 +639,67 @@ def _write_policy(cls: Type["ReactiveModel"]) -> Dict[str, bool]:
     }
     _WRITE_POLICY[cls] = (fields, policy)
     return policy
+
+
+#: ``class -> (fields, names written directly, scalar types)``: what
+#: ``model_write`` needs, in one lookup. Written directly: tracked, not
+#: Exclusive, and the model doesn't validate assignments (any other write is
+#: an assignment). The scalar types are the comparable ones a value's type
+#: can be checked against by identity (``COMPARABLE_TYPES`` decides). Keyed on
+#: the field dict like ``_TRACKED_FIELDS``.
+_PLAIN_WRITES: Dict[type, Tuple[Any, frozenset, frozenset]] = {}
+
+
+def _plain_writes(cls: Type["ReactiveModel"]) -> Tuple[Any, frozenset, frozenset]:
+    fields = cls.__pydantic_fields__
+    validates = cls.model_config.get("validate_assignment")
+    direct = frozenset(
+        ()
+        if validates
+        else (name for name, exclusive in _write_policy(cls).items() if not exclusive)
+    )
+    scalars = frozenset(
+        {type(None)}
+        | {t for t in (int, float, str, bool) if issubclass(t, cls.COMPARABLE_TYPES)}
+    )
+    entry = _PLAIN_WRITES[cls] = (fields, direct, scalars)
+    return entry
+
+
+#: ``class -> (fields, defaults by field in field order or None, required
+#: names)``: ``model_fresh``'s template. ``None``: the class can't be built
+#: from it (see ``model_fresh``). Keyed on the field dict like
+#: ``_TRACKED_FIELDS``.
+_FRESH: Dict[type, Tuple[Any, Optional[Dict[str, Any]], frozenset]] = {}
+
+_PLAIN_DEFAULTS = (type(None), int, float, str, bool, enum.Enum)
+
+
+def _fresh_template(cls: Type["ReactiveModel"]) -> Tuple[Any, Optional[Dict[str, Any]], frozenset]:
+    fields = cls.__pydantic_fields__
+    decorators = cls.__pydantic_decorators__
+    plain = (
+        cls.model_post_init is ReactiveModel.model_post_init
+        and not cls.__private_attributes__
+        and cls.model_config.get("extra") != "allow"
+        and not any(
+            (
+                decorators.validators,
+                decorators.field_validators,
+                decorators.root_validators,
+                decorators.model_validators,
+            )
+        )
+    )
+    defaults: Optional[Dict[str, Any]] = {}
+    required = []
+    for name, info in fields.items():
+        if info.is_required():
+            required.append(name)
+            defaults[name] = None  # a placeholder: values always has it
+        elif info.default_factory is None and isinstance(info.default, _PLAIN_DEFAULTS):
+            defaults[name] = info.default
+        else:
+            plain = False
+    entry = _FRESH[cls] = (fields, defaults if plain else None, frozenset(required))
+    return entry

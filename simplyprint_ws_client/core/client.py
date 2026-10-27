@@ -800,9 +800,14 @@ class Client(
         return self.msg_id
 
     def stamp_change(self, model: ReactiveModel, field: str) -> int:
-        """The printer state's change to ``model.field``: its message id."""
-        self._touched_kinds |= _affected(type(model), field)
-        return self.next_msg_id()
+        """The printer state's change to ``model.field``: its message id.
+        Per changed field: the kinds' cache read and the id taken inline."""
+        bits = _AFFECTED.get((type(model), field))
+        if bits is None:
+            bits = _affected(type(model), field)
+        self._touched_kinds |= bits
+        self.msg_id += 1
+        return self.msg_id
 
     def state_attached(self, model: ReactiveModel) -> None:
         """A state subtree was bound to this client (``provide_context``): any
