@@ -539,6 +539,13 @@ class _Held(NamedTuple):
     taken: bool = False
 
 
+#: How long a multi-printer add or remove waits for the server's answer. The
+#: server answers a remove within its own 30 s bound; a lost answer (a server
+#: restart between request and reply) would otherwise leave the printer off
+#: SimplyPrint for good, since only that answer moves the state on.
+PENDING_REPLY_TIMEOUT = timedelta(seconds=45)
+
+
 class Client(
     Generic[TConfig],
     EventLoopProvider[asyncio.AbstractEventLoop],
@@ -757,6 +764,7 @@ class Client(
         if mode == ConnectionMode.SINGLE:
             return self.state == ClientState.CONNECTED
 
+        self._expire_pending_reply()
         if self.state == ClientState.NOT_CONNECTED and self._can_do_pending():
             self.state = ClientState.PENDING_ADDED
             await self.send(MultiPrinterAddConnectionMsg(self.config, allow_setup))
@@ -775,12 +783,30 @@ class Client(
         if mode == ConnectionMode.SINGLE:
             return True
 
+        self._expire_pending_reply()
         if self.state == ClientState.CONNECTED and self._can_do_pending():
             self.state = ClientState.PENDING_REMOVED
             await self.send(MultiPrinterRemoveConnectionMsg(self.config))
             self._do_pending()
 
         return self.state <= ClientState.NOT_CONNECTED
+
+    def _expire_pending_reply(self) -> None:
+        """An add or remove the server never answered counts as not connected
+        after :data:`PENDING_REPLY_TIMEOUT`: the next pass adds the printer
+        again (paced by the pending-action backoff), and the server's
+        newest-wins supersession retires whatever it still holds."""
+        state = self.state
+        if state not in (ClientState.PENDING_ADDED, ClientState.PENDING_REMOVED):
+            return
+        if datetime.now() - self._pending_action_ts < PENDING_REPLY_TIMEOUT:
+            return
+        self.logger.warning(
+            "No answer to %s within %ss; treating the printer as not connected",
+            "add_connection" if state == ClientState.PENDING_ADDED else "remove_connection",
+            int(PENDING_REPLY_TIMEOUT.total_seconds()),
+        )
+        self.state = ClientState.NOT_CONNECTED
 
     def _can_do_pending(self):
         now = datetime.now()
