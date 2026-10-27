@@ -41,3 +41,47 @@ def test_random_writes_match_assignments():
         changed = get(b.printer).model_write(name, value)
         assert changed == (b.msg_id != changed_before)
         assert _state(a) == _state(b)
+
+
+def test_model_write_many_matches_assignments_in_order():
+    rng = random.Random(11)
+    a, b = _pair()
+    fields = {
+        "ui": ["Device", "Other", None],
+        "api": ["Client", None],
+        "local_ip": ["192.0.2.1", "192.0.2.2", None],
+        "is_ethernet": [True, False, None],
+        "core_count": [4, 8, None],
+        "sp_version": ["2.0.0", "3.0.0"],
+    }
+    for _ in range(500):
+        items = [(name, rng.choice(values)) for name, values in rng.sample(list(fields.items()), 4)]
+        for name, value in items:
+            setattr(a.printer.info, name, value)
+        before = b.msg_id
+        changed = b.printer.info.model_write_many(items)
+        assert changed == b.msg_id - before
+        assert (
+            a.printer.info.model_dump(),
+            a.printer.info.model_self_changed_fields,
+            sorted(a.printer.info.__pydantic_fields_set__),
+            a.msg_id,
+        ) == (
+            b.printer.info.model_dump(),
+            b.printer.info.model_self_changed_fields,
+            sorted(b.printer.info.__pydantic_fields_set__),
+            b.msg_id,
+        )
+
+
+def test_model_write_many_signals_once(monkeypatch):
+    client = Client(PrinterConfig.get_new(), context=ClientContext())
+    signals = []
+    monkeypatch.setattr(client, "signal", lambda: signals.append(1))
+    changed = client.printer.info.model_write_many(
+        [("ui", "Device"), ("api", "Client"), ("ui", "Device"), ("os", "Linux")]
+    )
+    assert changed == 3
+    assert signals == [1]
+    assert client.printer.info.model_write_many([("ui", "Device")]) == 0
+    assert signals == [1]

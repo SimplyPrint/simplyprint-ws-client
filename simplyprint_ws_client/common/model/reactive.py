@@ -461,6 +461,37 @@ class ReactiveModel(BaseModel, Synchronized):
             ctx.signal()
         return True
 
+    def model_write_many(self, items: Iterable[Tuple[str, Any]]) -> int:
+        """``model_write`` for each ``(name, value)``, in order: the same
+        outcome per field, with the model's write policy and context read
+        once and one signal for all of them. For a writer that describes a
+        model at once (a printer's host and client facts, when it is built).
+        Returns how many fields changed."""
+        cls = self.__class__
+        policy = _write_policy(cls)
+        validates = cls.model_config.get("validate_assignment")
+        d = self.__dict__
+        fields_set = self.__pydantic_fields_set__
+        comparable = self._model_value_is_comparable_type
+        ctx = self.ctx()
+        changed = 0
+        for name, value in items:
+            exclusive = policy.get(name)
+            if exclusive is None or exclusive or validates:
+                changed += self.model_write(name, value)
+                continue
+            original = d[name]
+            d[name] = value
+            fields_set.add(name)
+            if original == value and comparable(original) and comparable(value):
+                continue
+            changed += 1
+            if ctx:
+                self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
+        if changed and ctx:
+            ctx.signal()
+        return changed
+
     def __getstate__(self) -> Dict[str, Any]:
         state = super().__getstate__()
         state["model_self_changed_fields"] = self.model_self_changed_fields.copy()
