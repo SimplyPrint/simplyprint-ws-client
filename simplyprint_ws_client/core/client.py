@@ -599,6 +599,9 @@ class Client(
         )
         self.v = -1
         self.msg_id = -1
+        #: Nesting depth of :meth:`batched_signals`, and whether a signal is owed.
+        self._signals_held = 0
+        self._signal_pending = False
         #: The change id when a FILE demand last set the job id (``_hold``).
         self._job_id_admitted_at: Optional[int] = None
         self.last_msg_id = -1
@@ -832,7 +835,28 @@ class Client(
         )
 
     def signal(self):
+        if self._signals_held:
+            # Inside batched_signals(): one emit when the batch ends.
+            self._signal_pending = True
+            return
         self.event_bus.emit_sync(ClientStateChangeEvent)
+
+    @contextlib.contextmanager
+    def batched_signals(self) -> Iterator[None]:
+        """Within: state changes signal once, when the outermost batch ends.
+
+        Every changed field signals the scheduler through the event bus; an
+        integration that projects a whole report at once (many fields) needs
+        the scheduler woken once for it, not once per field. Nothing reads
+        the signal in between: the scheduler only runs after the batch."""
+        self._signals_held += 1
+        try:
+            yield
+        finally:
+            self._signals_held -= 1
+            if not self._signals_held and self._signal_pending:
+                self._signal_pending = False
+                self.event_bus.emit_sync(ClientStateChangeEvent)
 
     def consume(self) -> list:
         """Consume and return the list of pending messages.
