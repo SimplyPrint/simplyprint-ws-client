@@ -71,12 +71,65 @@ async def test_an_mqtt_link_retries_at_the_device_pace():
     assert isinstance(transport.policy.backoff, DecorrelatedJitterBackoff)
 
 
-def test_a_failing_poller_waits_between_half_and_all_of_its_backoff():
+class _PollClient:
+    """The client surface a poller touches."""
+
+    def __init__(self, loop, poll, logger) -> None:
+        self.event_loop = loop
+        self.logger = logger
+        self.poll_device = poll
+
+    async def on_device_connected(self, driver) -> None:
+        pass
+
+    async def on_device_disconnected(self, driver, reason=None) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_an_outage_logs_one_traceback_then_counts_then_the_recovery(
+    caplog, monkeypatch
+):
+    import asyncio
+    import logging
+
     from simplyprint_ws_client.integration.drivers import DevicePoller
 
-    poller = DevicePoller.__new__(DevicePoller)  # only the timing is used
-    poller.failure_backoff = 10.0
-    delays = [poller.failure_delay() for _ in range(500)]
+    outcomes = [ConnectionRefusedError("refused")] * 4
+    sleeps: list = []
 
-    assert all(5.0 <= d <= 10.0 for d in delays)
-    assert max(delays) - min(delays) > 4.0
+    async def poll() -> None:
+        if outcomes:
+            raise outcomes.pop(0)
+
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(seconds, *args, **kwargs):
+        sleeps.append(seconds)
+        await real_sleep(0)
+
+    logger = logging.getLogger("test.poll_outage")
+    caplog.set_level(logging.DEBUG, logger="test.poll_outage")
+    client = _PollClient(asyncio.get_running_loop(), poll, logger)
+    poller = DevicePoller(client, interval=1.0, failure_backoff=10.0, name="prusa")
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)  # the poller's waits
+    try:
+        poller.start()
+        for _ in range(500):
+            if len(sleeps) >= 6:
+                break
+            await real_sleep(0)
+    finally:
+        await poller.close()
+        monkeypatch.undo()
+
+    records = [r for r in caplog.records if r.name == "test.poll_outage"]
+    failed = [r for r in records if "poll failed" in r.getMessage()]
+    assert len(failed) == 4
+    tracebacks = [r.exc_info is not None and r.exc_info[0] is not None for r in failed]
+    assert tracebacks == [True, False, False, False]
+    assert "(4 in a row)" in failed[-1].getMessage()
+    assert any("answered again after 4 failed" in r.getMessage() for r in records)
+    # A failed poll waits its whole backoff: not shortened (more attempts
+    # than legacy) nor lengthened (a later recovery); then the interval.
+    assert sleeps[:5] == [10.0, 10.0, 10.0, 10.0, 1.0]

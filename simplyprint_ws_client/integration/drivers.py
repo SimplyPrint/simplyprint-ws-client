@@ -20,7 +20,6 @@ on the client's allocation flag.
 from __future__ import annotations
 
 import asyncio
-import random
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -764,6 +763,8 @@ class DevicePoller(DeviceDriver):
 
     async def _run(self) -> None:
         started = time.monotonic()
+        #: Polls failed in a row: what the log reports instead of a traceback each.
+        failures = 0
         while True:
             failed = False
             try:
@@ -772,18 +773,23 @@ class DevicePoller(DeviceDriver):
                 )
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
                 failed = True
-                self.client.logger.debug(
-                    "%s poll timed out after %.0fs", self.name, self.poll_timeout
-                )
+                failures += 1
+                self._log_failure(failures, error)
             except DeviceAuthError:
                 failed = True
                 self.request_credential_refresh()
-            except Exception:  # noqa: BLE001 -- supervised: a bad poll backs off
+            except Exception as error:  # noqa: BLE001 -- supervised: a bad poll backs off
                 failed = True
-                self.client.logger.debug("%s poll failed", self.name, exc_info=True)
+                failures += 1
+                self._log_failure(failures, error)
             else:
+                if failures:
+                    self.client.logger.info(
+                        "%s poll answered again after %d failed", self.name, failures
+                    )
+                    failures = 0
                 await self.set_reachability(DeviceReachability.UP)
                 self.note_device_message()
 
@@ -800,11 +806,30 @@ class DevicePoller(DeviceDriver):
             ):
                 await self.set_reachability(DeviceReachability.DOWN)
 
-            await asyncio.sleep(self.failure_delay() if failed else self.interval)
+            # Not jittered: a printer's polls already run at its own phase
+            # (its poller started when it did), so pollers that fail together
+            # retry spread over one interval. Shortening the wait would only
+            # add attempts; lengthening it would delay the recovery.
+            await asyncio.sleep(self.failure_backoff if failed else self.interval)
 
-    def failure_delay(self) -> float:
-        """The wait after a failed poll: ``failure_backoff``, jittered down
-        to half of it. Pollers that failed together (every printer behind a
-        switch that rebooted) then poll again spread out, not in one burst
-        the moment the network is back."""
-        return self.failure_backoff * random.uniform(0.5, 1.0)
+    def _log_failure(self, failures: int, error: BaseException) -> None:
+        """One outage logs its first failure with the traceback, and every
+        later one as a single line with the count. Why: a traceback through
+        an HTTP client is dozens of formatted frames; a fleet of unreachable
+        printers formatted one per printer per retry, which cost more CPU
+        than the retries themselves."""
+        if isinstance(error, asyncio.TimeoutError):
+            reason = f"timed out after {self.poll_timeout:.0f}s"
+        else:
+            reason = str(error) or type(error).__name__
+        if failures == 1:
+            self.client.logger.debug(
+                "%s poll failed: %s",
+                self.name,
+                reason,
+                exc_info=not isinstance(error, asyncio.TimeoutError),
+            )
+        else:
+            self.client.logger.debug(
+                "%s poll failed (%d in a row): %s", self.name, failures, reason
+            )
