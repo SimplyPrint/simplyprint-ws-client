@@ -240,14 +240,7 @@ class PeripheralsState(ReactiveModel):
         entry = self.entries.get(peripheral_id)
 
         if entry is None:
-            # Bound at birth (provide_context without walking a subtree: a
-            # fresh entry has none), then attached as provide_context does.
-            entry = PeripheralState(self.ctx, id=peripheral_id)
-            if (live := self.ctx()) is not None:
-                live.state_attached(entry)
-            self.entries[peripheral_id] = entry
-            self.model_set_changed("entries")
-            entry.model_set_changed("id")
+            return self._add(peripheral_id, value, available, updated)
 
         # An assignment's outcome, without pydantic's setattr dispatch: every
         # report that moves a fan or light comes through here.
@@ -260,6 +253,40 @@ class PeripheralsState(ReactiveModel):
         if updated is not _PERIPHERAL_UNSET:
             entry.model_write("updated", updated)
 
+        return entry
+
+    def _add(
+        self, peripheral_id: str, value: Any, available: Any, updated: Any
+    ) -> PeripheralState:
+        """A new entry, as ``PeripheralState(id=...)``, bound, attached and
+        then written field by field leaves it: built from the class's
+        template (``model_fresh``) with its values in place, each one that
+        differs from the default marked changed, in field order."""
+        values: Dict[str, Any] = {"id": peripheral_id}
+        if value is not _PERIPHERAL_UNSET:
+            values["value"] = value
+        if available is not _PERIPHERAL_UNSET:
+            values["available"] = available
+        if updated is not _PERIPHERAL_UNSET:
+            values["updated"] = updated
+        ctx = self.ctx
+        entry = PeripheralState.model_fresh(ctx, values)
+        self.entries[peripheral_id] = entry
+        live = ctx()
+        if live is None:
+            return entry
+        live.state_attached(entry)
+        self.model_self_changed_fields["entries"] = live.stamp_change(self, "entries")
+        changed = entry.model_self_changed_fields
+        changed["id"] = live.stamp_change(entry, "id")
+        # The defaults are None: a None written over one marks nothing.
+        if values.get("value") is not None:
+            changed["value"] = live.stamp_change(entry, "value")
+        if values.get("available") is not None:
+            changed["available"] = live.stamp_change(entry, "available")
+        if values.get("updated") is not None:
+            changed["updated"] = live.stamp_change(entry, "updated")
+        live.signal()
         return entry
 
 

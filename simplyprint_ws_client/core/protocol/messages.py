@@ -1134,10 +1134,12 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
     @classmethod
     def build(cls, state: PrinterState) -> TClientMsgDataGenerator:
         for peripheral in state.peripherals.entries.values():
-            if not peripheral.model_has_changed:
+            # An entry's fields are plain values (nothing nested to walk):
+            # what changed is what it marked itself.
+            changed = peripheral.model_self_changed_fields
+            if not changed:
                 continue
 
-            changed = peripheral.model_changed_fields
             data = {}
             if "value" in changed:
                 data["v"] = peripheral.value
@@ -1155,7 +1157,8 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
         state.peripherals.model_reset_changed("entries", v=v)
 
         for peripheral in state.peripherals.entries.values():
-            peripheral.model_reset_changed(v=v)
+            if peripheral.model_self_changed_fields:  # else nothing to reset
+                peripheral.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
         return state.intervals.dispatch_mode(Interval.PERIPHERAL)
