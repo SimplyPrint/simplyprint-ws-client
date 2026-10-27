@@ -2,16 +2,20 @@
 SimplyPrint (``remove_connection``) and how it comes back (``add_connection``).
 
 Driven through the scheduler's own pass (``_schedule_client``) with a fake
-hub manager, so every add and remove the printer would send is recorded.
+hub manager, so every add and remove the printer would send is recorded, on
+a fake clock for the removal hold (``PrinterClient.unreachable_grace``).
 """
 
+import asyncio
+import time
 from datetime import datetime
 from typing import List
 
 import pytest
 
 from simplyprint_ws_client import PrinterConfig
-from simplyprint_ws_client.core.client import ClientState
+from simplyprint_ws_client.core import client as client_module
+from simplyprint_ws_client.core.client import ClientState, ClientStateChangeEvent
 from simplyprint_ws_client.core.client_context import ClientContext
 from simplyprint_ws_client.core.manager import ClientList
 from simplyprint_ws_client.core.protocol.connection import ConnectionMode
@@ -21,6 +25,7 @@ from simplyprint_ws_client.core.protocol.events import (
 from simplyprint_ws_client.core.protocol.models import ClientMsgType
 from simplyprint_ws_client.core.scheduler import Scheduler
 from simplyprint_ws_client.core.settings import ClientSettings
+from simplyprint_ws_client.core.state import PrinterStatus
 from simplyprint_ws_client.integration.client import PrinterClient
 from simplyprint_ws_client.integration.drivers import (
     DeviceDriver,
@@ -82,6 +87,24 @@ class _FakeManager:
         self.allocated.discard(client.unique_id)
 
 
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch) -> _Clock:
+    fake = _Clock()
+    monkeypatch.setattr(client_module, "_clock", fake)
+    return fake
+
+
+GRACE = PrinterClient.unreachable_grace
+
+
 @pytest.fixture
 def scheduler() -> Scheduler:
     settings = ClientSettings(mode=ConnectionMode.MULTI, camera_workers=None)
@@ -109,23 +132,33 @@ async def _pass(scheduler: Scheduler, printer: _Printer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_printer_whose_link_drops_is_removed(scheduler):
+async def test_a_printer_whose_link_drops_is_removed_once_the_grace_ends(
+    scheduler, clock
+):
     printer = await _added_printer(scheduler)
 
     await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
     await _pass(scheduler, printer)
-
+    # Within the grace: still added, nothing sent, still on its hub.
     assert printer.active is False
+    assert printer.sent_types() == []
+    assert printer.state == ClientState.CONNECTED
+    assert scheduler.manager.is_allocated(printer)
+
+    clock.now += GRACE
+    await _pass(scheduler, printer)
+
     assert printer.sent_types() == [ClientMsgType.REMOVE_CONNECTION]
     assert printer.state == ClientState.PENDING_REMOVED
 
 
 @pytest.mark.asyncio
 async def test_a_removed_printer_is_deallocated_then_added_again_once_back(
-    scheduler,
+    scheduler, clock
 ):
     printer = await _added_printer(scheduler)
     await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    clock.now += GRACE
     await _pass(scheduler, printer)
     printer.state = ClientState.NOT_CONNECTED  # the server's answer
     await _pass(scheduler, printer)
@@ -153,3 +186,122 @@ async def test_a_printer_made_inactive_directly_is_removed_at_once(scheduler):
     await _pass(scheduler, printer)
 
     assert printer.sent_types() == [ClientMsgType.REMOVE_CONNECTION]
+
+
+@pytest.mark.asyncio
+async def test_a_link_back_within_the_grace_skips_the_remove_and_the_re_add(
+    scheduler, clock
+):
+    printer = await _added_printer(scheduler)
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    await _pass(scheduler, printer)
+    clock.now += GRACE - 1
+
+    await printer.link.set_reachability(DeviceReachability.UP)
+    await _pass(scheduler, printer)
+    # Long after the grace would have ended: the hold ended with the outage.
+    clock.now += 10 * GRACE
+    await _pass(scheduler, printer)
+
+    assert printer.active is True
+    assert printer.removal_held() is False
+    assert printer.state == ClientState.CONNECTED
+    sent = printer.sent_types()
+    assert ClientMsgType.REMOVE_CONNECTION not in sent
+    assert ClientMsgType.ADD_CONNECTION not in sent
+    assert (scheduler.manager.allocate_calls, scheduler.manager.deallocate_calls) == (
+        0,
+        0,
+    )
+    assert printer.halts == 0
+
+
+@pytest.mark.asyncio
+async def test_changes_during_the_grace_go_out_once_the_link_is_back(
+    scheduler, clock
+):
+    printer = await _added_printer(scheduler)
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    printer.printer.status = PrinterStatus.PAUSED
+    await _pass(scheduler, printer)
+    assert printer.sent_types() == []  # inactive: nothing is sent meanwhile
+
+    await printer.link.set_reachability(DeviceReachability.UP)
+    await _pass(scheduler, printer)
+
+    sent = printer.sent_types()
+    assert ClientMsgType.STATUS in sent
+    assert ClientMsgType.ADD_CONNECTION not in sent
+
+
+@pytest.mark.asyncio
+async def test_a_second_link_going_down_does_not_extend_the_grace(scheduler, clock):
+    printer = await _added_printer(scheduler)
+    other = printer.attach_driver(_Link(printer, name="other"))
+    await other.set_reachability(DeviceReachability.UP)
+
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    clock.now += GRACE - 1
+    await other.set_reachability(DeviceReachability.DOWN, reason="gone too")
+    clock.now += 1
+    await _pass(scheduler, printer)
+
+    assert printer.sent_types() == [ClientMsgType.REMOVE_CONNECTION]
+
+
+@pytest.mark.asyncio
+async def test_a_printer_being_deleted_is_not_held(scheduler, clock):
+    printer = await _added_printer(scheduler)
+    scheduler.client_list.add(printer)
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    assert printer.removal_held()
+
+    scheduler.remove(printer)
+    await _pass(scheduler, printer)
+
+    assert printer.sent_types() == [ClientMsgType.REMOVE_CONNECTION]
+
+
+@pytest.mark.asyncio
+async def test_a_held_printer_is_not_scheduled_on_every_wake(scheduler, clock):
+    printer = await _added_printer(scheduler)
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+    now = datetime.now()
+    scheduler._last_ticked[printer.unique_id] = now
+    printer.last_msg_id = printer.msg_id
+
+    assert not scheduler._should_schedule_client(printer, now)
+    clock.now += GRACE
+    assert scheduler._should_schedule_client(printer, now)
+
+
+@pytest.mark.asyncio
+async def test_losing_the_hub_during_the_grace_resends_the_full_state(
+    scheduler, clock
+):
+    from simplyprint_ws_client.core.protocol.events import (
+        SimplyPrintConnectionLostEvent,
+    )
+
+    printer = await _added_printer(scheduler)
+    await printer.link.set_reachability(DeviceReachability.DOWN, reason="gone")
+
+    await printer.event_bus.emit(SimplyPrintConnectionLostEvent(printer.v))
+
+    # Still added when the hub went: the server may have missed what it was
+    # sent, so the next `connected` sends everything again.
+    assert printer._resend_state is True
+
+
+@pytest.mark.asyncio
+async def test_the_end_of_the_grace_wakes_the_scheduler(monkeypatch):
+    monkeypatch.setattr(client_module, "_clock", time.monotonic)
+    printer = _Printer()
+    woken = asyncio.Event()
+    printer.event_bus.on(ClientStateChangeEvent, lambda *_: woken.set())
+
+    printer.hold_removal(0.05)
+    woken.clear()
+    await asyncio.wait_for(woken.wait(), timeout=2.0)
+
+    assert printer.removal_held() is False

@@ -132,6 +132,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
             return
 
         client.active = False
+        client.hold_removal(0)  # a printer being deleted leaves at once
         self._to_delete.add(client.unique_id)
         self.signal()
 
@@ -254,7 +255,7 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         # Schedule if the client needs to change its connection state.
         is_active = client.active
         return (is_active and not client.is_added()) or (
-            not is_active and not client.is_removed()
+            not is_active and not client.is_removed() and not client.removal_held()
         )
 
     async def _schedule_client(self, client: Client):
@@ -307,6 +308,11 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
 
             if not client.active:
                 if not was_allocated:
+                    return
+
+                if client.removal_held():
+                    # Its device dropped moments ago: it stays added (and on
+                    # its hub) until the hold ends, which wakes this pass.
                     return
 
                 # Remove the connection from the multi printer.

@@ -12,6 +12,7 @@ import contextlib
 import logging
 import random
 import re
+import time
 import weakref
 from datetime import timedelta, datetime
 from enum import IntEnum
@@ -525,6 +526,11 @@ def _jitter(upper: float) -> float:
     return random.uniform(0, upper) if upper > 0 else 0.0
 
 
+def _clock() -> float:
+    """Monotonic seconds. Module-level so tests can run a fake clock."""
+    return time.monotonic()
+
+
 class _Held(NamedTuple):
     """A message built by :meth:`Client.consume` whose reset waits for its write."""
 
@@ -650,6 +656,9 @@ class Client(
         #: For the first send after that resend: one-shot edges kept from the
         #: dead link go out before the state.
         self._edges_first = False
+        #: While inactive and before this ``_clock()`` time, the printer stays
+        #: added on SimplyPrint (:meth:`hold_removal`). ``None``: no hold.
+        self._removal_held_until: Optional[float] = None
         self._should_be_allocated = True
         self.initialized = False
         self.offload = context.offload
@@ -726,8 +735,42 @@ class Client(
 
     @active.setter
     def active(self, value: bool):
+        if value:
+            self._removal_held_until = None  # back: nothing left to hold
         self._should_be_allocated = value
         self.signal()
+
+    def hold_removal(self, seconds: float) -> None:
+        """Keep this printer added on SimplyPrint for ``seconds`` while it is
+        inactive; ``seconds <= 0`` ends a hold.
+
+        Why: a device link that drops and comes back within seconds (a Wi-Fi
+        blip, a broker restart, every printer at once when a switch reboots)
+        would otherwise cost a ``remove_connection``, an ``add_connection``
+        and the full-state send after it, per printer, for an outage the
+        server never needed to see. Becoming active again ends the hold; an
+        outage that outlasts it is removed as before, only that much later.
+        """
+        if seconds <= 0:
+            self._removal_held_until = None
+            return
+        self._removal_held_until = _clock() + seconds
+        try:
+            # Wake the scheduler when the hold ends (a little after, so the
+            # pass sees it ended), not at its next tick.
+            asyncio.get_running_loop().call_later(seconds + 0.01, self.signal)
+        except RuntimeError:
+            pass  # no loop (sync tests): the scheduler's tick picks it up
+
+    def removal_held(self) -> bool:
+        """Inactive, but still within a :meth:`hold_removal` hold."""
+        until = self._removal_held_until
+        if until is None:
+            return False
+        if _clock() < until:
+            return True
+        self._removal_held_until = None
+        return False
 
     @property
     def state(self) -> ClientState:
@@ -1177,8 +1220,9 @@ class Client(
         # An added printer losing its link is a failure: the server may have
         # missed anything since, so the next `connected` resends the full
         # state. A deliberate removal (deallocate of an inactive printer) is
-        # not: it is removed first, or inactive.
-        if self.active and self.state == ClientState.CONNECTED:
+        # not: it is removed first, or inactive. A printer inside its removal
+        # hold is still added, so losing the link is a failure for it too.
+        if (self.active or self.removal_held()) and self.state == ClientState.CONNECTED:
             self._resend_state = True
 
         # handle connection lost.

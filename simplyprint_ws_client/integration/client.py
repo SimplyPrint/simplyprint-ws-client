@@ -178,6 +178,12 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
     #: camera remains independently reachable opt out.
     clear_camera_on_unreachable: ClassVar[bool] = True
 
+    #: Seconds an added printer whose device went unreachable stays added on
+    #: SimplyPrint before it is removed (:meth:`Client.hold_removal`). A link
+    #: back within it skips the remove, the re-add and the full-state send
+    #: after it; a longer outage is removed as before, this much later.
+    unreachable_grace: ClassVar[float] = 15.0
+
     # ``active`` is device reachability and gates SimplyPrint allocation. The
     # scheduler still runs drivers while inactive so they can reconnect it.
     # Printer and job state remain independent device-reported facts.
@@ -342,6 +348,10 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         self, driver: "DeviceDriver", reason: Optional[object] = None
     ) -> None:
         """Handle a link edge without inferring printer or job state."""
+        if self.active:
+            # Held from the moment it went unreachable: a later edge (another
+            # driver going down too) does not extend it.
+            self.hold_removal(self.unreachable_grace)
         self.active = False
         self.logger.info(
             "Printer unreachable via %s device link%s",
