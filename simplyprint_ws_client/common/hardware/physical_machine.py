@@ -38,6 +38,32 @@ def callonce(func):
     return wrapper
 
 
+#: How long a network fact (MAC, address, link type) is reused. Every printer
+#: reads them when it is built; a farm builds hundreds at start, and each read
+#: walks the interfaces. A changed address shows within this long.
+NETWORK_FACT_TTL = 30.0
+
+
+def ttl_cached(seconds: float):
+    """Reuse a no-argument function's result for ``seconds``."""
+
+    def decorate(func):
+        state = {"at": None, "value": None}
+
+        @functools.wraps(func)
+        def wrapper():
+            now = time.monotonic()
+            at = state["at"]
+            if at is None or now - at >= seconds:
+                state["value"], state["at"] = func(), now
+            return state["value"]
+
+        wrapper.cache_clear = lambda: state.update(at=None)  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorate
+
+
 # FIXME:
 # There is a bug in Python that ends up with process.communicate hanging even after
 # The process it runs has exited. This is a workaround for that issue by just introducing a timeout
@@ -151,6 +177,7 @@ class PhysicalMachine:
         return name
 
     @classmethod
+    @functools.lru_cache(maxsize=1)  # the CPU model doesn't change in a process
     def machine(cls) -> Optional[str]:
         if platform.system() == "Linux":
             return cls.__get_cpu_model_linux()
@@ -160,6 +187,7 @@ class PhysicalMachine:
             return cls.__get_cpu_model_windows()
 
     @staticmethod
+    @ttl_cached(NETWORK_FACT_TTL)
     @exception_as_value(return_default=True)
     def mac_address() -> Optional[str]:
         # Use netifaces
@@ -168,6 +196,7 @@ class PhysicalMachine:
         )[netifaces.AF_LINK][0]["addr"]
 
     @staticmethod
+    @ttl_cached(NETWORK_FACT_TTL)
     @exception_as_value(return_default=True, default=False)
     def is_ethernet() -> bool:
         return netifaces.gateways()["default"][netifaces.AF_INET][1].startswith("eth")
@@ -269,6 +298,7 @@ class PhysicalMachine:
         return socket.gethostname()
 
     @staticmethod
+    @ttl_cached(NETWORK_FACT_TTL)
     @exception_as_value(return_default=True)
     def local_ip() -> Optional[str]:
         interface = netifaces.gateways()["default"][netifaces.AF_INET][1]
