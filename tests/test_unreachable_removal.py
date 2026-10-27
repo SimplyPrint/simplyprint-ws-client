@@ -305,3 +305,66 @@ async def test_the_end_of_the_grace_wakes_the_scheduler(monkeypatch):
     await asyncio.wait_for(woken.wait(), timeout=2.0)
 
     assert printer.removal_held() is False
+
+
+# -- a printer waiting on its add or remove is not run on every wake ------------
+
+
+def _idle(scheduler: Scheduler, printer: _Printer) -> datetime:
+    """Ticked just now and nothing changed: only the connection state can
+    get the printer scheduled."""
+    now = datetime.now()
+    scheduler._last_ticked[printer.unique_id] = now
+    printer.last_msg_id = printer.msg_id
+    return now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [ClientState.CONNECTING, ClientState.PENDING_ADDED, ClientState.PENDING_REMOVED],
+)
+async def test_a_printer_waiting_on_its_hub_or_the_server_is_not_scheduled(
+    scheduler, state
+):
+    printer = await _added_printer(scheduler)
+    printer.state = state
+
+    assert not scheduler._should_schedule_client(printer, _idle(scheduler, printer))
+
+
+@pytest.mark.asyncio
+async def test_a_printer_whose_add_is_held_is_scheduled_once_the_hold_ends(scheduler):
+    from datetime import timedelta
+
+    printer = await _added_printer(scheduler)
+    printer.state = ClientState.NOT_CONNECTED
+    printer._pending_action_ts = datetime.now()
+    printer._pending_action_delay = timedelta(seconds=30)
+    assert not scheduler._should_schedule_client(printer, _idle(scheduler, printer))
+
+    printer._pending_action_ts -= timedelta(seconds=31)
+    assert scheduler._should_schedule_client(printer, _idle(scheduler, printer))
+
+
+@pytest.mark.asyncio
+async def test_an_unplaced_active_printer_is_scheduled(scheduler):
+    printer = await _added_printer(scheduler)
+    scheduler.manager.allocated.clear()
+    printer.state = ClientState.CONNECTING
+
+    assert scheduler._should_schedule_client(printer, _idle(scheduler, printer))
+
+
+@pytest.mark.asyncio
+async def test_an_add_or_remove_hold_wakes_the_scheduler_when_it_ends():
+    printer = _Printer()
+    woken = asyncio.Event()
+    printer.event_bus.on(ClientStateChangeEvent, lambda *_: woken.set())
+    printer._pending_action_backoff.delay = lambda: 0.05
+
+    printer._do_pending()
+    woken.clear()
+    await asyncio.wait_for(woken.wait(), timeout=2.0)
+
+    assert printer.pending_action_ready()

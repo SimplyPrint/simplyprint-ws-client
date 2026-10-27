@@ -755,12 +755,7 @@ class Client(
             self._removal_held_until = None
             return
         self._removal_held_until = _clock() + seconds
-        try:
-            # Wake the scheduler when the hold ends (a little after, so the
-            # pass sees it ended), not at its next tick.
-            asyncio.get_running_loop().call_later(seconds + 0.01, self.signal)
-        except RuntimeError:
-            pass  # no loop (sync tests): the scheduler's tick picks it up
+        self._wake_after(seconds)  # the remove goes then, not at the next tick
 
     def removal_held(self) -> bool:
         """Inactive, but still within a :meth:`hold_removal` hold."""
@@ -890,11 +885,27 @@ class Client(
 
         return can_do_pending
 
+    def pending_action_ready(self) -> bool:
+        """The add/remove hold has ended (:meth:`_can_do_pending`, unlogged)."""
+        return datetime.now() - self._pending_action_ts > self._pending_action_delay
+
     def _do_pending(self):
         self._pending_action_ts = datetime.now()
         self._pending_action_delay = timedelta(
             seconds=self._pending_action_backoff.delay()
         )
+        self._wake_after(self._pending_action_delay.total_seconds())
+
+    def _wake_after(self, seconds: float) -> None:
+        """Wake the scheduler once a hold of ``seconds`` ended: it no longer
+        runs a waiting printer on every wake (``Scheduler._connection_step_ready``)."""
+        if seconds <= 0:
+            return
+        try:
+            # A little after, so the pass finds the hold over.
+            asyncio.get_running_loop().call_later(seconds + 0.01, self.signal)
+        except RuntimeError:
+            pass  # no loop (sync tests): the scheduler's tick picks it up
 
     def signal(self):
         if self._signals_held:
@@ -1265,6 +1276,7 @@ class Client(
         retry_after = float(match.group(1))
         self._pending_action_ts = datetime.now()
         self._pending_action_delay = timedelta(seconds=retry_after)
+        self._wake_after(retry_after)
         return retry_after
 
     async def _on_multi_printer_removed(self, msg: MultiPrinterRemovedMsg):

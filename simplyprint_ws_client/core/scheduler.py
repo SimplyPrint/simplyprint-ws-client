@@ -252,11 +252,37 @@ class Scheduler(AsyncStoppable, EventLoopProvider[asyncio.AbstractEventLoop]):
         ):
             return True
 
-        # Schedule if the client needs to change its connection state.
+        # Schedule if the client needs to change its connection state, and a
+        # pass now can move it on.
         is_active = client.active
-        return (is_active and not client.is_added()) or (
-            not is_active and not client.is_removed() and not client.removal_held()
-        )
+        if is_active and not client.is_added():
+            return self._connection_step_ready(client)
+        if not is_active and not client.is_removed() and not client.removal_held():
+            return self._connection_step_ready(client)
+        return False
+
+    def _connection_step_ready(self, client: Client) -> bool:
+        """Whether a pass now could move the client's add or remove on.
+
+        Why: every printer's state change wakes the scheduler, so with
+        hundreds of printers it wakes many times a second. A printer waiting
+        (for the server's answer, for its hub to connect, for its add or
+        remove hold to end) used to get a fresh task on every one of those
+        wakes, only to find it still had to wait: hundreds of no-op passes a
+        second through a reconnect storm. Each wait ends with a wake of its
+        own (the answer and the hub's connect change the state, which
+        signals; a hold arms a timer), and the tick-rate pass still runs
+        every client as the backstop (e.g. for the reply timeout).
+        """
+        if not self.manager.is_allocated(client):
+            return client.active  # to place it on a hub
+        if client.state in (
+            ClientState.CONNECTING,
+            ClientState.PENDING_ADDED,
+            ClientState.PENDING_REMOVED,
+        ):
+            return False
+        return client.pending_action_ready()
 
     async def _schedule_client(self, client: Client):
         """Schedule single client.
