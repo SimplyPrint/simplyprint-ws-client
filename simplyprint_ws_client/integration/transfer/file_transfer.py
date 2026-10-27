@@ -421,6 +421,28 @@ class FileTransfer:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.driver.close()
 
+    async def cancel(self) -> None:
+        """Abandon the file of a job SimplyPrint cancelled.
+
+        SimplyPrint can return a cancelled job's queue item straight away, so an
+        upload that finishes afterwards must never start it.
+        """
+        self._staged = None
+        lifecycle = self._lifecycle
+        if lifecycle is None or not lifecycle.is_preparing:
+            return
+        start_sent = (
+            lifecycle.start_in_flight or lifecycle.start_disposition is not None
+        )
+        self._fail("Print was cancelled", "job cancelled")
+        if start_sent:
+            try:
+                await self.driver.cancel_start()
+            except Exception:
+                self._logger.warning(
+                    "Failed to cancel printer start for a cancelled job", exc_info=True
+                )
+
     async def _prepare(self, data: FileDemandData) -> None:
         lifecycle = self._executing()
         route = lifecycle.route

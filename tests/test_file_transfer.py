@@ -15,6 +15,7 @@ from simplyprint_ws_client import (
 )
 from simplyprint_ws_client.common.utils.slugify import slugify
 from simplyprint_ws_client.core.config import PrinterConfig
+from simplyprint_ws_client.core.protocol.messages import CancelDemandData, DemandMsgType
 from simplyprint_ws_client.integration.client import PrinterClient
 from simplyprint_ws_client.integration.transfer import file_transfer as transfer_module
 from simplyprint_ws_client.integration.transfer import (
@@ -523,3 +524,95 @@ async def test_printer_client_builds_the_superseded_job_message():
         "message": "superseded",
     }
     assert client.send.await_args.kwargs == {"skip_dispatch": True}
+
+
+class _BlockingUploadDriver(Driver):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def upload(self, data, source, progress):
+        self.entered.set()
+        await self.release.wait()
+        return await super().upload(data, source, progress)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_upload_never_starts_the_print(client: Client):
+    """SimplyPrint cancelled the job (and may have re-queued it) while the
+    upload was still running; finishing the upload must not start it."""
+    driver = _BlockingUploadDriver()
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(job_id=1, file_name="job.gcode", auto_start=True))
+    await driver.entered.wait()
+
+    await transfer.cancel()
+    driver.release.set()
+    await transfer.wait()
+
+    assert driver.starts == 0
+    assert not transfer.is_preparing_to_print
+    assert client.printer.file_progress.state == FileProgressStateEnum.ERROR
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_awaiting_device_start_cancels_the_start(client: Client):
+    driver = Driver(disposition=StartDisposition.AWAIT_DEVICE)
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(job_id=1, file_name="job.gcode", auto_start=True))
+    await transfer.wait()
+    assert transfer.awaiting_device_start
+
+    await transfer.cancel()
+
+    assert driver.cancelled_starts == 1
+    assert not transfer.is_preparing_to_print
+
+
+@pytest.mark.asyncio
+async def test_cancel_discards_a_staged_upload(client: Client):
+    driver = Driver()
+    transfer = _transfer(client, driver)
+    transfer.submit(FileDemandData(job_id=1, file_name="job.gcode", auto_start=False))
+    await transfer.wait()
+
+    await transfer.cancel()
+
+    assert not transfer.start_staged()
+    assert driver.starts == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_preparation_is_a_no_op(client: Client):
+    driver = Driver()
+    transfer = _transfer(client, driver)
+
+    await transfer.cancel()
+
+    assert driver.cancelled_starts == 0
+    assert client.printer.file_progress.state != FileProgressStateEnum.ERROR
+
+
+@pytest.mark.asyncio
+async def test_cancel_demand_stops_the_transfer_before_the_integration_hook():
+    observed = []
+
+    class CancelRecordingClient(PrinterClient):
+        async def on_cancel(self, _data):
+            observed.append(self.file_transfer.is_preparing_to_print)
+
+    client = CancelRecordingClient(PrinterConfig.get_new(), context=ClientContext())
+    driver = _BlockingUploadDriver()
+    client.attach_file_transfer(_transfer(client, driver))
+    client.file_transfer.submit(
+        FileDemandData(job_id=1, file_name="job.gcode", auto_start=True)
+    )
+    await driver.entered.wait()
+
+    await client.event_bus.emit(DemandMsgType.CANCEL, CancelDemandData())
+    driver.release.set()
+    await client.file_transfer.wait()
+
+    assert observed == [False]
+    assert driver.starts == 0

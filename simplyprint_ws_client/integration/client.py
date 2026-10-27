@@ -219,6 +219,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         on(DemandMsgType.START_PRINT, self.on_start_print)
         on(DemandMsgType.PAUSE, self.on_pause)
         on(DemandMsgType.RESUME, self.on_resume)
+        on(DemandMsgType.CANCEL, self._cancel_file_transfer, priority=1)
         on(DemandMsgType.CANCEL, self.on_cancel)
         on(DemandMsgType.GCODE, self.on_gcode)
         on(DemandMsgType.TERMINAL, self.on_terminal)
@@ -425,6 +426,12 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         self, _data: ResolveNotificationDemandData
     ) -> None:
         """React after the core resolves/responds to a notification."""
+
+    async def _cancel_file_transfer(self, _data: CancelDemandData) -> None:
+        # Runs before the integration's on_cancel: a cancelled job's file must
+        # not be started by an upload that is still in flight.
+        if self.file_transfer is not None:
+            await self.file_transfer.cancel()
 
     async def on_file(self, data: FileDemandData) -> None:
         """Submit a file to the attached transfer lifecycle."""
