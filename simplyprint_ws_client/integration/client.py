@@ -684,8 +684,10 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         try:
             if self.camera.set_uri(camera_uri):
                 self.logger.debug("Set camera URI to %s", redacted_uri)
-            else:
+            elif self.camera.has_pool:
                 self.logger.warning("Failed to set camera URI to %s", redacted_uri)
+            # Without a camera pool (cameras off for this app) it is refused
+            # by design, logged by the controller: no warning per report.
 
         except Exception as e:
             self.logger.warning(

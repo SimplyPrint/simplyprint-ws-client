@@ -28,6 +28,26 @@ from simplyprint_ws_client.core.state import Interval, PrinterState
 StreamSender = Callable[[StreamMsg], Awaitable[None]]
 
 
+def _child_with_level(logger: logging.Logger, suffix: str, level: int) -> logging.Logger:
+    """``logger.getChild(suffix)`` at ``level``.
+
+    ``setLevel`` clears the level cache of every logger in the process, and
+    every printer has its own loggers: per printer built, that is quadratic at
+    farm scale. A logger created just now has nothing cached and no children
+    that could have, so its level is set directly; an existing one (a printer
+    built again under the same name) goes through ``setLevel``.
+    """
+    name = suffix if logger is logger.root else f"{logger.name}.{suffix}"
+    created = logger.manager.loggerDict.get(name) is None
+    child = logger.getChild(suffix)
+    if child.level != level:
+        if created:
+            child.level = level
+        else:
+            child.setLevel(level)
+    return child
+
+
 class _CameraWorkKind(Enum):
     STREAM = "stream"
     SNAPSHOT = "snapshot"
@@ -105,12 +125,9 @@ class CameraController:
         self._camera_debug = (
             "SIMPLYPRINT_DEBUG_CAMERA" in os.environ if debug is None else debug
         )
-        self._camera_logger = logger.getChild("camera")
-        level = logging.DEBUG if self._camera_debug else logging.INFO
-        # setLevel clears every logger's level cache in the process; per
-        # printer that is quadratic at farm scale. Only when it differs.
-        if self._camera_logger.level != level:
-            self._camera_logger.setLevel(level)
+        self._camera_logger = _child_with_level(
+            logger, "camera", logging.DEBUG if self._camera_debug else logging.INFO
+        )
         self._camera_work_queue = AsyncQueue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
         self._request_count = 0
         self._last_stream_frame_at = None
@@ -124,6 +141,11 @@ class CameraController:
         self._camera_stream_cancel_requested = False
         self._stream_retry_delay = self._STREAM_RETRY_MIN
         self._stream_retry_handle: Optional[asyncio.TimerHandle] = None
+
+    @property
+    def has_pool(self) -> bool:
+        """Cameras are on for this app: a URI can be streamed."""
+        return self._camera_pool is not None
 
     @property
     def uri(self) -> Optional[URL]:
@@ -149,7 +171,7 @@ class CameraController:
 
         if self._camera_pool is None:
             self._camera_logger.debug(
-                f"Dropped camera URI {uri} because no camera pool is available."
+                "Dropped camera URI %s because no camera pool is available.", uri
             )
             self._printer.webcam_info.connected = False
             return False
