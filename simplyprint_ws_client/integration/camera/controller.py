@@ -106,9 +106,11 @@ class CameraController:
             "SIMPLYPRINT_DEBUG_CAMERA" in os.environ if debug is None else debug
         )
         self._camera_logger = logger.getChild("camera")
-        self._camera_logger.setLevel(
-            logging.DEBUG if self._camera_debug else logging.INFO
-        )
+        level = logging.DEBUG if self._camera_debug else logging.INFO
+        # setLevel clears every logger's level cache in the process; per
+        # printer that is quadratic at farm scale. Only when it differs.
+        if self._camera_logger.level != level:
+            self._camera_logger.setLevel(level)
         self._camera_work_queue = AsyncQueue(maxsize=self._CAMERA_QUEUE_MAXSIZE)
         self._request_count = 0
         self._last_stream_frame_at = None

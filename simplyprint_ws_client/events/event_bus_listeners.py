@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import weakref
 import heapq
 from enum import Enum
 from typing import (
@@ -41,11 +42,23 @@ class EventBusListenerOptions(TypedDict):
     unique: NotRequired[ListenerUniqueness]
 
 
+#: function -> whether it is a coroutine function. Every client registers the
+#: same few dozen methods; inspect's check is the cost of a registration.
+_ASYNC: "weakref.WeakKeyDictionary[Callable, bool]" = weakref.WeakKeyDictionary()
+
+
 def _is_async(handler: Callable) -> bool:
     if isinstance(handler, functools.partial):
         return _is_async(handler.func)
-
-    return asyncio.iscoroutinefunction(handler)
+    # A bound method: decide by its function (shared by every instance).
+    func = getattr(handler, "__func__", handler)
+    try:
+        cached = _ASYNC.get(func)
+    except TypeError:  # not weak-referenceable
+        return asyncio.iscoroutinefunction(handler)
+    if cached is None:
+        cached = _ASYNC[func] = asyncio.iscoroutinefunction(handler)
+    return cached
 
 
 class EventBusListener:
