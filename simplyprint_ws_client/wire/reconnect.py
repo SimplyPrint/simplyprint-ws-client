@@ -91,9 +91,10 @@ class Reconnecting(Transport):
         self.live = False
         self.stopped = False
         self.task: Optional[asyncio.Task] = None
-        #: Armed while an attempt's consume loop runs; a failed send sets it via
-        #: :meth:`trip` so the attempt ends even when recv never gets to raise.
-        self._tripped: Optional[asyncio.Event] = None
+        #: Armed while an attempt's consume loop runs; a failed send resolves it
+        #: via :meth:`trip` so the attempt ends even when recv never gets to
+        #: raise. A plain future, so waiting on it costs no task per connect.
+        self._tripped: Optional["asyncio.Future[None]"] = None
         self._trip_reason: Optional[Exception] = None
 
     @abstractmethod
@@ -210,10 +211,15 @@ class Reconnecting(Transport):
 
         def fire() -> None:
             tripped = self._tripped
-            if tripped is None or generation != self.generation or self.stopped:
+            if (
+                tripped is None
+                or tripped.done()
+                or generation != self.generation
+                or self.stopped
+            ):
                 return
             self._trip_reason = reason
-            tripped.set()
+            tripped.set_result(None)
 
         loop = self.provider.event_loop
         try:
@@ -253,7 +259,7 @@ class Reconnecting(Transport):
                     # from inside a Connected handler (the classic "hello on
                     # connect") must be able to trip this very attempt.
                     self._trip_reason = None
-                    self._tripped = asyncio.Event()
+                    self._tripped = asyncio.get_running_loop().create_future()
                     await self.mark_connected()
                     self.policy.reset()
                     await self.consume()
@@ -330,21 +336,23 @@ class Reconnecting(Transport):
         """
         tripped = self._tripped
         if tripped is None:  # pragma: no cover -- supervise always arms first
-            self._tripped = tripped = asyncio.Event()
+            self._tripped = tripped = asyncio.get_running_loop().create_future()
+        # One task per connection: the stream (it must be cancellable on a
+        # trip). The tripwire is a future, waited on as it is.
         stream = asyncio.ensure_future(self.consume_stream())
-        trip = asyncio.ensure_future(tripped.wait())
         try:
             done, _pending = await asyncio.wait(
-                {stream, trip}, return_when=asyncio.FIRST_COMPLETED
+                {stream, tripped}, return_when=asyncio.FIRST_COMPLETED
             )
         finally:
             self._tripped = None
             stream.cancel()
-            trip.cancel()
-            # Settle both so a cancellation or late exception is never
+            if not tripped.done():
+                tripped.cancel()
+            # Settle the stream so a cancellation or late exception is never
             # left unobserved (the gather itself must survive our own
-            # cancellation having already hit the children).
-            await asyncio.gather(stream, trip, return_exceptions=True)
+            # cancellation having already hit the child).
+            await asyncio.gather(stream, return_exceptions=True)
         if stream in done:
             stream.result()  # re-raise the drop that ended the stream
             return

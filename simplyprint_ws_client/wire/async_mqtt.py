@@ -61,11 +61,26 @@ def mqtt_retry_policy() -> RetryPolicy:
     return device_retry_policy()
 
 
+#: The contexts without a client certificate, by ``verify_tls``: one each per
+#: process. A context is only configuration (and, verified, the parsed CA
+#: store, the expensive part), so every connection can share it.
+_SHARED_CONTEXTS: Dict[bool, ssl.SSLContext] = {}
+
+
 def mqtt_ssl_context(
     *, verify_tls: bool, tls_client_auth: Optional[TlsClientAuth]
 ) -> ssl.SSLContext:
+    """The TLS context for a broker connection. Shared unless it carries a
+    printer's own client certificate; never modify the one returned."""
     if tls_client_auth is not None:
         return client_cert_ssl_context(tls_client_auth)
+    context = _SHARED_CONTEXTS.get(verify_tls)
+    if context is None:
+        context = _SHARED_CONTEXTS[verify_tls] = _new_ssl_context(verify_tls)
+    return context
+
+
+def _new_ssl_context(verify_tls: bool) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if verify_tls:
         context.load_default_certs()
@@ -74,6 +89,16 @@ def mqtt_ssl_context(
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
     return context
+
+
+def _stream_error(error: BaseException) -> TransportError:
+    """How a stream that died before CONNACK ends the attempt (as ``_read``
+    would have raised it)."""
+    if isinstance(error, TransportError):
+        return error
+    if isinstance(error, codec.MalformedPacket):
+        return TransientError(f"malformed MQTT packet: {error}")
+    return TransientError.wrap(error)
 
 
 def random_client_id() -> str:
@@ -131,18 +156,29 @@ class AsyncMqtt(MqttTransport, Reconnecting):
         self._pinger: Optional["asyncio.Task[None]"] = None
         self._last_in = self._last_out = 0.0
         self._ping_sent: Optional[float] = None
+        #: Built on the first secure connect and kept for every reconnect:
+        #: building one per connect (a client certificate's is parsed from
+        #: PEM each time) is work a storm of reconnects multiplies.
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        #: The last connection's TLS session: the next handshake resumes it
+        #: when the broker agrees (no certificate exchange again).
+        self._tls_session: Optional[ssl.SSLSession] = None
 
     # -- the wire hooks --------------------------------------------------------
 
-    async def open(self) -> None:
-        secure = self.url.scheme == "mqtts"
-        context = (
-            mqtt_ssl_context(
+    def ssl_context(self) -> Optional[ssl.SSLContext]:
+        """This transport's TLS context (``None`` for plain ``mqtt``)."""
+        if self.url.scheme != "mqtts":
+            return None
+        if self._ssl_context is None:
+            self._ssl_context = mqtt_ssl_context(
                 verify_tls=self.verify_tls, tls_client_auth=self.tls_client_auth
             )
-            if secure
-            else None
-        )
+        return self._ssl_context
+
+    async def open(self) -> None:
+        secure = self.url.scheme == "mqtts"
+        context = self.ssl_context()
         # A broker that refuses an empty client id gets a random one, within
         # this same attempt (a one-shot probe must not see it as a failure).
         for _ in range(2):
@@ -167,12 +203,13 @@ class AsyncMqtt(MqttTransport, Reconnecting):
         )
         self._connack = connack
         try:
-            self.connection = await MqttStream.open(
+            self.connection = connection = await MqttStream.open(
                 self.url.host,
                 self.port(),
                 ssl_context=context,
                 server_hostname=self.url.host if secure else None,
                 on_control=self._on_control,
+                session=self._tls_session if secure else None,
             )
         except (OSError, ssl.SSLError, ssl.CertificateError) as error:
             raise TransientError.wrap(error)
@@ -187,17 +224,16 @@ class AsyncMqtt(MqttTransport, Reconnecting):
             )
         )
         await self._drain()
-        # CONNACK arrives as a control packet; a dead stream ends the read.
-        reading = asyncio.ensure_future(self._read())
+        # CONNACK arrives as a control packet (``_on_control``); the stream
+        # failing ends the wait. Both are futures: no reader task per connect.
         try:
-            await asyncio.wait({connack, reading}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(
+                {connack, connection.failed}, return_when=asyncio.FIRST_COMPLETED
+            )
         finally:
-            reading.cancel()
-            await asyncio.gather(reading, return_exceptions=True)
             self._connack = None
         if not connack.done():
-            reading.result()  # re-raises how the stream died
-            raise TransientError("PUBLISH before CONNACK")
+            raise _stream_error(connection.failed.result())
         _session, code = codec.decode_connack(connack.result().body)
         return code
 
@@ -269,6 +305,11 @@ class AsyncMqtt(MqttTransport, Reconnecting):
         self._qos2_received.clear()
         if connection is None:
             return
+        # Read now, at the end: a TLS 1.3 broker sends its ticket after the
+        # handshake, so only a used connection's session can be resumed.
+        session = connection.tls_session
+        if session is not None:
+            self._tls_session = session
         try:
             connection.write(codec.DISCONNECT_PACKET)  # a goodbye, if it still can
         except Exception:  # noqa: BLE001 -- the wire is already gone

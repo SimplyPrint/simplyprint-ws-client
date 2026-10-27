@@ -43,8 +43,12 @@ class MqttStream(asyncio.Protocol):
         ssl_context: Optional[ssl.SSLContext] = None,
         server_hostname: Optional[str] = None,
         on_control: Optional[Callable[[codec.Packet], None]] = None,
+        session: Optional[ssl.SSLSession] = None,
     ) -> None:
         self._loop = loop
+        #: A TLS session of an earlier connection to resume (cheaper
+        #: handshake); the server may decline it and run a full one.
+        self._session = session
         #: Receives every control packet (all but PUBLISH and PUBREL, which stay
         #: in wire order) as soon as it arrives, so acknowledgements never wait
         #: behind a slow message consumer.
@@ -71,6 +75,9 @@ class MqttStream(asyncio.Protocol):
         self._closed = False
         self._ready: "asyncio.Future[None]" = loop.create_future()
         self._lost: "asyncio.Future[None]" = loop.create_future()
+        #: Resolves with the error once the connection failed (its result,
+        #: not its exception: nobody has to retrieve it).
+        self.failed: "asyncio.Future[BaseException]" = loop.create_future()
 
     @classmethod
     async def open(
@@ -81,11 +88,15 @@ class MqttStream(asyncio.Protocol):
         ssl_context: Optional[ssl.SSLContext] = None,
         server_hostname: Optional[str] = None,
         on_control: Optional[Callable[[codec.Packet], None]] = None,
+        session: Optional[ssl.SSLSession] = None,
     ) -> "MqttStream":
-        """Connect (and finish the TLS handshake). Raises on failure."""
+        """Connect (and finish the TLS handshake, resuming ``session`` when
+        the server agrees). Raises on failure."""
         loop = asyncio.get_running_loop()
         transport, connection = await loop.create_connection(
-            lambda: cls(loop, ssl_context, server_hostname, on_control), host, port
+            lambda: cls(loop, ssl_context, server_hostname, on_control, session),
+            host,
+            port,
         )
         if connection._transport is None:  # connection_made failed
             transport.abort()
@@ -168,6 +179,24 @@ class MqttStream(asyncio.Protocol):
     async def wait_closed(self) -> None:
         await asyncio.shield(self._lost)
 
+    @property
+    def tls_session(self) -> Optional[ssl.SSLSession]:
+        """This connection's TLS session, to resume on the next one. Read it
+        late (at close): TLS 1.3 sends its resumption ticket after the
+        handshake. ``None`` without TLS or before a finished handshake."""
+        tls = self._tls
+        if tls is None or not self._handshaken:
+            return None
+        try:
+            return tls.session
+        except (ValueError, ssl.SSLError):
+            return None
+
+    @property
+    def session_reused(self) -> bool:
+        """The handshake resumed an earlier session."""
+        return self._tls is not None and self._handshaken and self._tls.session_reused
+
     # -- asyncio.Protocol --------------------------------------------------------
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -177,12 +206,26 @@ class MqttStream(asyncio.Protocol):
             return
         self._incoming, self._outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
         try:
-            self._tls = self._context.wrap_bio(
-                self._incoming,
-                self._outgoing,
-                server_side=False,
-                server_hostname=self._server_hostname,
-            )
+            try:
+                self._tls = self._context.wrap_bio(
+                    self._incoming,
+                    self._outgoing,
+                    server_side=False,
+                    server_hostname=self._server_hostname,
+                    session=self._session,
+                )
+            except ValueError:
+                if self._session is None:
+                    raise
+                # A session the context can't take (another context's): a
+                # full handshake instead.
+                self._session = None
+                self._tls = self._context.wrap_bio(
+                    self._incoming,
+                    self._outgoing,
+                    server_side=False,
+                    server_hostname=self._server_hostname,
+                )
         except (ssl.SSLError, ValueError) as error:
             self._fail(error)
             transport.abort()  # type: ignore[attr-defined]
@@ -327,6 +370,8 @@ class MqttStream(asyncio.Protocol):
     def _fail(self, error: BaseException) -> None:
         if self._error is None:
             self._error = error
+        if not self.failed.done():
+            self.failed.set_result(self._error)
         if not self._ready.done():
             self._ready.set_exception(error)
             self._ready.exception()  # retrieved: open() re-raises its own copy
