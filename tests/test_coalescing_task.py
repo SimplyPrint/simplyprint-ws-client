@@ -60,7 +60,26 @@ async def test_trigger_during_run_causes_exactly_one_trailing_run():
 
 
 @pytest.mark.asyncio
-async def test_debounce_collapses_a_burst_to_one_run():
+async def test_debounce_collapses_a_burst_to_one_run(monkeypatch):
+    # The debounce window is a gate the test opens, not wall time: ten
+    # triggers 5 ms apart inside a real 50 ms window failed on a loaded box.
+    from simplyprint_ws_client.common.asyncio import coalescing_task as module
+
+    window = asyncio.Event()
+    real = asyncio.sleep
+
+    class _Asyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        @staticmethod
+        async def sleep(delay, *args):
+            if delay == 0.05:
+                await window.wait()  # the debounce window, open until released
+            else:
+                await real(delay, *args)
+
+    monkeypatch.setattr(module, "asyncio", _Asyncio())
     runs = 0
 
     async def fn():
@@ -70,8 +89,10 @@ async def test_debounce_collapses_a_burst_to_one_run():
     ct = CoalescingTask(fn, delay=0.05, loop=asyncio.get_running_loop())
     for _ in range(10):
         ct.trigger()
-        await asyncio.sleep(0.005)  # all within the 50ms window
-    await asyncio.sleep(0.1)
+        await real(0)  # the runner gets to run between triggers
+    window.set()  # the window closes
+    for _ in range(5):
+        await real(0)
     await ct.aclose()
 
     assert runs == 1
