@@ -539,6 +539,25 @@ class _Held(NamedTuple):
     taken: bool = False
 
 
+class _SignalBatch:
+    """:meth:`Client.batched_signals`."""
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: "Client") -> None:
+        self._client = client
+
+    def __enter__(self) -> None:
+        self._client._signals_held += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        client = self._client
+        client._signals_held -= 1
+        if not client._signals_held and client._signal_pending:
+            client._signal_pending = False
+            client.event_bus.emit_sync(ClientStateChangeEvent)
+
+
 #: How long a multi-printer add or remove waits for the server's answer. The
 #: server answers a remove within its own 30 s bound; a lost answer (a server
 #: restart between request and reply) would otherwise leave the printer off
@@ -841,22 +860,15 @@ class Client(
             return
         self.event_bus.emit_sync(ClientStateChangeEvent)
 
-    @contextlib.contextmanager
-    def batched_signals(self) -> Iterator[None]:
+    def batched_signals(self) -> "_SignalBatch":
         """Within: state changes signal once, when the outermost batch ends.
 
         Every changed field signals the scheduler through the event bus; an
         integration that projects a whole report at once (many fields) needs
         the scheduler woken once for it, not once per field. Nothing reads
-        the signal in between: the scheduler only runs after the batch."""
-        self._signals_held += 1
-        try:
-            yield
-        finally:
-            self._signals_held -= 1
-            if not self._signals_held and self._signal_pending:
-                self._signal_pending = False
-                self.event_bus.emit_sync(ClientStateChangeEvent)
+        the signal in between: the scheduler only runs after the batch. A
+        plain class, not a generator context manager: it runs per report."""
+        return _SignalBatch(self)
 
     def consume(self) -> list:
         """Consume and return the list of pending messages.
