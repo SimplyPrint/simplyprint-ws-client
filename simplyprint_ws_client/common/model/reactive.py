@@ -430,6 +430,37 @@ class ReactiveModel(BaseModel, Synchronized):
             self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
             ctx.signal()
 
+    def model_write(self, name: str, value: Any) -> bool:
+        """Set field ``name`` to ``value`` as an assignment would, cheaper:
+        for a writer that projects already-typed values (an integration's
+        state projection). ``True`` if it was a change.
+
+        Exactly an assignment's outcome: a model that validates assignments,
+        an untracked field or an exclusive one go through ``setattr``; for
+        the rest the value is stored the way pydantic stores a plain field
+        (instance dict and fields-set) and marked changed only if it differs.
+        """
+        cls = self.__class__
+        exclusive = _write_policy(cls).get(name)
+        if exclusive is None or exclusive or cls.model_config.get("validate_assignment"):
+            before = self.model_self_changed_fields.get(name)
+            setattr(self, name, value)
+            return self.model_self_changed_fields.get(name) != before
+        d = self.__dict__
+        original = d[name]
+        d[name] = value
+        self.__pydantic_fields_set__.add(name)  # as pydantic does, changed or not
+        if (
+            original == value
+            and self._model_value_is_comparable_type(original)
+            and self._model_value_is_comparable_type(value)
+        ):
+            return False
+        if ctx := self.ctx():
+            self.model_self_changed_fields[name] = ctx.stamp_change(self, name)
+            ctx.signal()
+        return True
+
     def __getstate__(self) -> Dict[str, Any]:
         state = super().__getstate__()
         state["model_self_changed_fields"] = self.model_self_changed_fields.copy()
