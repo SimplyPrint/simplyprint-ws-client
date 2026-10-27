@@ -34,7 +34,7 @@ import yarl
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.wire.messages import WsKind, WsMessage
-from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.policy import RetryPolicy, device_retry_policy
 from simplyprint_ws_client.wire.transport import WsTransport
 from simplyprint_ws_client.wire.websockets import Websockets
 from simplyprint_ws_client.wire.lease import WsLease
@@ -131,7 +131,10 @@ def connect(
     lease = pool.connect(
         url,
         WsConnectParams(
-            options.retry or RetryPolicy(), options.logger, options.open_timeout
+            # Unless the caller paces it: a device link's jittered pace.
+            options.retry or device_retry_policy(),
+            options.logger,
+            options.open_timeout,
         ),
     )
     if not isinstance(lease, WsLease):

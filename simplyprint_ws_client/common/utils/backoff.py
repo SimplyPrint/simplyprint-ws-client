@@ -1,6 +1,6 @@
 import time
 from random import Random
-from typing import Protocol
+from typing import Optional, Protocol
 
 
 class Backoff(Protocol):
@@ -20,6 +20,35 @@ class ConstantBackoff(Backoff):
 
     def reset(self) -> None:
         pass
+
+
+class DecorrelatedJitterBackoff(Backoff):
+    """Exponential backoff with decorrelated jitter: each delay is drawn from
+    ``[base, 3 * previous]``, capped at ``maximum``.
+
+    Why: links that drop together (every printer behind a switch that just
+    rebooted) must not retry together. With a fixed or merely scaled delay
+    each retry round is another synchronised burst of handshakes; here the
+    first retry is quick but spread over ``[base, 3 * base]``, and every
+    later one draws from a range that depends on the link's own previous
+    delay, so the retries drift further apart each round.
+    """
+
+    def __init__(
+        self, base: float = 0.5, maximum: float = 5.0, rand: Optional[Random] = None
+    ) -> None:
+        self.base = base
+        self.max_delay = maximum
+        self.rand = rand or Random()
+        self._previous = base
+
+    def delay(self) -> float:
+        upper = max(self.base, self._previous * 3)
+        self._previous = min(self.max_delay, self.rand.uniform(self.base, upper))
+        return self._previous
+
+    def reset(self) -> None:
+        self._previous = self.base
 
 
 class ExponentialBackoff(Backoff):

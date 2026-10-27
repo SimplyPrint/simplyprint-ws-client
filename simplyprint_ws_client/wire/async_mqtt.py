@@ -31,14 +31,13 @@ from typing import Callable, Dict, Optional, Set, Tuple
 import yarl
 
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.utils.backoff import ExponentialBackoff
 from simplyprint_ws_client.wire import mqtt_codec as codec
 from simplyprint_ws_client.wire.errors import AuthenticationError, TransportError
 from simplyprint_ws_client.wire.events import MessageReceived
 from simplyprint_ws_client.wire.messages import MqttMessage, QoS
 from simplyprint_ws_client.wire.mqtt_stream import MqttStream
 from simplyprint_ws_client.wire.options import TlsClientAuth
-from simplyprint_ws_client.wire.policy import RetryPolicy
+from simplyprint_ws_client.wire.policy import RetryPolicy, device_retry_policy
 from simplyprint_ws_client.wire.reconnect import Reconnecting
 from simplyprint_ws_client.wire.transport import MqttTransport, TransientError
 from simplyprint_ws_client.wire.tls import client_cert_ssl_context
@@ -57,8 +56,9 @@ AUTHENTICATION_FAILURES = frozenset((4, 5))
 IDENTIFIER_REJECTED = 2
 
 def mqtt_retry_policy() -> RetryPolicy:
-    """Reconnect in about 1, 2, 4, then 5 seconds (a printer rebooting is back fast)."""
-    return RetryPolicy(ExponentialBackoff(base=1.0, maximum=5.0))
+    """A device link's pace (:func:`device_retry_policy`): the first retry
+    within [0.5, 1.5] s, spread; later ones drifting apart, up to 5 s."""
+    return device_retry_policy()
 
 
 def mqtt_ssl_context(

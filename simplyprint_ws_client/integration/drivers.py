@@ -20,6 +20,7 @@ on the client's allocation flag.
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -799,4 +800,11 @@ class DevicePoller(DeviceDriver):
             ):
                 await self.set_reachability(DeviceReachability.DOWN)
 
-            await asyncio.sleep(self.failure_backoff if failed else self.interval)
+            await asyncio.sleep(self.failure_delay() if failed else self.interval)
+
+    def failure_delay(self) -> float:
+        """The wait after a failed poll: ``failure_backoff``, jittered down
+        to half of it. Pollers that failed together (every printer behind a
+        switch that rebooted) then poll again spread out, not in one burst
+        the moment the network is back."""
+        return self.failure_backoff * random.uniform(0.5, 1.0)
