@@ -17,7 +17,7 @@ from simplyprint_ws_client.core.state.models import (
     VolumeType,
 )
 from simplyprint_ws_client.core.state.notifications import NotificationsState
-from simplyprint_ws_client.common.model.reactive import ReactiveModel
+from simplyprint_ws_client.common.model.reactive import ReactiveModel, intercepts
 from simplyprint_ws_client.common.model.annotations import Exclusive, Untracked
 from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 from simplyprint_ws_client.core.state.utils import _resize_state_inplace
@@ -91,6 +91,7 @@ class FileProgressState(ReactiveModel):
     message: Optional[str] = None
 
     @no_type_check
+    @intercepts("state")
     def __setattr__(self, key, value):
         super().__setattr__(key, value)
 
@@ -321,6 +322,7 @@ class JobInfoState(ReactiveModel, validate_assignment=True):
     }
 
     @no_type_check
+    @intercepts("started", "finished", "cancelled", "failed")
     def __setattr__(self, key, value):
         """Only one of the 4 fields can be True at a time."""
         if key not in self.MUTUALLY_EXCLUSIVE_FIELDS:

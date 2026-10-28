@@ -465,19 +465,30 @@ class ReactiveModel(BaseModel, Synchronized):
         for a writer that projects already-typed values (an integration's
         state projection). ``True`` if it was a change.
 
-        Exactly an assignment's outcome: a model that validates assignments,
-        an untracked field or an exclusive one go through ``setattr``; for
-        the rest the value is stored the way pydantic stores a plain field
-        (instance dict and fields-set) and marked changed only if it differs.
+        Exactly an assignment's outcome: an untracked field, an exclusive one,
+        one an own ``__setattr__`` acts on, or a validated one given a value
+        its validation would change go through ``setattr``; for the rest the
+        value is stored the way pydantic stores it (instance dict and
+        fields-set) and marked changed only if it differs. A validated field
+        of a plain scalar type keeps a value of exactly that type, and turns
+        an int into a float for a float field (see ``_typed_writes``).
         """
         cls = self.__class__
         plain = _PLAIN_WRITES.get(cls)
         if plain is None or plain[0] is not cls.__pydantic_fields__:
             plain = _plain_writes(cls)
         if name not in plain[1]:
-            before = self.model_self_changed_fields.get(name)
-            setattr(self, name, value)
-            return self.model_self_changed_fields.get(name) != before
+            typed = plain[3].get(name)
+            if typed is None or type(value) not in typed:
+                before = self.model_self_changed_fields.get(name)
+                setattr(self, name, value)
+                return self.model_self_changed_fields.get(name) != before
+            if type(value) is int and float in typed:
+                if not -_EXACT_INT <= value <= _EXACT_INT:
+                    before = self.model_self_changed_fields.get(name)
+                    setattr(self, name, value)
+                    return self.model_self_changed_fields.get(name) != before
+                value = float(value)  # what validation stores
         d = self.__dict__
         original = d[name]
         d[name] = value
@@ -506,7 +517,7 @@ class ReactiveModel(BaseModel, Synchronized):
         plain = _PLAIN_WRITES.get(cls)
         if plain is None or plain[0] is not cls.__pydantic_fields__:
             plain = _plain_writes(cls)
-        _, direct, scalars = plain
+        _, direct, scalars, _typed = plain
         d = self.__dict__
         fields_set = self.__pydantic_fields_set__
         comparable = self._model_value_is_comparable_type
@@ -515,6 +526,9 @@ class ReactiveModel(BaseModel, Synchronized):
         for name, value in items:
             if name not in direct:
                 changed += self.model_write(name, value)
+                # A validated assignment replaces the instance dict.
+                d = self.__dict__
+                fields_set = self.__pydantic_fields_set__
                 continue
             original = d[name]
             d[name] = value
@@ -531,6 +545,20 @@ class ReactiveModel(BaseModel, Synchronized):
         if changed and ctx:
             ctx.signal()
         return changed
+
+    @classmethod
+    def model_writer(cls, *names: str) -> Callable[..., int]:
+        """``write(model, *values)``: ``model_write_many(zip(names, values))``
+        on a ``cls`` model, as one generated function per class and names.
+        Each field's write policy is settled when it is generated, so a call
+        is straight-line code: no per-field lookup, no pairs built, the
+        context read once, one signal. For a projection that writes the same
+        fields of a model on every report. Returns how many fields changed."""
+        key = (cls, names)
+        entry = _WRITERS.get(key)
+        if entry is None or entry[0] is not cls.__pydantic_fields__:
+            entry = _WRITERS[key] = (cls.__pydantic_fields__, _writer(cls, names))
+        return entry[1]
 
     def __getstate__(self) -> Dict[str, Any]:
         state = super().__getstate__()
@@ -641,29 +669,205 @@ def _write_policy(cls: Type["ReactiveModel"]) -> Dict[str, bool]:
     return policy
 
 
-#: ``class -> (fields, names written directly, scalar types)``: what
-#: ``model_write`` needs, in one lookup. Written directly: tracked, not
-#: Exclusive, and the model doesn't validate assignments (any other write is
-#: an assignment). The scalar types are the comparable ones a value's type
-#: can be checked against by identity (``COMPARABLE_TYPES`` decides). Keyed on
-#: the field dict like ``_TRACKED_FIELDS``.
-_PLAIN_WRITES: Dict[type, Tuple[Any, frozenset, frozenset]] = {}
+#: ``class -> (fields, names written directly, scalar types, typed
+#: names)``: what ``model_write`` needs, in one lookup. Written directly:
+#: tracked, not Exclusive, not acted on by an own ``__setattr__``, and the
+#: model doesn't validate assignments. Typed names (a validating model's):
+#: written directly given a value of one of their types (``_typed_writes``).
+#: The scalar types are the comparable ones a value's type can be checked
+#: against by identity (``COMPARABLE_TYPES`` decides). Keyed on the field
+#: dict like ``_TRACKED_FIELDS``.
+_PLAIN_WRITES: Dict[type, Tuple[Any, frozenset, frozenset, Dict[str, frozenset]]] = {}
+
+#: The largest int a float holds exactly: within it, ``float(value)`` is what
+#: a float field's validation stores; beyond, the assignment decides.
+_EXACT_INT = 2**53
 
 
-def _plain_writes(cls: Type["ReactiveModel"]) -> Tuple[Any, frozenset, frozenset]:
+def intercepts(*names: str) -> Callable[[Callable], Callable]:
+    """Declares that a model's own ``__setattr__`` acts on ``names`` only:
+    ``model_write`` may write the class's other fields directly. A model
+    whose ``__setattr__`` doesn't declare it is assigned field by field."""
+
+    def mark(setter: Callable) -> Callable:
+        setter.__intercepts__ = frozenset(names)  # type: ignore[attr-defined]
+        return setter
+
+    return mark
+
+
+def _intercepted(cls: Type["ReactiveModel"]) -> Optional[frozenset]:
+    """The names own ``__setattr__`` overrides act on, ``None`` for "any"."""
+    names: Set[str] = set()
+    for klass in cls.__mro__:
+        if klass is ReactiveModel:
+            break
+        setter = klass.__dict__.get("__setattr__")
+        if setter is None:
+            continue
+        acts_on = getattr(setter, "__intercepts__", None)
+        if acts_on is None:
+            return None
+        names.update(acts_on)
+    return frozenset(names)
+
+
+def _plain_writes(
+    cls: Type["ReactiveModel"],
+) -> Tuple[Any, frozenset, frozenset, Dict[str, frozenset]]:
     fields = cls.__pydantic_fields__
     validates = cls.model_config.get("validate_assignment")
-    direct = frozenset(
+    intercepted = _intercepted(cls)
+    writable = (
         ()
-        if validates
-        else (name for name, exclusive in _write_policy(cls).items() if not exclusive)
+        if intercepted is None
+        else [
+            name
+            for name, exclusive in _write_policy(cls).items()
+            if not exclusive and name not in intercepted
+        ]
     )
+    direct = frozenset(() if validates else writable)
+    typed = _typed_writes(cls, writable) if validates else {}
     scalars = frozenset(
         {type(None)}
         | {t for t in (int, float, str, bool) if issubclass(t, cls.COMPARABLE_TYPES)}
     )
-    entry = _PLAIN_WRITES[cls] = (fields, direct, scalars)
+    entry = _PLAIN_WRITES[cls] = (fields, direct, scalars, typed)
     return entry
+
+
+_STR_CONFIG = (
+    "str_strip_whitespace",
+    "str_to_lower",
+    "str_to_upper",
+    "str_min_length",
+    "str_max_length",
+)
+
+
+def _typed_writes(cls: Type["ReactiveModel"], names: Iterable[str]) -> Dict[str, frozenset]:
+    """A validating model's fields whose validation is known for some value
+    types: a field annotated ``X`` or ``Optional[X]``, ``X`` one of int,
+    float, str and bool, with no constraints, validators or freezing. A
+    value of exactly ``X`` (or ``None`` for an optional one) is stored as
+    given, an int as ``float(value)`` for a float field. Any other value,
+    or any field of a model with model validators, is assigned."""
+    config = cls.model_config
+    decorators = cls.__pydantic_decorators__
+    if config.get("frozen") or any(
+        (decorators.validators, decorators.root_validators, decorators.model_validators)
+    ):
+        return {}
+    validated: Set[str] = set()
+    for decorator in decorators.field_validators.values():
+        validated.update(decorator.info.fields)
+    if "*" in validated:
+        return {}
+    fields = cls.__pydantic_fields__
+    typed: Dict[str, frozenset] = {}
+    for name in names:
+        info = fields[name]
+        if name in validated or info.metadata or info.frozen:
+            continue
+        annotation = info.annotation
+        kinds: Set[type] = set()
+        if get_origin(annotation) is Union:
+            args = get_args(annotation)
+            if len(args) != 2 or type(None) not in args:
+                continue
+            kinds.add(type(None))
+            annotation = args[0] if args[1] is type(None) else args[1]
+        if annotation not in (int, float, str, bool):
+            continue
+        if annotation is str and any(config.get(key) for key in _STR_CONFIG):
+            continue
+        if annotation is float:
+            if config.get("allow_inf_nan") is False:
+                continue
+            kinds.add(int)  # stored as float(value)
+        kinds.add(annotation)
+        typed[name] = frozenset(kinds)
+    return typed
+
+
+#: ``(class, names) -> (fields, writer)``: ``model_writer``'s functions, keyed
+#: on the field dict like ``_TRACKED_FIELDS``.
+_WRITERS: Dict[Tuple[type, Tuple[str, ...]], Tuple[Any, Callable[..., int]]] = {}
+
+
+def _writer(cls: Type["ReactiveModel"], names: Tuple[str, ...]) -> Callable[..., int]:
+    """The source of ``model_writer``'s function, compiled. Per field: the
+    direct write (``model_write``'s, inline), behind a type test for a typed
+    one, or a ``model_write`` call for one that is assigned."""
+    fields = cls.__pydantic_fields__
+    for name in names:
+        if name not in fields:
+            raise AttributeError(f"{cls.__name__} has no field {name!r}")
+    _, direct, scalars, typed = _plain_writes(cls)
+    params = [f"v{i}" for i in range(len(names))]
+    lines = [
+        f"def write(m, {', '.join(params)}):",
+        "    d = m.__dict__",
+        "    fs = m.__pydantic_fields_set__",
+        "    ctx = m.ctx()",
+        "    c = 0",
+    ]
+    namespace: Dict[str, Any] = {
+        "S": scalars,
+        "EXACT": _EXACT_INT,
+    }
+
+    def direct_write(name: str, v: str, indent: str) -> None:
+        lines.extend(
+            indent + line
+            for line in (
+                f"o = d[{name!r}]",
+                f"d[{name!r}] = {v}",
+                f"fs.add({name!r})",
+                f"if not (o == {v} and (type(o) in S or m._model_value_is_comparable_type(o))"
+                f" and (type({v}) in S or m._model_value_is_comparable_type({v}))):",
+                "    c += 1",
+                "    if ctx:",
+                f"        m.model_self_changed_fields[{name!r}] = ctx.stamp_change(m, {name!r})",
+            )
+        )
+
+    def assigned(name: str, v: str, indent: str) -> None:
+        lines.extend(
+            indent + line
+            for line in (
+                f"c += m.model_write({name!r}, {v})",
+                # A validated assignment replaces the instance dict.
+                "d = m.__dict__",
+                "fs = m.__pydantic_fields_set__",
+            )
+        )
+
+    for i, (name, v) in enumerate(zip(names, params)):
+        if name in direct:
+            direct_write(name, v, "    ")
+            continue
+        kinds = typed.get(name)
+        if kinds is None:
+            assigned(name, v, "    ")
+            continue
+        namespace[f"K{i}"] = kinds
+        test = f"type({v}) in K{i}"
+        if float in kinds:
+            # An int is stored as float(value), within the exact range.
+            lines.append(
+                f"    if type({v}) is int and -EXACT <= {v} <= EXACT: {v} = float({v})"
+            )
+            test = f"type({v}) is not int and {test}"
+        lines.append(f"    if {test}:")
+        direct_write(name, v, "        ")
+        lines.append("    else:")
+        assigned(name, v, "        ")
+    lines.extend(("    if c and ctx:", "        ctx.signal()", "    return c"))
+    code = compile("\n".join(lines), f"<model_writer {cls.__qualname__}{names}>", "exec")
+    exec(code, namespace)
+    return namespace["write"]
 
 
 #: ``class -> (fields, defaults by field in field order or None, required

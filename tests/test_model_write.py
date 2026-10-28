@@ -159,3 +159,104 @@ def test_new_peripheral_entry_matches_construct_then_write():
         assert a.printer.peripherals.model_self_changed_fields == b.printer.peripherals.model_self_changed_fields
         assert (a.msg_id, a._touched_kinds) == (b.msg_id, b._touched_kinds)
         assert dict(PeripheralMsg.build(a.printer)) == dict(PeripheralMsg.build(b.printer))
+
+
+def _typed(m):
+    """Fields with their types (an int and a float compare equal), marks, fields set."""
+    return (
+        [(k, type(v), v) for k, v in m.__dict__.items() if not k.startswith("_")],
+        sorted(m.model_self_changed_fields.items()),
+        sorted(m.__pydantic_fields_set__),
+    )
+
+
+# Values a projection or anyone else may write, incl. ones validation turns
+# into something else (an int into a float), ones it refuses and the ends of
+# a float's exact int range.
+_ANY = [None, 0, 1, -3, 2**53, 2**53 + 1, 10**30, 10**400, 0.0, 1.5, 1.0, float("nan"),
+        float("inf"), True, False, "7", "x", [1], b"1"]
+
+
+def _assign(model, name, value):
+    try:
+        setattr(model, name, value)
+    except Exception as error:  # pydantic's ValidationError
+        return type(error)
+
+
+def _write(model, name, value):
+    try:
+        model.model_write(name, value)
+    except Exception as error:
+        return type(error)
+
+
+def test_validated_fields_written_as_assigned():
+    """A validating model (job info): model_write stores what validation would,
+    refuses what it refuses, and marks the same."""
+    rng = random.Random(23)
+    a, b = _pair()
+    names = list(type(a.printer.job_info).model_fields)
+    for _ in range(3000):
+        name, value = rng.choice(names), rng.choice(_ANY)
+        assert _assign(a.printer.job_info, name, value) == _write(b.printer.job_info, name, value)
+        assert (_typed(a.printer.job_info), a.msg_id) == (_typed(b.printer.job_info), b.msg_id), (name, value)
+
+
+def test_own_setattr_runs_for_the_fields_it_acts_on():
+    """FileProgressState resets the percent when the state moves: a write of
+    the state through model_write still does."""
+    from simplyprint_ws_client.core.state.models import FileProgressStateEnum
+
+    a, b = _pair()
+    for model in (a.printer.file_progress, b.printer.file_progress):
+        model.percent = 40.0
+    a.printer.file_progress.state = FileProgressStateEnum.READY
+    b.printer.file_progress.model_write("state", FileProgressStateEnum.READY)
+    assert b.printer.file_progress.percent == 0.0
+    assert (_typed(a.printer.file_progress), a.msg_id) == (_typed(b.printer.file_progress), b.msg_id)
+
+
+def test_model_writer_is_model_write_many():
+    """The generated writer leaves each model as model_write_many with the
+    same names does: plain, validated and intercepted fields, any values."""
+    rng = random.Random(29)
+    a, b = _pair()
+    targets = [
+        (lambda p: p.peripherals, None),  # replaced below by an entry
+        (lambda p: p.job_info, ["progress", "time", "layer", "filename", "started", "skipped_objects"]),
+        (lambda p: p.bed.temperature, ["actual", "target"]),
+        (lambda p: p.file_progress, ["state", "percent", "message"]),
+        (lambda p: p.info, ["ui", "core_count", "is_ethernet"]),
+    ]
+    for client in (a, b):
+        client.printer.peripherals.update("fan:x", value=1, available=True, updated=1)
+    targets[0] = (lambda p: p.peripherals.entries["fan:x"], ["value", "available", "updated", "id"])
+    from simplyprint_ws_client.core.state.models import FileProgressStateEnum
+
+    values = _ANY + list(FileProgressStateEnum)
+    for _ in range(2000):
+        get, names = rng.choice(targets)
+        chosen = tuple(rng.sample(names, rng.randint(1, len(names))))
+        items = [(name, rng.choice(values)) for name in chosen]
+        try:
+            expected = get(a.printer).model_write_many(items)
+        except Exception as error:
+            expected = type(error)
+        writer = type(get(b.printer)).model_writer(*chosen)
+        try:
+            got = writer(get(b.printer), *(v for _, v in items))
+        except Exception as error:
+            got = type(error)
+        assert expected == got, items
+        assert (_typed(get(a.printer)), a.msg_id) == (_typed(get(b.printer)), b.msg_id), items
+
+
+def test_model_writer_is_built_once_and_checks_names():
+    from simplyprint_ws_client.core.state.printer import TemperatureState
+
+    assert TemperatureState.model_writer("actual", "target") is TemperatureState.model_writer("actual", "target")
+    import pytest
+
+    with pytest.raises(AttributeError):
+        TemperatureState.model_writer("nope")
