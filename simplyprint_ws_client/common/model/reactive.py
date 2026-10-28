@@ -175,7 +175,7 @@ class ReactiveModel(BaseModel, Synchronized):
         object.__setattr__(m, "__pydantic_fields_set__", set(values))
         object.__setattr__(m, "__pydantic_extra__", None)
         object.__setattr__(m, "__pydantic_private__", None)
-        Synchronized.__init__(m)
+        Synchronized.lazily(m)  # entries are rarely locked: no lock until one is
         object.__setattr__(m, "ctx", ctx)
         object.__setattr__(m, "model_self_changed_fields", {})
         return m

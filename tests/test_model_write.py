@@ -260,3 +260,20 @@ def test_model_writer_is_built_once_and_checks_names():
 
     with pytest.raises(AttributeError):
         TemperatureState.model_writer("nope")
+
+
+def test_a_fresh_entry_makes_its_lock_on_first_use():
+    """model_fresh builds no lock; ``with`` makes one, and still refuses a
+    re-entry from the same thread."""
+    import pytest
+    from simplyprint_ws_client.core.state.printer import PeripheralState
+
+    entry = PeripheralState.model_fresh(lambda: None, {"id": "fan:x"})
+    assert "_Synchronized__lock" not in entry.__dict__
+    with entry:
+        pass
+    lock = entry.__dict__["_Synchronized__lock"]
+    with entry:
+        assert entry.__dict__["_Synchronized__lock"] is lock
+        with pytest.raises(RuntimeError):
+            entry.__enter__()
