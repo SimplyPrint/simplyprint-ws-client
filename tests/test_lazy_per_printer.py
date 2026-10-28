@@ -14,11 +14,15 @@ from yarl import URL
 
 from simplyprint_ws_client import ClientContext, PrinterClient, PrinterConfig
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
-from simplyprint_ws_client.common.utils.synchronized import locked_on_first_use
+from simplyprint_ws_client.common.utils.synchronized import (
+    LOCKED_ON_FIRST_USE,
+    locked_on_first_use,
+)
 from simplyprint_ws_client.core.client import class_routes
 from simplyprint_ws_client.core.protocol.messages import WebcamSnapshotDemandData
 from simplyprint_ws_client.core.protocol.models import DemandMsgType, ServerMsgType
 from simplyprint_ws_client.core.state import PrinterState
+from simplyprint_ws_client.core.state.printer import ToolState
 from simplyprint_ws_client.events.event import Event
 from simplyprint_ws_client.events.event_bus import EventBus, Routes
 from simplyprint_ws_client.integration.camera.controller import CameraController
@@ -223,6 +227,21 @@ def test_two_threads_entering_first_share_one_lock():
     for thread in threads:
         thread.join()
     assert len(set(map(id, locks))) == 1
+
+
+def test_the_block_form_nests_and_ends_with_its_block():
+    with LOCKED_ON_FIRST_USE:
+        with LOCKED_ON_FIRST_USE:
+            inner = ToolState(nozzle=0)
+        outer = ToolState(nozzle=1)
+    with pytest.raises(KeyError):
+        with LOCKED_ON_FIRST_USE:
+            raise KeyError
+    after = ToolState(nozzle=2)
+    assert not any(_locks(inner)) and not any(_locks(outer))
+    assert all(_locks(after))
+    with outer:  # locks as an eager one
+        assert outer.__dict__["_Synchronized__lock"].locked()
 
 
 def test_a_lazy_printer_and_its_reset_state_lock_on_first_use():

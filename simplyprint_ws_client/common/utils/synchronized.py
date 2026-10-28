@@ -7,11 +7,29 @@ T = TypeVar("T")
 
 
 class _Lazy(threading.local):
-    #: Within :func:`locked_on_first_use` on this thread.
-    on = False
+    #: How many :func:`locked_on_first_use` blocks this thread is in.
+    depth = 0
 
 
 _LAZY = _Lazy()
+
+
+class _LockedOnFirstUse:
+    """``with LOCKED_ON_FIRST_USE:``, :func:`locked_on_first_use` for a
+    block. One object for every caller (the depth is the thread's), so code
+    that runs per report (a projection that may add state models) pays
+    nothing to build it. Nests."""
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        _LAZY.depth += 1
+
+    def __exit__(self, *exc_info) -> None:
+        _LAZY.depth -= 1
+
+
+LOCKED_ON_FIRST_USE = _LockedOnFirstUse()
 
 
 def locked_on_first_use(build: Callable[[], T]) -> T:
@@ -20,13 +38,8 @@ def locked_on_first_use(build: Callable[[], T]) -> T:
     :meth:`Synchronized.lazily` does. The same locking either way: the first
     enter creates the lock atomically. For state built per printer whose
     models are rarely or never locked."""
-    if _LAZY.on:
+    with LOCKED_ON_FIRST_USE:
         return build()
-    _LAZY.on = True
-    try:
-        return build()
-    finally:
-        _LAZY.on = False
 
 
 class Synchronized:

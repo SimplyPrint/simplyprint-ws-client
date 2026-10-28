@@ -146,7 +146,7 @@ class ReactiveModel(BaseModel, Synchronized):
 
     def __init__(self, ctx: ContextRef = lambda: None, **kwargs: Any) -> None:
         BaseModel.__init__(self, **kwargs)
-        if _LAZY.on:  # within locked_on_first_use
+        if _LAZY.depth:  # within locked_on_first_use
             Synchronized.lazily(self)
         else:
             Synchronized.__init__(self)
