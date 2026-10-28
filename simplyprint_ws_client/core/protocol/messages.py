@@ -619,6 +619,29 @@ class ClientMsg(Msg[TMsgType, Optional[dict]]):
     def __init__(self, data: Optional[dict] = None, **kwargs):
         super().__init__(type=self.msg_type(), data=data, **kwargs)
 
+    @classmethod
+    def prebuilt(cls, data: dict) -> "ClientMsg":
+        """``cls(data)`` for a ``data`` dict built for this message alone,
+        without validation: the class's type, fields order and private
+        defaults are worked out once (its template) and copied. A class with
+        its own ``__init__``, validators, other fields or a ``data`` that isn't
+        a plain dict is built the validated way. ``consume`` builds every
+        state message of a :attr:`~Client.prebuilt_messages` client so."""
+        template = _PREBUILT.get(cls)
+        if template is None or template[0] is not cls.__pydantic_fields__:
+            template = _prebuilt_template(cls)
+        _, msg_type, private = template
+        if msg_type is None:
+            return cls(data)
+        m = cls.__new__(cls)
+        object.__setattr__(
+            m, "__dict__", {"type": msg_type, "data": data, "for_client": None}
+        )
+        _set_fields_set(m, {"type", "data"})  # its own: ``for`` is set later
+        _set_extra(m, None)
+        _set_private(m, private.copy() if private else None)
+        return m
+
     @property
     def write_outcome(self) -> Optional[WriteOutcome]:
         """What became of this message's frame (``None``: nobody reported)."""
@@ -691,6 +714,60 @@ class ClientMsg(Msg[TMsgType, Optional[dict]]):
         """
         _ = self
         return DispatchMode.DISPATCH
+
+
+_set_fields_set = BaseModel.__dict__["__pydantic_fields_set__"].__set__
+_set_extra = BaseModel.__dict__["__pydantic_extra__"].__set__
+_set_private = BaseModel.__dict__["__pydantic_private__"].__set__
+
+#: Per message class: (its fields, its type, its private defaults), or a type
+#: of ``None`` for a class built the validated way (``ClientMsg.prebuilt``).
+_PREBUILT: Dict[type, Tuple[Any, Any, Dict[str, Any]]] = {}
+
+_PREBUILT_FIELDS = ("type", "data", "for_client")
+
+
+def _sets_only_private(cls: type) -> bool:
+    """Whether ``cls``'s post-init is none, or pydantic's own setting of the
+    private attributes' defaults (which ``prebuilt`` copies)."""
+    post_init = cls.__pydantic_post_init__
+    if post_init is None:
+        return True
+    function = getattr(cls, post_init)
+    return (
+        function.__name__ == "init_private_attributes"
+        and function.__module__.startswith("pydantic.")
+    )
+
+
+def _prebuilt_template(cls: type) -> Tuple[Any, Any, Dict[str, Any]]:
+    fields = cls.__pydantic_fields__
+    decorators = cls.__pydantic_decorators__
+    private: Optional[Dict[str, Any]] = {}
+    for name, attr in (cls.__private_attributes__ or {}).items():
+        if attr.default_factory is not None or not isinstance(
+            attr.default, (NoneType, bool, int, float, str)
+        ):
+            private = None
+            break
+        private[name] = attr.default
+    plain = (
+        private is not None
+        and cls.__init__ is ClientMsg.__init__
+        and tuple(fields) == _PREBUILT_FIELDS
+        and fields["data"].annotation == Optional[dict]
+        and not cls.model_config.get("validate_default")
+        and not (
+            decorators.validators
+            or decorators.field_validators
+            or decorators.root_validators
+            or decorators.model_validators
+        )
+        and _sets_only_private(cls)
+    )
+    template = (fields, cls.msg_type() if plain else None, private)
+    _PREBUILT[cls] = template
+    return template
 
 
 class MultiPrinterAddConnectionMsg(ClientMsg[Literal[ClientMsgType.ADD_CONNECTION]]):
@@ -1157,7 +1234,13 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
         state.peripherals.model_reset_changed("entries", v=v)
 
         for peripheral in state.peripherals.entries.values():
-            if peripheral.model_self_changed_fields:  # else nothing to reset
+            changed = peripheral.model_self_changed_fields
+            if not changed:  # nothing to reset
+                continue
+            # Built from these marks just now: none is newer, the slot clears.
+            if v is None or max(changed.values()) <= v:
+                peripheral.model_reset_changed()
+            else:
                 peripheral.model_reset_changed(v=v)
 
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:

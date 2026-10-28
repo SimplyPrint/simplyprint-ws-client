@@ -576,14 +576,33 @@ def _pair() -> Tuple[_FastClient, Client]:
     return clients[0], clients[1]
 
 
+def _whole(msgs: List[ClientMsg]) -> list:
+    """Each message as built: its fields (in order), the fields set, its
+    private and extra attributes and both its frames."""
+    return [
+        (
+            type(m),
+            list(m.__dict__.items()),
+            m.__pydantic_fields_set__,
+            m.__pydantic_private__,
+            m.__pydantic_extra__,
+            m.model_dump(mode="json"),
+            m.model_dump_json(),
+        )
+        for m in msgs
+    ]
+
+
+@pytest.mark.parametrize("prebuilt", [False, True])
 @pytest.mark.parametrize("seed", range(40))
-def test_consume_matches_the_full_scan(seed, monkeypatch):
+def test_consume_matches_the_full_scan(seed, prebuilt, monkeypatch):
     # Rate limits read the clock: both clients read this one.
     clock = [10_000_000]
     monkeypatch.setattr(Intervals, "now", staticmethod(lambda: clock[0]))
 
     rng = random.Random(seed)
     fast, scan = _pair()
+    fast.prebuilt_messages = prebuilt  # the scan's are validated
     edits = [edit for edit, _ in _EDITS]
     weights = [weight for _, weight in _EDITS]
 
@@ -601,6 +620,7 @@ def test_consume_matches_the_full_scan(seed, monkeypatch):
             # What consume read as changed: the scan's kinds, versions, order.
             assert list(fast.read_kinds.items()) == list(want_kinds.items())
             assert _wire(got) == _wire(want), (seed, step, mode)
+            assert _whole(got) == _whole(want), (seed, step, mode)
         elif roll < 0.27:
             clock[0] += rng.choice([0, 100, 1_000, 3_000, 6_000, 40_000])
         else:

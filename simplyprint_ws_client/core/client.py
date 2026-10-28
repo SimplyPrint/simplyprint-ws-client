@@ -207,6 +207,26 @@ def _field_version(
     return latest
 
 
+def _peripherals_version(peripherals: PeripheralsState) -> Optional[int]:
+    """``_field_version(peripherals, "entries", entries)``: an entry of the
+    framework's own class nests nothing, so its newest change is its newest
+    mark; any other is walked."""
+    latest = peripherals.model_self_changed_fields.get("entries")
+    for entry in peripherals.entries.values():
+        if type(entry) is PeripheralState:
+            own = entry.model_self_changed_fields
+            if not own:
+                continue
+            entry_latest = max(own.values())
+        else:
+            entry_latest = entry.model_latest_change()
+            if entry_latest is None:
+                continue
+        if latest is None or entry_latest > latest:
+            latest = entry_latest
+    return latest
+
+
 _Versions = Callable[[PrinterState], Iterable[Optional[int]]]
 
 #: Every message kind built from the printer state, in build order (a tie in
@@ -275,12 +295,7 @@ _MESSAGE_KINDS: Tuple[Tuple[Type[ClientMsg], _Versions], ...] = (
             ),
         ),
     ),
-    (
-        PeripheralMsg,
-        lambda s: (
-            _field_version(s.peripherals, "entries", s.peripherals.entries.values()),
-        ),
-    ),
+    (PeripheralMsg, lambda s: (_peripherals_version(s.peripherals),)),
 )
 
 
@@ -670,6 +685,12 @@ class Client(
     #: build. A lazy class's routes are its ``_route_table``.
     lazy_per_printer: ClassVar[bool] = False
 
+    #: ``consume`` builds each state message as :meth:`ClientMsg.prebuilt`,
+    #: not through validation: its data is a dict built for it alone, so the
+    #: message is the same (fields, frame and equality); a class that needs
+    #: validation is still built the validated way.
+    prebuilt_messages: ClassVar[bool] = False
+
     _CORE_ROUTES = _CORE_ROUTES
 
     _state: VersionedState
@@ -1012,6 +1033,7 @@ class Client(
         is_pending = self.printer.config.is_pending()
 
         msgs = []
+        prebuilt = self.prebuilt_messages
 
         # Sort by the lowest version.
         for msg_kind, (lowest, highest) in sorted(
@@ -1026,7 +1048,7 @@ class Client(
             if not data:
                 continue
 
-            msg = msg_kind(data)
+            msg = msg_kind.prebuilt(data) if prebuilt else msg_kind(data)
 
             # Skip over messages that are not supposed to be sent.
             dispatch_mode = msg.dispatch_mode(self.printer)
