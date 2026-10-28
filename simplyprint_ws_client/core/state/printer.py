@@ -17,7 +17,14 @@ from simplyprint_ws_client.core.state.models import (
     VolumeType,
 )
 from simplyprint_ws_client.core.state.notifications import NotificationsState
-from simplyprint_ws_client.common.model.reactive import ReactiveModel, intercepts
+from simplyprint_ws_client.common.model.reactive import (
+    SHARED_MARKS,
+    ReactiveModel,
+    SharedFields,
+    _set_changed,
+    intercepts,
+    shared_context,
+)
 from simplyprint_ws_client.common.model.annotations import Exclusive, Untracked
 from simplyprint_ws_client.common.hardware.physical_machine import PhysicalMachine
 from simplyprint_ws_client.core.state.utils import _resize_state_inplace
@@ -152,6 +159,19 @@ class PSUState(ReactiveModel):
 _PERIPHERAL_UNSET = object()
 
 
+def _unchanged(current: Any, value: Any) -> bool:
+    """Writing ``value`` over a shared entry's ``current`` would change and
+    mark nothing (``model_write`` on a plain value)."""
+    return (
+        value is _PERIPHERAL_UNSET
+        or value is current
+        or (type(value) is type(current) in _PLAIN and value == current)
+    )
+
+
+_PLAIN = frozenset({int, float, bool, str})
+
+
 class PeripheralHandle:
     def __init__(self, peripherals: "PeripheralsState", peripheral_id: str):
         self.peripherals = peripherals
@@ -209,8 +229,71 @@ class PeripheralState(ReactiveModel):
     updated: Optional[int] = Field(None, alias="u")
 
 
+#: Unavailable entries several printers hold (``share_unavailable``), by
+#: (id, updated): what makes two of them the same entry.
+_SHARED_UNAVAILABLE: Dict[Tuple[str, Optional[int]], PeripheralState] = {}
+#: Entries the cache holds before it is emptied (printers keep theirs).
+_SHARED_LIMIT = 1024
+
+
+def _shared_unavailable(peripheral_id: str, updated: Optional[int]) -> PeripheralState:
+    key = (peripheral_id, updated)
+    entry = _SHARED_UNAVAILABLE.get(key)
+    if entry is None:
+        if len(_SHARED_UNAVAILABLE) >= _SHARED_LIMIT:
+            _SHARED_UNAVAILABLE.clear()
+        entry = PeripheralState.model_fresh(
+            shared_context,
+            {"id": peripheral_id, "value": None, "available": False, "updated": updated},
+        )
+        object.__setattr__(entry, "__dict__", SharedFields(entry.__dict__))
+        _set_changed(entry, SHARED_MARKS)
+        entry = _SHARED_UNAVAILABLE.setdefault(key, entry)
+    return entry
+
+
 class PeripheralsState(ReactiveModel):
     entries: Dict[str, PeripheralState] = Field(default_factory=dict)
+
+    def share_unavailable(self) -> None:
+        """Each entry that is unavailable with nothing left to send (a fan
+        the printer doesn't report, once SimplyPrint has it) becomes the one
+        object every printer with that entry holds: the same id, value
+        (none), availability and second. A shared entry has no marks and is
+        bound to no printer; a write takes this printer's own copy first
+        (:meth:`own`), so nothing it builds or sends changes."""
+        entries = self.entries
+        for peripheral_id, entry in entries.items():
+            changed = entry.model_self_changed_fields
+            if (
+                entry.available is False
+                and entry.value is None
+                and not changed
+                and changed is not SHARED_MARKS
+                and type(entry) is PeripheralState
+                and entry.id == peripheral_id
+            ):
+                # Replacing a key's value is not a resize: the walk goes on.
+                entries[peripheral_id] = _shared_unavailable(peripheral_id, entry.updated)
+
+    def own(self, peripheral_id: str) -> PeripheralState:
+        """The entry, as this printer's own: a shared one (see
+        :meth:`share_unavailable`) is replaced by a copy bound to this
+        printer, with its values and nothing marked (it was sent)."""
+        entry = self.entries[peripheral_id]
+        if entry.model_self_changed_fields is not SHARED_MARKS:
+            return entry
+        own = PeripheralState.model_fresh(
+            self.ctx,
+            {
+                "id": entry.id,
+                "value": entry.value,
+                "available": entry.available,
+                "updated": entry.updated,
+            },
+        )
+        self.entries[peripheral_id] = own
+        return own
 
     def get(self, peripheral_id: str) -> Optional[PeripheralState]:
         return self.entries.get(peripheral_id)
@@ -242,6 +325,15 @@ class PeripheralsState(ReactiveModel):
 
         if entry is None:
             return self._add(peripheral_id, value, available, updated)
+
+        if entry.model_self_changed_fields is SHARED_MARKS:
+            if (
+                _unchanged(entry.value, value)
+                and _unchanged(entry.available, available)
+                and _unchanged(entry.updated, updated)
+            ):
+                return entry  # writes nothing: stays shared
+            entry = self.own(peripheral_id)
 
         # An assignment's outcome, without pydantic's setattr dispatch: every
         # report that moves a fan or light comes through here.

@@ -593,9 +593,10 @@ def _whole(msgs: List[ClientMsg]) -> list:
     ]
 
 
+@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("prebuilt", [False, True])
 @pytest.mark.parametrize("seed", range(40))
-def test_consume_matches_the_full_scan(seed, prebuilt, monkeypatch):
+def test_consume_matches_the_full_scan(seed, prebuilt, shared, monkeypatch):
     # Rate limits read the clock: both clients read this one.
     clock = [10_000_000]
     monkeypatch.setattr(Intervals, "now", staticmethod(lambda: clock[0]))
@@ -603,6 +604,7 @@ def test_consume_matches_the_full_scan(seed, prebuilt, monkeypatch):
     rng = random.Random(seed)
     fast, scan = _pair()
     fast.prebuilt_messages = prebuilt  # the scan's are validated
+    fast.shared_peripherals = shared  # the scan's entries are its own
     edits = [edit for edit, _ in _EDITS]
     weights = [weight for _, weight in _EDITS]
 

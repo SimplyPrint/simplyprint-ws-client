@@ -1243,6 +1243,10 @@ class PeripheralMsg(ClientMsg[Literal[ClientMsgType.PERIPHERAL]]):
             else:
                 peripheral.model_reset_changed(v=v)
 
+        live = state.peripherals.ctx()
+        if live is not None and getattr(live, "shared_peripherals", False):
+            state.peripherals.share_unavailable()
+
     def dispatch_mode(self, state: PrinterState) -> DispatchMode:
         return state.intervals.dispatch_mode(Interval.PERIPHERAL)
 

@@ -141,7 +141,7 @@ from simplyprint_ws_client.common.utils.synchronized import locked_on_first_use
 from simplyprint_ws_client.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.logging import printer_logger
-from simplyprint_ws_client.common.model.reactive import ReactiveModel
+from simplyprint_ws_client.common.model.reactive import SHARED_MARKS, ReactiveModel
 from simplyprint_ws_client.common.utils.backoff import Backoff, ExponentialBackoff
 
 if TYPE_CHECKING:
@@ -482,7 +482,10 @@ def _resend_materials(state: PrinterState) -> None:
 
 
 def _resend_peripherals(state: PrinterState) -> None:
-    for peripheral in state.peripherals.entries.values():
+    peripherals = state.peripherals
+    for peripheral_id, peripheral in list(peripherals.entries.items()):
+        if peripheral.model_self_changed_fields is SHARED_MARKS:
+            peripheral = peripherals.own(peripheral_id)  # marks are its own
         _mark_present(peripheral, "value", "available", "updated")
 
 
@@ -690,6 +693,13 @@ class Client(
     #: message is the same (fields, frame and equality); a class that needs
     #: validation is still built the validated way.
     prebuilt_messages: ClassVar[bool] = False
+
+    #: Once sent, a peripheral entry that is unavailable (a fan the printer
+    #: doesn't report) is the one object every printer with that entry, at
+    #: that second, holds (``PeripheralsState.share_unavailable``): a farm's
+    #: unread fans and lights cost one entry each, not one per printer. A
+    #: write takes the printer's own copy first; the messages are the same.
+    shared_peripherals: ClassVar[bool] = False
 
     _CORE_ROUTES = _CORE_ROUTES
 

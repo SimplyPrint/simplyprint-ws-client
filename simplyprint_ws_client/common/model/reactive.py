@@ -7,6 +7,7 @@ import enum
 import functools
 import weakref
 from itertools import repeat
+from types import MappingProxyType
 from typing import (
     Callable,
     Optional,
@@ -35,6 +36,42 @@ from simplyprint_ws_client.common.utils.synchronized import Synchronized, _LAZY
 from simplyprint_ws_client.common.model.annotations import _is_exclusive, _is_untracked
 
 TReactiveModel = TypeVar("TReactiveModel", bound="ReactiveModel")
+
+#: The marks of a model several state trees hold at once (a shared
+#: peripheral entry, see ``PeripheralsState.share_unavailable``): it has
+#: none, and none can be added. Its owner swaps it for its own copy before a
+#: write (``PeripheralsState.own``).
+SHARED_MARKS: "collections.abc.Mapping[str, int]" = MappingProxyType({})
+
+
+def _read_only(*_args: Any, **_kwargs: Any) -> None:
+    raise TypeError("a shared state model is read-only: take the owner's copy first")
+
+
+class SharedFields(dict):
+    """A shared model's fields (its instance dict): read-only, so a write
+    that reaches it (an assignment, ``model_write``, a generated writer)
+    fails before it changes anything. A copy is an ordinary dict."""
+
+    __slots__ = ()
+    __setitem__ = __delitem__ = _read_only
+    update = pop = popitem = setdefault = clear = _read_only
+
+    def __copy__(self) -> dict:
+        return dict(self)
+
+    def __deepcopy__(self, memo: dict) -> dict:
+        import copy
+
+        return copy.deepcopy(dict(self), memo)
+
+    def __reduce__(self) -> tuple:
+        return dict, (dict(self),)
+
+
+def shared_context() -> None:
+    """A shared model's context: it belongs to no tree."""
+    _read_only()
 
 
 class ReactiveContext(Protocol):
@@ -231,6 +268,8 @@ class ReactiveModel(BaseModel, Synchronized):
     def _bind_context(
         self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
     ) -> None:
+        if self.model_self_changed_fields is SHARED_MARKS:
+            return  # held by other trees too: bound to none
         if isinstance(ctx, ReactiveModel):
             object.__setattr__(self, "ctx", ctx.ctx)
         else:
