@@ -142,6 +142,10 @@ class CameraController:
         self._stream_retry_delay = self._STREAM_RETRY_MIN
         self._stream_retry_handle: Optional[asyncio.TimerHandle] = None
 
+    def follow(self, printer: PrinterState) -> None:
+        """Report into ``printer`` from now on (the client replaced its state)."""
+        self._printer = printer
+
     @property
     def has_pool(self) -> bool:
         """Cameras are on for this app: a URI can be streamed."""

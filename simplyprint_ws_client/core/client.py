@@ -14,13 +14,17 @@ import random
 import re
 import time
 import weakref
+from types import FunctionType
 from datetime import timedelta, datetime
 from enum import IntEnum
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
+    ClassVar,
     Dict,
     Generic,
+    Hashable,
     Iterable,
     Iterator,
     Literal,
@@ -132,6 +136,8 @@ from simplyprint_ws_client.core.state.printer import (
 )
 
 from simplyprint_ws_client.events import EventBus, Event
+from simplyprint_ws_client.events.event_bus import Routes
+from simplyprint_ws_client.common.utils.synchronized import locked_on_first_use
 from simplyprint_ws_client.events.event import sync_only
 from simplyprint_ws_client.common.asyncio.event_loop_provider import EventLoopProvider
 from simplyprint_ws_client.common.logging import printer_logger
@@ -571,6 +577,59 @@ class _SignalBatch:
 PENDING_REPLY_TIMEOUT = timedelta(seconds=45)
 
 
+#: (event, method name, options): the protocol state machine's fixed routes.
+#: This table is intentionally explicit: event selection, ordering, and
+#: handler arity are visible here and cannot change because a method was
+#: renamed or received a different annotation.
+_P1: Dict[str, Any] = {"priority": 1}
+_CORE_ROUTES: Tuple[Tuple[Hashable, str, Dict[str, Any]], ...] = (
+    (SimplyPrintConnectionIncomingEvent, "_on_connection_incoming", {}),
+    (SimplyPrintConnectionEstablishedEvent, "_on_connection_established", {}),
+    (SimplyPrintConnectionLostEvent, "_on_connection_lost", {}),
+    (ServerMsgType.ADD_CONNECTION, "_on_multi_printer_added", _P1),
+    (ServerMsgType.REMOVE_CONNECTION, "_on_multi_printer_removed", _P1),
+    (ServerMsgType.CONNECTED, "_on_connected_state", {"priority": 2}),
+    (ServerMsgType.ERROR, "_on_error", _P1),
+    (ServerMsgType.NEW_TOKEN, "_on_new_token", _P1),
+    (ServerMsgType.CONNECTED, "_on_connected_data", _P1),
+    (ServerMsgType.COMPLETE_SETUP, "_on_setup_complete", _P1),
+    (ServerMsgType.INTERVAL_CHANGE, "_on_interval_change", _P1),
+    (ServerMsgType.PONG, "_on_pong", _P1),
+    (ServerMsgType.PRINTER_SETTINGS, "_on_printer_settings", _P1),
+    (ServerMsgType.STREAM_RECEIVED, "_on_stream_received", _P1),
+    (DemandMsgType.WEBCAM_SNAPSHOT, "_on_webcam_snapshot", _P1),
+    (DemandMsgType.FILE, "_on_file_demand", _P1),
+    (DemandMsgType.SET_MATERIAL_DATA, "_apply_material_data", _P1),
+    (DemandMsgType.REFRESH_MATERIAL_DATA, "on_refresh_material_data", _P1),
+    (DemandMsgType.REFRESH_PERIPHERALS, "on_refresh_peripherals", _P1),
+    (DemandMsgType.RESOLVE_NOTIFICATION, "_on_resolve_notification", _P1),
+)
+
+#: Class -> (its route functions, its Routes): built once per class, again
+#: only if one of its route methods was replaced since (a test's patch).
+_CLASS_ROUTES: "weakref.WeakKeyDictionary[type, Tuple[tuple, Optional[Routes]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def class_routes(cls: type) -> Optional[Routes]:
+    """The class's fixed routes (``_route_table``) as one shared table, or
+    ``None`` when a route is not a plain method (registered per instance)."""
+    table = cls._route_table()
+    functions = tuple([getattr(cls, name) for _, name, _ in table])
+    cached = _CLASS_ROUTES.get(cls)
+    if cached is not None and cached[0] == functions:
+        return cached[1]
+    routes: Optional[Routes] = None
+    if all(isinstance(function, FunctionType) for function in functions):
+        routes = Routes(
+            (event_type, function, options)
+            for (event_type, _, options), function in zip(table, functions)
+        )
+    _CLASS_ROUTES[cls] = (functions, routes)
+    return routes
+
+
 class Client(
     Generic[TConfig],
     EventLoopProvider[asyncio.AbstractEventLoop],
@@ -601,6 +660,17 @@ class Client(
     printer: PrinterState
     event_bus: EventBus
     logger: logging.Logger
+
+    #: Build what every printer of the class builds alike once per class or
+    #: on first use, not with each printer: the fixed event routes as one
+    #: class table (:func:`class_routes`), the state models' locks on their
+    #: first ``with`` (:func:`locked_on_first_use`) and, on a
+    #: ``PrinterClient``, the camera controller on first camera use. The
+    #: behaviour is the same; a printer costs fewer objects and less time to
+    #: build. A lazy class's routes are its ``_route_table``.
+    lazy_per_printer: ClassVar[bool] = False
+
+    _CORE_ROUTES = _CORE_ROUTES
 
     _state: VersionedState
     _pending_action_backoff: Backoff
@@ -668,56 +738,36 @@ class Client(
         self._pending_action_delay = timedelta.min
         self._pending_action_ts = datetime.min
         self._pending_action_log_ts = datetime.min
-        self.event_bus = EventBus(event_loop_provider=self)
-        self.printer = PrinterState(config=config)
+        routes = class_routes(type(self)) if self.lazy_per_printer else None
+        #: The fixed routes are the class's (``lazy_per_printer``), not
+        #: registered on this printer's bus.
+        self._routed = routes is not None
+        self.event_bus = EventBus(
+            event_loop_provider=self, routes=routes, owner=self if routes else None
+        )
+        self.printer = self._new_printer_state(config)
         self.printer.provide_context(weakref.ref(self))
         self.logger = printer_logger(self.unique_id)
-        self._register_core_handlers()
+        if not self._routed:
+            self._register_core_handlers()
+
+    def _new_printer_state(self, config: TConfig) -> PrinterState:
+        if self.lazy_per_printer:
+            return locked_on_first_use(lambda: PrinterState(config=config))
+        return PrinterState(config=config)
 
     def _register_core_handlers(self) -> None:
-        """Install the protocol state machine's fixed routes.
-
-        This table is intentionally explicit: event selection, ordering, and
-        handler arity are visible here and cannot change because a method was
-        renamed or received a different annotation.
-        """
+        """Install the protocol state machine's fixed routes (``_CORE_ROUTES``)."""
         on = self.event_bus.on
-        on(SimplyPrintConnectionIncomingEvent, self._on_connection_incoming)
-        on(SimplyPrintConnectionEstablishedEvent, self._on_connection_established)
-        on(SimplyPrintConnectionLostEvent, self._on_connection_lost)
-        on(ServerMsgType.ADD_CONNECTION, self._on_multi_printer_added, priority=1)
-        on(
-            ServerMsgType.REMOVE_CONNECTION,
-            self._on_multi_printer_removed,
-            priority=1,
-        )
-        on(ServerMsgType.CONNECTED, self._on_connected_state, priority=2)
-        on(ServerMsgType.ERROR, self._on_error, priority=1)
-        on(ServerMsgType.NEW_TOKEN, self._on_new_token, priority=1)
-        on(ServerMsgType.CONNECTED, self._on_connected_data, priority=1)
-        on(ServerMsgType.COMPLETE_SETUP, self._on_setup_complete, priority=1)
-        on(ServerMsgType.INTERVAL_CHANGE, self._on_interval_change, priority=1)
-        on(ServerMsgType.PONG, self._on_pong, priority=1)
-        on(ServerMsgType.PRINTER_SETTINGS, self._on_printer_settings, priority=1)
-        on(ServerMsgType.STREAM_RECEIVED, self._on_stream_received, priority=1)
-        on(DemandMsgType.WEBCAM_SNAPSHOT, self._on_webcam_snapshot, priority=1)
-        on(DemandMsgType.FILE, self._on_file_demand, priority=1)
-        on(DemandMsgType.SET_MATERIAL_DATA, self._apply_material_data, priority=1)
-        on(
-            DemandMsgType.REFRESH_MATERIAL_DATA,
-            self.on_refresh_material_data,
-            priority=1,
-        )
-        on(
-            DemandMsgType.REFRESH_PERIPHERALS,
-            self.on_refresh_peripherals,
-            priority=1,
-        )
-        on(
-            DemandMsgType.RESOLVE_NOTIFICATION,
-            self._on_resolve_notification,
-            priority=1,
-        )
+        for event_type, name, options in self._CORE_ROUTES:
+            on(event_type, getattr(self, name), **options)
+
+    @classmethod
+    def _route_table(cls) -> Tuple[Tuple[Hashable, str, Dict[str, Any]], ...]:
+        """Every fixed route of the class, in registration order: the class
+        routes of a :attr:`lazy_per_printer` client. A subclass with routes
+        of its own extends it (and registers them itself when not lazy)."""
+        return cls._CORE_ROUTES
 
     @property
     def unique_id(self) -> Union[str, int]:

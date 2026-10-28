@@ -31,7 +31,7 @@ from typing import (
 from pydantic import BaseModel, PrivateAttr
 from pydantic.fields import FieldInfo
 
-from simplyprint_ws_client.common.utils.synchronized import Synchronized
+from simplyprint_ws_client.common.utils.synchronized import Synchronized, _LAZY
 from simplyprint_ws_client.common.model.annotations import _is_exclusive, _is_untracked
 
 TReactiveModel = TypeVar("TReactiveModel", bound="ReactiveModel")
@@ -146,7 +146,10 @@ class ReactiveModel(BaseModel, Synchronized):
 
     def __init__(self, ctx: ContextRef = lambda: None, **kwargs: Any) -> None:
         BaseModel.__init__(self, **kwargs)
-        Synchronized.__init__(self)
+        if _LAZY.on:  # within locked_on_first_use
+            Synchronized.lazily(self)
+        else:
+            Synchronized.__init__(self)
         # Default to static no-context to prevent unnecessary errors
         object.__setattr__(self, "ctx", ctx)
         self.model_reset_changed()

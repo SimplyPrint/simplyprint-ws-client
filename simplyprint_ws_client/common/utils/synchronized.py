@@ -1,6 +1,32 @@
 import threading
+from typing import Callable, TypeVar
 
 from pydantic import PrivateAttr
+
+T = TypeVar("T")
+
+
+class _Lazy(threading.local):
+    #: Within :func:`locked_on_first_use` on this thread.
+    on = False
+
+
+_LAZY = _Lazy()
+
+
+def locked_on_first_use(build: Callable[[], T]) -> T:
+    """``build()``, every reactive model it constructs (on this thread)
+    making its lock on its first ``with`` instead of with the model, as
+    :meth:`Synchronized.lazily` does. The same locking either way: the first
+    enter creates the lock atomically. For state built per printer whose
+    models are rarely or never locked."""
+    if _LAZY.on:
+        return build()
+    _LAZY.on = True
+    try:
+        return build()
+    finally:
+        _LAZY.on = False
 
 
 class Synchronized:

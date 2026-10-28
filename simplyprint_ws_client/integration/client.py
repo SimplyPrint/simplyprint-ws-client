@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import weakref
 from dataclasses import dataclass
 from datetime import timedelta
@@ -44,9 +45,12 @@ from typing import (
     Any,
     ClassVar,
     Coroutine,
+    Dict,
     Generic,
+    Hashable,
     Optional,
     Protocol,
+    Tuple,
     TypeVar,
 )
 
@@ -148,6 +152,11 @@ TOwnedResource = TypeVar("TOwnedResource", bound=OwnedResource)
 TDeviceDriver = TypeVar("TDeviceDriver", bound="DeviceDriver")
 
 
+def _camera_debug() -> bool:
+    """Whether a camera controller built now logs at debug (its default)."""
+    return "SIMPLYPRINT_DEBUG_CAMERA" in os.environ
+
+
 class PrinterClient(Client[TConfig], Generic[TConfig]):
     """Common base for device printer clients.
 
@@ -202,45 +211,89 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         self.active = False
         self.app_updater = context.app_updater
         self.host_telemetry = context.host_telemetry
-        self.camera = CameraController(
-            printer=self.printer,
-            logger=self.logger,
-            event_loop_provider=self,
-            send_stream=self.send,
-            context=context,
-            pause_timeout=self.camera_pause_timeout,
-            max_cache_age=self.camera_max_cache_age,
+        #: Built on first camera use when ``lazy_per_printer`` (``camera``).
+        self._camera_controller: Optional[CameraController] = (
+            None if self.lazy_per_printer else self._new_camera()
         )
         self._owned_resources: list[OwnedResource] = []
         self._drivers: list["DeviceDriver"] = []
         self.file_transfer: Optional["FileTransfer"] = None
-        self._register_printer_handlers()
+        if not self._routed:
+            self._register_printer_handlers()
+
+    def _new_camera(self) -> CameraController:
+        return CameraController(
+            printer=self.printer,
+            logger=self.logger,
+            event_loop_provider=self,
+            send_stream=self.send,
+            context=self.context,
+            pause_timeout=self.camera_pause_timeout,
+            max_cache_age=self.camera_max_cache_age,
+        )
+
+    @property
+    def camera(self) -> CameraController:
+        """The printer's camera controller (built here on first use when
+        ``lazy_per_printer``: most printers' first camera use is their
+        camera's URI, or a stream demand)."""
+        camera = self._camera_controller
+        if camera is None:
+            camera = self._camera_controller = self._new_camera()
+        return camera
+
+    @camera.setter
+    def camera(self, camera: CameraController) -> None:
+        self._camera_controller = camera
+
+    def _set_camera_uri(self, uri: Optional[URL]) -> bool:
+        """``camera.set_uri(uri)``. While no controller is built yet, a clear,
+        or a URI refused for want of a camera pool, leaves what it would in
+        a new one (nothing) and in the state, without building it."""
+        if self._camera_controller is None and (
+            uri is None
+            or (self.context.camera_pool is None and not _camera_debug())
+        ):
+            self.printer.webcam_info.connected = False
+            return uri is None
+        return self.camera.set_uri(uri)
 
     def _register_printer_handlers(self) -> None:
-        """Install the author-facing printer routes in one visible table."""
+        """Install the author-facing printer routes (``_PRINTER_ROUTES``)."""
         on = self.event_bus.on
-        on(ServerMsgType.CONNECTED, self.on_connected)
-        on(ServerMsgType.PRINTER_SETTINGS, self.on_printer_settings)
-        on(DemandMsgType.FILE, self.on_file)
-        on(DemandMsgType.START_PRINT, self.on_start_print)
-        on(DemandMsgType.PAUSE, self.on_pause)
-        on(DemandMsgType.RESUME, self.on_resume)
-        on(DemandMsgType.CANCEL, self.on_cancel)
-        on(DemandMsgType.GCODE, self.on_gcode)
-        on(DemandMsgType.TERMINAL, self.on_terminal)
-        on(DemandMsgType.SKIP_OBJECTS, self.on_skip_objects)
-        on(DemandMsgType.SYSTEM_RESTART, self.on_system_restart)
-        on(DemandMsgType.SYSTEM_SHUTDOWN, self.on_system_shutdown)
-        on(DemandMsgType.API_RESTART, self.on_api_restart)
-        on(DemandMsgType.PLUGIN_INSTALL, self.on_plugin_install)
-        on(DemandMsgType.SEND_LOGS, self.on_send_logs)
-        on(DemandMsgType.PERIPHERAL_ACTION, self.on_peripheral_action)
-        on(DemandMsgType.SET_MATERIAL_DATA, self.on_set_material_data)
-        on(DemandMsgType.RESOLVE_NOTIFICATION, self.on_resolve_notification)
-        on(DemandMsgType.STREAM_ON, self.on_stream_on)
-        on(DemandMsgType.STREAM_OFF, self.on_stream_off)
-        on(DemandMsgType.TEST_WEBCAM, self.on_test_webcam)
-        on(DemandMsgType.WEBCAM_SNAPSHOT, self.on_webcam_snapshot)
+        for event_type, name, options in self._PRINTER_ROUTES:
+            on(event_type, getattr(self, name), **options)
+
+    @classmethod
+    def _route_table(cls) -> Tuple[Tuple[Hashable, str, Dict[str, Any]], ...]:
+        return super()._route_table() + cls._PRINTER_ROUTES
+
+    #: (event, method name, options): the author-facing printer routes, in
+    #: one visible table.
+    _PRINTER_ROUTES: ClassVar[Tuple[Tuple[Hashable, str, Dict[str, Any]], ...]] = (
+        (ServerMsgType.CONNECTED, "on_connected", {}),
+        (ServerMsgType.PRINTER_SETTINGS, "on_printer_settings", {}),
+        (DemandMsgType.FILE, "on_file", {}),
+        (DemandMsgType.START_PRINT, "on_start_print", {}),
+        (DemandMsgType.PAUSE, "on_pause", {}),
+        (DemandMsgType.RESUME, "on_resume", {}),
+        (DemandMsgType.CANCEL, "on_cancel", {}),
+        (DemandMsgType.GCODE, "on_gcode", {}),
+        (DemandMsgType.TERMINAL, "on_terminal", {}),
+        (DemandMsgType.SKIP_OBJECTS, "on_skip_objects", {}),
+        (DemandMsgType.SYSTEM_RESTART, "on_system_restart", {}),
+        (DemandMsgType.SYSTEM_SHUTDOWN, "on_system_shutdown", {}),
+        (DemandMsgType.API_RESTART, "on_api_restart", {}),
+        (DemandMsgType.PLUGIN_INSTALL, "on_plugin_install", {}),
+        (DemandMsgType.SEND_LOGS, "on_send_logs", {}),
+        (DemandMsgType.PERIPHERAL_ACTION, "on_peripheral_action", {}),
+        (DemandMsgType.SET_MATERIAL_DATA, "on_set_material_data", {}),
+        (DemandMsgType.RESOLVE_NOTIFICATION, "on_resolve_notification", {}),
+        (DemandMsgType.STREAM_ON, "on_stream_on", {}),
+        (DemandMsgType.STREAM_OFF, "on_stream_off", {}),
+        (DemandMsgType.TEST_WEBCAM, "on_test_webcam", {}),
+        (DemandMsgType.WEBCAM_SNAPSHOT, "on_webcam_snapshot", {}),
+    )
 
     def own(self, resource: TOwnedResource) -> TOwnedResource:
         """Retain an async resource for reverse-order teardown."""
@@ -259,9 +312,12 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         return driver
 
     def reset_printer_state(self) -> PrinterState:
-        """Replace the device state and restore its client context."""
-        self.printer = PrinterState(config=self.config)
+        """Replace the device state and restore its client context. The
+        camera reports into the new state from now on."""
+        self.printer = self._new_printer_state(self.config)
         self.printer.provide_context(weakref.ref(self))
+        if self._camera_controller is not None:
+            self._camera_controller.follow(self.printer)
         return self.printer
 
     @property
@@ -330,7 +386,10 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
         await super().teardown()
         for driver in self._drivers:
             await driver.close()
-        await self.camera.close()
+        if self._camera_controller is not None:
+            await self._camera_controller.close()
+        else:  # what closing a new one leaves
+            self._set_camera_uri(None)
         await self.stop_connection()
 
     async def on_device_connected(self, driver: "DeviceDriver") -> None:
@@ -682,9 +741,9 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
             redacted_uri = camera_uri
 
         try:
-            if self.camera.set_uri(camera_uri):
+            if self._set_camera_uri(camera_uri):
                 self.logger.debug("Set camera URI to %s", redacted_uri)
-            elif self.camera.has_pool:
+            elif (camera := self._camera_controller) is not None and camera.has_pool:
                 self.logger.warning("Failed to set camera URI to %s", redacted_uri)
             # Without a camera pool (cameras off for this app) it is refused
             # by design, logged by the controller: no warning per report.
@@ -696,7 +755,7 @@ class PrinterClient(Client[TConfig], Generic[TConfig]):
 
     def clear_camera_uri(self) -> None:
         try:
-            self.camera.set_uri(None)
+            self._set_camera_uri(None)
         except Exception as e:
             self.logger.warning("Failed to clear camera URI", exc_info=e)
 

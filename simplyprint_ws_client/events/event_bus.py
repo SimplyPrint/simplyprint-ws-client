@@ -51,8 +51,11 @@ class _EmitGenerator(Generic[TEvent]):
     :meth:`update`.
     """
 
-    __slots__ = ("listeners", "event", "args", "kwargs", "_stop_check")
+    __slots__ = ("listeners", "event", "args", "kwargs", "owner", "_stop_check")
     listeners: Iterator[EventBusListener]
+    #: For a class route (:class:`Routes`): the instance its functions are
+    #: called on, first. ``None``: the listeners' handlers are called as they are.
+    owner: Any
 
     event: Union[Hashable, TEvent]
     args: Tuple[Any, ...]
@@ -64,11 +67,13 @@ class _EmitGenerator(Generic[TEvent]):
         event: Union[Hashable, TEvent],
         args: Tuple[Any, ...],
         kwargs: Dict[Any, Any],
+        owner: Any = None,
     ):
         self.listeners = iter(listeners)
         self.event = event
         self.args = _initialize_args(self.event, args)
         self.kwargs = kwargs
+        self.owner = owner
         self._stop_check = isinstance(event, Event)
 
     def update(self, returned_args: Union[Tuple[Any, ...], Any, None]):
@@ -144,21 +149,118 @@ def _update_args(
     return returned_args
 
 
-class EventBus(Emitter[TEvent]):
-    __slots__ = ("listeners", "event_loop_provider")
+class Routes:
+    """One class's fixed listener table, shared by every instance's bus.
 
-    listeners: Dict[Hashable, EventBusListeners]
-    event_loop_provider: EventLoopProvider[AbstractEventLoop]
+    A bus per instance with a bound method and a listener per route is ~200
+    objects per printer, built the same for every printer of a class. A bus
+    given a class's :class:`Routes` and the instance (``owner``) dispatches a
+    route's function with the owner first instead: the same order, the same
+    calls. Its own registrations for an event start from the routes' own, as
+    if registered after them (see :meth:`EventBus._take`).
+    """
+
+    __slots__ = ("routes", "table")
+
+    #: (event, function, options) in registration order.
+    routes: Tuple[Tuple[Hashable, Callable, Dict[str, Any]], ...]
+    #: Event -> its routes as a bus would hold them (the functions unbound).
+    table: Dict[Hashable, EventBusListeners]
 
     def __init__(
-        self, event_loop_provider: Optional[EventLoopProvider[AbstractEventLoop]] = None
+        self, routes: Iterable[Tuple[Hashable, Callable, Dict[str, Any]]]
+    ) -> None:
+        self.routes = tuple(routes)
+        self.table = {}
+        for event_type, function, options in self.routes:
+            _listeners_of(self.table, event_type).add(function, **options)
+
+    def bound(self, event_type: Hashable, owner: Any) -> EventBusListeners:
+        """The event's routes as ``owner``'s own registrations, in order."""
+        listeners = _new_listeners(event_type)
+        for registered, function, options in self.routes:
+            if registered == event_type:
+                listeners.add(function.__get__(owner), **options)
+        return listeners
+
+
+def _new_listeners(event_type: Hashable) -> EventBusListeners:
+    # An event can be marked as "sync_only", meaning non async listeners can be attached.
+    return EventBusListeners(
+        event_type.is_sync_only()
+        if isinstance(event_type, type) and issubclass(event_type, Event)
+        else False
+    )
+
+
+def _listeners_of(
+    table: Dict[Hashable, EventBusListeners], event_type: Hashable
+) -> EventBusListeners:
+    listeners = table.get(event_type)
+    if listeners is None:
+        listeners = table[event_type] = _new_listeners(event_type)
+    return listeners
+
+
+class EventBus(Emitter[TEvent]):
+    __slots__ = ("_listeners", "event_loop_provider", "_routes", "_owner", "_taken")
+
+    _listeners: Dict[Hashable, EventBusListeners]
+    event_loop_provider: EventLoopProvider[AbstractEventLoop]
+    #: The owner's class routes, dispatched with ``_owner`` first, for every
+    #: event not ``_taken`` (registered on this bus since: see ``_take``).
+    _routes: Optional[Routes]
+    _owner: Any
+    _taken: Union[Tuple[()], set]
+
+    def __init__(
+        self,
+        event_loop_provider: Optional[EventLoopProvider[AbstractEventLoop]] = None,
+        *,
+        routes: Optional[Routes] = None,
+        owner: Any = None,
     ) -> None:
         self.event_loop_provider = event_loop_provider or EventLoopProvider.default()
-        self.listeners = {}
+        self._listeners = {}
+        self._routes = routes
+        self._owner = owner
+        self._taken = ()
+
+    @property
+    def listeners(self) -> Dict[Hashable, EventBusListeners]:
+        """Every event's listeners, the class routes' as bound registrations."""
+        routes = self._routes
+        if routes is not None:
+            for event_type in routes.table:
+                self._take(event_type)
+        return self._listeners
+
+    def _take(self, event_type: Hashable) -> None:
+        """From now on the event's listeners are this bus's own, starting
+        with its class routes bound to the owner (as registering them in
+        ``__init__`` would have left them)."""
+        routes = self._routes
+        if routes is None or event_type in self._taken:
+            return
+        if not self._taken:
+            self._taken = set()
+        self._taken.add(event_type)
+        if event_type in routes.table:
+            self._listeners[event_type] = routes.bound(event_type, self._owner)
 
     async def emit(self, event: Union[Hashable, TEvent], *args, **kwargs) -> None:
         generator = self._emit_generator(event, args, kwargs)
         if generator is None:
+            return
+
+        owner = generator.owner
+        if owner is not None:
+            for listener, nargs, nkwargs in generator:
+                if listener.is_async:
+                    ret = await listener.handler(owner, *nargs, **nkwargs)
+                else:
+                    ret = listener.handler(owner, *nargs, **nkwargs)
+                generator.update(ret)
             return
 
         for listener, nargs, nkwargs in generator:
@@ -173,11 +275,15 @@ class EventBus(Emitter[TEvent]):
         if generator is None:
             return
 
+        owner = generator.owner
         for listener, nargs, nkwargs in generator:
             # Only invoke non-async listeners.
             if listener.is_async:
                 continue
-            ret = listener.handler(*nargs, **nkwargs)
+            if owner is not None:
+                ret = listener.handler(owner, *nargs, **nkwargs)
+            else:
+                ret = listener.handler(*nargs, **nkwargs)
             generator.update(ret)
 
     def _emit_generator(
@@ -188,9 +294,17 @@ class EventBus(Emitter[TEvent]):
         Picks the cached fast listener list when there are no one-shot
         listeners; otherwise it iterates the live registration collection.
         """
-        listeners = self._listeners_for(event)
+        key = self._event_key(event)
+        listeners = self._listeners.get(key)
         if listeners is None:
-            return None
+            routes = self._routes
+            if routes is None or key in self._taken:
+                return None
+            routed = routes.table.get(key)
+            if routed is None:
+                return None
+            # Class routes are never one-shot: their order is the whole list.
+            return _EmitGenerator(routed.ordered(), event, args, kwargs, self._owner)
 
         iterable: Iterable[EventBusListener] = (
             listeners.fast_emit_listeners() or listeners
@@ -285,33 +399,32 @@ class EventBus(Emitter[TEvent]):
 
     def off(self, event_type: Hashable, listener: Callable) -> None:
         """Remove a listener from the event bus."""
-        if event_type not in self.listeners:
+        self._take(event_type)
+        listeners = self._listeners
+        if event_type not in listeners:
             return
 
-        self.listeners[event_type].remove(listener)
+        listeners[event_type].remove(listener)
 
-        if len(self.listeners[event_type]) == 0:
-            self.listeners.pop(event_type)
+        if len(listeners[event_type]) == 0:
+            listeners.pop(event_type)
 
     def clear(self, *event_types: Hashable) -> None:
         """Clear all listeners for a given event type."""
         for event_type in event_types:
-            self.listeners.pop(event_type, None)
+            self._take(event_type)
+            self._listeners.pop(event_type, None)
 
     def clear_all(self) -> None:
         """Drop every listener for every event type."""
-        self.listeners.clear()
+        self._routes = None
+        self._listeners.clear()
 
     @staticmethod
     def _event_key(event: Union[Hashable, TEvent]) -> Hashable:
         if isinstance(event, Event):
             return event.__class__
         return event
-
-    def _listeners_for(
-        self, event: Union[Hashable, TEvent]
-    ) -> Optional[EventBusListeners]:
-        return self.listeners.get(self._event_key(event))
 
     def _register_listener(
         self,
@@ -320,13 +433,6 @@ class EventBus(Emitter[TEvent]):
         **kwargs: Unpack[EventBusListenerOptions],
     ) -> Callable:
         """Registers a single listener for a given event type."""
-        if event_type not in self.listeners:
-            # An event can be marked as "sync_only", meaning non async listeners can be attached.
-            self.listeners[event_type] = EventBusListeners(
-                event_type.is_sync_only()
-                if isinstance(event_type, type) and issubclass(event_type, Event)
-                else False
-            )
-
-        self.listeners[event_type].add(listener, **kwargs)
+        self._take(event_type)
+        _listeners_of(self._listeners, event_type).add(listener, **kwargs)
         return listener
