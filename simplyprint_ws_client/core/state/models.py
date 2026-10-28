@@ -153,17 +153,23 @@ class Intervals(BaseModel):
             return self.notification
         raise ValueError(f"Unknown interval: {interval}")
 
+    # The usages are read straight from the private store: a private
+    # attribute read goes through pydantic's ``__getattr__``, and every
+    # message sent asks its interval.
+
     def time_until_ready(self, interval: Interval) -> int:
-        if self._usages[interval] is None:
+        used = self.__pydantic_private__["_usages"][interval]
+        if used is None:
             return 0
 
-        return self.duration(interval) - (self.now() - self._usages[interval])
+        return self.duration(interval) - (self.now() - used)
 
     def is_ready(self, interval: Interval):
-        if self._usages[interval] is None:
+        used = self.__pydantic_private__["_usages"][interval]
+        if used is None:
             return True
 
-        return self.now() - self._usages[interval] >= self.duration(interval)
+        return self.now() - used >= self.duration(interval)
 
     def dispatch_mode(self, interval: Interval):
         if not self.use(interval):
@@ -172,10 +178,13 @@ class Intervals(BaseModel):
         return DispatchMode.DISPATCH
 
     def use(self, interval: Interval) -> bool:
-        if not self.is_ready(interval):
+        usages = self.__pydantic_private__["_usages"]
+        used = usages[interval]
+        now = self.now()
+        if used is not None and now - used < self.duration(interval):
             return False
 
-        self._usages[interval] = self.now()
+        usages[interval] = now
 
         return True
 

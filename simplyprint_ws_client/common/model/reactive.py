@@ -25,6 +25,7 @@ from typing import (
     no_type_check,
     cast,
     Tuple,
+    List,
 )
 
 from pydantic import BaseModel, PrivateAttr
@@ -165,20 +166,53 @@ class ReactiveModel(BaseModel, Synchronized):
         template = _FRESH.get(cls)
         if template is None or template[0] is not cls.__pydantic_fields__:
             template = _fresh_template(cls)
-        _, defaults, required = template
+        _, defaults, required, every = template
         if defaults is None or not required.issubset(values):
             return cls(ctx, **values)
         m = cls.__new__(cls)
         state = defaults.copy()  # field order, as validation leaves it
         state.update(values)
         object.__setattr__(m, "__dict__", state)
-        object.__setattr__(m, "__pydantic_fields_set__", set(values))
-        object.__setattr__(m, "__pydantic_extra__", None)
-        object.__setattr__(m, "__pydantic_private__", None)
+        # Every field set (as a new entry's usually are): the class's one set
+        # of them, shared. Nothing removes a field from a fields set, and
+        # adding one that is in it changes nothing.
+        _set_fields_set(m, every if values.keys() == every else set(values))
+        _set_extra(m, None)
+        _set_private(m, None)
         Synchronized.lazily(m)  # entries are rarely locked: no lock until one is
-        object.__setattr__(m, "ctx", ctx)
-        object.__setattr__(m, "model_self_changed_fields", {})
+        _set_ctx(m, ctx)
+        _set_changed(m, {})
         return m
+
+    @classmethod
+    def model_fresh_rows(
+        cls: Type[TReactiveModel], ctx: ContextRef, rows: List[Tuple[Any, ...]]
+    ) -> List[TReactiveModel]:
+        """``model_fresh(ctx, dict(zip(fields, row)))`` for each row, a value
+        for every field in field order: the template is looked up once, and
+        each row becomes its instance's fields as it is, with the class's one
+        fields set (see ``model_fresh``)."""
+        template = _FRESH.get(cls)
+        if template is None or template[0] is not cls.__pydantic_fields__:
+            template = _fresh_template(cls)
+        _, defaults, _, every = template
+        if defaults is None:
+            return [cls(ctx, **dict(zip(cls.__pydantic_fields__, row))) for row in rows]
+        names = tuple(defaults)
+        new = cls.__new__
+        set_dict = object.__setattr__
+        built = []
+        for row in rows:
+            m = new(cls)
+            set_dict(m, "__dict__", dict(zip(names, row)))
+            _set_fields_set(m, every)
+            _set_extra(m, None)
+            _set_private(m, None)
+            Synchronized.lazily(m)
+            _set_ctx(m, ctx)
+            _set_changed(m, {})
+            built.append(m)
+        return built
 
     def provide_context(
         self, ctx: Union["ReactiveModel", "weakref.ref[ReactiveContext]"]
@@ -871,15 +905,17 @@ def _writer(cls: Type["ReactiveModel"], names: Tuple[str, ...]) -> Callable[...,
 
 
 #: ``class -> (fields, defaults by field in field order or None, required
-#: names)``: ``model_fresh``'s template. ``None``: the class can't be built
+#: names, the set of every field name)``: ``model_fresh``'s template. ``None``: the class can't be built
 #: from it (see ``model_fresh``). Keyed on the field dict like
 #: ``_TRACKED_FIELDS``.
-_FRESH: Dict[type, Tuple[Any, Optional[Dict[str, Any]], frozenset]] = {}
+_FRESH: Dict[type, Tuple[Any, Optional[Dict[str, Any]], frozenset, Set[str]]] = {}
 
 _PLAIN_DEFAULTS = (type(None), int, float, str, bool, enum.Enum)
 
 
-def _fresh_template(cls: Type["ReactiveModel"]) -> Tuple[Any, Optional[Dict[str, Any]], frozenset]:
+def _fresh_template(
+    cls: Type["ReactiveModel"],
+) -> Tuple[Any, Optional[Dict[str, Any]], frozenset, Set[str]]:
     fields = cls.__pydantic_fields__
     decorators = cls.__pydantic_decorators__
     plain = (
@@ -905,5 +941,19 @@ def _fresh_template(cls: Type["ReactiveModel"]) -> Tuple[Any, Optional[Dict[str,
             defaults[name] = info.default
         else:
             plain = False
-    entry = _FRESH[cls] = (fields, defaults if plain else None, frozenset(required))
+    entry = _FRESH[cls] = (
+        fields,
+        defaults if plain else None,
+        frozenset(required),
+        set(defaults),
+    )
     return entry
+
+
+# model_fresh's slot writes, straight through the slots' descriptors (what
+# object.__setattr__ finds for them, without the lookup).
+_set_fields_set = BaseModel.__dict__["__pydantic_fields_set__"].__set__
+_set_extra = BaseModel.__dict__["__pydantic_extra__"].__set__
+_set_private = BaseModel.__dict__["__pydantic_private__"].__set__
+_set_ctx = ReactiveModel.__dict__["ctx"].__set__
+_set_changed = ReactiveModel.__dict__["model_self_changed_fields"].__set__

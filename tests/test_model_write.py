@@ -161,6 +161,49 @@ def test_new_peripheral_entry_matches_construct_then_write():
         assert dict(PeripheralMsg.build(a.printer)) == dict(PeripheralMsg.build(b.printer))
 
 
+def test_model_fresh_rows_is_model_fresh():
+    from simplyprint_ws_client.core.state.printer import JobInfoState, PeripheralState
+
+    rows = [("fan:a", None, False, 5), ("fan:b", 20, True, None)]
+    names = list(PeripheralState.model_fields)
+    built = PeripheralState.model_fresh_rows(lambda: None, rows)
+    assert [_fields(m) for m in built] == [
+        _fields(PeripheralState.model_fresh(lambda: None, dict(zip(names, row)))) for row in rows
+    ]
+    # A class model_fresh builds the validated way: so are its rows.
+    row = tuple(JobInfoState.model_fields[name].default for name in JobInfoState.model_fields)
+    (job,) = JobInfoState.model_fresh_rows(lambda: None, [row])
+    assert job.model_dump() == JobInfoState().model_dump()
+
+
+def test_add_all_is_one_add_after_another():
+    """add_all leaves the entries, marks, message ids and kinds that adding
+    each entry in turn (_add) does."""
+    from simplyprint_ws_client.core.protocol.messages import PeripheralMsg
+
+    rng = random.Random(11)
+    options = [None, 0, 50, True, False]
+    for _ in range(200):
+        a, b = _pair()
+        if rng.random() < 0.3:  # some entries already there
+            for client in (a, b):
+                client.printer.peripherals.update("light:x", value=True)
+        items = [
+            (f"fan:{i}", value, rng.choice([value is not None, None, True, False]))
+            for i, value in enumerate(rng.choice(options) for _ in range(rng.randint(0, 5)))
+        ]
+        updated = rng.choice([None, 1700000000])
+        for pid, value, available in items:
+            a.printer.peripherals._add(pid, value, available, updated)
+        b.printer.peripherals.add_all(items, updated)
+        old, new = a.printer.peripherals.entries, b.printer.peripherals.entries
+        assert list(old) == list(new)
+        assert [_fields(e) for e in old.values()] == [_fields(e) for e in new.values()]
+        assert a.printer.peripherals.model_self_changed_fields == b.printer.peripherals.model_self_changed_fields
+        assert (a.msg_id, a._touched_kinds) == (b.msg_id, b._touched_kinds)
+        assert dict(PeripheralMsg.build(a.printer)) == dict(PeripheralMsg.build(b.printer))
+
+
 def _typed(m):
     """Fields with their types (an int and a float compare equal), marks, fields set."""
     return (

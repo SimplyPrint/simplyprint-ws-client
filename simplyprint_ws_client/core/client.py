@@ -809,6 +809,22 @@ class Client(
         self.msg_id += 1
         return self.msg_id
 
+    def stamp_run(
+        self, kinds: Iterable[Tuple[type, Optional[str]]], count: int
+    ) -> int:
+        """``count`` tracked changes, each to one of the models and fields in
+        ``kinds`` (a field of ``None``: a bind, as :meth:`state_attached`):
+        the id before them, so theirs are that +1 to +count, in order. For a
+        writer making many changes at once (a printer's first peripherals):
+        the kinds are worked out once, not per change."""
+        bits = 0
+        for cls, field in kinds:
+            bits |= _affected(cls, field)
+        self._touched_kinds |= bits
+        first = self.msg_id
+        self.msg_id = first + count
+        return first
+
     def state_attached(self, model: ReactiveModel) -> None:
         """A state subtree was bound to this client (``provide_context``): any
         change it already carries is now in the tree."""

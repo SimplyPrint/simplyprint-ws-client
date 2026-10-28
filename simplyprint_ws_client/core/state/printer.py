@@ -1,7 +1,7 @@
 """The reactive printer state model tree (:class:`PrinterState` and its parts)."""
 
 import time
-from typing import Any, ClassVar, Dict, List, Optional, Set, Union, no_type_check
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Union, no_type_check
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -289,6 +289,65 @@ class PeripheralsState(ReactiveModel):
             changed["updated"] = live.stamp_change(entry, "updated")
         live.signal()
         return entry
+
+    def add_all(
+        self, items: List[Tuple[str, Any, Optional[bool]]], updated: Optional[int]
+    ) -> None:
+        """``_add(peripheral_id, value, available, updated)`` for each
+        ``(peripheral_id, value, available)`` in ``items``, in order, ids not
+        in ``entries`` and none twice: the same entries, marks and message
+        ids, in one pass. A printer's first report adds every fan and light
+        it has at once; one by one, each paid for its own values dict,
+        template lookup, context call and kinds lookups."""
+        ctx = self.ctx
+        entries = self.entries
+        live = ctx()
+        stamp_run = getattr(live, "stamp_run", None)
+        if stamp_run is None:  # unbound, or a context without runs
+            for peripheral_id, value, available in items:
+                self._add(peripheral_id, value, available, updated)
+            return
+        # Per entry, as _add stamps them: "entries", "id", then each of
+        # value, available and updated that isn't the default (None).
+        count = 0
+        stamped = 2 + (updated is not None)
+        for _, value, available in items:
+            count += stamped + (value is not None) + (available is not None)
+        last = stamp_run(_ADD_KINDS, count)
+        built = PeripheralState.model_fresh_rows(
+            ctx, [(pid, value, available, updated) for pid, value, available in items]
+        )
+        for (peripheral_id, value, available), entry in zip(items, built):
+            entries[peripheral_id] = entry
+            changed = entry.model_self_changed_fields
+            last += 1
+            entries_stamp = last
+            last += 1
+            changed["id"] = last
+            if value is not None:
+                last += 1
+                changed["value"] = last
+            if available is not None:
+                last += 1
+                changed["available"] = last
+            if updated is not None:
+                last += 1
+                changed["updated"] = last
+        if items:
+            self.model_self_changed_fields["entries"] = entries_stamp
+            live.signal()
+
+
+#: What adding entries changes (``PeripheralsState.add_all``): the entry
+#: bound, the entries map, and the entry's fields.
+_ADD_KINDS = (
+    (PeripheralState, None),
+    (PeripheralsState, "entries"),
+    (PeripheralState, "id"),
+    (PeripheralState, "value"),
+    (PeripheralState, "available"),
+    (PeripheralState, "updated"),
+)
 
 
 class JobInfoState(ReactiveModel, validate_assignment=True):
