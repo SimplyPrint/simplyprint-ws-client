@@ -58,3 +58,30 @@ def scan_hosts(max_hosts: int = _MAX_SCAN_HOSTS) -> List[str]:
                 return hosts
 
     return hosts
+
+
+def multicast_interfaces() -> List[str]:
+    """IPv4 addresses of this machine's interfaces that are up, loopback excluded.
+
+    A multicast group has to be joined on each of them (and searches sent out of
+    each) for a printer on any of this machine's networks to be heard; the OS's
+    single default interface is often a VPN or a virtual adapter. Empty when the
+    interfaces can't be listed, so callers fall back to the OS default.
+    """
+    try:
+        addresses = psutil.net_if_addrs()
+        stats = psutil.net_if_stats()
+    except Exception:
+        return []
+
+    found: set[str] = set()
+    for name, addrs in addresses.items():
+        stat = stats.get(name)
+        if stat is not None and not stat.isup:
+            continue
+        for addr in addrs:
+            if addr.family != socket.AF_INET or addr.address.startswith("127."):
+                continue
+            found.add(addr.address)
+
+    return sorted(found)

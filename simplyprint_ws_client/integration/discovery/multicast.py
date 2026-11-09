@@ -26,7 +26,9 @@ from simplyprint_ws_client.common.asyncio.bounded_dispatch import (
 from simplyprint_ws_client.common.utils.expiring_dict import ExpiringDict
 from simplyprint_ws_client.integration.discovery.multicast_base import (
     MulticastListenerBase,
+    send_from_interfaces,
 )
+from simplyprint_ws_client.integration.discovery.netif import multicast_interfaces
 from simplyprint_ws_client.integration.discovery.spec import MulticastSpec
 from simplyprint_ws_client.integration.discovery.ssdp import SSDPRequestParser
 
@@ -138,9 +140,7 @@ class MulticastDiscoveryBackend(MulticastListenerBase):
     async def run_transport(self, transport: asyncio.DatagramTransport) -> None:
         if self.spec.is_active:
             while not self.is_stopped():
-                transport.sendto(
-                    self.spec.search_payload, (self.spec.group, self.spec.port)
-                )
+                self.send_to_group(transport, self.spec.search_payload)
                 await self.wait(self.spec.search_interval)
         else:
             await self.wait()
@@ -162,7 +162,14 @@ def scan_blocking(spec: MulticastSpec, timeout: float = 5.0) -> list:
     sock.settimeout(1.0)
 
     if spec.search_payload:
-        sock.sendto(spec.search_payload, (spec.group, spec.port))
+        # Out of every interface: the default one may not be the printers' network.
+        send_from_interfaces(
+            sock,
+            spec.search_payload,
+            (spec.group, spec.port),
+            multicast_interfaces(),
+            logger,
+        )
 
     devices: dict = {}
     deadline = time.monotonic() + timeout

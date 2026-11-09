@@ -223,12 +223,16 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
     _WORKERS = 2
     _IDLE_TIMEOUT = 1.0
 
-    def __init__(self, spec: MDNSSpec, devices: ExpiringDict, emit, logger, queried):
+    def __init__(
+        self, spec: MDNSSpec, devices: ExpiringDict, emit, logger, queried, send=None
+    ):
         self._spec = spec
         self._devices = devices
         self._emit = emit  # async callable(record) | None
         self._logger = logger
         self._queried = queried  # TTL'd set of already-issued follow-up names
+        # send(transport, payload): the backend's every-interface send; plain sendto without one.
+        self._send = send
         self._transport = None
         self._dispatch = BoundedAsyncDispatcher(
             self._handle,
@@ -289,10 +293,11 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
             if name in self._queried or self._transport is None:
                 continue
             self._queried[name] = True
-            self._transport.sendto(
-                MDNSResponseParser.build_query(name),
-                (self._spec.group, self._spec.port),
-            )
+            query = MDNSResponseParser.build_query(name)
+            if self._send is not None:
+                self._send(self._transport, query)
+            else:
+                self._transport.sendto(query, (self._spec.group, self._spec.port))
 
     def error_received(self, exc) -> None:
         if isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
@@ -324,7 +329,12 @@ class MDNSDiscoveryBackend(MulticastListenerBase):
 
     def protocol_factory(self) -> _MDNSProtocol:
         return _MDNSProtocol(
-            self.spec, self.devices, self._emit, self.logger, self._queried
+            self.spec,
+            self.devices,
+            self._emit,
+            self.logger,
+            self._queried,
+            self.send_to_group,
         )
 
     async def bind_socket(self, sock: socket.socket) -> None:
@@ -342,8 +352,5 @@ class MDNSDiscoveryBackend(MulticastListenerBase):
     async def run_transport(self, transport: asyncio.DatagramTransport) -> None:
         while not self.is_stopped():
             for name in self.spec.queries:
-                transport.sendto(
-                    MDNSResponseParser.build_query(name),
-                    (self.spec.group, self.spec.port),
-                )
+                self.send_to_group(transport, MDNSResponseParser.build_query(name))
             await self.wait(self.spec.query_interval)
