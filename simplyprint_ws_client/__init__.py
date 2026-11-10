@@ -11,4 +11,5 @@ from .core.ws_protocol.models import (
     DemandMsgType,  # noqa: F401
     ClientMsgType,  # noqa: F401
     DispatchMode,  # noqa: F401
+    PeripheralAction,  # noqa: F401
 )

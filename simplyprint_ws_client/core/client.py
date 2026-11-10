@@ -6,6 +6,8 @@ __all__ = [
     "PhysicalClient",
     "ClientState",
     "configure",
+    "PeripheralDefinitionEntry",
+    "PeripheralDefinitions",
 ]
 
 import asyncio
@@ -15,12 +17,12 @@ import weakref
 from abc import ABC
 from datetime import timedelta, datetime
 from enum import IntEnum
-from typing import NamedTuple, Optional, Union, Generic, TypeVar, cast
+from typing import Dict, Literal, NamedTuple, Optional, Union, Generic, TypeVar, cast
 
 try:
-    from typing import Unpack, Never
+    from typing import NotRequired, TypedDict, Unpack, Never
 except ImportError:
-    from typing_extensions import Unpack, Never
+    from typing_extensions import NotRequired, TypedDict, Unpack, Never
 
 from .autowire import (
     configure,
@@ -70,6 +72,8 @@ from .ws_protocol.messages import (
     PowerControllerMsg,
     CpuInfoMsg,
     NotificationMsg,
+    PeripheralDefinitionsMsg,
+    PeripheralMsg,
     ResolveNotificationDemandData,
 )
 from .ws_protocol.models import (
@@ -118,6 +122,17 @@ class ClientConfigChangedEvent(Event): ...
 class ClientStateChangeEvent(Event): ...
 
 
+class PeripheralDefinitionEntry(TypedDict):
+    f: Literal["r", "w", "rw"]
+    n: NotRequired[str]
+    d: NotRequired[str]
+    o: NotRequired[int]
+    vt: NotRequired[Literal["bool", "percent"]]
+
+
+PeripheralDefinitions = Dict[str, PeripheralDefinitionEntry]
+
+
 TConfig = TypeVar("TConfig", bound=PrinterConfig)
 
 # Map message producers
@@ -149,6 +164,7 @@ _CLIENT_MSG_PRODUCERS = {
     NotificationMsg: [
         "notifications.notifications",
     ],
+    PeripheralMsg: ["peripherals.entries"],
 }
 
 _CLIENT_MSG_MAP = {k: v for v, keys in _CLIENT_MSG_PRODUCERS.items() for k in keys}
@@ -543,6 +559,11 @@ class DefaultClient(Client[TConfig], ABC):
         """
         await self.send(NotificationMsg(data={"events": [NotificationEvent(**kwargs)]}))
 
+    def get_current_peripheral_definitions(
+        self,
+    ) -> Optional[PeripheralDefinitions]:
+        return None
+
     # Default event handling.
 
     @configure(ServerMsgType.ERROR, priority=1)
@@ -627,6 +648,15 @@ class DefaultClient(Client[TConfig], ABC):
                 data=dict(MaterialDataMsg.build(self.printer, is_refresh=True))
             )
         )
+
+    @configure(DemandMsgType.REFRESH_PERIPHERALS, priority=1)
+    async def _on_refresh_peripherals(self):
+        definitions = self.get_current_peripheral_definitions()
+
+        if definitions is None:
+            return
+
+        await self.send(PeripheralDefinitionsMsg(data=definitions), skip_dispatch=True)
 
     @configure(DemandMsgType.RESOLVE_NOTIFICATION, priority=1)
     async def _on_resolve_notification(self, data: ResolveNotificationDemandData):
