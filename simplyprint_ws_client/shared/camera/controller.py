@@ -1,3 +1,4 @@
+import functools
 import logging
 import threading
 from typing import final, Optional, Callable
@@ -12,6 +13,9 @@ from .base import (
 from ..utils.stoppable import SyncStoppable
 from ..utils.synchronized import Synchronized
 
+# How long stop() waits for the reader thread before leaving it behind (seconds).
+STOP_JOIN_TIMEOUT = 5.0
+
 
 @final
 class CameraController(SyncStoppable, Synchronized):
@@ -24,6 +28,7 @@ class CameraController(SyncStoppable, Synchronized):
     _frame_cb: Callable[[Optional[FrameT]], None]
     _pause_timer: Optional[threading.Timer] = None
     _main_thread: Optional[threading.Thread] = None
+    _generation: int = 0
 
     def __init__(
         self,
@@ -60,8 +65,11 @@ class CameraController(SyncStoppable, Synchronized):
 
         self.clear()
         self._refresh_timer()
+        self._generation += 1
         self._main_thread = threading.Thread(
-            target=self._exception_handler, args=(self._read_loop,), daemon=True
+            target=self._exception_handler,
+            args=(functools.partial(self._read_loop, self._generation),),
+            daemon=True,
         )
         self._main_thread.start()
 
@@ -69,7 +77,14 @@ class CameraController(SyncStoppable, Synchronized):
         super().stop()
 
         if self._main_thread:
-            self._main_thread.join()
+            # A read blocked on a camera that sends nothing would hold this camera's lock, and a worker thread,
+            # for as long as it blocks. Leave it behind instead: its generation is spent, so it delivers nothing.
+            self._main_thread.join(timeout=STOP_JOIN_TIMEOUT)
+
+            if self._main_thread.is_alive():
+                self.logger.debug("Camera reader did not stop within %ss, abandoning it", STOP_JOIN_TIMEOUT)
+                self._generation += 1
+
             self._main_thread = None
 
         if self._pause_timer:
@@ -95,10 +110,10 @@ class CameraController(SyncStoppable, Synchronized):
             self._frame_cb(frame)
             break
 
-    def _read_loop(self):
+    def _read_loop(self, generation: int):
         """Continuous frame reading loop"""
         for frame in self.protocol:
-            if self.is_stopped():
+            if self.is_stopped() or generation != self._generation:
                 break
 
             self._frame_cb(frame)

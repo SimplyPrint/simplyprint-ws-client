@@ -16,6 +16,10 @@ from ..utils.stoppable import StoppableInterface
 if TYPE_CHECKING:
     from .pool import CameraPool
 
+# How long a caller waits for a frame (seconds). Without a bound, a camera that sends nothing parks every
+# snapshot request for it, AI bed checks included, until something restarts it.
+RECEIVE_FRAME_TIMEOUT = 15.0
+
 
 class CameraHandle(StoppableInterface):
     pool: "CameraPool"
@@ -23,7 +27,7 @@ class CameraHandle(StoppableInterface):
 
     _waiters: List[asyncio.Future]
     _frame_time_window: List[float]
-    _last_poll_time: datetime.datetime
+    _last_poll_time: Optional[datetime.datetime] = None
     _cached_frame: Optional[FrameT] = None
 
     def __init__(self, pool: "CameraPool", camera_id: int):
@@ -55,8 +59,11 @@ class CameraHandle(StoppableInterface):
             loop.call_soon_threadsafe(fut.set_result, res.data)
 
     async def receive_frame(
-        self, allow_cache_age: Optional[datetime.timedelta] = None
-    ) -> FrameT:
+        self,
+        allow_cache_age: Optional[datetime.timedelta] = None,
+        timeout: Optional[float] = RECEIVE_FRAME_TIMEOUT,
+    ) -> Optional[FrameT]:
+        """A fresh frame, or None if the camera sends none within `timeout` seconds."""
         # Always ask for a new frame
         self.pool.submit_request(PollCamera(self.id))
 
@@ -74,7 +81,14 @@ class CameraHandle(StoppableInterface):
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._waiters.append(fut)
-        return await fut
+
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            if fut in self._waiters:
+                self._waiters.remove(fut)
+
+            return None
 
     def start(self):
         self.pool.submit_request(StartCamera(self.id))
